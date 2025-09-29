@@ -1,0 +1,17 @@
+request_id,strategy,time_slot,emission,error
+0,Medium,0,1000,3
+1,High,0,2000,0
+2,Medium,0,1000,3
+3,Medium,0,1000,3
+4,High,0,2000,0
+5,Medium,0,1000,3
+6,Low,0,100,6
+7,Low,0,100,6
+8,High,0,2000,0
+9,Medium,0,1000,3
+Statistics:
+computing_time:0.0019
+strategy:Medium
+all_emissions:11200
+slot_emissions:[11200, 0, 0]
+avg_errors:2.7

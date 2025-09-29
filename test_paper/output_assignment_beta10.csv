@@ -1,0 +1,17 @@
+0,Medium,0,1000,3
+1,Low,0,100,6
+2,Medium,0,1000,3
+3,Medium,0,1000,3
+4,Medium,0,1000,3
+5,Low,0,100,6
+6,Low,0,100,6
+7,Low,0,100,6
+8,Low,0,100,6
+9,Low,0,100,6
+
+max_weighted_error_threshold: 48
+solver_status: 4
+all_emissions:4600
+slot_emissions:[4600]
+all_errors:4.8
+solve_time:0.0067

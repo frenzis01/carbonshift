@@ -1,0 +1,81 @@
+all_requests,computing_time,solver_status,solve_time,objective_value,all_emissions,slot_emissions,all_errors,slot_errors,iteration
+512,1.121009981,solver_status:4,solve_time:0.4801,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],1
+512,1.304016736,solver_status:4,solve_time:0.4679,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],2
+512,1.131179135,solver_status:4,solve_time:0.4588,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],3
+512,1.268018069,solver_status:4,solve_time:0.4934,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],4
+512,1.112132256,solver_status:4,solve_time:0.383,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],5
+512,1.392120897,solver_status:4,solve_time:0.57,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],6
+512,1.163632686,solver_status:4,solve_time:0.4942,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],7
+512,1.118875651,solver_status:4,solve_time:0.5198,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],8
+512,1.366442543,solver_status:4,solve_time:0.4688,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],9
+512,1.232116073,solver_status:4,solve_time:0.5576,objective_value:2381200.0,all_emissions:28114,slot_emissions:[26100, 109, 1800, 105],all_errors:1584,slot_errors:[1566, 6, 6, 6],10
+1024,2.298248861,solver_status:4,solve_time:1.2491,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],1
+1024,2.055451107,solver_status:4,solve_time:1.1787,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],2
+1024,1.966409724,solver_status:4,solve_time:1.1449,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],3
+1024,2.324217786,solver_status:4,solve_time:1.4073,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],4
+1024,2.259282538,solver_status:4,solve_time:1.3238,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],5
+1024,2.108105496,solver_status:4,solve_time:1.2431,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],6
+1024,2.317963478,solver_status:4,solve_time:1.3235,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],7
+1024,2.328183483,solver_status:4,solve_time:1.5023,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],8
+1024,2.224394297,solver_status:4,solve_time:1.2475,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],9
+1024,2.176035525,solver_status:4,solve_time:1.2693,objective_value:3483520.0,all_emissions:55519,slot_emissions:[53400, 109, 1800, 210],all_errors:3228,slot_errors:[3204, 6, 6, 12],10
+2048,5.928002890,solver_status:4,solve_time:4.8389,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],1
+2048,6.020017686,solver_status:4,solve_time:4.7209,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],2
+2048,5.897757653,solver_status:4,solve_time:4.7115,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],3
+2048,6.187986887,solver_status:4,solve_time:4.8757,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],4
+2048,6.188073489,solver_status:4,solve_time:5.0435,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],5
+2048,6.376022133,solver_status:4,solve_time:5.1452,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],6
+2048,6.492061774,solver_status:4,solve_time:5.3263,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],7
+2048,5.884062334,solver_status:4,solve_time:4.7199,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],8
+2048,5.788311039,solver_status:4,solve_time:4.5608,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],9
+2048,6.544039135,solver_status:4,solve_time:5.3513,objective_value:4951540.0,all_emissions:102304,slot_emissions:[99900, 109, 1980, 315],all_errors:6036,slot_errors:[5994, 6, 18, 18],10
+4096,13.768078768,solver_status:4,solve_time:12.1172,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],1
+4096,14.156043261,solver_status:4,solve_time:12.2473,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],2
+4096,14.640022198,solver_status:4,solve_time:12.667,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],3
+4096,14.216089145,solver_status:4,solve_time:12.3876,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],4
+4096,13.856079178,solver_status:4,solve_time:12.0951,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],5
+4096,14.334513900,solver_status:4,solve_time:12.2995,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],6
+4096,14.020124182,solver_status:4,solve_time:12.348,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],7
+4096,13.732016597,solver_status:4,solve_time:11.9226,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],8
+4096,13.588005557,solver_status:4,solve_time:11.7897,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],9
+4096,13.940106062,solver_status:4,solve_time:11.8101,objective_value:7998840.0,all_emissions:211113,slot_emissions:[207400, 218, 2970, 525],all_errors:12513,slot_errors:[12444, 12, 27, 30],10
+8192,45.785975115,solver_status:4,solve_time:42.2969,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],1
+8192,45.301681875,solver_status:4,solve_time:42.0473,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],2
+8192,45.134170728,solver_status:4,solve_time:41.5693,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],3
+8192,46.840101429,solver_status:4,solve_time:43.4052,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],4
+8192,45.735788256,solver_status:4,solve_time:42.1752,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],5
+8192,44.229798537,solver_status:4,solve_time:40.7291,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],6
+8192,45.351480078,solver_status:4,solve_time:41.9675,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],7
+8192,44.115888821,solver_status:4,solve_time:40.9705,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],8
+8192,46.097743902,solver_status:4,solve_time:42.5266,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],9
+8192,44.769662694,solver_status:4,solve_time:41.5761,objective_value:13801580.0,all_emissions:408122,slot_emissions:[401900, 327, 4950, 945],all_errors:24231,slot_errors:[24114, 18, 45, 54],10
+16384,187.364073100,solver_status:4,solve_time:181.2667,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],1
+16384,186.911227830,solver_status:4,solve_time:180.4912,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],2
+16384,186.840103782,solver_status:4,solve_time:180.5754,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],3
+16384,188.993680401,solver_status:4,solve_time:182.6415,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],4
+16384,191.664145145,solver_status:4,solve_time:185.0425,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],5
+16384,188.612033422,solver_status:4,solve_time:182.1921,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],6
+16384,186.836768900,solver_status:4,solve_time:180.69,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],7
+16384,184.760025832,solver_status:4,solve_time:178.9995,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],8
+16384,190.480076865,solver_status:4,solve_time:183.9345,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],9
+16384,187.160131307,solver_status:4,solve_time:181.1547,objective_value:25700160.0,all_emissions:834339,slot_emissions:[823800, 654, 8100, 1785],all_errors:49650,slot_errors:[49428, 36, 84, 102],10
+32768,312.382123555,solver_status:2,solve_time:300.1713,,,,,,1
+32768,312.144297850,solver_status:2,solve_time:300.1912,,,,,,2
+32768,312.228060154,solver_status:2,solve_time:300.2033,,,,,,3
+32768,311.652100293,solver_status:2,solve_time:300.1389,,,,,,4
+32768,311.887457402,solver_status:2,solve_time:300.152,,,,,,5
+32768,312.068382694,solver_status:2,solve_time:300.1858,,,,,,6
+32768,312.028908104,solver_status:2,solve_time:300.1141,,,,,,7
+32768,311.636109613,solver_status:2,solve_time:300.1892,,,,,,8
+32768,312.239176994,solver_status:2,solve_time:300.1816,,,,,,9
+32768,312.144127026,solver_status:2,solve_time:300.1224,,,,,,10
+65536,324.113530731,solver_status:0,solve_time:0.0,,,,,,1
+65536,323.072068872,solver_status:0,solve_time:0.0,,,,,,2
+65536,324.104119396,solver_status:0,solve_time:0.0,,,,,,3
+65536,324.166741438,solver_status:0,solve_time:0.0,,,,,,4
+65536,323.723797934,solver_status:0,solve_time:0.0,,,,,,5
+65536,323.763723126,solver_status:0,solve_time:0.0,,,,,,6
+65536,323.034735694,solver_status:0,solve_time:0.0,,,,,,7
+65536,323.360100044,solver_status:0,solve_time:0.0,,,,,,8
+65536,322.944073025,solver_status:0,solve_time:0.0,,,,,,9
+65536,323.668058219,solver_status:0,solve_time:0.0,,,,,,10
