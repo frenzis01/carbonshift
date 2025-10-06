@@ -65,7 +65,7 @@ y = np.arange(len(policies))
 fig, ax = plt.subplots(figsize=(16, 6))
 
 bars_em = ax.barh(y - bar_height/2, emissions_pct, bar_height,
-color=color_emissions, label="Carbon Intensity Efficiency")
+color=color_emissions, label="Reduction of Carbon Emissions")
 bars_err = ax.barh(y + bar_height/2, errors, bar_height,
 color=color_errors, label="Average Error")
 
