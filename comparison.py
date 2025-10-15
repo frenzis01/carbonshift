@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 
-err = 4.0
+err = 5.0
 
 if err == 2.0:
     data = {
@@ -82,5 +82,5 @@ plt.grid(True, linestyle='-', alpha=0.7, zorder=0) # zorder per metterla sotto i
 
 fig = plt.gcf()
 with PdfPages("grafico_confronto"+str(int(err))+".pdf") as pdf:
-    pdf.savefig(fig)
+    pdf.savefig(fig, bbox_inches='tight') 
     plt.close(fig)
