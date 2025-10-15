@@ -32,7 +32,12 @@ Welcome to **CARBONSHIFT**! This guide will help you run different heuristic imp
     python3.8 percentage_reductions.py
     ```
 
-7. Generate the normalized scatter plot
+7. Generate the comparison reductions graph
+    ```bash
+    python3.8 comparison.py
+    ```
+
+8. Generate the normalized scatter plot
     ```bash
     python3.8 normalized_scatter_plot.py
     ```    
