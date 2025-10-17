@@ -1,7 +1,6 @@
 
 # ------------------------
-# change the path to the input files accordingly
-# ------------------------
+#
 #    RUN with <delta, error>
 # nohup python3.8 orchestrate_heuristics.py 5 2 > log.txt
 # nohup python3.8 orchestrate_heuristics.py 5 4 > log.txt
@@ -12,10 +11,11 @@ from argparse import ArgumentParser
 import subprocess
 import os
 
-INPUT_STRATEGIES                       = "test/input_strategies.csv"
+main_directory                         = "tests/"
+INPUT_STRATEGIES                       = main_directory+"test/input_strategies.csv"
 
-#heuristic                              = "greedy"
-heuristic                               = "carbonshift"
+heuristic                              = "greedy"
+#heuristic                               = "carbonshift"
 
 # ------------------------ UTILITY FUNCTIONS ------------------------
 def clear_file(OUTPUT_TIME):                                    # Clear the content of the files
@@ -35,12 +35,12 @@ def clear_file_greedy(OUTPUT_TIME):
 
 def main(DELTA, error):    
     for w in range(0,5):       #(0,5):                          # {0,1,2,3,4} -> 5 sliding windows
-        INPUT_CO2                       = f"test/window_{w}/input_co2.csv"
+        INPUT_CO2                       = f"{main_directory}test/window_{w}/input_co2.csv"
 
         if heuristic == "carbonshift":
             BETA                        = [100,250,500,1000]    # 4 different β values
             for beta in BETA:                     
-                directory               = f"test/window_{w}/beta_"+str(beta)+"/"
+                directory               = f"{main_directory}test/window_{w}/beta_"+str(beta)+"/"
                 OUTPUT_TIME             = ""
                 OUTPUT_ASSIGNMENT       = directory+"output_assignment.csv"
                 
@@ -52,7 +52,7 @@ def main(DELTA, error):
                     N_REQUESTS = 1024
                     while N_REQUESTS<131073 :                       #limit: 2^17+1
                         
-                        INPUT_FILE          =f"test/window_{w}/input_requests/delta_"+str(d)+"/input_"+str(N_REQUESTS)+".csv"                 
+                        INPUT_FILE          =f"{main_directory}test/window_{w}/input_requests/delta_"+str(d)+"/input_"+str(N_REQUESTS)+".csv"                 
                         
                         for i in range(1,11):                       # Iterate sequentially                              
                             if os.path.exists(OUTPUT_ASSIGNMENT):   # Ensure OUTPUT_ASSIGNMENT is cleared before each run
@@ -124,7 +124,7 @@ def main(DELTA, error):
                         N_REQUESTS *= 2
 
         elif heuristic == "greedy":
-            directory                   = f"test_greedy/window_{w}/"
+            directory                   = f"{main_directory}test_greedy/window_{w}/"
 
             policies                    = ["baseline","random","n_carbon","n_err2","n_err4","n_err5","n_shift"]            
             OUT_ASSIGN_baseline         = directory+"output_assignment_"+policies[0]+".csv"
@@ -158,7 +158,7 @@ def main(DELTA, error):
             N_REQUESTS = 1024
             while N_REQUESTS<131073 :                       #limit: 2^17+1
                 
-                INPUT_FILE          =f"test_greedy/window_{w}/input_"+str(N_REQUESTS)+".csv"                 
+                INPUT_FILE          =f"{main_directory}test_greedy/window_{w}/input_"+str(N_REQUESTS)+".csv"                 
 
                 process = subprocess.Popen([
                     "python3.8","greedy.py",
