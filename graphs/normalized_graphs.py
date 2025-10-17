@@ -73,7 +73,7 @@ plt.tight_layout()
 
 # === Save outputs ===
 
-fig.savefig("normalized_scatter_plot.pdf")
+fig.savefig("plot/normalized_scatter_plot.pdf")
 #fig.savefig("normalized_scatter_plot.png", dpi=300)
 
 #plt.show()

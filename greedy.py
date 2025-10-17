@@ -286,14 +286,10 @@ def main(
     output_assignments = [assign_baseline, assign_random, assign_naive_carbon, assign_naive_err_2, assign_naive_err_4, assign_naive_err_5, assign_naive_shift]
     print_each = True #False # True if you want to print each assignment, False otherwise
 
-    for a_elem, f_elem in zip(output_assignments, output_files):
-
-        #print(a_elem)
-        
+    for a_elem, f_elem in zip(output_assignments, output_files):        
 
         all_emissions, avg_errors, fixed_strategy = 0, 0, a_elem[0]['strategy']
         co2_per_slot = [0 for _ in all_slots]
-        #err_per_slot = [0 for _ in all_slots]
 
         if print_each:
             with open(f_elem, "w") as output_csv:
@@ -306,7 +302,6 @@ def main(
             co2_per_slot[a['time_slot']] += a['emission']       # emissions = the sum of all emissions in the time slot
             all_emissions += a['emission']
 
-            #err_per_slot[a['time_slot']] += a['error']          # errors = the average sum of all errors in the time slot
             avg_errors += a['error'] 
 
             if print_each:
@@ -357,7 +352,6 @@ parser.add_argument('input_requests', type=str, help="File with requests' deadli
 parser.add_argument('input_strategies', type=str, help="File with statistics on strategies' errors and duration, for each delta's slot.")
 parser.add_argument('input_co2', type=str, help="File with carbon intensities' data, for each delta's slot.")
 parser.add_argument('delta', type=int, help='Number of slots per window.')
-
 parser.add_argument('out_baseline', type=str, help='File where to write the output assignment.')
 parser.add_argument('out_random', type=str, help='File where to write the output assignment.')
 parser.add_argument('out_naive_carbon', type=str, help='File where to write the output assignment.')
@@ -371,8 +365,7 @@ main(
     args.input_requests, 
     args.input_strategies, 
     args.input_co2, 
-    args.delta, 
-    
+    args.delta,     
     args.out_baseline,
     args.out_random,
     args.out_naive_carbon,

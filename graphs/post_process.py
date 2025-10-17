@@ -131,11 +131,11 @@ def main():
             ax2.set_ylim(0, 8)
             ax2.grid(False)
             fig.tight_layout()                                      # Adjust layout to prevent overlap
-            plt.savefig("all_policies_results.pdf", format='pdf')
+            plt.savefig("plot/all_policies_results.pdf", format='pdf')
 
         else:        
             fig.tight_layout()                                      # Adjust layout to prevent overlap
-            plt.savefig("all_policies_emissions_H.pdf", format='pdf')
+            plt.savefig("plot/all_policies_emissions_H.pdf", format='pdf')
     else:
         # Vertical bar chart for total emissions
         bars = ax1.barh(agg_df['policy_label'], agg_df['total_emissions'], color='#709957')
@@ -159,7 +159,7 @@ def main():
         ax1.invert_yaxis()  # Reverse the y-axis so the first policy appears at the top
 
         fig.tight_layout()                                      # Adjust layout to prevent overlap
-        plt.savefig("all_policies_emissions_V.pdf", format='pdf')
+        plt.savefig("plot/all_policies_emissions_V.pdf", format='pdf')
     # ------------------------    
     
     avg_errors_df = df.groupby('policy').agg(              # Group by policy and compute average error
@@ -197,7 +197,7 @@ def main():
                         ha='center', va='bottom', fontsize=9)
         """
         fig.tight_layout()
-        plt.savefig("all_policies_errors_H.pdf", format='pdf')
+        plt.savefig("plot/all_policies_errors_H.pdf", format='pdf')
     else:
         bars = ax.barh(x, y, color='#709957')                  # Horizontal bar chart
         ax.set_yticks(x)
@@ -219,7 +219,7 @@ def main():
         """
         ax.invert_yaxis()
         fig.tight_layout()
-        plt.savefig("all_policies_errors_V.pdf", format='pdf')
+        plt.savefig("plot/all_policies_errors_V.pdf", format='pdf')
 
 
 

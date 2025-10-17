@@ -101,6 +101,6 @@ for b in bars_err:
 
 # === SALVATAGGIO PDF ===
 
-with PdfPages("grafico_emissioni_errori.pdf") as pdf:
+with PdfPages("plot/grafico_emissioni_errori.pdf") as pdf:
     pdf.savefig(fig)
     plt.close(fig)

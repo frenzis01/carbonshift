@@ -66,4 +66,4 @@ ax1.legend(lines, labels, loc='lower right', fontsize=14)
 
 # Salva grafico in PDF
 fig.tight_layout()
-plt.savefig("all_results_together.pdf", format='pdf')
+plt.savefig("plot/all_results_together.pdf", format='pdf')

@@ -1,5 +1,7 @@
 
 # ------------------------
+# change the path to the input files accordingly
+# ------------------------
 #    RUN with <delta, error>
 # nohup python3.8 orchestrate_heuristics.py 5 2 > log.txt
 # nohup python3.8 orchestrate_heuristics.py 5 4 > log.txt
@@ -8,13 +10,28 @@
 
 from argparse import ArgumentParser
 import subprocess
-import utility_features
 import os
 
 INPUT_STRATEGIES                       = "test/input_strategies.csv"
 
 #heuristic                              = "greedy"
 heuristic                               = "carbonshift"
+
+# ------------------------ UTILITY FUNCTIONS ------------------------
+def clear_file(OUTPUT_TIME):                                    # Clear the content of the files
+    with open(OUTPUT_TIME, "w") as file_out:                
+        file_out.write(f"")                 
+        file_out.write(f"all_requests,solver_status,computing_time,solve_time,all_emissions,slot_emissions,avg_errors,iteration\n")
+        file_out.flush()
+
+def clear_file_greedy(OUTPUT_TIME):
+    with open(OUTPUT_TIME, "w") as file_out:                
+        file_out.write(f"")                 
+        file_out.write(f"all_requests,computing_time,strategy,all_emissions,slot_emissions,avg_errors\n")
+        file_out.flush()
+
+
+# ------------------------ MAIN FUNCTION ------------------------
 
 def main(DELTA, error):    
     for w in range(0,5):       #(0,5):                          # {0,1,2,3,4} -> 5 sliding windows
@@ -29,7 +46,7 @@ def main(DELTA, error):
                 
                 for d in range(1, DELTA+1):                         #{1,2,3,4,5} -> 5 slots per window
                     OUTPUT_TIME = directory+"times_0"+str(d)+".csv"
-                    utility_features.clear_file(OUTPUT_TIME)
+                    clear_file(OUTPUT_TIME)
 
                 for d in range(1, DELTA+1):                         #{1,2,3,4,5} -> 5 slots per window
                     N_REQUESTS = 1024
@@ -37,13 +54,6 @@ def main(DELTA, error):
                         
                         INPUT_FILE          =f"test/window_{w}/input_requests/delta_"+str(d)+"/input_"+str(N_REQUESTS)+".csv"                 
                         
-                        preprocessing = False
-                        if preprocessing: # parte del PREPOCESSING: compressione delle richieste in blocchi     
-                            OUTPUT_FILE=directory+"delta_"+str(d)+"/input_"+str(N_REQUESTS)+".csv"
-                            ratio = utility_features.prepare_file(d, beta, N_REQUESTS, INPUT_FILE, OUTPUT_FILE) 
-                            #print(f"Ratio: {ratio} for {N_REQUESTS} requests, slot={d}, beta={beta}, window={w}", flush=True)           
-                            INPUT_FILE  = OUTPUT_FILE               # = File with the compressed requests into blocks                 
-
                         for i in range(1,11):                       # Iterate sequentially                              
                             if os.path.exists(OUTPUT_ASSIGNMENT):   # Ensure OUTPUT_ASSIGNMENT is cleared before each run
                                 os.remove(OUTPUT_ASSIGNMENT)
@@ -52,7 +62,7 @@ def main(DELTA, error):
                             process = subprocess.Popen([
                                 "python3.8","carbonshift.py",
                                 INPUT_FILE,INPUT_STRATEGIES,INPUT_CO2, 
-                                str(d),str(beta),#str(ratio),
+                                str(d),str(beta),
                                 str(error),
                                 OUTPUT_ASSIGNMENT                            
                             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)  #])
@@ -133,13 +143,13 @@ def main(DELTA, error):
             OUT_TIME_n_err5           = directory+"times_"+policies[5]+".csv"
             OUT_TIME_n_shift          = directory+"times_"+policies[6]+".csv"
 
-            utility_features.clear_file_greedy(OUT_TIME_baseline)
-            utility_features.clear_file_greedy(OUT_TIME_random)
-            utility_features.clear_file_greedy(OUT_TIME_n_carbon)
-            utility_features.clear_file_greedy(OUT_TIME_n_err2)
-            utility_features.clear_file_greedy(OUT_TIME_n_err4)
-            utility_features.clear_file_greedy(OUT_TIME_n_err5)
-            utility_features.clear_file_greedy(OUT_TIME_n_shift)
+            clear_file_greedy(OUT_TIME_baseline)
+            clear_file_greedy(OUT_TIME_random)
+            clear_file_greedy(OUT_TIME_n_carbon)
+            clear_file_greedy(OUT_TIME_n_err2)
+            clear_file_greedy(OUT_TIME_n_err4)
+            clear_file_greedy(OUT_TIME_n_err5)
+            clear_file_greedy(OUT_TIME_n_shift)
 
             OUT_ASSIGN = [ OUT_ASSIGN_baseline,OUT_ASSIGN_random,OUT_ASSIGN_n_carbon,OUT_ASSIGN_n_err2,OUT_ASSIGN_n_err4,OUT_ASSIGN_n_err5, OUT_ASSIGN_n_shift]
             OUT_TIMES = [ OUT_TIME_baseline,OUT_TIME_random,OUT_TIME_n_carbon, OUT_TIME_n_err2,OUT_TIME_n_err4, OUT_TIME_n_err5, OUT_TIME_n_shift]

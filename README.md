@@ -18,30 +18,12 @@ Welcome to **CARBONSHIFT**! This guide will help you run different heuristic imp
     - move to each test_err and run with: python3.8 aggregate_carbonshift_times.py 5
     - move to test_greedy and run with: python3.8 aggregate_greedy_times.py 5
 
-4. Generate result .csv file and splitted graphs :
-    ```bash
-    python3.8 post_process.py
-    ```
-5. Generate the all together graph
-    ```bash
-    python3.8 policies_results.py
-    ```
-
-6. Generate the percentage reductions graph
-    ```bash
-    python3.8 percentage_reductions.py
-    ```
-
-7. Generate the comparison reductions graph
-    ```bash
-    python3.8 comparison.py
-    ```
-
-8. Generate the normalized scatter plot
-    ```bash
-    python3.8 normalized_scatter_plot.py
-    ```    
-
+4. Move to graphs and generate 
+    - the result .csv file and splitted graphs: python3.8 post_process.py
+    - the all together graph:                   python3.8 policies_results.py
+    - the percentage reductions graph:          python3.8 percentage_reductions.py
+    - the comparison reductions graph:          python3.8 comparison.py
+    - the normalized scatter plot:              python3.8 normalized_scatter_plot.py
 
 ---
 

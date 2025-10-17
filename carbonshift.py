@@ -46,23 +46,7 @@ def import_input_carbon(input_co2):                 # Import carbon intensities'
 
     return carbon
 
-"""
-class SolutionCollector(cp_model.CpSolverSolutionCallback):
-    def __init__(self, assignment_vars):
-        cp_model.CpSolverSolutionCallback.__init__(self)
-        self.assignment_vars = assignment_vars
-        self.best_solution = {}
 
-    def on_solution_callback(self):
-        for key, var in self.assignment_vars.items():
-            self.best_solution[key] = self.Value(var)
-
-    def get_best_solution(self):
-        return self.best_solution
-"""
-
-
-#def main(input_requests,input_strategies,input_co2,delta,beta,ratio,error,output_assignment): file already compressed
 def main(input_requests,input_strategies,input_co2,delta,beta,error,output_assignment):
     
     all_slots               = range(delta)                                      # {0,1,...,delta-1}
@@ -75,16 +59,12 @@ def main(input_requests,input_strategies,input_co2,delta,beta,error,output_assig
     # Divisione delle richieste in blocchi (β)
     if beta is None:
         beta = 1000
-        #ratio                   = math.ceil(len(requests) / beta)      
     if beta >= len(requests):                   # Versione base → ogni richiesta è un blocco separato
         blocks = [[req] for req in requests]
-        #ratio                   = 1
     else:                                       # Versione con blocchi → raggruppa le richieste in β blocchi        
         sorted_requests = sorted(requests, key=lambda r: r["deadline"])   
-        group_size                   = math.ceil(len(requests) / beta)              # ratio
+        group_size                   = math.ceil(len(requests) / beta)              
         blocks = [sorted_requests[i:i + group_size] for i in range(0, len(sorted_requests), group_size)]
-    #print(f"Number of requests: {len(requests)} divided in {len(blocks)} blocks of max {group_size} requests each.", flush=True)
-    #print(blocks)
 
     model = cp_model.CpModel()
 
@@ -100,7 +80,6 @@ def main(input_requests,input_strategies,input_co2,delta,beta,error,output_assig
 
     # Vincolo: ogni blocco ha deadline = min delle deadline interne
     block_deadlines = [min(req["deadline"] for req in group) for group in blocks]
-    #print(f"Block deadlines: {block_deadlines}", flush=True)
 
     # Variabili decisionali binarie: x[b,s,t] = 1 se blocco b è assegnato alla strategia s nello slot t
     x = {}
@@ -142,13 +121,6 @@ def main(input_requests,input_strategies,input_co2,delta,beta,error,output_assig
     
     status = solver.Solve(model) # 0=UNKNOWN, 1=MODEL_INVALID, 2=FEASIBLE, 3=INFEASIBLE, 4=OPTIMAL
     solve_time = solver.UserTime()
-
-    # con il solution collector ottengo solve time tanto quanto comp time
-    # e complessivamente più soluzioni più lente 
-    #solution_collector = SolutionCollector(x)
-    #solver.parameters.enumerate_all_solutions = False
-    #status = solver.SolveWithSolutionCallback(model, solution_collector)
-
     
 
     # Se non esiste soluzione ammissibile, segnala errore
@@ -179,8 +151,6 @@ def main(input_requests,input_strategies,input_co2,delta,beta,error,output_assig
                             error = int(strategies[s]["error"])                           
                             emission = solver.Value(x[(b, s, t)]) * carbon[t] * duration / 3600 # in kWh
                             
-                            #* len(blocks[b]) or the ratio  if it was emission per block of requests, now it's per request
-
                             # converting to gCO2 based on server consumption
                             server_kwh_per_hour = 0.05  # Typical server consumption in kiloWatt-hour    
                             emission = round(emission*server_kwh_per_hour, 6)  # Emission in grams of CO2
@@ -205,8 +175,7 @@ def main(input_requests,input_strategies,input_co2,delta,beta,error,output_assig
         slot_emissions_list = [slot_emissions_dict.get(t, 0) for t in T]
         num_requests = len(rows)
         avg_error = round(max_weighted_error_threshold / num_requests, 4) if num_requests > 0 else 0.0
-        
-        
+                
 
         # Scrittura delle metriche nel file
         csvfile.write(f"\n"
@@ -231,8 +200,6 @@ parser.add_argument('input_strategies', type=str, help="File with statistics on 
 parser.add_argument('input_co2', type=str, help="File with carbon intensities' data, for each delta's slot.")
 parser.add_argument('delta', type=int, help='Number of slots per window.')
 parser.add_argument('beta', type=int, help='Number of blocks of requests per actual slot.')
-#parser.add_argument('beta', type=int, default=None, help='Number of blocks of requests per actual slot.')
-#parser.add_argument('ratio', type=int, help='Number of requests per block.')
 parser.add_argument('error', type=int, help='Tolerated error (%).')
 parser.add_argument('output_assignment', type=str, help='File where to write the output assignment.')
 
@@ -243,7 +210,6 @@ main(
     args.input_co2,
     args.delta,
     args.beta,
-    #args.ratio,
     args.error,
     args.output_assignment
     )

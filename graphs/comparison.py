@@ -95,6 +95,6 @@ plt.subplots_adjust(left=0.01, right=0.99, top=0.9, bottom=0.1)
 
 # Salvataggio in PDF con rimozione dei margini bianchi esterni
 # **MODIFICA**: fig è già definito da plt.subplots
-with PdfPages("grafico_confronto"+str(int(err))+".pdf") as pdf:
+with PdfPages("plot/grafico_confronto"+str(int(err))+".pdf") as pdf:
     pdf.savefig(fig, bbox_inches='tight') 
     plt.close(fig)
