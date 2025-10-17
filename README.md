@@ -8,7 +8,7 @@ Welcome to **CARBONSHIFT**! This guide will help you run different heuristic imp
 ### 1. Run Multiple Instances
 
 1. Activate venv environment
-    -  source /home/ubuntu/ornela/carbonshift_/venv/bin/activate
+    -  source venv/bin/activate
 
 2. Open `orchestrate_beta_blocks.py` and follow the instructions to execute various heuristics:
     - `carbonshift.py`
