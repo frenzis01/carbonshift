@@ -15,7 +15,7 @@ import os
 import random
 
 # Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from online.request_predictor import MockRequestPredictor
 from online.heuristics import (
@@ -54,8 +54,9 @@ def calculate_emissions(assignments, strategies, carbon):
         # Find strategy
         strategy = next(s for s in strategies if s.name == strategy_name)
 
-        # Emission = carbon[slot] * duration (simplified, no server_kwh)
-        emission = carbon[slot] * strategy.duration
+        # Match carbonshift.py emission calculation
+        # carbon[gCO2/kWh] * duration[s] / 3600 * 0.05kW = gCO2
+        emission = carbon[slot] * strategy.duration / 3600 * 0.05
         total_emissions += emission
         total_error += strategy.error
 
@@ -194,8 +195,8 @@ def main():
     print("-" * 70)
 
     # Check if carbonshift.py exists
-    module_dir = os.path.dirname(os.path.abspath(__file__))
-    carbonshift_path = os.path.join(os.path.dirname(module_dir), 'carbonshift.py')
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    carbonshift_path = os.path.join(project_root, 'carbonshift.py')
 
     if os.path.exists(carbonshift_path):
         print("Found carbonshift.py - running ILP optimization...")

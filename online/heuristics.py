@@ -40,7 +40,7 @@ class GreedyCarbonLookahead:
     3. Capacity constraints
 
     Decision for request r at time t:
-        score(slot, strategy) = carbon[slot] * duration[strategy] * (1 + α * pressure)
+        score(slot, strategy) = carbon[slot] * duration[strategy] / 3600 * 0.05 * (1 + α * pressure)
         where pressure = (current_load + predicted_load) / capacity
 
     Minimizes score subject to deadline and error constraints.
@@ -138,7 +138,9 @@ class GreedyCarbonLookahead:
                     continue
 
                 # Calculate score: carbon cost + pressure penalty
-                carbon_cost = self.carbon[slot] * strategy.duration
+                # Emission calculation matches carbonshift.py:
+                # carbon[gCO2/kWh] * duration[s] / 3600 * server_kwh[0.05kW] = gCO2
+                carbon_cost = self.carbon[slot] * strategy.duration / 3600 * 0.05
 
                 # Pressure penalty: linearly increase cost with congestion
                 pressure_penalty = 1.0 + (self.pressure_weight * pressure)

@@ -276,8 +276,8 @@ class TestHeuristicComparison(unittest.TestCase):
         total = 0.0
         for req_id, (slot, strategy_name) in assignments.items():
             strategy = next(s for s in strategies if s.name == strategy_name)
-            # Simplified emission: carbon * duration (no server_kwh factor)
-            emission = carbon[slot] * strategy.duration
+            # Match carbonshift.py emission calculation
+            emission = carbon[slot] * strategy.duration / 3600 * 0.05
             total += emission
         return total
 
@@ -375,7 +375,8 @@ def run_benchmark():
     for req in requests:
         slot, strategy = lookahead.schedule(req, current_time=req.arrival_time)
         strat = next(s for s in strategies if s.name == strategy)
-        lookahead_emissions += carbon[slot] * strat.duration
+        # Match carbonshift.py emission calculation
+        lookahead_emissions += carbon[slot] * strat.duration / 3600 * 0.05
 
     # Scheduler 3: ProbabilisticSlack
     slack_scheduler = ProbabilisticSlackScheduler(
@@ -390,7 +391,8 @@ def run_benchmark():
     for req in requests:
         slot, strategy = slack_scheduler.schedule(req, current_time=req.arrival_time)
         strat = next(s for s in strategies if s.name == strategy)
-        slack_emissions += carbon[slot] * strat.duration
+        # Match carbonshift.py emission calculation
+        slack_emissions += carbon[slot] * strat.duration / 3600 * 0.05
 
     # Results
     print("\nEmissions (arbitrary units):")

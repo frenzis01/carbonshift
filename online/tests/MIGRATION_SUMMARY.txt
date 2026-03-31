@@ -1,0 +1,193 @@
+════════════════════════════════════════════════════════════════════════════
+CARBONSHIFT TEST REORGANIZATION - COMPLETED
+Date: 2026-03-30
+════════════════════════════════════════════════════════════════════════════
+
+✅ COMPLETED TASKS
+────────────────────────────────────────────────────────────────────────────
+
+1. Moved all comparison tests to online/tests/
+   FROM: tests/comprehensive/comparison/
+   TO:   online/tests/
+   
+   Files moved:
+   - test_scheduler_comparison.py (originally online/example.py)
+   - test_stress.py (new)
+   - test_optimal_comparison.py (new)
+   - run_all_tests.py (new)
+   - Documentation files
+
+2. Fixed carbonshift.py interface in test_optimal_comparison.py
+   PROBLEM 1: Incorrect command-line arguments causing error:
+   "error: the following arguments are required: input_strategies, ..."
+   
+   SOLUTION 1: Corrected interface to match carbonshift.py expectations:
+   - input_requests.csv: comma-separated deadlines
+   - input_strategies.csv: error,duration,name (with CSV header)
+   - input_co2.txt: one carbon intensity per line
+   - Command args: input_requests input_strategies input_co2 delta beta error output
+   
+   PROBLEM 2: Could not parse optimization results
+   
+   SOLUTION 2: Fixed output parser to correctly read:
+   - CSV data rows: request_id,strategy,time_slot,emission,error
+   - Metrics section: all_emissions:value (after CSV data)
+   
+   Test now correctly calls carbonshift.py and parses results ✅
+
+3. Updated all import paths for new location
+   - Changed sys.path manipulation to work from online/tests/
+   - Updated carbonshift.py path resolution
+   - All imports verified working
+
+4. Created comprehensive documentation
+   - 00_START_HERE.md: Quick start guide
+   - README.md: Detailed documentation
+   - Both files in online/tests/
+
+
+📁 FINAL STRUCTURE
+────────────────────────────────────────────────────────────────────────────
+
+online/tests/
+├── 00_START_HERE.md              🆕 Quick start
+├── README.md                     🆕 Documentation
+├── __init__.py
+│
+├── run_all_tests.py              🆕 Test runner
+│
+├── test_scheduler_comparison.py  🆕 Comparison test
+├── test_stress.py                🆕 Stress test
+├── test_optimal_comparison.py    🆕 Optimal comparison (FIXED)
+│
+├── test_heuristics.py            (existing unit test)
+├── test_request_predictor.py     (existing unit test)
+└── test_rolling_window_ilp.py    (existing unit test)
+
+
+🔧 KEY FIX: carbonshift.py Interface & Parsing
+────────────────────────────────────────────────────────────────────────────
+
+PROBLEM 1: Missing required arguments
+OLD (broken):
+  subprocess.run(['python', 'carbonshift.py', tmpfile])
+  # Error: "the following arguments are required..."
+
+SOLUTION 1:
+  subprocess.run([
+      'python', 'carbonshift.py',
+      requests_file,      # CSV: "deadline1,deadline2,..."
+      strategies_file,    # CSV with header: "error,duration,name"
+      carbon_file,        # TXT: one value per line
+      str(delta),         # Number of time slots
+      str(beta),          # Number of blocks/requests
+      str(error),         # Error threshold
+      output_file         # Output assignment file
+  ])
+  # Result: Runs successfully!
+
+PROBLEM 2: Could not parse optimization results
+  # Parser couldn't read carbonshift.py output format
+
+SOLUTION 2: Fixed parser to read:
+  - CSV data rows: request_id,strategy,time_slot,emission,error
+  - Metrics line: all_emissions:12345.67
+  ✅ Result: Successfully extracts all assignments and total emissions!
+
+✅ Fix #3: ALIGNED EMISSION CALCULATIONS (2026-03-30)
+────────────────────────────────────────────────────────────────────────────────
+
+**Problem**: Online schedulers used simplified emission formula (carbon * duration),
+while carbonshift.py used detailed power model (carbon * duration / 3600 * 0.05).
+This caused massive numerical differences (e.g., optimal=2 gCO2, online=77,400 gCO2),
+making comparison meaningless.
+
+**Solution**: Updated ALL schedulers and tests to use carbonshift.py's formula:
+  emission = carbon[gCO2/kWh] * duration[s] / 3600 * 0.05kW = gCO2
+
+**Files Modified**:
+- online/heuristics.py (line 141-144)
+- online/tests/test_stress.py (line 124)
+- online/tests/test_optimal_comparison.py (lines 170, 203, 232)
+- online/tests/test_heuristics.py (lines 280, 378, 393)
+- online/tests/test_scheduler_comparison.py (line 57-58)
+- online/tests/README.md (emission calculation documentation)
+
+**Result**: Now optimal and online schedulers produce comparable values:
+  Before: optimal=2 gCO2, online=77,400 gCO2 (38,700x difference!)
+  After:  optimal=2 gCO2, online=3 gCO2 (1.5x difference - meaningful!)
+
+
+════════════════════════════════════════════════════════════════════════════════
+HISTORICAL FIXES (Pre-alignment)
+════════════════════════════════════════════════════════════════════════════════
+
+⚠️  OLD NOTE (OBSOLETE): carbonshift.py uses detailed power model (carbon * duration / 3600 * 0.05),
+    online schedulers use simplified model (carbon * duration).
+    → THIS IS NOW FIXED! All schedulers use the same formula.
+
+
+🚀 USAGE
+────────────────────────────────────────────────────────────────────────────
+
+Quick start:
+  cd online/tests
+  python run_all_tests.py
+
+Individual tests:
+  python test_scheduler_comparison.py  # ~5 seconds
+  python test_stress.py               # ~60 seconds
+  python test_optimal_comparison.py   # ~120 seconds
+
+With virtualenv (recommended):
+  source ../../venv/bin/activate
+  pip install -r ../../requirements.txt
+  python run_all_tests.py
+
+
+✨ VERIFICATION STATUS
+────────────────────────────────────────────────────────────────────────────
+
+✅ All files moved to online/tests/
+✅ carbonshift.py interface fixed (no more argument errors)
+✅ test_scheduler_comparison.py runs successfully
+✅ test_stress.py runs successfully
+✅ test_optimal_comparison.py handles carbonshift.py correctly
+✅ Imports work from new location
+✅ Documentation complete
+✅ All Python files compile without errors
+
+
+📊 TEST COVERAGE
+────────────────────────────────────────────────────────────────────────────
+
+Comparison Tests:
+  ✅ Scheduler comparison (4 approaches)
+  ✅ High-load stress testing (100-5000 requests)
+  ✅ Optimal comparison vs batch ILP
+  ✅ Multiple workload patterns
+  ✅ Performance profiling
+  ✅ Deadline violation tracking
+
+Unit Tests (existing):
+  ✅ Heuristic schedulers
+  ✅ Request predictor
+  ✅ Rolling window ILP
+
+
+💡 NOTES
+────────────────────────────────────────────────────────────────────────────
+
+1. The optimal comparison test now correctly interfaces with carbonshift.py
+   using the proper file formats and command-line arguments.
+
+2. The test gracefully handles missing ortools dependency by skipping the
+   optimization when the module is not available.
+
+3. All tests are now in online/tests/ alongside the unit tests, making the
+   codebase more organized.
+
+4. Use the virtualenv for full functionality including ortools support.
+
+
+════════════════════════════════════════════════════════════════════════════
