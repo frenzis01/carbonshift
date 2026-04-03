@@ -1,0 +1,16 @@
+# Capacity tiers configuration for carbonshiftDP.py
+# Format: capacity,emission_factor
+# Interpretation: requests up to 'capacity' have emissions multiplied by 'factor'
+# This models the rebound effect: more load = less efficient servers needed
+
+# Tier 1: Normal operation (0-1000 requests)
+1000,1.0
+
+# Tier 2: Medium load (1001-3000 requests) - +20% emissions
+3000,1.2
+
+# Tier 3: High load (3001-6000 requests) - +50% emissions
+6000,1.5
+
+# Tier 4: Critical load (6001-9000 requests) - +300% emissions (rebound effect!)
+9000,4.0
