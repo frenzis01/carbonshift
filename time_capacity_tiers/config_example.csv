@@ -1,0 +1,8 @@
+# Time-Capacity Configuration Example
+# Format: capacity, emission_factor
+# Capacity = max requests before penalty
+# Emission factor = multiplier on emissions
+5, 1.0
+10, 2.0
+15, 4.0
+30, 8.0
