@@ -103,7 +103,11 @@ class RollingWindowILPScheduler:
         self.last_reopt_time: float = 0.0
 
         # Fallback heuristic (import inline to avoid circular dependency)
-        from .heuristics import GreedyCarbonLookahead
+        try:
+            from .heuristics import GreedyCarbonLookahead
+        except ImportError:
+            from heuristics import GreedyCarbonLookahead
+        
         self.fallback_heuristic = GreedyCarbonLookahead(
             strategies=strategies,
             carbon=carbon,

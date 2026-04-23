@@ -1,3 +1,1 @@
-"""
-Test suite for online scheduling module
-"""
+"""Online scheduler tests"""
