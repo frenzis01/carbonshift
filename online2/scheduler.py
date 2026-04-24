@@ -13,9 +13,14 @@ import time
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import random
+import sys
+import os
 
 from shared_state import Request, Assignment, SharedSchedulerState
 import config
+
+# Import DP solver
+from rolling_window_dp import RollingWindowDPScheduler, RequestAssignment
 
 
 @dataclass
@@ -50,6 +55,26 @@ class BatchScheduler:
         # Statistics
         self._batches_processed = 0
         self._total_scheduled = 0
+
+        # Initialize DP solver
+        carbon_forecast = self._get_carbon_forecast()
+        strategies_for_dp = [
+            {
+                'name': s['name'],
+                'error': s['error'],
+                'duration': s['duration']
+            }
+            for s in config.STRATEGIES
+        ]
+        
+        self.dp_solver = RollingWindowDPScheduler(
+            strategies=strategies_for_dp,
+            carbon_forecast=carbon_forecast,
+            window_size=config.TOTAL_SLOTS,
+            pruning=config.DP_PRUNING_STRATEGY,
+            pruning_k=config.DP_PRUNING_K,
+            timeout=config.DP_TIMEOUT
+        )
 
     def start(self) -> None:
         """Start scheduler thread"""
@@ -140,6 +165,8 @@ class BatchScheduler:
         """
         Solve batch scheduling using DP with optional Beam Search pruning.
         
+        Uses RollingWindowDPScheduler to find optimal batch assignment.
+        
         Args:
             requests: Batch of requests to schedule
             current_slot: Current slot index
@@ -147,53 +174,42 @@ class BatchScheduler:
         Returns:
             List of assignments
         """
-        # TODO: Implement DP solver
-        # This is a placeholder - will integrate with existing carbonshift DP module
-
+        # Prepare input for DP solver
+        dp_requests = []
+        for req in requests:
+            dp_requests.append({
+                'id': req.id,
+                'deadline_slot': req.deadline_slot
+            })
+        
+        # Calculate capacity multiplier for all requests in batch
+        capacity_multiplier = self._get_capacity_multiplier(current_slot, len(requests))
+        
+        # Solve using DP
+        try:
+            dp_assignments = self.dp_solver.solve_batch(
+                requests=dp_requests,
+                current_slot=current_slot,
+                capacity_multiplier=capacity_multiplier,
+                error_window_errors=None
+            )
+        except Exception as e:
+            if config.VERBOSE:
+                print(f"[Scheduler] ✗ DP solver error: {e}, falling back to greedy")
+            dp_assignments = []
+        
+        # Convert RequestAssignment objects to Assignment objects
         assignments = []
-
-        for request in requests:
-            # Naive greedy: assign to best available slot
-            best_slot = None
-            best_strategy = None
-            best_cost = float('inf')
-
-            for slot in range(request.arrival_slot, request.deadline_slot + 1):
-                if slot >= len(config.STRATEGIES):  # Skip if beyond forecast
-                    continue
-
-                # Get carbon value for this slot (placeholder)
-                carbon = 500  # TODO: Get actual carbon forecast
-
-                for strategy in self.strategies:
-                    # Calculate cost
-                    cost = carbon * strategy.duration / 3600
-
-                    # Apply capacity tier multiplier
-                    cost *= self._get_capacity_multiplier(slot, len(requests))
-
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_slot = slot
-                        best_strategy = strategy
-
-            if best_slot is not None and best_strategy is not None:
-                # Check error window constraint
-                avg_error = self.shared_state.get_average_error_in_window(
-                    best_slot,
-                    config.ERROR_WINDOW_PAST,
-                    config.ERROR_WINDOW_FUTURE
-                )
-
-                if avg_error is None or avg_error + best_strategy.error <= config.MAX_ERROR_THRESHOLD:
-                    assignments.append(Assignment(
-                        request_id=request.id,
-                        scheduled_slot=best_slot,
-                        strategy_name=best_strategy.name,
-                        carbon_cost=best_cost,
-                        error=best_strategy.error,
-                    ))
-
+        for dp_assignment in dp_assignments:
+            assignment = Assignment(
+                request_id=dp_assignment.request_id,
+                scheduled_slot=dp_assignment.slot,
+                strategy_name=dp_assignment.strategy_name,
+                carbon_cost=dp_assignment.carbon_cost,
+                error=dp_assignment.error,
+            )
+            assignments.append(assignment)
+        
         return assignments
 
     def _get_capacity_multiplier(self, slot: int, num_requests: int) -> float:
@@ -218,6 +234,28 @@ class BatchScheduler:
                 return tier["multiplier"]
 
         return config.CAPACITY_TIERS[-1]["multiplier"]
+    
+    def _get_carbon_forecast(self) -> List[float]:
+        """
+        Generate carbon intensity forecast for all time slots.
+        Uses sinusoidal pattern (realistic day-night cycle).
+        
+        Returns:
+            List of carbon intensity values [0..TOTAL_SLOTS-1]
+        """
+        forecast = []
+        num_slots = config.TOTAL_SLOTS
+        base_carbon = 500
+        amplitude = 200
+        
+        for slot in range(num_slots):
+            # Sinusoidal pattern: high at midday, low at night
+            # Use sin to create realistic day-night cycle
+            phase = (slot / num_slots) * 2 * 3.14159
+            value = base_carbon + amplitude * (1 + 0.8 * (1 - abs((slot - num_slots / 2) / (num_slots / 2))))
+            forecast.append(max(100, value))  # Ensure minimum carbon value
+        
+        return forecast
 
     def get_statistics(self) -> Dict:
         """Get scheduler statistics"""
