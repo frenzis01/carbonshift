@@ -9,7 +9,7 @@ Online2 is a production-ready batch scheduling system for carbon-aware request p
 1. **Batches requests**: Waits for N requests before scheduling (N ≥ 1)
 2. **Uses DP solver**: Finds optimal batch placement considering all decisions
 3. **Handles capacity tiers**: Implements rebound effect (emissions multiply when overloaded)
-4. **Enforces error windows**: Average error in [t-5, t+5] must stay below threshold
+4. **Enforces error windows**: Weighted average error on requests in [t-5, t+5] must stay below threshold
 5. **Thread-safe**: Uses shared state and background processing
 
 ## Architecture
@@ -55,7 +55,7 @@ Thread-safe state container managing:
 - **Request queue**: Pending requests waiting to be scheduled
 - **Assignments**: Current scheduling decisions
 - **Historical tracking**: Past assignments for reference
-- **Error budget**: Average error per slot and sliding windows
+- **Error budget**: Weighted average error on requests in sliding windows
 - **Statistics**: Total requests, scheduled count, pending queue size
 
 **Key methods**:
@@ -86,12 +86,12 @@ Batch processing scheduler using DP:
   - Previous decisions
 - Returns list of assignments for the batch
 
-**DP Solver (placeholder)**:
-Currently uses naive greedy; will integrate with existing carbonshift DP module to:
-- Generate all possible (request, slot, strategy) combinations
-- Build DP table: `D[batch_index][(error_budget_used, slot_loads)]`
-- Apply Beam Search or K-Best pruning
-- Backtrack to find optimal assignments
+**DP Solver**:
+Uses dynamic programming with pruning to:
+- Generate feasible `(request, slot, strategy)` placements
+- Respect `current_slot <= scheduled_slot <= deadline_slot`
+- Reprice slot carbon cost when capacity tier changes
+- Enforce weighted error window constraints
 
 ### `main.py`
 System orchestrator:
@@ -110,7 +110,7 @@ SLOT_DURATION_SECONDS = 10
 # Schedule 3 requests at a time
 BATCH_SIZE = 3
 
-# Maximum average error in 10-slot window
+# Maximum weighted average error in 11-slot window
 MAX_ERROR_THRESHOLD = 3.0
 
 # Rebound effect: >2000 requests = 1.5x carbon multiplier
@@ -123,6 +123,11 @@ CAPACITY_TIERS = [
 # DP solver: optional Beam Search
 DP_PRUNING_STRATEGY = 'beam'
 DP_PRUNING_K = 150
+
+# Future commitments behavior:
+# True  -> keep already assigned future requests fixed
+# False -> include future assignments in DP and allow re-planning
+DP_LOCK_FUTURE_ASSIGNMENTS = True
 ```
 
 ## Running

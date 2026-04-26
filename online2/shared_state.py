@@ -32,6 +32,9 @@ class Assignment:
     strategy_name: str
     carbon_cost: float
     error: float
+    strategy_duration: int = 0
+    arrival_slot: Optional[int] = None
+    deadline_slot: Optional[int] = None
     assignment_time: float = field(default_factory=time.time)
 
 
@@ -62,9 +65,6 @@ class SharedSchedulerState:
         # Statistics
         self._total_requests_received = 0
         self._total_requests_scheduled = 0
-
-        # Error budget tracking: {slot -> list of errors in that slot}
-        self._slot_errors: Dict[int, List[float]] = defaultdict(list)
 
     def add_request(self, request: Request) -> None:
         """Add a new request to pending queue (thread-safe)"""
@@ -99,9 +99,10 @@ class SharedSchedulerState:
         """
         with self._lock:
             for assignment in assignments:
+                is_new_request = assignment.request_id not in self._assignments
                 self._assignments[assignment.request_id] = assignment
-                self._slot_errors[assignment.scheduled_slot].append(assignment.error)
-                self._total_requests_scheduled += 1
+                if is_new_request:
+                    self._total_requests_scheduled += 1
 
             # Move old assignments to history
             self._archive_old_assignments()
@@ -130,15 +131,51 @@ class SharedSchedulerState:
         """
         with self._lock:
             all_errors = []
+            window_start = center_slot - window_past
+            window_end = center_slot + window_future
 
-            for slot in range(center_slot - window_past, center_slot + window_future + 1):
-                if slot >= 0:
-                    all_errors.extend(self._slot_errors.get(slot, []))
+            for assignment in self._assignments.values():
+                if window_start <= assignment.scheduled_slot <= window_end:
+                    all_errors.append(assignment.error)
 
             if not all_errors:
                 return None
 
             return sum(all_errors) / len(all_errors)
+
+    def get_window_error_stats(
+        self,
+        center_slot: int,
+        window_past: int,
+        window_future: int,
+        exclude_request_ids: Optional[set] = None,
+    ) -> Dict[str, float]:
+        """
+        Return weighted error stats in a window:
+        - error_sum: sum of per-request errors
+        - request_count: number of requests in the window
+        - average_error: error_sum / request_count (0 if empty)
+        """
+        with self._lock:
+            excluded = exclude_request_ids or set()
+            error_sum = 0.0
+            request_count = 0
+            window_start = center_slot - window_past
+            window_end = center_slot + window_future
+
+            for assignment in self._assignments.values():
+                if assignment.request_id in excluded:
+                    continue
+                if window_start <= assignment.scheduled_slot <= window_end:
+                    error_sum += assignment.error
+                    request_count += 1
+
+            average_error = (error_sum / request_count) if request_count > 0 else 0.0
+            return {
+                "error_sum": error_sum,
+                "request_count": request_count,
+                "average_error": average_error,
+            }
 
     def get_requests_in_slot(self, slot: int) -> List[Assignment]:
         """
@@ -147,6 +184,13 @@ class SharedSchedulerState:
         """
         with self._lock:
             return [a for a in self._assignments.values() if a.scheduled_slot == slot]
+
+    def get_future_assignments(self, current_slot: int) -> List[Assignment]:
+        """
+        Get assignments scheduled at or after current_slot.
+        """
+        with self._lock:
+            return [a for a in self._assignments.values() if a.scheduled_slot >= current_slot]
 
     def set_current_slot(self, slot: int) -> None:
         """Update current slot counter (thread-safe)"""

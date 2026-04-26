@@ -11,7 +11,7 @@ in Online2. It handles:
 
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-import math
+import time
 
 
 @dataclass
@@ -65,150 +65,275 @@ class RollingWindowDPScheduler:
         if len(carbon_forecast) != window_size:
             raise ValueError(f"Carbon forecast length {len(carbon_forecast)} != window_size {window_size}")
     
-    def solve_batch(self, 
-                   requests: List[dict],
-                   current_slot: int,
-                   capacity_multiplier: float = 1.0,
-                   error_window_errors: Dict[int, float] = None) -> List[RequestAssignment]:
+    def solve_batch(
+        self,
+        requests: List[dict],
+        current_slot: int,
+        capacity_multiplier: float = 1.0,
+        error_window_errors: Dict[int, float] = None,
+        capacity_tiers: Optional[List[dict]] = None,
+        baseline_slot_counts: Optional[Dict[int, int]] = None,
+        baseline_slot_durations: Optional[Dict[int, int]] = None,
+        error_window_baseline: Optional[Dict[str, float]] = None,
+        max_error_threshold: Optional[float] = None,
+        error_window_past: int = 5,
+        error_window_future: int = 5,
+    ) -> List[RequestAssignment]:
         """
-        Solve batch scheduling problem for N requests using DP with pruning.
-        
-        Args:
-            requests: List of request dicts with 'id', 'deadline_slot'
-            current_slot: Current time slot (for window calculations)
-            capacity_multiplier: Capacity tier multiplier (1.0 to 3.0)
-            error_window_errors: Dict mapping slot -> current average error in that slot
-            
-        Returns:
-            List of RequestAssignment objects (one per request)
-            
-        Raises:
-            ValueError: If problem is infeasible or timeout exceeded
+        Solve batch scheduling with DP.
+
+        Key properties:
+        - Requests cannot be scheduled before current_slot.
+        - Capacity multipliers are dynamic per slot and depend on runtime load.
+        - Slot carbon cost is repriced globally when tier changes.
+        - Error budget uses weighted average on requests:
+          total_error_in_window / total_requests_in_window.
         """
         if not requests:
             return []
-        
+
+        if current_slot >= self.window_size:
+            return []
+
+        if capacity_tiers is None:
+            capacity_tiers = [{"max_requests": float("inf"), "multiplier": capacity_multiplier}]
+        if baseline_slot_counts is None:
+            baseline_slot_counts = {}
+        if baseline_slot_durations is None:
+            baseline_slot_durations = {}
+        if error_window_baseline is None:
+            error_window_baseline = {"error_sum": 0.0, "request_count": 0}
         if error_window_errors is None:
             error_window_errors = {}
-        
-        N = len(requests)
-        S = len(self.strategies)
+
         T = self.window_size
-        
-        # === STEP 1: EXTRACT DEADLINES AND BUILD INITIAL DP STATE ===
-        deadlines = [max(0, min(req.get('deadline_slot', T-1), T-1)) for req in requests]
-        
-        # === STEP 2: DP WITH PRUNING ===
-        # State: DP[req_idx][error_state] = (min_cost, assignments)
-        # We represent error as an integer (0-100 representing percentage * 100)
-        
-        # Initialize DP table
-        DP_prev = {0: (0.0, [])}  # {error_state: (cost, assignments_so_far)}
-        
-        for req_idx in range(N):
-            req_id = requests[req_idx]['id']
+        window_start = max(0, current_slot - error_window_past)
+        window_end = min(T - 1, current_slot + error_window_future)
+
+        deadlines = [max(current_slot, min(req.get("deadline_slot", T - 1), T - 1)) for req in requests]
+
+        base_counts = [0] * T
+        base_durations = [0] * T
+        for slot, count in baseline_slot_counts.items():
+            if 0 <= slot < T:
+                base_counts[slot] = int(count)
+        for slot, duration_sum in baseline_slot_durations.items():
+            if 0 <= slot < T:
+                base_durations[slot] = int(duration_sum)
+
+        # Backward-compatible fallback: if legacy per-slot errors are provided,
+        # treat each slot average as one sample (best-effort only).
+        legacy_error_sum = 0.0
+        legacy_error_count = 0
+        for slot, avg_err in error_window_errors.items():
+            if window_start <= slot <= window_end:
+                legacy_error_sum += float(avg_err)
+                legacy_error_count += 1
+
+        initial_error_sum_bp = int(round((error_window_baseline.get("error_sum", 0.0) + legacy_error_sum) * 100))
+        initial_error_count = int(error_window_baseline.get("request_count", 0)) + legacy_error_count
+
+        # state_key = (
+        #   error_sum_bp, error_count, slot_incremental_counts(tuple), slot_incremental_durations(tuple)
+        # )
+        init_state = (initial_error_sum_bp, initial_error_count, tuple([0] * T), tuple([0] * T))
+        dp_prev = {init_state: (0.0, [])}
+
+        start_ts = time.time()
+
+        for req_idx, req in enumerate(requests):
+            req_id = req["id"]
             deadline = deadlines[req_idx]
-            DP_curr = {}
-            
-            # Try all (strategy, slot) combinations for this request
-            for s_idx, strategy in enumerate(self.strategies):
-                for t in range(deadline + 1):  # Can only schedule before deadline
-                    strategy_error = int(strategy['error'] * 100)  # Convert to int (percentage * 100)
-                    strategy_duration = strategy['duration']
-                    
-                    # Calculate carbon cost for this request with this strategy at this slot
-                    base_carbon = self.carbon_forecast[t] * strategy_duration * capacity_multiplier
-                    
-                    # Try to extend each previous state
-                    for prev_error, (prev_cost, prev_assignments) in DP_prev.items():
-                        new_error = prev_error + strategy_error
-                        new_cost = prev_cost + base_carbon
-                        
+            dp_curr = {}
+
+            for state_key, (prev_cost, prev_assignments) in dp_prev.items():
+                error_sum_bp, error_count, inc_counts_t, inc_durations_t = state_key
+                inc_counts = list(inc_counts_t)
+                inc_durations = list(inc_durations_t)
+
+                for strategy in self.strategies:
+                    strategy_error = float(strategy["error"])
+                    strategy_error_bp = int(round(strategy_error * 100))
+                    strategy_duration = int(strategy["duration"])
+
+                    for slot in range(current_slot, deadline + 1):
+                        delta_cost = self._incremental_carbon_cost(
+                            slot=slot,
+                            add_duration=strategy_duration,
+                            base_counts=base_counts,
+                            base_durations=base_durations,
+                            inc_counts=inc_counts,
+                            inc_durations=inc_durations,
+                            capacity_tiers=capacity_tiers,
+                        )
+
+                        new_error_sum_bp = error_sum_bp
+                        new_error_count = error_count
+                        if window_start <= slot <= window_end:
+                            new_error_sum_bp += strategy_error_bp
+                            new_error_count += 1
+                            if max_error_threshold is not None and new_error_count > 0:
+                                avg_error = (new_error_sum_bp / 100.0) / new_error_count
+                                if avg_error > max_error_threshold:
+                                    continue
+
+                        new_inc_counts = inc_counts.copy()
+                        new_inc_durations = inc_durations.copy()
+                        new_inc_counts[slot] += 1
+                        new_inc_durations[slot] += strategy_duration
+
                         assignment = RequestAssignment(
                             request_id=req_id,
-                            strategy_name=strategy['name'],
-                            slot=t,
-                            carbon_cost=base_carbon,
-                            error=strategy['error']
+                            strategy_name=strategy["name"],
+                            slot=slot,
+                            carbon_cost=delta_cost,
+                            error=strategy_error,
                         )
                         new_assignments = prev_assignments + [assignment]
-                        
-                        # Update DP: keep state if it's better or doesn't exist
-                        if new_error not in DP_curr or DP_curr[new_error][0] > new_cost:
-                            DP_curr[new_error] = (new_cost, new_assignments)
-            
-            # === PRUNING: Keep only best K states ===
-            if self.pruning == 'beam' and len(DP_curr) > self.pruning_k:
-                # Beam search: keep top-K by cost
-                sorted_states = sorted(DP_curr.items(), key=lambda x: x[1][0])
-                DP_curr = dict(sorted_states[:self.pruning_k])
-            elif self.pruning == 'kbest' and len(DP_curr) > self.pruning_k:
-                # K-Best: keep states with error and cost in top-K
-                sorted_states = sorted(DP_curr.items(), key=lambda x: (x[1][0], x[0]))
-                DP_curr = dict(sorted_states[:self.pruning_k])
-            
-            DP_prev = DP_curr
-        
-        # === STEP 3: EXTRACT BEST SOLUTION ===
-        if not DP_prev:
-            # Fallback: create greedy assignment
-            return self._greedy_fallback(requests, deadlines)
-        
-        # Find solution with minimum cost
-        best_error, (best_cost, best_assignments) = min(
-            DP_prev.items(),
-            key=lambda x: x[1][0]
-        )
-        
+                        new_cost = prev_cost + delta_cost
+                        new_state = (
+                            new_error_sum_bp,
+                            new_error_count,
+                            tuple(new_inc_counts),
+                            tuple(new_inc_durations),
+                        )
+
+                        if new_state not in dp_curr or new_cost < dp_curr[new_state][0]:
+                            dp_curr[new_state] = (new_cost, new_assignments)
+
+            if not dp_curr:
+                # Infeasible with current constraints
+                return []
+
+            if self.pruning in {"beam", "kbest"} and len(dp_curr) > self.pruning_k:
+                if self.pruning == "beam":
+                    sorted_states = sorted(dp_curr.items(), key=lambda x: x[1][0])
+                else:
+                    # kbest: prioritize low cost and low average error
+                    sorted_states = sorted(
+                        dp_curr.items(),
+                        key=lambda x: (
+                            x[1][0],
+                            (x[0][0] / max(1, x[0][1])),  # avg error in basis points
+                        ),
+                    )
+                dp_curr = dict(sorted_states[: self.pruning_k])
+
+            if time.time() - start_ts > self.timeout:
+                return self._greedy_fallback(
+                    requests=requests[req_idx:],
+                    deadlines=deadlines[req_idx:],
+                    current_slot=current_slot,
+                    capacity_tiers=capacity_tiers,
+                    base_counts=base_counts,
+                    base_durations=base_durations,
+                )
+
+            dp_prev = dp_curr
+
+        _, (__, best_assignments) = min(dp_prev.items(), key=lambda x: x[1][0])
         return best_assignments
     
-    def _greedy_fallback(self, 
-                        requests: List[dict],
-                        deadlines: List[int]) -> List[RequestAssignment]:
+    def _greedy_fallback(
+        self,
+        requests: List[dict],
+        deadlines: List[int],
+        current_slot: int,
+        capacity_tiers: Optional[List[dict]] = None,
+        base_counts: Optional[List[int]] = None,
+        base_durations: Optional[List[int]] = None,
+    ) -> List[RequestAssignment]:
         """
         Fallback greedy scheduler when DP fails.
         Assigns each request to the earliest available slot with the fastest strategy.
         """
         assignments = []
-        slot_loads = {}  # Track requests per slot for load balancing
-        
+        if capacity_tiers is None:
+            capacity_tiers = [{"max_requests": float("inf"), "multiplier": 1.0}]
+        if base_counts is None:
+            base_counts = [0] * self.window_size
+        if base_durations is None:
+            base_durations = [0] * self.window_size
+
+        inc_counts = [0] * self.window_size
+        inc_durations = [0] * self.window_size
+
         for req_idx, req in enumerate(requests):
-            req_id = req['id']
+            req_id = req["id"]
             deadline = deadlines[req_idx]
-            
-            # Find slot with minimum load before deadline
-            best_slot = 0
-            best_load = float('inf')
-            for t in range(deadline + 1):
-                load = slot_loads.get(t, 0)
-                if load < best_load:
-                    best_load = load
-                    best_slot = t
-            
-            # Choose fastest strategy (lowest error = smallest impact)
-            strategy = self.strategies[0]  # Assume first is fast
-            
-            carbon_cost = self.carbon_forecast[best_slot] * strategy['duration']
-            
+
+            best_choice = None
+            for strategy in self.strategies:
+                duration = int(strategy["duration"])
+                for slot in range(current_slot, deadline + 1):
+                    delta_cost = self._incremental_carbon_cost(
+                        slot=slot,
+                        add_duration=duration,
+                        base_counts=base_counts,
+                        base_durations=base_durations,
+                        inc_counts=inc_counts,
+                        inc_durations=inc_durations,
+                        capacity_tiers=capacity_tiers,
+                    )
+                    if best_choice is None or delta_cost < best_choice[0]:
+                        best_choice = (delta_cost, slot, strategy)
+
+            if best_choice is None:
+                continue
+
+            carbon_cost, best_slot, strategy = best_choice
+            inc_counts[best_slot] += 1
+            inc_durations[best_slot] += int(strategy["duration"])
+
             assignment = RequestAssignment(
                 request_id=req_id,
-                strategy_name=strategy['name'],
+                strategy_name=strategy["name"],
                 slot=best_slot,
                 carbon_cost=carbon_cost,
-                error=strategy['error']
+                error=float(strategy["error"]),
             )
             assignments.append(assignment)
-            
-            slot_loads[best_slot] = slot_loads.get(best_slot, 0) + 1
-        
+
         return assignments
-    
-    def solve_with_error_window(self,
-                               requests: List[dict],
-                               current_slot: int,
-                               capacity_multiplier: float = 1.0,
-                               max_error_threshold: float = 3.0,
-                               error_window_data: Dict[int, float] = None) -> Tuple[List[RequestAssignment], float]:
+
+    def _get_capacity_multiplier(self, capacity_tiers: List[dict], request_count: int) -> float:
+        for tier in capacity_tiers:
+            if request_count <= tier["max_requests"]:
+                return float(tier["multiplier"])
+        return float(capacity_tiers[-1]["multiplier"])
+
+    def _incremental_carbon_cost(
+        self,
+        slot: int,
+        add_duration: int,
+        base_counts: List[int],
+        base_durations: List[int],
+        inc_counts: List[int],
+        inc_durations: List[int],
+        capacity_tiers: List[dict],
+    ) -> float:
+        before_count = base_counts[slot] + inc_counts[slot]
+        after_count = before_count + 1
+
+        before_duration = base_durations[slot] + inc_durations[slot]
+        after_duration = before_duration + add_duration
+
+        before_mult = self._get_capacity_multiplier(capacity_tiers, before_count)
+        after_mult = self._get_capacity_multiplier(capacity_tiers, after_count)
+
+        slot_carbon = self.carbon_forecast[slot]
+        before_cost = slot_carbon * before_mult * before_duration
+        after_cost = slot_carbon * after_mult * after_duration
+        return after_cost - before_cost
+
+    def solve_with_error_window(
+        self,
+        requests: List[dict],
+        current_slot: int,
+        capacity_multiplier: float = 1.0,
+        max_error_threshold: float = 3.0,
+        error_window_data: Dict[int, float] = None,
+    ) -> Tuple[List[RequestAssignment], float]:
         """
         Solve batch problem while respecting error budget window constraint.
         
@@ -229,24 +354,26 @@ class RollingWindowDPScheduler:
             requests=requests,
             current_slot=current_slot,
             capacity_multiplier=capacity_multiplier,
-            error_window_errors=error_window_data
+            error_window_errors=error_window_data,
+            max_error_threshold=max_error_threshold,
         )
-        
-        # Calculate average error in the window after this batch
+
         window_start = max(0, current_slot - 5)
         window_end = min(self.window_size - 1, current_slot + 5)
-        
-        # Collect all errors in window (existing + new assignments)
-        window_errors = []
+
+        # Best-effort weighted average reconstruction.
+        error_sum = 0.0
+        request_count = 0
         if error_window_data:
-            for slot in range(window_start, window_end + 1):
-                window_errors.append(error_window_data.get(slot, 0.0))
-        
-        # Add errors from new assignments that fall in window
+            for slot, avg_err in error_window_data.items():
+                if window_start <= slot <= window_end:
+                    error_sum += avg_err
+                    request_count += 1
+
         for assignment in assignments:
             if window_start <= assignment.slot <= window_end:
-                window_errors.append(assignment.error)
-        
-        avg_error = sum(window_errors) / len(window_errors) if window_errors else 0.0
-        
+                error_sum += assignment.error
+                request_count += 1
+
+        avg_error = (error_sum / request_count) if request_count else 0.0
         return assignments, avg_error

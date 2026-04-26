@@ -51,9 +51,9 @@ ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE  # 11 total
 # Capacity tiers: (max_requests, carbon_multiplier)
 # If slot receives more than this many requests, carbon emissions multiply
 CAPACITY_TIERS = [
-    {"max_requests": 1000, "multiplier": 1.0},
-    {"max_requests": 2000, "multiplier": 1.5},
-    {"max_requests": 3000, "multiplier": 2.0},
+    {"max_requests": 10, "multiplier": 1.0},
+    {"max_requests": 20, "multiplier": 1.5},
+    {"max_requests": 30, "multiplier": 4.0},
     {"max_requests": float('inf'), "multiplier": 3.0},
 ]
 
@@ -61,21 +61,28 @@ CAPACITY_TIERS = [
 # DP SOLVER PARAMETERS
 # ============================================================================
 
-# Pruning strategy: 'kbest' or 'beam'
+# Pruning strategy: 'kbest' or 'beam' or 'None' (no pruning)
 DP_PRUNING_STRATEGY = 'beam'
+# DP_PRUNING_STRATEGY = 'None'
 
 # Number of states to keep during pruning
 DP_PRUNING_K = 150
 
 # Maximum seconds for DP solver per batch
-DP_TIMEOUT = 5.0
+DP_TIMEOUT = 7.0
+
+# If True, assignments already made on future slots are fixed and considered as
+# baseline load/error by the DP.
+# If False, those future assignments are included in the optimization and can
+# be moved.
+DP_LOCK_FUTURE_ASSIGNMENTS = False
 
 # ============================================================================
 # REQUEST GENERATION PARAMETERS
 # ============================================================================
 
 # Rate of request arrivals per slot (average)
-REQUESTS_PER_SLOT = 5
+REQUESTS_PER_SLOT = 10
 
 # Deadline range for generated requests (in slots from arrival)
 DEADLINE_MIN_SLACK = 2
