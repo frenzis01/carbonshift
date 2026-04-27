@@ -95,7 +95,7 @@ class RequestGenerator:
             request_id = self._request_id
             self._request_id += 1
 
-        # Random deadline: 2-8 slots from arrival
+        # Random deadline: configurable range (default: +0 .. +8 from arrival)
         slack = random.randint(config.DEADLINE_MIN_SLACK, config.DEADLINE_MAX_SLACK)
         deadline_slot = min(arrival_slot + slack, config.TOTAL_SLOTS - 1)
 

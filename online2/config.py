@@ -35,14 +35,18 @@ STRATEGIES = [
 # ERROR BUDGET PARAMETERS
 # ============================================================================
 
-# Maximum average error allowed in any sliding window of 10 slots
-# (5 past + current + 5 future)
+# Maximum average error allowed in the sliding window.
 MAX_ERROR_THRESHOLD = 4.0  # %
 
 # Window size for error calculation (symmetric around current slot)
 ERROR_WINDOW_PAST = 5
-ERROR_WINDOW_FUTURE = 5
-ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE  # 11 total
+ERROR_WINDOW_FUTURE = 8
+ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE
+
+# Requests cannot be placed beyond current_slot + ASSIGNMENT_MAX_FUTURE_SLOTS.
+# Keep this aligned with ERROR_WINDOW_FUTURE unless you explicitly want a smaller
+# placement horizon.
+ASSIGNMENT_MAX_FUTURE_SLOTS = 8
 
 # Virtual pre-history for early iterations:
 # for current_slot < ERROR_WINDOW_PAST, we assume virtual past slots (-W..-1)
@@ -71,8 +75,8 @@ CAPACITY_TIERS = [
 # ============================================================================
 
 # Pruning strategy: 'kbest' or 'beam' or 'None' (no pruning)
-DP_PRUNING_STRATEGY = 'beam'
-# DP_PRUNING_STRATEGY = 'None'
+# DP_PRUNING_STRATEGY = 'beam'
+DP_PRUNING_STRATEGY = 'None'
 
 # Number of states to keep during pruning
 DP_PRUNING_K = 150
@@ -85,6 +89,21 @@ DP_TIMEOUT = 7.0
 # If False, those future assignments are included in the optimization and can
 # be moved.
 DP_LOCK_FUTURE_ASSIGNMENTS = True
+
+# If strict error-window DP is infeasible, allow one relaxed retry.
+# Disable to enforce hard-threshold behavior only.
+DP_ALLOW_RELAXED_ERROR_RETRY = True
+
+# When relaxed retry is enabled, prefer the minimum-error strategy(ies) so the
+# system can recover from a violated baseline instead of drifting to high error.
+DP_RELAXED_RETRY_PREFER_MIN_ERROR = True
+
+# Behavior when strict infeasibility is caused by an error baseline that is
+# difficult to recover right after the window slides:
+# - "min_error_recovery": assign with minimum-error strategy on recovery steps
+# - "carryover_last_slot": use mock carryover from the slot that just left window
+# - "forecast_mock_current_slot": use mock expected arrivals for current slot
+INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
 
 # ============================================================================
 # REQUEST GENERATION PARAMETERS
@@ -103,7 +122,7 @@ REQUESTS_PER_SLOT = PREDICTED_REQUESTS_PER_SLOT
 REQUEST_RATE_STD_FACTOR = 0.5
 
 # Deadline range for generated requests (in slots from arrival)
-DEADLINE_MIN_SLACK = 1
+DEADLINE_MIN_SLACK = 0
 DEADLINE_MAX_SLACK = 8
 
 # ============================================================================

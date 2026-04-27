@@ -31,7 +31,7 @@ class RollingWindowDPScheduler:
     Solves: Assign N requests to time slots and strategies to minimize carbon cost
     while respecting:
     - Deadline constraints
-    - Error budget window (t-5 to t+5)
+    - Error budget window (t-Wpast to t+Wfuture)
     - Capacity tier multipliers (rebound effect)
     - Max average error threshold
     """
@@ -78,6 +78,8 @@ class RollingWindowDPScheduler:
         max_error_threshold: Optional[float] = None,
         error_window_past: int = 5,
         error_window_future: int = 5,
+        assignment_max_slot: Optional[int] = None,
+        dynamic_mock_pool: Optional[Dict[str, float]] = None,
     ) -> List[RequestAssignment]:
         """
         Solve batch scheduling with DP.
@@ -105,12 +107,24 @@ class RollingWindowDPScheduler:
             error_window_baseline = {"error_sum": 0.0, "request_count": 0}
         if error_window_errors is None:
             error_window_errors = {}
+        if dynamic_mock_pool is None:
+            dynamic_mock_pool = {"initial_count": 0, "error_per_request": 0.0}
 
         T = self.window_size
         window_start = max(0, current_slot - error_window_past)
         window_end = min(T - 1, current_slot + error_window_future)
+        if assignment_max_slot is None:
+            assignment_max_slot = T - 1
+        assignment_cap = max(current_slot, min(int(assignment_max_slot), T - 1))
 
-        deadlines = [max(current_slot, min(req.get("deadline_slot", T - 1), T - 1)) for req in requests]
+        # Clamp every request deadline to:
+        # 1) current slot (cannot schedule in the past)
+        # 2) global horizon [0, T-1]
+        # 3) assignment cap (right edge of allowed placement horizon)
+        deadlines = [
+            max(current_slot, min(req.get("deadline_slot", T - 1), T - 1, assignment_cap))
+            for req in requests
+        ]
 
         base_counts = [0] * T
         base_durations = [0] * T
@@ -132,31 +146,46 @@ class RollingWindowDPScheduler:
 
         initial_error_sum_bp = int(round((error_window_baseline.get("error_sum", 0.0) + legacy_error_sum) * 100))
         initial_error_count = int(error_window_baseline.get("request_count", 0)) + legacy_error_count
+        initial_mock_count = max(0, int(dynamic_mock_pool.get("initial_count", 0)))
+        mock_error_bp = int(round(float(dynamic_mock_pool.get("error_per_request", 0.0)) * 100))
 
-        # state_key = (
-        #   error_sum_bp, error_count, slot_incremental_counts(tuple), slot_incremental_durations(tuple)
-        # )
-        init_state = (initial_error_sum_bp, initial_error_count, tuple([0] * T), tuple([0] * T))
+        # DP state fields:
+        # - error_sum_bp: total error in the active window (basis points)
+        # - error_count: number of requests counted in that window
+        # - mock_remaining: synthetic requests still counted in baseline
+        # - inc_counts / inc_durations: incremental slot load introduced by this batch
+        init_state = (
+            initial_error_sum_bp,
+            initial_error_count,
+            initial_mock_count,
+            tuple([0] * T),
+            tuple([0] * T),
+        )
         dp_prev = {init_state: (0.0, [])}
 
         start_ts = time.time()
 
+        # Expand request-by-request: each DP layer schedules exactly one request.
         for req_idx, req in enumerate(requests):
             req_id = req["id"]
             deadline = deadlines[req_idx]
             dp_curr = {}
 
             for state_key, (prev_cost, prev_assignments) in dp_prev.items():
-                error_sum_bp, error_count, inc_counts_t, inc_durations_t = state_key
+                error_sum_bp, error_count, mock_remaining, inc_counts_t, inc_durations_t = state_key
                 inc_counts = list(inc_counts_t)
                 inc_durations = list(inc_durations_t)
 
+                # Try every strategy and every feasible slot for the current request.
                 for strategy in self.strategies:
                     strategy_error = float(strategy["error"])
                     strategy_error_bp = int(round(strategy_error * 100))
                     strategy_duration = int(strategy["duration"])
 
                     for slot in range(current_slot, deadline + 1):
+                        # Incremental cost is computed with dynamic repricing:
+                        # if the new assignment changes capacity tier, the whole slot
+                        # cost is repriced, not only the marginal request.
                         delta_cost = self._incremental_carbon_cost(
                             slot=slot,
                             add_duration=strategy_duration,
@@ -169,13 +198,18 @@ class RollingWindowDPScheduler:
 
                         new_error_sum_bp = error_sum_bp
                         new_error_count = error_count
+                        new_mock_remaining = mock_remaining
                         if window_start <= slot <= window_end:
                             new_error_sum_bp += strategy_error_bp
                             new_error_count += 1
-                            if max_error_threshold is not None and new_error_count > 0:
-                                avg_error = (new_error_sum_bp / 100.0) / new_error_count
-                                if avg_error > max_error_threshold:
-                                    continue
+
+                            # Optional synthetic baseline decay:
+                            # each new in-window assignment can "replace" one mock
+                            # request injected by the recovery policy.
+                            if new_mock_remaining > 0 and mock_error_bp > 0:
+                                new_error_sum_bp -= mock_error_bp
+                                new_error_count = max(0, new_error_count - 1)
+                                new_mock_remaining -= 1
 
                         new_inc_counts = inc_counts.copy()
                         new_inc_durations = inc_durations.copy()
@@ -194,6 +228,7 @@ class RollingWindowDPScheduler:
                         new_state = (
                             new_error_sum_bp,
                             new_error_count,
+                            new_mock_remaining,
                             tuple(new_inc_counts),
                             tuple(new_inc_durations),
                         )
@@ -202,7 +237,7 @@ class RollingWindowDPScheduler:
                             dp_curr[new_state] = (new_cost, new_assignments)
 
             if not dp_curr:
-                # Infeasible with current constraints
+                # No feasible expansion for this request layer.
                 return []
 
             if self.pruning in {"beam", "kbest"} and len(dp_curr) > self.pruning_k:
@@ -220,6 +255,7 @@ class RollingWindowDPScheduler:
                 dp_curr = dict(sorted_states[: self.pruning_k])
 
             if time.time() - start_ts > self.timeout:
+                # Timeout fallback keeps the system responsive under high complexity.
                 return self._greedy_fallback(
                     requests=requests[req_idx:],
                     deadlines=deadlines[req_idx:],
@@ -230,6 +266,17 @@ class RollingWindowDPScheduler:
                 )
 
             dp_prev = dp_curr
+
+        if max_error_threshold is not None:
+            # Enforce strict window constraint on complete assignments only.
+            feasible_states = {
+                state: payload
+                for state, payload in dp_prev.items()
+                if state[1] == 0 or ((state[0] / 100.0) / state[1]) <= max_error_threshold
+            }
+            if not feasible_states:
+                return []
+            dp_prev = feasible_states
 
         _, (__, best_assignments) = min(dp_prev.items(), key=lambda x: x[1][0])
         return best_assignments

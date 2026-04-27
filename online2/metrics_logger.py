@@ -14,6 +14,7 @@ class SolverMetricsLogger:
 
     RUN_FIELDS = [
         "run_id",
+        "run_sequence",
         "current_slot",
         "pending_batch_size",
         "total_assignments",
@@ -27,6 +28,16 @@ class SolverMetricsLogger:
         "solver_elapsed_ms",
         "avg_ms_per_new_request",
         "avg_ms_per_assignment",
+        "total_carbon_cost",
+        "carbon_cost_per_new_request",
+        "carbon_cost_per_assignment",
+        "error_window_avg_after",
+        "error_window_avg_after_real",
+        "error_window_start_slot",
+        "error_window_end_slot",
+        "error_window_threshold",
+        "error_window_violated_after",
+        "error_window_violated_after_real",
         "batches_processed_after",
         "total_scheduled_after",
     ]
@@ -57,6 +68,7 @@ class SolverMetricsLogger:
         "avg_error_in_slot",
         "run_avg_error_in_slot",
         "slot_has_assignments_after",
+        "carbon_intensity",
         "capacity_multiplier_after",
         "capacity_level_max_requests",
         "request_ids",

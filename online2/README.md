@@ -110,10 +110,11 @@ SLOT_DURATION_SECONDS = 10
 # Schedule 3 requests at a time
 BATCH_SIZE = 3
 
-# Maximum weighted average error in 11-slot window
+# Maximum weighted average error in sliding window
 MAX_ERROR_THRESHOLD = 3.0
 ERROR_WINDOW_PAST = 5
-ERROR_WINDOW_FUTURE = 5
+ERROR_WINDOW_FUTURE = 8
+ASSIGNMENT_MAX_FUTURE_SLOTS = 8
 
 # Rebound effect: >2000 requests = 1.5x carbon multiplier
 CAPACITY_TIERS = [
@@ -130,6 +131,16 @@ DP_PRUNING_K = 150
 # True  -> keep already assigned future requests fixed
 # False -> include future assignments in DP and allow re-planning
 DP_LOCK_FUTURE_ASSIGNMENTS = True
+
+# Strict infeasibility handling:
+# - allow one relaxed retry
+# - relaxed retry can prefer minimum-error strategy for recovery
+DP_ALLOW_RELAXED_ERROR_RETRY = True
+DP_RELAXED_RETRY_PREFER_MIN_ERROR = True
+
+# Sliding-window infeasibility recovery policy:
+# "min_error_recovery" | "carryover_last_slot" | "forecast_mock_current_slot"
+INFEASIBILITY_RECOVERY_MODE = "min_error_recovery"
 
 # Predicted request rate (used by generator and startup pre-history)
 PREDICTED_REQUESTS_PER_SLOT = 10.0
@@ -214,6 +225,8 @@ Use:
 
 The notebook contains:
 1. a single trend chart for **avg processing time per request** and **processing time per batch**
+2. a trend chart for **total carbon cost** and **carbon cost per request**
+2. a chart for **carbon intensity per slot**
 2. one stacked bar chart per solver execution with:
    - all active assignments by slot and strategy color
    - request IDs in each rectangle
@@ -229,6 +242,10 @@ You can choose plotting scope via notebook options:
 - all runs
 - one run per slot (`first_per_slot` / `last_per_slot`)
 - all runs for a specific slot
+
+The error-window trend chart shows both:
+- modeled average used by the solver constraint
+- real-only average (without virtual pre-history)
 
 Run:
 ```bash

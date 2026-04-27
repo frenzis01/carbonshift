@@ -112,6 +112,145 @@ def plot_processing_times(runs_df: pd.DataFrame):
     return fig
 
 
+def plot_carbon_cost_trend(runs_df: pd.DataFrame):
+    """
+    Trend of carbon cost per solver run:
+    - total carbon cost
+    - carbon cost per new request
+    """
+    if runs_df.empty:
+        raise ValueError("runs_df is empty: no solver run data to plot.")
+    if "total_carbon_cost" not in runs_df.columns:
+        raise ValueError("Missing total_carbon_cost in runs data.")
+
+    df = runs_df.sort_values("solver_start_ts").reset_index(drop=True).copy()
+    df["total_carbon_cost"] = pd.to_numeric(df["total_carbon_cost"], errors="coerce")
+    if "carbon_cost_per_new_request" in df.columns:
+        df["carbon_cost_per_new_request"] = pd.to_numeric(df["carbon_cost_per_new_request"], errors="coerce")
+    else:
+        denom = pd.to_numeric(df.get("new_assignments", 1), errors="coerce").replace(0, pd.NA)
+        df["carbon_cost_per_new_request"] = df["total_carbon_cost"] / denom
+
+    x = df.index + 1
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(x, df["total_carbon_cost"], marker="o", linewidth=2, label="Total carbon cost / run")
+    ax.set_xlabel("Solver execution #")
+    ax.set_ylabel("Total carbon cost")
+    ax.grid(True, alpha=0.25)
+
+    ax2 = ax.twinx()
+    ax2.plot(
+        x,
+        df["carbon_cost_per_new_request"],
+        marker="s",
+        linewidth=1.8,
+        color="#ff7f0e",
+        label="Carbon cost / new request",
+    )
+    ax2.set_ylabel("Carbon cost per new request")
+
+    lines_1, labels_1 = ax.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right")
+    ax.set_title("Carbon cost trend per solver run")
+    plt.tight_layout()
+    return fig
+
+
+def plot_carbon_intensity_by_slot(
+    slot_metrics_df: Optional[pd.DataFrame] = None,
+    total_slots: int = config.TOTAL_SLOTS,
+):
+    """
+    Carbon intensity profile across slots.
+    Uses slot_metrics if available, otherwise falls back to default forecast.
+    """
+    slots = list(range(int(total_slots)))
+    intensities: List[float] = []
+
+    if slot_metrics_df is not None and not slot_metrics_df.empty and "carbon_intensity" in slot_metrics_df.columns:
+        tmp = slot_metrics_df.copy()
+        tmp["scheduled_slot"] = pd.to_numeric(tmp["scheduled_slot"], errors="coerce")
+        tmp["carbon_intensity"] = pd.to_numeric(tmp["carbon_intensity"], errors="coerce")
+        tmp = tmp.dropna(subset=["scheduled_slot", "carbon_intensity"])
+        if not tmp.empty:
+            slot_to_ci = tmp.groupby(tmp["scheduled_slot"].astype(int))["carbon_intensity"].median().to_dict()
+            intensities = [float(slot_to_ci.get(slot, _default_carbon_intensity(slot, int(total_slots)))) for slot in slots]
+
+    if not intensities:
+        intensities = [_default_carbon_intensity(slot, int(total_slots)) for slot in slots]
+
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    ax.plot(slots, intensities, marker="o", linewidth=2, color="#d62728")
+    ax.fill_between(slots, intensities, alpha=0.15, color="#d62728")
+    ax.set_xlabel("Slot")
+    ax.set_ylabel("Carbon intensity")
+    ax.set_title("Carbon intensity per slot")
+    ax.grid(True, alpha=0.25)
+    tick_step = max(1, int(total_slots) // 12)
+    ax.set_xticks(list(range(0, int(total_slots), tick_step)))
+    plt.tight_layout()
+    return fig
+
+
+def plot_error_window_trend(runs_df: pd.DataFrame):
+    """Plot error-window average after each run against threshold."""
+    if runs_df.empty:
+        raise ValueError("runs_df is empty: no solver run data to plot.")
+    if "error_window_avg_after" not in runs_df.columns:
+        raise ValueError("Missing error_window_avg_after in runs data.")
+
+    df = runs_df.sort_values("solver_start_ts").reset_index(drop=True).copy()
+    df["error_window_avg_after"] = pd.to_numeric(df["error_window_avg_after"], errors="coerce")
+    if "error_window_avg_after_real" in df.columns:
+        df["error_window_avg_after_real"] = pd.to_numeric(df["error_window_avg_after_real"], errors="coerce")
+    if "error_window_threshold" in df.columns:
+        df["error_window_threshold"] = pd.to_numeric(df["error_window_threshold"], errors="coerce")
+    else:
+        df["error_window_threshold"] = float(config.MAX_ERROR_THRESHOLD)
+
+    x = df.index + 1
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    ax.plot(
+        x,
+        df["error_window_avg_after"],
+        marker="o",
+        linewidth=2,
+        label="Window avg error after run (modeled, solver constraint)",
+    )
+    if "error_window_avg_after_real" in df.columns:
+        ax.plot(
+            x,
+            df["error_window_avg_after_real"],
+            marker=".",
+            linewidth=1.2,
+            alpha=0.8,
+            label="Window avg error after run (real assignments only)",
+        )
+    ax.plot(x, df["error_window_threshold"], linestyle="--", linewidth=1.5, label="Threshold")
+
+    if "solver_mode" in df.columns:
+        relaxed_mask = df["solver_mode"].astype(str).str.contains("relaxed", case=False, na=False)
+        if relaxed_mask.any():
+            ax.scatter(
+                (df[relaxed_mask].index + 1).tolist(),
+                df.loc[relaxed_mask, "error_window_avg_after"].tolist(),
+                marker="x",
+                s=70,
+                color="red",
+                label="Relaxed run",
+                zorder=5,
+            )
+
+    ax.set_xlabel("Solver execution #")
+    ax.set_ylabel("Error (%)")
+    ax.set_title("Error-window trend (after each solver run)")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    plt.tight_layout()
+    return fig
+
+
 def plot_solver_execution_stacked(
     run_id: str,
     runs_df: pd.DataFrame,
@@ -142,9 +281,46 @@ def plot_solver_execution_stacked(
     run_assignments = assignments_df[assignments_df["run_id"].astype(str) == run_id].copy()
 
     run_info = run_row.iloc[0]
+    run_sequence = None
+    if "run_sequence" in run_info and pd.notna(run_info["run_sequence"]):
+        run_sequence = int(run_info["run_sequence"])
+    elif "run_id" in runs_df.columns:
+        sorted_ids = runs_df.sort_values("solver_start_ts")["run_id"].astype(str).tolist()
+        if run_id in sorted_ids:
+            run_sequence = sorted_ids.index(run_id) + 1
     current_slot = int(run_info["current_slot"])
     start_dt = datetime.fromtimestamp(float(run_info["solver_start_ts"]))
     end_dt = datetime.fromtimestamp(float(run_info["solver_end_ts"]))
+    window_start = int(
+        run_info["error_window_start_slot"]
+        if "error_window_start_slot" in run_info
+        else max(0, current_slot - int(config.ERROR_WINDOW_PAST))
+    )
+    window_end = int(
+        run_info["error_window_end_slot"]
+        if "error_window_end_slot" in run_info
+        else min(int(config.TOTAL_SLOTS) - 1, current_slot + int(config.ERROR_WINDOW_FUTURE))
+    )
+    window_avg_modeled = (
+        float(run_info["error_window_avg_after"])
+        if "error_window_avg_after" in run_info and pd.notna(run_info["error_window_avg_after"])
+        else None
+    )
+    window_avg_real = (
+        float(run_info["error_window_avg_after_real"])
+        if "error_window_avg_after_real" in run_info and pd.notna(run_info["error_window_avg_after_real"])
+        else None
+    )
+    total_carbon_cost = (
+        float(run_info["total_carbon_cost"])
+        if "total_carbon_cost" in run_info and pd.notna(run_info["total_carbon_cost"])
+        else None
+    )
+    carbon_cost_per_req = (
+        float(run_info["carbon_cost_per_new_request"])
+        if "carbon_cost_per_new_request" in run_info and pd.notna(run_info["carbon_cost_per_new_request"])
+        else None
+    )
     all_slots = list(range(int(config.TOTAL_SLOTS)))
     slots = all_slots
 
@@ -274,7 +450,32 @@ def plot_solver_execution_stacked(
             marker="o",
             linewidth=1.2,
             linestyle="-",
-            label="Avg error per slot (total after run)",
+            label="Avg error per slot (total after run, not window avg)",
+        )
+        if window_avg_modeled is not None:
+            ax2.plot(
+                [window_start, window_end],
+                [window_avg_modeled, window_avg_modeled],
+                color="#1f77b4",
+                linewidth=2.0,
+                label=f"Window avg (modeled) [{window_start},{window_end}]",
+            )
+        if window_avg_real is not None:
+            ax2.plot(
+                [window_start, window_end],
+                [window_avg_real, window_avg_real],
+                color="#2ca02c",
+                linewidth=1.8,
+                linestyle="--",
+                label=f"Window avg (real) [{window_start},{window_end}]",
+            )
+        ax2.axhline(
+            y=float(config.MAX_ERROR_THRESHOLD),
+            color="red",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.7,
+            label=f"Threshold={float(config.MAX_ERROR_THRESHOLD):.2f}%",
         )
         ax2.set_ylabel("Average error (%)")
         ax2.legend(loc="upper right")
@@ -306,10 +507,20 @@ def plot_solver_execution_stacked(
     ax.set_xlabel("Scheduled slot")
     ax.set_ylabel("Assignments count")
     ax.set_title(
-        f"Solver run {run_id}\n"
+        (
+            f"Solver execution #{run_sequence}\n"
+            if run_sequence is not None
+            else f"Solver run {run_id}\n"
+        )
+        +
         f"start={start_dt.strftime('%H:%M:%S.%f')[:-3]} "
         f"end={end_dt.strftime('%H:%M:%S.%f')[:-3]} "
         f"elapsed={float(run_info['solver_elapsed_ms']):.2f} ms"
+        + (
+            f"  carbon={total_carbon_cost:.2f}  carbon/new={carbon_cost_per_req:.2f}"
+            if total_carbon_cost is not None and carbon_cost_per_req is not None
+            else ""
+        )
     )
     ax.legend(loc="upper left")
     ax.grid(True, axis="y", alpha=0.2)
@@ -446,6 +657,13 @@ def plot_infeasibility_event(event_id: str, debug_df: pd.DataFrame):
 
 def _as_bool(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _default_carbon_intensity(slot: int, total_slots: int) -> float:
+    base_carbon = 500.0
+    amplitude = 200.0
+    value = base_carbon + amplitude * (1 + 0.8 * (1 - abs((slot - total_slots / 2) / (total_slots / 2))))
+    return max(100.0, value)
 
 
 def _parse_int_map(serialized: str) -> Dict[int, int]:

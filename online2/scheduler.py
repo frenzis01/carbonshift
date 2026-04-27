@@ -11,6 +11,7 @@ Considers:
 import threading
 import time
 import random
+import math
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
@@ -64,7 +65,7 @@ class BatchScheduler:
         self._last_infeasible_pending: Optional[int] = None
 
         # Initialize DP solver
-        carbon_forecast = self._get_carbon_forecast()
+        self.carbon_forecast = self._get_carbon_forecast()
         strategies_for_dp = [
             {
                 'name': s['name'],
@@ -76,7 +77,7 @@ class BatchScheduler:
         
         self.dp_solver = RollingWindowDPScheduler(
             strategies=strategies_for_dp,
-            carbon_forecast=carbon_forecast,
+            carbon_forecast=self.carbon_forecast,
             window_size=config.TOTAL_SLOTS,
             pruning=config.DP_PRUNING_STRATEGY,
             pruning_k=config.DP_PRUNING_K,
@@ -187,6 +188,10 @@ class BatchScheduler:
         avg_ms_per_assignment = solver_elapsed_ms / total_assignments if total_assignments else 0.0
 
         if assignments:
+            total_cost = sum(a.carbon_cost for a in assignments)
+            avg_cost_per_new_request = total_cost / new_assignments if new_assignments else 0.0
+            avg_cost_per_assignment = total_cost / total_assignments if total_assignments else 0.0
+
             # Add assignments to shared state
             self.shared_state.add_assignments(assignments)
 
@@ -203,13 +208,13 @@ class BatchScheduler:
                 self._last_solver_elapsed_ms = solver_elapsed_ms
 
             if config.VERBOSE:
-                total_cost = sum(a.carbon_cost for a in assignments)
                 avg_error = sum(a.error for a in assignments) / len(assignments)
                 replanned = max(0, len(assignments) - len(pending))
                 print(
                     f"[Scheduler] ✓ Scheduled {len(pending)} new requests"
                     f"{' + ' + str(replanned) + ' re-planned' if replanned else ''}"
-                    f" (cost={total_cost:.2f}, error={avg_error:.2f}%, "
+                    f" (cost={total_cost:.2f}, cost/new={avg_cost_per_new_request:.2f}, "
+                    f"error={avg_error:.2f}%, "
                     f"solver={solver_elapsed_ms:.2f}ms, {avg_ms_per_new_request:.2f}ms/req)"
                 )
 
@@ -218,6 +223,29 @@ class BatchScheduler:
 
             # Log only successful scheduling runs (with actual assignments).
             all_assignments_after = list(self.shared_state.get_current_assignments().values())
+            real_error_window_after = self.shared_state.get_window_error_stats(
+                center_slot=current_slot,
+                window_past=config.ERROR_WINDOW_PAST,
+                window_future=config.ERROR_WINDOW_FUTURE,
+            )
+            modeled_error_window_avg_after = float(
+                solve_context.get(
+                    "modeled_window_avg_after",
+                    real_error_window_after.get("average_error", 0.0),
+                )
+            )
+            window_start = int(
+                solve_context.get(
+                    "window_start_slot",
+                    max(0, current_slot - int(config.ERROR_WINDOW_PAST)),
+                )
+            )
+            window_end = int(
+                solve_context.get(
+                    "window_end_slot",
+                    min(int(config.TOTAL_SLOTS) - 1, current_slot + int(config.ERROR_WINDOW_FUTURE)),
+                )
+            )
             slot_metrics = self._build_slot_metrics(
                 assignments=assignments,
                 current_slot=current_slot,
@@ -231,6 +259,7 @@ class BatchScheduler:
                 solver_end_ts=solver_end_wall,
             )
             run_row = {
+                "run_sequence": self._solver_total_runs,
                 "current_slot": current_slot,
                 "pending_batch_size": len(pending),
                 "total_assignments": total_assignments,
@@ -244,6 +273,20 @@ class BatchScheduler:
                 "solver_elapsed_ms": solver_elapsed_ms,
                 "avg_ms_per_new_request": avg_ms_per_new_request,
                 "avg_ms_per_assignment": avg_ms_per_assignment,
+                "total_carbon_cost": total_cost,
+                "carbon_cost_per_new_request": avg_cost_per_new_request,
+                "carbon_cost_per_assignment": avg_cost_per_assignment,
+                "error_window_avg_after": modeled_error_window_avg_after,
+                "error_window_avg_after_real": real_error_window_after.get("average_error", 0.0),
+                "error_window_start_slot": window_start,
+                "error_window_end_slot": window_end,
+                "error_window_threshold": config.MAX_ERROR_THRESHOLD,
+                "error_window_violated_after": (
+                    modeled_error_window_avg_after > float(config.MAX_ERROR_THRESHOLD)
+                ),
+                "error_window_violated_after_real": (
+                    real_error_window_after.get("average_error", 0.0) > float(config.MAX_ERROR_THRESHOLD)
+                ),
                 "batches_processed_after": self._batches_processed,
                 "total_scheduled_after": self._total_scheduled,
             }
@@ -275,11 +318,19 @@ class BatchScheduler:
             req.id: {"arrival_slot": req.arrival_slot, "deadline_slot": req.deadline_slot}
             for req in requests
         }
+        assignment_cap_slot = min(
+            int(config.TOTAL_SLOTS) - 1,
+            current_slot + int(getattr(config, "ASSIGNMENT_MAX_FUTURE_SLOTS", config.ERROR_WINDOW_FUTURE)),
+        )
+
+        def _cap_deadline(deadline_slot: Optional[int]) -> int:
+            raw = int(deadline_slot) if deadline_slot is not None else assignment_cap_slot
+            return max(current_slot, min(raw, assignment_cap_slot, int(config.TOTAL_SLOTS) - 1))
 
         future_assignments = self.shared_state.get_future_assignments(current_slot)
         future_ids = {a.request_id for a in future_assignments}
 
-        dp_requests = [{"id": req.id, "deadline_slot": req.deadline_slot} for req in requests]
+        dp_requests = [{"id": req.id, "deadline_slot": _cap_deadline(req.deadline_slot)} for req in requests]
         assignment_metadata = dict(pending_metadata)
 
         fixed_future_assignments: List[Assignment] = []
@@ -296,12 +347,12 @@ class BatchScheduler:
                 dp_requests.append(
                     {
                         "id": assignment.request_id,
-                        "deadline_slot": inferred_deadline,
+                        "deadline_slot": _cap_deadline(inferred_deadline),
                     }
                 )
                 assignment_metadata[assignment.request_id] = {
                     "arrival_slot": assignment.arrival_slot,
-                    "deadline_slot": inferred_deadline,
+                    "deadline_slot": _cap_deadline(inferred_deadline),
                 }
 
         # Baseline load from fixed assignments that remain pinned
@@ -326,6 +377,11 @@ class BatchScheduler:
             error_baseline=error_baseline,
         )
         solve_context.update(prehistory_ctx)
+        error_baseline, dynamic_mock_pool, recovery_ctx = self._apply_infeasibility_recovery_policy(
+            current_slot=current_slot,
+            error_baseline=error_baseline,
+        )
+        solve_context.update(recovery_ctx)
         if solve_context.get("virtual_past_slots_used", 0) > 0 and config.VERBOSE:
             print(
                 "[Scheduler] ℹ Virtual pre-history applied: "
@@ -345,6 +401,8 @@ class BatchScheduler:
                 max_error_threshold=config.MAX_ERROR_THRESHOLD,
                 error_window_past=config.ERROR_WINDOW_PAST,
                 error_window_future=config.ERROR_WINDOW_FUTURE,
+                assignment_max_slot=assignment_cap_slot,
+                dynamic_mock_pool=dynamic_mock_pool,
             )
         except Exception as e:
             if config.VERBOSE:
@@ -362,25 +420,16 @@ class BatchScheduler:
             if config.VERBOSE:
                 print("[Scheduler] ⚠ Infeasible with strict error window: retry with relaxed window.")
 
-            # Retry once by relaxing the hard error-window threshold to avoid deadlocks,
-            # especially when future assignments are locked.
-            try:
-                relaxed_assignments = self.dp_solver.solve_batch(
-                    requests=dp_requests,
-                    current_slot=current_slot,
-                    capacity_tiers=config.CAPACITY_TIERS,
-                    baseline_slot_counts=baseline_slot_counts,
-                    baseline_slot_durations=baseline_slot_durations,
-                    error_window_baseline=error_baseline,
-                    max_error_threshold=None,
-                    error_window_past=config.ERROR_WINDOW_PAST,
-                    error_window_future=config.ERROR_WINDOW_FUTURE,
-                )
-            except Exception as e:
-                if config.VERBOSE:
-                    print(f"[Scheduler] ✗ Relaxed DP retry failed: {e}")
-                relaxed_assignments = []
-
+            relaxed_assignments, relaxed_mode = self._solve_relaxed_retry(
+                dp_requests=dp_requests,
+                current_slot=current_slot,
+                baseline_slot_counts=baseline_slot_counts,
+                baseline_slot_durations=baseline_slot_durations,
+                error_baseline=error_baseline,
+                assignment_cap_slot=assignment_cap_slot,
+                dynamic_mock_pool=dynamic_mock_pool,
+                recovery_mode=solve_context.get("infeasibility_recovery_mode", "min_error_recovery"),
+            )
             relaxed_pending_ids = {a.request_id for a in relaxed_assignments if a.request_id in pending_ids}
             debug_event_id = self._log_strict_infeasibility_debug(
                 current_slot=current_slot,
@@ -397,7 +446,11 @@ class BatchScheduler:
             if len(relaxed_pending_ids) == len(pending_ids):
                 dp_assignments = relaxed_assignments
                 solve_context["status"] = "ok_relaxed"
-                solve_context["mode"] = "dp_relaxed_error"
+                solve_context["mode"] = relaxed_mode
+            elif relaxed_mode == "dp_relaxed_disabled":
+                solve_context["status"] = "infeasible_strict"
+                solve_context["mode"] = "dp_strict_only"
+                dp_assignments = []
             else:
                 if config.VERBOSE:
                     print("[Scheduler] ⚠ Still infeasible: forcing greedy scheduling for pending requests.")
@@ -413,7 +466,7 @@ class BatchScheduler:
 
                 pending_only_requests = [{"id": req.id, "deadline_slot": req.deadline_slot} for req in requests]
                 pending_only_deadlines = [
-                    max(current_slot, min(req.deadline_slot, config.TOTAL_SLOTS - 1))
+                    _cap_deadline(req.deadline_slot)
                     for req in requests
                 ]
                 dp_assignments = self.dp_solver._greedy_fallback(
@@ -451,6 +504,27 @@ class BatchScheduler:
                 deadline_slot=metadata.get("deadline_slot"),
             )
             assignments.append(assignment)
+
+        window_start = max(0, current_slot - int(config.ERROR_WINDOW_PAST))
+        window_end = min(int(config.TOTAL_SLOTS) - 1, current_slot + int(config.ERROR_WINDOW_FUTURE))
+        solve_context["window_start_slot"] = window_start
+        solve_context["window_end_slot"] = window_end
+        modeled_error_sum = float(error_baseline.get("error_sum", 0.0))
+        modeled_request_count = int(error_baseline.get("request_count", 0))
+        mock_remaining = int(dynamic_mock_pool.get("initial_count", 0))
+        mock_error = float(dynamic_mock_pool.get("error_per_request", 0.0))
+        for assignment in assignments:
+            if window_start <= int(assignment.scheduled_slot) <= window_end:
+                modeled_error_sum += float(assignment.error)
+                modeled_request_count += 1
+                if mock_remaining > 0 and mock_error > 0.0:
+                    modeled_error_sum -= mock_error
+                    modeled_request_count = max(0, modeled_request_count - 1)
+                    mock_remaining -= 1
+        solve_context["modeled_window_avg_after"] = (
+            modeled_error_sum / modeled_request_count if modeled_request_count > 0 else 0.0
+        )
+        solve_context["modeled_window_request_count_after"] = modeled_request_count
 
         return assignments, solve_context
 
@@ -512,6 +586,66 @@ class BatchScheduler:
             }
         )
         return augmented, context
+
+    def _apply_infeasibility_recovery_policy(
+        self,
+        current_slot: int,
+        error_baseline: Dict[str, float],
+    ) -> Tuple[Dict[str, float], Dict[str, float], Dict]:
+        """
+        Apply one of three recovery policies to the strict error baseline.
+
+        Returns:
+            (augmented_baseline, dynamic_mock_pool, context)
+        """
+        mode = str(getattr(config, "INFEASIBILITY_RECOVERY_MODE", "min_error_recovery")).strip().lower()
+        context = {
+            "infeasibility_recovery_mode": mode,
+            "mock_recovery_count": 0,
+            "mock_recovery_error": 0.0,
+        }
+        dynamic_mock_pool = {"initial_count": 0, "error_per_request": 0.0}
+
+        if mode == "min_error_recovery":
+            return error_baseline, dynamic_mock_pool, context
+
+        augmented = dict(error_baseline)
+        mock_count = 0
+        mock_error = 0.0
+
+        if mode == "carryover_last_slot":
+            window_start = max(0, current_slot - int(config.ERROR_WINDOW_PAST))
+            dropped_slot = window_start - 1
+            if dropped_slot >= 0:
+                dropped_assignments = self.shared_state.get_requests_in_slot(dropped_slot)
+                mock_count = len(dropped_assignments)
+                if mock_count > 0:
+                    mock_error = sum(a.error for a in dropped_assignments) / mock_count
+
+        elif mode == "forecast_mock_current_slot":
+            expected_rate = float(config.PREDICTED_REQUESTS_PER_SLOT)
+            sigma = max(1.0, expected_rate * float(config.REQUEST_RATE_STD_FACTOR))
+            rng = random.Random(int(config.PREHISTORY_RANDOM_SEED) + int(current_slot))
+            mock_count = max(0, int(rng.gauss(expected_rate, sigma)))
+            mock_error = float(config.MAX_ERROR_THRESHOLD) * float(config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD)
+
+        if mock_count > 0 and mock_error > 0.0:
+            augmented_error_sum = float(augmented.get("error_sum", 0.0)) + mock_count * mock_error
+            augmented_request_count = int(augmented.get("request_count", 0)) + mock_count
+            augmented = {
+                "error_sum": augmented_error_sum,
+                "request_count": augmented_request_count,
+                "average_error": augmented_error_sum / augmented_request_count if augmented_request_count > 0 else 0.0,
+            }
+            dynamic_mock_pool = {"initial_count": mock_count, "error_per_request": mock_error}
+            context.update(
+                {
+                    "mock_recovery_count": mock_count,
+                    "mock_recovery_error": mock_error,
+                }
+            )
+
+        return augmented, dynamic_mock_pool, context
     
     def _get_carbon_forecast(self) -> List[float]:
         """
@@ -526,10 +660,12 @@ class BatchScheduler:
         base_carbon = 500
         amplitude = 400
         
+        K = 6
+
         for slot in range(num_slots):
-            # Sinusoidal pattern: high at midday, low at night
-            value = base_carbon + amplitude * (1 + 0.8 * (1 - abs((slot - num_slots / 2) / (num_slots / 2))))
-            forecast.append(max(100, value))  # Ensure minimum carbon value
+            phase = 2 * math.pi * (slot % K) / K  # ciclo su K
+            value = base_carbon + amplitude * (1 + 0.8 * math.cos(phase))
+            forecast.append(max(100, value))
         
         return forecast
 
@@ -591,6 +727,7 @@ class BatchScheduler:
                     "avg_error_in_slot": total_avg_error,
                     "run_avg_error_in_slot": run_avg_error,
                     "slot_has_assignments_after": total_after > 0,
+                    "carbon_intensity": self.carbon_forecast[slot] if 0 <= slot < len(self.carbon_forecast) else 0.0,
                     "capacity_multiplier_after": multiplier,
                     "capacity_level_max_requests": tier_max,
                     "request_ids": request_ids,
@@ -598,6 +735,64 @@ class BatchScheduler:
                 }
             )
         return rows
+
+    def _solve_relaxed_retry(
+        self,
+        dp_requests: List[Dict],
+        current_slot: int,
+        baseline_slot_counts: Dict[int, int],
+        baseline_slot_durations: Dict[int, int],
+        error_baseline: Dict[str, float],
+        assignment_cap_slot: int,
+        dynamic_mock_pool: Dict[str, float],
+        recovery_mode: str,
+    ) -> Tuple[List, str]:
+        if (
+            not getattr(config, "DP_ALLOW_RELAXED_ERROR_RETRY", True)
+            and recovery_mode != "min_error_recovery"
+        ):
+            return [], "dp_relaxed_disabled"
+
+        preferred_mode = "dp_relaxed_error"
+        original_strategies = self.dp_solver.strategies
+        relaxed_strategies = original_strategies
+
+        prefer_min_error = (
+            recovery_mode == "min_error_recovery"
+            or getattr(config, "DP_RELAXED_RETRY_PREFER_MIN_ERROR", False)
+        )
+        if prefer_min_error and original_strategies:
+            min_error = min(float(s["error"]) for s in original_strategies)
+            relaxed_strategies = [
+                s for s in original_strategies if abs(float(s["error"]) - min_error) < 1e-9
+            ]
+            if relaxed_strategies:
+                preferred_mode = "dp_relaxed_min_error"
+
+        try:
+            self.dp_solver.strategies = relaxed_strategies
+            relaxed_assignments = self.dp_solver.solve_batch(
+                requests=dp_requests,
+                current_slot=current_slot,
+                capacity_tiers=config.CAPACITY_TIERS,
+                baseline_slot_counts=baseline_slot_counts,
+                baseline_slot_durations=baseline_slot_durations,
+                error_window_baseline=error_baseline,
+                max_error_threshold=None,
+                error_window_past=config.ERROR_WINDOW_PAST,
+                error_window_future=config.ERROR_WINDOW_FUTURE,
+                assignment_max_slot=assignment_cap_slot,
+                dynamic_mock_pool=dynamic_mock_pool,
+            )
+        except Exception as e:
+            if config.VERBOSE:
+                print(f"[Scheduler] ✗ Relaxed DP retry failed: {e}")
+            relaxed_assignments = []
+            preferred_mode = "dp_relaxed_failed"
+        finally:
+            self.dp_solver.strategies = original_strategies
+
+        return relaxed_assignments, preferred_mode
 
     def _build_assignment_rows(
         self,

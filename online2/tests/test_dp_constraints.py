@@ -68,6 +68,41 @@ class TestDPSolverConstraints(unittest.TestCase):
         self.assertEqual(len(feasible), 1)  # (4 + 5) / (2 + 1) = 3.0 -> feasible
         self.assertEqual(len(infeasible), 0)  # (8 + 5) / (2 + 1) > 3.0 -> infeasible
 
+    def test_strict_threshold_checks_final_window_average_even_if_new_requests_outside_window(self):
+        forecast = [1000.0] * 6 + [1.0] * 6
+        solver = RollingWindowDPScheduler(
+            strategies=[{"name": "S", "error": 1.0, "duration": 1}],
+            carbon_forecast=forecast,
+            window_size=12,
+            pruning="none",
+            timeout=2.0,
+        )
+        assignments = solver.solve_batch(
+            requests=[{"id": 1, "deadline_slot": 11}],
+            current_slot=0,
+            max_error_threshold=4.0,
+            error_window_baseline={"error_sum": 50.0, "request_count": 10},  # baseline avg=5.0 (>4.0)
+            error_window_past=5,
+            error_window_future=5,
+        )
+        self.assertEqual(len(assignments), 0)
+
+    def test_assignment_max_slot_limits_deadline_domain(self):
+        solver = RollingWindowDPScheduler(
+            strategies=[{"name": "S", "error": 1.0, "duration": 1}],
+            carbon_forecast=[10.0] * 12,
+            window_size=12,
+            pruning="none",
+            timeout=2.0,
+        )
+        assignments = solver.solve_batch(
+            requests=[{"id": 1, "deadline_slot": 11}],
+            current_slot=2,
+            assignment_max_slot=4,
+        )
+        self.assertEqual(len(assignments), 1)
+        self.assertLessEqual(assignments[0].slot, 4)
+
 
 class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
     def test_lock_future_assignments_flag_changes_dp_scope(self):
@@ -150,6 +185,7 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
         original_debug_file = config.SOLVER_INFEASIBLE_DEBUG_FILE
         original_solver_logging = config.ENABLE_SOLVER_LOGGING
         original_prehistory_use = config.PREHISTORY_USE_VIRTUAL_PAST
+        original_relaxed_retry = config.DP_ALLOW_RELAXED_ERROR_RETRY
         debug_rows = []
         try:
             config.DP_LOCK_FUTURE_ASSIGNMENTS = True
@@ -158,6 +194,7 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
             config.ENABLE_SOLVER_LOGGING = True
             config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = True
             config.PREHISTORY_USE_VIRTUAL_PAST = False
+            config.DP_ALLOW_RELAXED_ERROR_RETRY = True
             with tempfile.TemporaryDirectory() as tmp:
                 config.SOLVER_INFEASIBLE_DEBUG_FILE = str(Path(tmp) / "strict_debug.csv")
                 scheduler = BatchScheduler(shared_state)
@@ -172,9 +209,13 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
             config.SOLVER_INFEASIBLE_DEBUG_FILE = original_debug_file
             config.ENABLE_SOLVER_LOGGING = original_solver_logging
             config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory_use
+            config.DP_ALLOW_RELAXED_ERROR_RETRY = original_relaxed_retry
 
         self.assertEqual(len(assignments), 3)
-        self.assertIn(context.get("mode"), {"dp_relaxed_error", "greedy_after_infeasible", "dp"})
+        self.assertIn(
+            context.get("mode"),
+            {"dp_relaxed_error", "dp_relaxed_min_error", "greedy_after_infeasible", "dp"},
+        )
         self.assertIn(context.get("status"), {"ok_relaxed", "ok_greedy_after_infeasible", "ok"})
         self.assertEqual(len(debug_rows), 1)
         self.assertEqual(debug_rows[0]["current_slot"], "3")
@@ -224,7 +265,7 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
         self.assertGreater(int(context.get("virtual_past_requests", 0)), 0)
         self.assertAlmostEqual(
             float(context.get("virtual_past_avg_error", 0.0)),
-            0.5 * float(config.MAX_ERROR_THRESHOLD),
+            0.5 * 3.0,
             places=6,
         )
 
