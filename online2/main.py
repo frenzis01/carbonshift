@@ -26,7 +26,7 @@ class Online2System:
         self.shared_state = SharedSchedulerState()
         self.request_generator = RequestGenerator(
             self.shared_state,
-            requests_per_slot=config.REQUESTS_PER_SLOT
+            requests_per_slot=config.PREDICTED_REQUESTS_PER_SLOT
         )
         self.batch_scheduler = BatchScheduler(self.shared_state)
 
@@ -58,7 +58,7 @@ class Online2System:
         print(f"  - Total Slots: {config.TOTAL_SLOTS}")
         print(f"  - Max Error: {config.MAX_ERROR_THRESHOLD}%")
         print(f"  - DP Pruning: {config.DP_PRUNING_STRATEGY}")
-        print(f"  - Requests/Slot: {config.REQUESTS_PER_SLOT}")
+        print(f"  - Predicted Requests/Slot: {config.PREDICTED_REQUESTS_PER_SLOT}")
         print()
 
         # Start components
@@ -114,6 +114,10 @@ class Online2System:
         print(f"  Pending: {stats['pending']}")
         print(f"  Current Slot: {stats['current_slot']}")
         print(f"  Batches: {sched_stats['batches_processed']}")
+        print(f"  Solver Runs: {sched_stats['solver_runs']}")
+        print(f"  Last Solver Time: {sched_stats['last_solver_elapsed_ms']:.2f} ms")
+        print(f"  Avg Solver Time/Batch: {sched_stats['avg_solver_ms_per_batch']:.2f} ms")
+        print(f"  Avg Solver Time/Request: {sched_stats['avg_solver_ms_per_request']:.2f} ms")
 
         if final:
             print(f"\n  Throughput: {gen_stats['generated'] / elapsed:.2f} req/s")

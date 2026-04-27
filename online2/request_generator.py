@@ -19,7 +19,7 @@ class RequestGenerator:
     Runs in background thread, adds to shared state.
     """
 
-    def __init__(self, shared_state: SharedSchedulerState, requests_per_slot: float = 5.0):
+    def __init__(self, shared_state: SharedSchedulerState, requests_per_slot: float = config.PREDICTED_REQUESTS_PER_SLOT):
         """
         Initialize request generator.
 
@@ -76,7 +76,8 @@ class RequestGenerator:
             if current_slot > slot:
                 # We've entered a new slot
                 slot = current_slot
-                num_requests = max(1, int(random.gauss(self.requests_per_slot, max(1, self.requests_per_slot * 0.3))))
+                sigma = max(1.0, self.requests_per_slot * config.REQUEST_RATE_STD_FACTOR)
+                num_requests = max(1, int(random.gauss(self.requests_per_slot, sigma)))
 
                 for _ in range(num_requests):
                     req = self._generate_request(slot)

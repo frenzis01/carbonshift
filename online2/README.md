@@ -112,6 +112,8 @@ BATCH_SIZE = 3
 
 # Maximum weighted average error in 11-slot window
 MAX_ERROR_THRESHOLD = 3.0
+ERROR_WINDOW_PAST = 5
+ERROR_WINDOW_FUTURE = 5
 
 # Rebound effect: >2000 requests = 1.5x carbon multiplier
 CAPACITY_TIERS = [
@@ -128,6 +130,14 @@ DP_PRUNING_K = 150
 # True  -> keep already assigned future requests fixed
 # False -> include future assignments in DP and allow re-planning
 DP_LOCK_FUTURE_ASSIGNMENTS = True
+
+# Predicted request rate (used by generator and startup pre-history)
+PREDICTED_REQUESTS_PER_SLOT = 10.0
+REQUEST_RATE_STD_FACTOR = 0.3
+
+# Startup pre-history: virtual past slots with avg error = threshold * 0.5
+PREHISTORY_USE_VIRTUAL_PAST = True
+PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 0.5
 ```
 
 ## Running
@@ -155,9 +165,9 @@ Configuration:
   - Total Slots: 24
   - Max Error: 3%
   - DP Pruning: beam
-  - Requests/Slot: 5
+  - Predicted Requests/Slot: 10
 
-[RequestGenerator] Started: 5.0 req/slot
+[RequestGenerator] Started: 10.0 req/slot
 [Scheduler] Started (batch_size=3)
 
 [t=10.0s] Statistics:
@@ -181,6 +191,50 @@ request_id,scheduled_slot,strategy,carbon_cost,error,assignment_time
 0,5,Accurate,45.23,1.0,1713873600.123
 1,5,Balanced,18.92,2.5,1713873600.124
 2,6,Fast,8.45,5.0,1713873600.125
+```
+
+Solver telemetry (per execution) is exported to:
+- `config.SOLVER_RUNS_FILE` (default: `/tmp/online2_solver_runs.csv`)
+- `config.SOLVER_ASSIGNMENTS_FILE` (default: `/tmp/online2_solver_assignments.csv`)
+- `config.SOLVER_SLOT_METRICS_FILE` (default: `/tmp/online2_solver_slot_metrics.csv`)
+- `config.SOLVER_INFEASIBLE_DEBUG_FILE` (default: `/tmp/online2_solver_infeasible_debug.csv`)
+
+These files include:
+- solver start/end timestamp and elapsed time
+- average processing time per request and per batch
+- assignment details for each solver run (all active assignments, with a flag for new assignments in that run)
+- per-slot run summaries (avg error, capacity multiplier after assignment)
+- strict-infeasibility debug snapshots (pending requests with deadlines, baseline error state, active/future slot load)
+
+## Visualization (Matplotlib + Notebook)
+
+Use:
+- `visualize_solver_logs.py` for plotting helpers
+- `notebooks/solver_logs_analysis.ipynb` for a complete analysis notebook
+
+The notebook contains:
+1. a single trend chart for **avg processing time per request** and **processing time per batch**
+2. one stacked bar chart per solver execution with:
+   - all active assignments by slot and strategy color
+   - request IDs in each rectangle
+   - new assignments highlighted and previous assignments faded
+   - average error per slot
+   - capacity level horizontal lines
+   - solver start/end times
+3. strict-infeasibility debug plots:
+   - overview of event frequency/severity
+   - per-event snapshot of current/future load and pending request deadlines
+
+You can choose plotting scope via notebook options:
+- all runs
+- one run per slot (`first_per_slot` / `last_per_slot`)
+- all runs for a specific slot
+
+Run:
+```bash
+cd online2
+python main.py --duration 30
+jupyter notebook notebooks/solver_logs_analysis.ipynb
 ```
 
 ## Future Enhancements
