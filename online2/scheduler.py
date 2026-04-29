@@ -629,6 +629,11 @@ class BatchScheduler:
             mock_count = max(0, int(rng.gauss(expected_rate, sigma)))
             mock_error = float(config.MAX_ERROR_THRESHOLD) * float(config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD)
 
+        if mode in {"carryover_last_slot", "forecast_mock_current_slot"} and mock_count > 0:
+            influence = float(getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0))
+            influence = max(0.0, min(1.0, influence))
+            mock_count = int(round(mock_count * influence))
+
         if mock_count > 0 and mock_error > 0.0:
             augmented_error_sum = float(augmented.get("error_sum", 0.0)) + mock_count * mock_error
             augmented_request_count = int(augmented.get("request_count", 0)) + mock_count

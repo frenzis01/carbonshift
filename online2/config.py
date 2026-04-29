@@ -105,6 +105,11 @@ DP_RELAXED_RETRY_PREFER_MIN_ERROR = True
 # - "forecast_mock_current_slot": use mock expected arrivals for current slot
 INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
 
+# Scales the number of mock requests used in carryover/forecast recovery modes.
+# Range [0, 1]: lower means less mock influence (more pessimistic).
+# 1.0 = full mock influence, 0.0 = disable mock contribution.
+INFEASIBILITY_MOCK_INFLUENCE = 0.8
+
 # ============================================================================
 # REQUEST GENERATION PARAMETERS
 # ============================================================================

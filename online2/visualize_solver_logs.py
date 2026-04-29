@@ -324,7 +324,7 @@ def plot_solver_execution_stacked(
     all_slots = list(range(int(config.TOTAL_SLOTS)))
     slots = all_slots
 
-    fig, ax = plt.subplots(figsize=(13, 6))
+    fig, ax = plt.subplots(figsize=(17, 7))
 
     run_slots = pd.DataFrame()
     if slot_metrics_df is not None and not slot_metrics_df.empty:
@@ -360,9 +360,14 @@ def plot_solver_execution_stacked(
     if not run_assignments.empty:
         run_assignments["scheduled_slot"] = pd.to_numeric(run_assignments["scheduled_slot"], errors="coerce")
         run_assignments["request_id"] = pd.to_numeric(run_assignments["request_id"], errors="coerce")
+        run_assignments["error"] = pd.to_numeric(run_assignments["error"], errors="coerce")
         run_assignments = run_assignments.dropna(subset=["scheduled_slot", "request_id"])
         run_assignments["scheduled_slot"] = run_assignments["scheduled_slot"].astype(int)
         run_assignments["request_id"] = run_assignments["request_id"].astype(int)
+        if "deadline_slot" in run_assignments.columns:
+            run_assignments["deadline_slot"] = pd.to_numeric(run_assignments["deadline_slot"], errors="coerce")
+        else:
+            run_assignments["deadline_slot"] = pd.NA
         if "is_new_assignment_in_run" in run_assignments.columns:
             run_assignments["is_new_assignment_in_run"] = run_assignments["is_new_assignment_in_run"].apply(
                 _as_bool
@@ -401,7 +406,7 @@ def plot_solver_execution_stacked(
                 [slot],
                 [1.0],
                 bottom=[bottom],
-                width=0.72,
+                width=0.78,
                 color=color,
                 alpha=alpha,
                 edgecolor="black",
@@ -409,17 +414,31 @@ def plot_solver_execution_stacked(
                 label=label,
                 zorder=3 if is_new else 2,
             )
+            text_color = "white" if is_new else "black"
+            text_effects = [pe.withStroke(linewidth=1.1, foreground="black")] if is_new else []
             ax.text(
                 slot,
                 bottom + 0.5,
                 f"{int(row.request_id)}",
-                ha="center",
+                ha="right",
                 va="center",
-                fontsize=7,
-                color="white" if is_new else "black",
-                path_effects=[pe.withStroke(linewidth=1.1, foreground="black")] if is_new else [],
+                fontsize=12,
+                color=text_color,
+                path_effects=text_effects,
                 zorder=4,
             )
+            if pd.notna(row.deadline_slot):
+                ax.text(
+                    slot + 0.12,
+                    bottom + 0.5,
+                    f"/{int(row.deadline_slot)}",
+                    ha="left",
+                    va="center",
+                    fontsize=8,
+                    color=text_color,
+                    path_effects=text_effects,
+                    zorder=4,
+                )
             slot_stack_height[slot] = bottom + 1
     else:
         ax.text(
@@ -450,8 +469,49 @@ def plot_solver_execution_stacked(
             marker="o",
             linewidth=1.2,
             linestyle="-",
+            alpha=0.6,
             label="Avg error per slot (total after run, not window avg)",
         )
+
+        if not run_assignments.empty:
+            t_values = list(range(0, max(0, current_slot) + 1))
+            window_avg_series_real = []
+            for t in t_values:
+                lo = max(0, t - int(config.ERROR_WINDOW_PAST))
+                hi = min(int(config.TOTAL_SLOTS) - 1, t + int(config.ERROR_WINDOW_FUTURE))
+                in_window = run_assignments[
+                    (run_assignments["scheduled_slot"] >= lo)
+                    & (run_assignments["scheduled_slot"] <= hi)
+                ]
+                if in_window.empty:
+                    window_avg_series_real.append(float("nan"))
+                else:
+                    window_avg_series_real.append(float(in_window["error"].astype(float).mean()))
+
+            window_avg_series_modeled = list(window_avg_series_real)
+            if (
+                window_avg_modeled is not None
+                and window_avg_real is not None
+                and pd.notna(window_avg_modeled)
+                and pd.notna(window_avg_real)
+            ):
+                modeled_delta = float(window_avg_modeled) - float(window_avg_real)
+                window_avg_series_modeled = [
+                    (v + modeled_delta) if pd.notna(v) else float("nan")
+                    for v in window_avg_series_real
+                ]
+
+            ax2.plot(
+                t_values,
+                window_avg_series_modeled,
+                color="#9467bd",
+                marker=".",
+                linestyle="-",
+                linewidth=1.4,
+                alpha=0.6,
+                label="Window avg by timeslot (0..current, modeled)",
+            )
+
         if window_avg_modeled is not None:
             ax2.plot(
                 [window_start, window_end],
@@ -467,6 +527,7 @@ def plot_solver_execution_stacked(
                 color="#2ca02c",
                 linewidth=1.8,
                 linestyle="--",
+                alpha=0.45,
                 label=f"Window avg (real) [{window_start},{window_end}]",
             )
         ax2.axhline(
