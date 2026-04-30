@@ -406,7 +406,7 @@ def plot_solver_execution_stacked(
                 [slot],
                 [1.0],
                 bottom=[bottom],
-                width=0.78,
+                width=0.95,
                 color=color,
                 alpha=alpha,
                 edgecolor="black",
@@ -422,7 +422,7 @@ def plot_solver_execution_stacked(
                 f"{int(row.request_id)}",
                 ha="right",
                 va="center",
-                fontsize=12,
+                fontsize=11.5,
                 color=text_color,
                 path_effects=text_effects,
                 zorder=4,
@@ -465,11 +465,11 @@ def plot_solver_execution_stacked(
         ax2.plot(
             slots,
             avg_errors,
-            color="black",
-            marker="o",
+            color="#af79e2",
+            marker=".",
             linewidth=1.2,
             linestyle="-",
-            alpha=0.6,
+            alpha=0.45,
             label="Avg error per slot (total after run, not window avg)",
         )
 
@@ -504,8 +504,8 @@ def plot_solver_execution_stacked(
             ax2.plot(
                 t_values,
                 window_avg_series_modeled,
-                color="#9467bd",
-                marker=".",
+                color="#7700ff",
+                marker="o",
                 linestyle="-",
                 linewidth=1.4,
                 alpha=0.6,
@@ -516,8 +516,9 @@ def plot_solver_execution_stacked(
             ax2.plot(
                 [window_start, window_end],
                 [window_avg_modeled, window_avg_modeled],
-                color="#1f77b4",
+                color="#e30eff",
                 linewidth=2.0,
+                alpha=0.45,
                 label=f"Window avg (modeled) [{window_start},{window_end}]",
             )
         if window_avg_real is not None:
