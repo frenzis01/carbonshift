@@ -1,9 +1,8 @@
 {
-  "batch_sizes": [2, 3, 4, 6],
+  "batch_sizes": [1, 2, 3, 4, 5, 6, 8, 10],
   "scenario_path": "scenario_seed_2026.json",
   "output_dir": "output",
   "runner": {
     "flush_partial_batch": true
   }
 }
-

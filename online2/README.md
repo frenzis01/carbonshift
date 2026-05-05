@@ -277,6 +277,12 @@ Outputs are written under:
 - `N*/per_timeslot.*`
 - `N*/batch_timings.*`
 
+Visualize and compare metrics across N:
+```bash
+cd online2
+jupyter notebook notebooks/nshift_speed_analysis.ipynb
+```
+
 ## Future Enhancements
 
 ### Phase 1 (Current)
