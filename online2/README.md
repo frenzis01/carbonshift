@@ -126,6 +126,8 @@ CAPACITY_TIERS = [
 # DP solver: optional Beam Search
 DP_PRUNING_STRATEGY = 'beam'
 DP_PRUNING_K = 150
+# Enable pruning only for batches with size >= threshold (0 disables pruning)
+DP_PRUNING_MIN_BATCH_SIZE = 5
 
 # Future commitments behavior:
 # True  -> keep already assigned future requests fixed
@@ -253,6 +255,27 @@ cd online2
 python main.py --duration 30
 jupyter notebook notebooks/solver_logs_analysis.ipynb
 ```
+
+## Reproducible multi-N benchmark harness (`tests/Nshift_speed`)
+
+Generate one static scenario (reused across all N values):
+```bash
+cd online2
+python tests/Nshift_speed/generate_scenario.py --seed 2026
+```
+
+Run benchmark for all configured batch sizes:
+```bash
+cd online2
+python tests/Nshift_speed/run_nshift_speed.py --config tests/Nshift_speed/config.json
+```
+
+Outputs are written under:
+`online2/tests/Nshift_speed/output/`
+- `summary_by_n.json` / `summary_by_n.csv`
+- `N*/per_request.*`
+- `N*/per_timeslot.*`
+- `N*/batch_timings.*`
 
 ## Future Enhancements
 

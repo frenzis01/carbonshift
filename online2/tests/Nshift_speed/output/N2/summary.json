@@ -1,0 +1,18 @@
+{
+  "batch_size": 2,
+  "batches_executed": 104,
+  "final_wait_seconds_avg": 25.991755364797076,
+  "final_wait_seconds_max": 80.00314015699996,
+  "final_wait_seconds_min": 0.0005075869999018323,
+  "global_average_error": 4.1521739130434785,
+  "queue_wait_seconds_avg": 0.5314009661835749,
+  "queue_wait_seconds_max": 10.0,
+  "queue_wait_seconds_min": 0.0,
+  "requests_scheduled": 207,
+  "requests_total": 207,
+  "requests_unscheduled": 0,
+  "solver_time_ms_avg": 1.4148670961425034,
+  "solver_time_ms_max": 3.1401569999616186,
+  "solver_time_ms_min": 0.5075869999018323,
+  "total_carbon_cost": 5037188.409890002
+}

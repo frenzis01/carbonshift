@@ -1,0 +1,9 @@
+{
+  "batch_sizes": [2, 3, 4, 6],
+  "scenario_path": "scenario_seed_2026.json",
+  "output_dir": "output",
+  "runner": {
+    "flush_partial_batch": true
+  }
+}
+

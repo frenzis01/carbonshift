@@ -312,8 +312,17 @@ class BatchScheduler:
         Returns:
             Tuple (assignments, context)
         """
+        effective_pruning = self._get_effective_pruning_mode(len(requests))
+        self.dp_solver.pruning = effective_pruning
+
         pending_ids: Set[int] = {req.id for req in requests}
-        solve_context: Dict = {"pending_ids": pending_ids, "status": "ok", "mode": "dp"}
+        solve_context: Dict = {
+            "pending_ids": pending_ids,
+            "status": "ok",
+            "mode": "dp",
+            "pruning_mode": effective_pruning,
+            "pruning_min_batch_size": int(getattr(config, "DP_PRUNING_MIN_BATCH_SIZE", 0)),
+        }
         pending_metadata = {
             req.id: {"arrival_slot": req.arrival_slot, "deadline_slot": req.deadline_slot}
             for req in requests
@@ -527,6 +536,22 @@ class BatchScheduler:
         solve_context["modeled_window_request_count_after"] = modeled_request_count
 
         return assignments, solve_context
+
+    def _get_effective_pruning_mode(self, pending_batch_size: int) -> str:
+        """
+        Resolve pruning mode based on configured threshold and current batch size.
+
+        Rules:
+        - DP_PRUNING_MIN_BATCH_SIZE <= 0 => pruning disabled
+        - pending_batch_size < threshold => pruning disabled
+        - otherwise use DP_PRUNING_STRATEGY
+        """
+        threshold = int(getattr(config, "DP_PRUNING_MIN_BATCH_SIZE", 0))
+        if threshold <= 0:
+            return "none"
+        if int(pending_batch_size) < threshold:
+            return "none"
+        return str(getattr(config, "DP_PRUNING_STRATEGY", "none")).strip().lower()
 
     def _augment_error_baseline_with_virtual_past(
         self,

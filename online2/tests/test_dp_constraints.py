@@ -270,5 +270,72 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
         )
 
 
+class TestSchedulerPruningThreshold(unittest.TestCase):
+    def test_pruning_applies_only_at_or_above_threshold(self):
+        shared_state = SharedSchedulerState()
+        shared_state.set_current_slot(0)
+
+        original_strategy = config.DP_PRUNING_STRATEGY
+        original_threshold = getattr(config, "DP_PRUNING_MIN_BATCH_SIZE", 0)
+        original_verbose = config.VERBOSE
+        original_threshold_error = config.MAX_ERROR_THRESHOLD
+        original_prehistory = config.PREHISTORY_USE_VIRTUAL_PAST
+        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
+        try:
+            config.DP_PRUNING_STRATEGY = "beam"
+            config.DP_PRUNING_MIN_BATCH_SIZE = 5
+            config.VERBOSE = False
+            config.MAX_ERROR_THRESHOLD = 10.0
+            config.PREHISTORY_USE_VIRTUAL_PAST = False
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
+
+            scheduler = BatchScheduler(shared_state)
+
+            small_batch = [Request(id=i, arrival_slot=0, deadline_slot=0) for i in range(1, 4)]
+            _, small_ctx = scheduler._solve_dp(small_batch, current_slot=0)
+            self.assertEqual(small_ctx.get("pruning_mode"), "none")
+
+            large_batch = [Request(id=i, arrival_slot=0, deadline_slot=0) for i in range(10, 15)]
+            _, large_ctx = scheduler._solve_dp(large_batch, current_slot=0)
+            self.assertEqual(large_ctx.get("pruning_mode"), "beam")
+        finally:
+            config.DP_PRUNING_STRATEGY = original_strategy
+            config.DP_PRUNING_MIN_BATCH_SIZE = original_threshold
+            config.VERBOSE = original_verbose
+            config.MAX_ERROR_THRESHOLD = original_threshold_error
+            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
+
+    def test_pruning_threshold_zero_disables_pruning(self):
+        shared_state = SharedSchedulerState()
+        shared_state.set_current_slot(0)
+
+        original_strategy = config.DP_PRUNING_STRATEGY
+        original_threshold = getattr(config, "DP_PRUNING_MIN_BATCH_SIZE", 0)
+        original_verbose = config.VERBOSE
+        original_threshold_error = config.MAX_ERROR_THRESHOLD
+        original_prehistory = config.PREHISTORY_USE_VIRTUAL_PAST
+        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
+        try:
+            config.DP_PRUNING_STRATEGY = "beam"
+            config.DP_PRUNING_MIN_BATCH_SIZE = 0
+            config.VERBOSE = False
+            config.MAX_ERROR_THRESHOLD = 10.0
+            config.PREHISTORY_USE_VIRTUAL_PAST = False
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
+
+            scheduler = BatchScheduler(shared_state)
+            batch = [Request(id=i, arrival_slot=0, deadline_slot=0) for i in range(20, 26)]
+            _, solve_ctx = scheduler._solve_dp(batch, current_slot=0)
+            self.assertEqual(solve_ctx.get("pruning_mode"), "none")
+        finally:
+            config.DP_PRUNING_STRATEGY = original_strategy
+            config.DP_PRUNING_MIN_BATCH_SIZE = original_threshold
+            config.VERBOSE = original_verbose
+            config.MAX_ERROR_THRESHOLD = original_threshold_error
+            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,1044 @@
+{
+  "rows": [
+    {
+      "batch_sequence": 1,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 0,
+      "solver_elapsed_ms": 2.5644150000516674
+    },
+    {
+      "batch_sequence": 2,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 0,
+      "solver_elapsed_ms": 0.6526860001940804
+    },
+    {
+      "batch_sequence": 3,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 0,
+      "solver_elapsed_ms": 0.7985060001374222
+    },
+    {
+      "batch_sequence": 4,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 0,
+      "solver_elapsed_ms": 1.8792179998854408
+    },
+    {
+      "batch_sequence": 5,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 0,
+      "solver_elapsed_ms": 1.3636319999932311
+    },
+    {
+      "batch_sequence": 6,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 0,
+      "solver_elapsed_ms": 0.8417649996772525
+    },
+    {
+      "batch_sequence": 7,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 0,
+      "solver_elapsed_ms": 0.5075869999018323
+    },
+    {
+      "batch_sequence": 8,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 1,
+      "solver_elapsed_ms": 1.6675499996381404
+    },
+    {
+      "batch_sequence": 9,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 1,
+      "solver_elapsed_ms": 1.1259380003139086
+    },
+    {
+      "batch_sequence": 10,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 1,
+      "solver_elapsed_ms": 2.1100450003359583
+    },
+    {
+      "batch_sequence": 11,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 2,
+      "solver_elapsed_ms": 1.891007999802241
+    },
+    {
+      "batch_sequence": 12,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 2,
+      "solver_elapsed_ms": 2.092245000312687
+    },
+    {
+      "batch_sequence": 13,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 2,
+      "solver_elapsed_ms": 1.3180819996705395
+    },
+    {
+      "batch_sequence": 14,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 2,
+      "solver_elapsed_ms": 2.193674999944051
+    },
+    {
+      "batch_sequence": 15,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 2,
+      "solver_elapsed_ms": 0.7390109999505512
+    },
+    {
+      "batch_sequence": 16,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 3,
+      "solver_elapsed_ms": 0.693634000072052
+    },
+    {
+      "batch_sequence": 17,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 3,
+      "solver_elapsed_ms": 0.6119619997662085
+    },
+    {
+      "batch_sequence": 18,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 3,
+      "solver_elapsed_ms": 0.7696180000493769
+    },
+    {
+      "batch_sequence": 19,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 4,
+      "solver_elapsed_ms": 0.8039909998842631
+    },
+    {
+      "batch_sequence": 20,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 4,
+      "solver_elapsed_ms": 2.429603999644314
+    },
+    {
+      "batch_sequence": 21,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 4,
+      "solver_elapsed_ms": 1.8747009999060538
+    },
+    {
+      "batch_sequence": 22,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 4,
+      "solver_elapsed_ms": 2.209700000094017
+    },
+    {
+      "batch_sequence": 23,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 4,
+      "solver_elapsed_ms": 1.6582260000177484
+    },
+    {
+      "batch_sequence": 24,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 4,
+      "solver_elapsed_ms": 2.39252299979853
+    },
+    {
+      "batch_sequence": 25,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 5,
+      "solver_elapsed_ms": 1.559259999794449
+    },
+    {
+      "batch_sequence": 26,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 5,
+      "solver_elapsed_ms": 0.9787160001906159
+    },
+    {
+      "batch_sequence": 27,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 5,
+      "solver_elapsed_ms": 0.6583869999303715
+    },
+    {
+      "batch_sequence": 28,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 5,
+      "solver_elapsed_ms": 0.571953999951802
+    },
+    {
+      "batch_sequence": 29,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 5,
+      "solver_elapsed_ms": 2.5125120000666357
+    },
+    {
+      "batch_sequence": 30,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 5,
+      "solver_elapsed_ms": 1.9102460000794963
+    },
+    {
+      "batch_sequence": 31,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 5,
+      "solver_elapsed_ms": 1.0726939999585738
+    },
+    {
+      "batch_sequence": 32,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 6,
+      "solver_elapsed_ms": 2.0573359997797525
+    },
+    {
+      "batch_sequence": 33,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 6,
+      "solver_elapsed_ms": 0.8797100003903324
+    },
+    {
+      "batch_sequence": 34,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 6,
+      "solver_elapsed_ms": 1.3845630001014797
+    },
+    {
+      "batch_sequence": 35,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 7,
+      "solver_elapsed_ms": 1.103737999983423
+    },
+    {
+      "batch_sequence": 36,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 7,
+      "solver_elapsed_ms": 3.1401569999616186
+    },
+    {
+      "batch_sequence": 37,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 7,
+      "solver_elapsed_ms": 2.1099639998283237
+    },
+    {
+      "batch_sequence": 38,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 8,
+      "solver_elapsed_ms": 2.7118869998048467
+    },
+    {
+      "batch_sequence": 39,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 8,
+      "solver_elapsed_ms": 0.9905729998536117
+    },
+    {
+      "batch_sequence": 40,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 8,
+      "solver_elapsed_ms": 2.095659999667987
+    },
+    {
+      "batch_sequence": 41,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 8,
+      "solver_elapsed_ms": 0.8437080000476271
+    },
+    {
+      "batch_sequence": 42,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 8,
+      "solver_elapsed_ms": 1.2931629999002325
+    },
+    {
+      "batch_sequence": 43,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 9,
+      "solver_elapsed_ms": 0.8904470000743459
+    },
+    {
+      "batch_sequence": 44,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 9,
+      "solver_elapsed_ms": 0.6945820000510139
+    },
+    {
+      "batch_sequence": 45,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 9,
+      "solver_elapsed_ms": 2.579136999884213
+    },
+    {
+      "batch_sequence": 46,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 10,
+      "solver_elapsed_ms": 0.6564650002474082
+    },
+    {
+      "batch_sequence": 47,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 10,
+      "solver_elapsed_ms": 0.9346080000796064
+    },
+    {
+      "batch_sequence": 48,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 10,
+      "solver_elapsed_ms": 1.5190959998108156
+    },
+    {
+      "batch_sequence": 49,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 10,
+      "solver_elapsed_ms": 0.7991120000951923
+    },
+    {
+      "batch_sequence": 50,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 11,
+      "solver_elapsed_ms": 1.9371500002307585
+    },
+    {
+      "batch_sequence": 51,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 11,
+      "solver_elapsed_ms": 1.3777330000266375
+    },
+    {
+      "batch_sequence": 52,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 11,
+      "solver_elapsed_ms": 1.5392870000141556
+    },
+    {
+      "batch_sequence": 53,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 12,
+      "solver_elapsed_ms": 1.1190260001967545
+    },
+    {
+      "batch_sequence": 54,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 12,
+      "solver_elapsed_ms": 0.9468050002396922
+    },
+    {
+      "batch_sequence": 55,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 12,
+      "solver_elapsed_ms": 1.2962509999852045
+    },
+    {
+      "batch_sequence": 56,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 12,
+      "solver_elapsed_ms": 1.0199270000157412
+    },
+    {
+      "batch_sequence": 57,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 12,
+      "solver_elapsed_ms": 2.3400229997605493
+    },
+    {
+      "batch_sequence": 58,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 12,
+      "solver_elapsed_ms": 1.5314940001189825
+    },
+    {
+      "batch_sequence": 59,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 12,
+      "solver_elapsed_ms": 2.0226379997438926
+    },
+    {
+      "batch_sequence": 60,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 13,
+      "solver_elapsed_ms": 1.0305870000593131
+    },
+    {
+      "batch_sequence": 61,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 13,
+      "solver_elapsed_ms": 1.3946120002401585
+    },
+    {
+      "batch_sequence": 62,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 13,
+      "solver_elapsed_ms": 0.8781680003266956
+    },
+    {
+      "batch_sequence": 63,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 13,
+      "solver_elapsed_ms": 2.363390000027721
+    },
+    {
+      "batch_sequence": 64,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 14,
+      "solver_elapsed_ms": 1.2316590000409633
+    },
+    {
+      "batch_sequence": 65,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 14,
+      "solver_elapsed_ms": 2.3438940002051822
+    },
+    {
+      "batch_sequence": 66,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 14,
+      "solver_elapsed_ms": 1.9946820002587629
+    },
+    {
+      "batch_sequence": 67,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 14,
+      "solver_elapsed_ms": 1.1695799998960865
+    },
+    {
+      "batch_sequence": 68,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 14,
+      "solver_elapsed_ms": 2.481118000105198
+    },
+    {
+      "batch_sequence": 69,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 14,
+      "solver_elapsed_ms": 1.0088859999086708
+    },
+    {
+      "batch_sequence": 70,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 14,
+      "solver_elapsed_ms": 2.0344219997241453
+    },
+    {
+      "batch_sequence": 71,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 15,
+      "solver_elapsed_ms": 2.1068770001875237
+    },
+    {
+      "batch_sequence": 72,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 15,
+      "solver_elapsed_ms": 1.8102199996974377
+    },
+    {
+      "batch_sequence": 73,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 16,
+      "solver_elapsed_ms": 0.9751919997142977
+    },
+    {
+      "batch_sequence": 74,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 16,
+      "solver_elapsed_ms": 1.1387250001462235
+    },
+    {
+      "batch_sequence": 75,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 16,
+      "solver_elapsed_ms": 1.1834399997496803
+    },
+    {
+      "batch_sequence": 76,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 16,
+      "solver_elapsed_ms": 1.8426850001560524
+    },
+    {
+      "batch_sequence": 77,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 17,
+      "solver_elapsed_ms": 0.9792629998628399
+    },
+    {
+      "batch_sequence": 78,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 17,
+      "solver_elapsed_ms": 1.787103999959072
+    },
+    {
+      "batch_sequence": 79,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 17,
+      "solver_elapsed_ms": 1.6094580000753922
+    },
+    {
+      "batch_sequence": 80,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 17,
+      "solver_elapsed_ms": 1.105305000237422
+    },
+    {
+      "batch_sequence": 81,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 18,
+      "solver_elapsed_ms": 1.198948999899585
+    },
+    {
+      "batch_sequence": 82,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 18,
+      "solver_elapsed_ms": 1.7273809999096557
+    },
+    {
+      "batch_sequence": 83,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 18,
+      "solver_elapsed_ms": 1.327558999946632
+    },
+    {
+      "batch_sequence": 84,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 19,
+      "solver_elapsed_ms": 1.2035089998789772
+    },
+    {
+      "batch_sequence": 85,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 19,
+      "solver_elapsed_ms": 1.4674079998258094
+    },
+    {
+      "batch_sequence": 86,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 19,
+      "solver_elapsed_ms": 1.4873590002935089
+    },
+    {
+      "batch_sequence": 87,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 19,
+      "solver_elapsed_ms": 1.2688419997175515
+    },
+    {
+      "batch_sequence": 88,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 19,
+      "solver_elapsed_ms": 1.4538899999934074
+    },
+    {
+      "batch_sequence": 89,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 20,
+      "solver_elapsed_ms": 1.3118890001351247
+    },
+    {
+      "batch_sequence": 90,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 20,
+      "solver_elapsed_ms": 1.144335999924806
+    },
+    {
+      "batch_sequence": 91,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 20,
+      "solver_elapsed_ms": 0.9992680002142151
+    },
+    {
+      "batch_sequence": 92,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 21,
+      "solver_elapsed_ms": 0.9859970000434259
+    },
+    {
+      "batch_sequence": 93,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 21,
+      "solver_elapsed_ms": 1.0927250000349886
+    },
+    {
+      "batch_sequence": 94,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 21,
+      "solver_elapsed_ms": 1.1229199999434059
+    },
+    {
+      "batch_sequence": 95,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 21,
+      "solver_elapsed_ms": 0.9454840001126286
+    },
+    {
+      "batch_sequence": 96,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 22,
+      "solver_elapsed_ms": 1.0183819999838306
+    },
+    {
+      "batch_sequence": 97,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 22,
+      "solver_elapsed_ms": 0.9922859999278444
+    },
+    {
+      "batch_sequence": 98,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 22,
+      "solver_elapsed_ms": 1.1563409998416319
+    },
+    {
+      "batch_sequence": 99,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 23,
+      "solver_elapsed_ms": 1.0152340000786353
+    },
+    {
+      "batch_sequence": 100,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 23,
+      "solver_elapsed_ms": 1.076732000001357
+    },
+    {
+      "batch_sequence": 101,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 23,
+      "solver_elapsed_ms": 1.4608110000153829
+    },
+    {
+      "batch_sequence": 102,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 23,
+      "solver_elapsed_ms": 1.021431000026496
+    },
+    {
+      "batch_sequence": 103,
+      "batch_size_n": 2,
+      "effective_batch_size": 2,
+      "flush_partial_batch": false,
+      "pending_before": 2,
+      "scheduled": true,
+      "slot": 23,
+      "solver_elapsed_ms": 0.9990039998228895
+    },
+    {
+      "batch_sequence": 104,
+      "batch_size_n": 2,
+      "effective_batch_size": 1,
+      "flush_partial_batch": true,
+      "pending_before": 1,
+      "scheduled": true,
+      "slot": 23,
+      "solver_elapsed_ms": 0.9318429997620115
+    }
+  ]
+}

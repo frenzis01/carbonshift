@@ -1,0 +1,220 @@
+{
+  "rows": [
+    {
+      "modeled_request_count": 79,
+      "real_request_count": 49,
+      "timeslot": 0,
+      "window_avg_error_modeled": 3.9683544303797467,
+      "window_avg_error_real": 4.561224489795919,
+      "window_end": 8,
+      "window_start": -5
+    },
+    {
+      "modeled_request_count": 92,
+      "real_request_count": 68,
+      "timeslot": 1,
+      "window_avg_error_modeled": 3.983695652173913,
+      "window_avg_error_real": 4.330882352941177,
+      "window_end": 9,
+      "window_start": -4
+    },
+    {
+      "modeled_request_count": 101,
+      "real_request_count": 81,
+      "timeslot": 2,
+      "window_avg_error_modeled": 3.9554455445544554,
+      "window_avg_error_real": 4.191358024691358,
+      "window_end": 10,
+      "window_start": -3
+    },
+    {
+      "modeled_request_count": 96,
+      "real_request_count": 84,
+      "timeslot": 3,
+      "window_avg_error_modeled": 4.067708333333333,
+      "window_avg_error_real": 4.220238095238095,
+      "window_end": 11,
+      "window_start": -2
+    },
+    {
+      "modeled_request_count": 90,
+      "real_request_count": 84,
+      "timeslot": 4,
+      "window_avg_error_modeled": 4.138888888888889,
+      "window_avg_error_real": 4.220238095238095,
+      "window_end": 12,
+      "window_start": -1
+    },
+    {
+      "modeled_request_count": 93,
+      "real_request_count": 93,
+      "timeslot": 5,
+      "window_avg_error_modeled": 4.295698924731183,
+      "window_avg_error_real": 4.295698924731183,
+      "window_end": 13,
+      "window_start": 0
+    },
+    {
+      "modeled_request_count": 113,
+      "real_request_count": 113,
+      "timeslot": 6,
+      "window_avg_error_modeled": 4.331858407079646,
+      "window_avg_error_real": 4.331858407079646,
+      "window_end": 14,
+      "window_start": 1
+    },
+    {
+      "modeled_request_count": 120,
+      "real_request_count": 120,
+      "timeslot": 7,
+      "window_avg_error_modeled": 4.308333333333334,
+      "window_avg_error_real": 4.308333333333334,
+      "window_end": 15,
+      "window_start": 2
+    },
+    {
+      "modeled_request_count": 133,
+      "real_request_count": 133,
+      "timeslot": 8,
+      "window_avg_error_modeled": 4.195488721804511,
+      "window_avg_error_real": 4.195488721804511,
+      "window_end": 16,
+      "window_start": 3
+    },
+    {
+      "modeled_request_count": 122,
+      "real_request_count": 122,
+      "timeslot": 9,
+      "window_avg_error_modeled": 4.14344262295082,
+      "window_avg_error_real": 4.14344262295082,
+      "window_end": 17,
+      "window_start": 4
+    },
+    {
+      "modeled_request_count": 112,
+      "real_request_count": 112,
+      "timeslot": 10,
+      "window_avg_error_modeled": 4.125,
+      "window_avg_error_real": 4.125,
+      "window_end": 18,
+      "window_start": 5
+    },
+    {
+      "modeled_request_count": 113,
+      "real_request_count": 113,
+      "timeslot": 11,
+      "window_avg_error_modeled": 4.132743362831858,
+      "window_avg_error_real": 4.132743362831858,
+      "window_end": 19,
+      "window_start": 6
+    },
+    {
+      "modeled_request_count": 126,
+      "real_request_count": 126,
+      "timeslot": 12,
+      "window_avg_error_modeled": 4.2023809523809526,
+      "window_avg_error_real": 4.2023809523809526,
+      "window_end": 20,
+      "window_start": 7
+    },
+    {
+      "modeled_request_count": 138,
+      "real_request_count": 138,
+      "timeslot": 13,
+      "window_avg_error_modeled": 4.079710144927536,
+      "window_avg_error_real": 4.079710144927536,
+      "window_end": 21,
+      "window_start": 8
+    },
+    {
+      "modeled_request_count": 146,
+      "real_request_count": 146,
+      "timeslot": 14,
+      "window_avg_error_modeled": 4.023972602739726,
+      "window_avg_error_real": 4.023972602739726,
+      "window_end": 22,
+      "window_start": 9
+    },
+    {
+      "modeled_request_count": 139,
+      "real_request_count": 139,
+      "timeslot": 15,
+      "window_avg_error_modeled": 4.075539568345324,
+      "window_avg_error_real": 4.075539568345324,
+      "window_end": 23,
+      "window_start": 10
+    },
+    {
+      "modeled_request_count": 126,
+      "real_request_count": 126,
+      "timeslot": 16,
+      "window_avg_error_modeled": 4.138888888888889,
+      "window_avg_error_real": 4.138888888888889,
+      "window_end": 24,
+      "window_start": 11
+    },
+    {
+      "modeled_request_count": 123,
+      "real_request_count": 123,
+      "timeslot": 17,
+      "window_avg_error_modeled": 4.117886178861789,
+      "window_avg_error_real": 4.117886178861789,
+      "window_end": 25,
+      "window_start": 12
+    },
+    {
+      "modeled_request_count": 123,
+      "real_request_count": 123,
+      "timeslot": 18,
+      "window_avg_error_modeled": 4.117886178861789,
+      "window_avg_error_real": 4.117886178861789,
+      "window_end": 26,
+      "window_start": 13
+    },
+    {
+      "modeled_request_count": 114,
+      "real_request_count": 114,
+      "timeslot": 19,
+      "window_avg_error_modeled": 4.048245614035087,
+      "window_avg_error_real": 4.048245614035087,
+      "window_end": 27,
+      "window_start": 14
+    },
+    {
+      "modeled_request_count": 94,
+      "real_request_count": 94,
+      "timeslot": 20,
+      "window_avg_error_modeled": 3.952127659574468,
+      "window_avg_error_real": 3.952127659574468,
+      "window_end": 28,
+      "window_start": 15
+    },
+    {
+      "modeled_request_count": 84,
+      "real_request_count": 84,
+      "timeslot": 21,
+      "window_avg_error_modeled": 3.9166666666666665,
+      "window_avg_error_real": 3.9166666666666665,
+      "window_end": 29,
+      "window_start": 16
+    },
+    {
+      "modeled_request_count": 69,
+      "real_request_count": 69,
+      "timeslot": 22,
+      "window_avg_error_modeled": 4.028985507246377,
+      "window_avg_error_real": 4.028985507246377,
+      "window_end": 30,
+      "window_start": 17
+    },
+    {
+      "modeled_request_count": 67,
+      "real_request_count": 67,
+      "timeslot": 23,
+      "window_avg_error_modeled": 4.0,
+      "window_avg_error_real": 4.0,
+      "window_end": 31,
+      "window_start": 18
+    }
+  ]
+}

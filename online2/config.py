@@ -76,10 +76,15 @@ CAPACITY_TIERS = [
 
 # Pruning strategy: 'kbest' or 'beam' or 'None' (no pruning)
 # DP_PRUNING_STRATEGY = 'beam'
-DP_PRUNING_STRATEGY = 'None'
+DP_PRUNING_STRATEGY = 'beam'
+
+# Apply DP pruning only when pending batch size is >= this threshold.
+# - 0: disable pruning entirely (even if DP_PRUNING_STRATEGY is set)
+# - N>0: enable pruning only for batches with size >= N
+DP_PRUNING_MIN_BATCH_SIZE = 5
 
 # Number of states to keep during pruning
-DP_PRUNING_K = 150
+DP_PRUNING_K = 600
 
 # Maximum seconds for DP solver per batch
 DP_TIMEOUT = 7.0
