@@ -1,2 +1,0 @@
-batch_size,requests_total,requests_scheduled,requests_unscheduled,batches_executed,total_carbon_cost,global_average_error,solver_time_ms_min,solver_time_ms_max,solver_time_ms_avg,queue_wait_seconds_min,queue_wait_seconds_max,queue_wait_seconds_avg,final_wait_seconds_min,final_wait_seconds_max,final_wait_seconds_avg
-3,207,207,0,69,6627184.720325003,4.144927536231884,0.8725550001145166,28.331332000107068,8.692303594216355,0.0,10.0,1.2560386473429952,0.0008725550001145166,80.02734301400005,26.820286506492764
