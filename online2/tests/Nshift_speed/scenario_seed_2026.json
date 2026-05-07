@@ -1,37 +1,39 @@
 {
   "carbon_forecast": [
-    1208.573597,
-    1060.075473,
-    740.354681,
-    590.800018,
-    728.079106,
-    1051.698537,
-    1223.03092,
-    1061.696771,
-    748.501201,
-    581.434344,
-    746.91617,
-    1068.04346,
-    1227.530779,
-    1062.595625,
-    732.198022,
-    583.426128,
-    728.322096,
-    1069.502841,
-    1218.489645,
-    1069.442881,
-    745.555342,
-    585.381668,
-    731.30674,
-    1052.545393
+    1128.588772,
+    1060.603781,
+    742.837451,
+    666.400141,
+    644.632844,
+    993.588294,
+    1244.247357,
+    1073.574165,
+    808.009612,
+    591.474749,
+    795.329358,
+    1124.347678,
+    1280.24623,
+    1080.765003,
+    677.584179,
+    607.409027,
+    646.57677,
+    1136.022725,
+    1207.91716,
+    1135.543045,
+    784.442736,
+    623.053346,
+    670.453919,
+    1000.363145
   ],
   "metadata": {
+    "carbon_random_noise_amplitude": 120.0,
     "deadline_max_slack": 8,
     "deadline_min_slack": 0,
     "error_window_future": 8,
     "error_window_past": 5,
     "max_error_threshold": 4.0,
     "prehistory_error_ratio": 0.75,
+    "prehistory_mock_influence": 0.2,
     "request_rate_std_factor": 0.35,
     "requests_per_slot": 8.0,
     "seed": 2026,
@@ -41,27 +43,27 @@
   "prehistory_slots": [
     {
       "error_per_request": 3.0,
-      "request_count": 6,
+      "request_count": 1,
       "slot": -5
     },
     {
       "error_per_request": 3.0,
-      "request_count": 4,
+      "request_count": 1,
       "slot": -4
     },
     {
       "error_per_request": 3.0,
-      "request_count": 8,
+      "request_count": 2,
       "slot": -3
     },
     {
       "error_per_request": 3.0,
-      "request_count": 6,
+      "request_count": 1,
       "slot": -2
     },
     {
       "error_per_request": 3.0,
-      "request_count": 6,
+      "request_count": 1,
       "slot": -1
     }
   ],

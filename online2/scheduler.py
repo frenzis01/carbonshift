@@ -63,6 +63,12 @@ class BatchScheduler:
         self._last_solver_elapsed_ms = 0.0
         self._last_infeasible_slot: Optional[int] = None
         self._last_infeasible_pending: Optional[int] = None
+        self._mock_influence_base = self._clamp_mock_influence(
+            getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0)
+        )
+        self._mock_influence_effective = self._mock_influence_base
+        self._mock_influence_above_threshold_streak = 0
+        self._mock_influence_last_eval_slot: Optional[int] = None
 
         # Initialize DP solver
         self.carbon_forecast = self._get_carbon_forecast()
@@ -624,10 +630,20 @@ class BatchScheduler:
             (augmented_baseline, dynamic_mock_pool, context)
         """
         mode = str(getattr(config, "INFEASIBILITY_RECOVERY_MODE", "min_error_recovery")).strip().lower()
+        baseline_avg_error = float(error_baseline.get("average_error", 0.0))
+        self._update_mock_influence_for_slot(
+            current_slot=current_slot,
+            baseline_avg_error=baseline_avg_error,
+        )
         context = {
             "infeasibility_recovery_mode": mode,
             "mock_recovery_count": 0,
             "mock_recovery_error": 0.0,
+            "mock_influence_base": self._mock_influence_base,
+            "mock_influence_effective": self._mock_influence_effective,
+            "mock_influence_decay_step": self._get_mock_influence_decay_step(),
+            "mock_influence_above_threshold_streak": self._mock_influence_above_threshold_streak,
+            "mock_influence_baseline_avg_error": baseline_avg_error,
         }
         dynamic_mock_pool = {"initial_count": 0, "error_per_request": 0.0}
 
@@ -655,8 +671,7 @@ class BatchScheduler:
             mock_error = float(config.MAX_ERROR_THRESHOLD) * float(config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD)
 
         if mode in {"carryover_last_slot", "forecast_mock_current_slot"} and mock_count > 0:
-            influence = float(getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0))
-            influence = max(0.0, min(1.0, influence))
+            influence = self._mock_influence_effective
             mock_count = int(round(mock_count * influence))
 
         if mock_count > 0 and mock_error > 0.0:
@@ -676,6 +691,46 @@ class BatchScheduler:
             )
 
         return augmented, dynamic_mock_pool, context
+
+    def _clamp_mock_influence(self, value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def _get_mock_influence_decay_step(self) -> float:
+        return max(
+            0.0,
+            float(getattr(config, "INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP", 0.10)),
+        )
+
+    def _update_mock_influence_for_slot(self, current_slot: int, baseline_avg_error: float) -> None:
+        """
+        Update effective mock influence once per slot.
+
+        Rules:
+        - If baseline window error at slot start is above threshold, decay by step.
+        - Decay accumulates across consecutive above-threshold slots.
+        - If baseline error is under/equal threshold, reset to configured base value.
+        """
+        slot = int(current_slot)
+        if self._mock_influence_last_eval_slot == slot:
+            return
+
+        self._mock_influence_base = self._clamp_mock_influence(
+            getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0)
+        )
+        decay_step = self._get_mock_influence_decay_step()
+        threshold = float(config.MAX_ERROR_THRESHOLD)
+
+        if float(baseline_avg_error) > threshold:
+            self._mock_influence_above_threshold_streak += 1
+            self._mock_influence_effective = max(
+                0.0,
+                self._mock_influence_base - (self._mock_influence_above_threshold_streak * decay_step),
+            )
+        else:
+            self._mock_influence_above_threshold_streak = 0
+            self._mock_influence_effective = self._mock_influence_base
+
+        self._mock_influence_last_eval_slot = slot
     
     def _get_carbon_forecast(self) -> List[float]:
         """

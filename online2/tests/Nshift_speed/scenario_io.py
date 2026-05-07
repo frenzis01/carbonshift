@@ -52,6 +52,8 @@ def generate_scenario_data(
     error_window_future: int,
     max_error_threshold: float,
     prehistory_error_ratio: float,
+    carbon_random_noise_amplitude: float = 200.0,
+    prehistory_mock_influence: float = 1.0,
 ) -> Dict[str, Any]:
     """
     Build a deterministic scenario payload.
@@ -68,7 +70,7 @@ def generate_scenario_data(
     cycle = 6
     base_carbon = 500.0
     amplitude = 400.0
-    noise = 15.0
+    noise = max(0.0, float(carbon_random_noise_amplitude))
     for slot in range(total_slots):
         phase = 2.0 * math.pi * (slot % cycle) / cycle
         value = base_carbon + amplitude * (1.0 + 0.8 * math.cos(phase)) + rng.uniform(-noise, noise)
@@ -93,8 +95,10 @@ def generate_scenario_data(
 
     prehistory_slots: List[Dict[str, Any]] = []
     synthetic_error = max_error_threshold * prehistory_error_ratio
+    prehistory_influence = max(0.0, min(1.0, float(prehistory_mock_influence)))
     for slot in range(-error_window_past, 0):
-        count = max(0, int(round(rng.gauss(requests_per_slot, sigma))))
+        raw_count = max(0, int(round(rng.gauss(requests_per_slot, sigma))))
+        count = int(round(raw_count * prehistory_influence))
         prehistory_slots.append(
             {
                 "slot": slot,
@@ -118,6 +122,8 @@ def generate_scenario_data(
             "error_window_future": int(error_window_future),
             "max_error_threshold": float(max_error_threshold),
             "prehistory_error_ratio": float(prehistory_error_ratio),
+            "carbon_random_noise_amplitude": noise,
+            "prehistory_mock_influence": prehistory_influence,
         },
         "carbon_forecast": forecast,
         "requests": requests,
@@ -149,4 +155,3 @@ def load_runner_config(config_path: Path) -> Dict[str, Any]:
         "output_dir": output_dir,
         "runner": runner_cfg,
     }
-

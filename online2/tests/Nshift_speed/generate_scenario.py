@@ -11,6 +11,7 @@ ONLINE2_ROOT = Path(__file__).resolve().parents[2]
 if str(ONLINE2_ROOT) not in sys.path:
     sys.path.insert(0, str(ONLINE2_ROOT))
 
+import config
 from tests.Nshift_speed.scenario_io import generate_scenario_data, save_json
 
 
@@ -28,7 +29,11 @@ def generate_and_save_scenario(
     error_window_future: int,
     max_error_threshold: float,
     prehistory_error_ratio: float,
+    carbon_random_noise_amplitude: float = 120.0,
+    prehistory_mock_influence: Optional[float] = None,
 ) -> Dict[str, Any]:
+    if prehistory_mock_influence is None:
+        prehistory_mock_influence = float(getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0))
     scenario = generate_scenario_data(
         seed=seed,
         total_slots=total_slots,
@@ -41,6 +46,8 @@ def generate_and_save_scenario(
         error_window_future=error_window_future,
         max_error_threshold=max_error_threshold,
         prehistory_error_ratio=prehistory_error_ratio,
+        carbon_random_noise_amplitude=carbon_random_noise_amplitude,
+        prehistory_mock_influence=prehistory_mock_influence,
     )
     save_json(output_path, scenario)
     return scenario
@@ -65,6 +72,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--error-window-future", type=int, default=8)
     parser.add_argument("--max-error-threshold", type=float, default=4.0)
     parser.add_argument("--prehistory-error-ratio", type=float, default=0.75)
+    parser.add_argument(
+        "--carbon-random-noise-amplitude",
+        type=float,
+        default=120.0,
+        help="Uniform random amplitude added to carbon intensity (+/- value).",
+    )
+    parser.add_argument(
+        "--prehistory-mock-influence",
+        type=float,
+        default=float(getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0)),
+        help="Scale factor [0..1] applied to synthetic prehistory request counts.",
+    )
     return parser
 
 
@@ -85,6 +104,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         error_window_future=args.error_window_future,
         max_error_threshold=args.max_error_threshold,
         prehistory_error_ratio=args.prehistory_error_ratio,
+        carbon_random_noise_amplitude=args.carbon_random_noise_amplitude,
+        prehistory_mock_influence=args.prehistory_mock_influence,
     )
     print(
         f"Scenario saved to {args.output} "

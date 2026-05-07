@@ -143,6 +143,8 @@ DP_RELAXED_RETRY_PREFER_MIN_ERROR = True
 # Sliding-window infeasibility recovery policy:
 # "min_error_recovery" | "carryover_last_slot" | "forecast_mock_current_slot"
 INFEASIBILITY_RECOVERY_MODE = "min_error_recovery"
+INFEASIBILITY_MOCK_INFLUENCE = 0.8
+INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.10
 
 # Predicted request rate (used by generator and startup pre-history)
 PREDICTED_REQUESTS_PER_SLOT = 10.0

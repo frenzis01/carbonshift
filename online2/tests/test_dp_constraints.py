@@ -337,5 +337,89 @@ class TestSchedulerPruningThreshold(unittest.TestCase):
             config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
 
 
+class TestSchedulerMockInfluenceDecay(unittest.TestCase):
+    def test_mock_influence_decays_on_consecutive_above_threshold_slots_and_resets(self):
+        shared_state = SharedSchedulerState()
+        scheduler = BatchScheduler(shared_state)
+
+        original_mode = config.INFEASIBILITY_RECOVERY_MODE
+        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
+        original_decay = getattr(config, "INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP", 0.10)
+        original_threshold = config.MAX_ERROR_THRESHOLD
+        try:
+            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
+            config.INFEASIBILITY_MOCK_INFLUENCE = 0.8
+            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.10
+            config.MAX_ERROR_THRESHOLD = 4.0
+
+            _, _, ctx_slot_10 = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=10,
+                error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
+            )
+            _, _, ctx_slot_10_repeat = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=10,
+                error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
+            )
+            _, _, ctx_slot_11 = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=11,
+                error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
+            )
+            _, _, ctx_slot_12_reset = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=12,
+                error_baseline={"error_sum": 30.0, "request_count": 10, "average_error": 3.0},
+            )
+            _, _, ctx_slot_13 = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=13,
+                error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
+            )
+        finally:
+            config.INFEASIBILITY_RECOVERY_MODE = original_mode
+            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
+            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = original_decay
+            config.MAX_ERROR_THRESHOLD = original_threshold
+
+        self.assertAlmostEqual(float(ctx_slot_10["mock_influence_effective"]), 0.7, places=9)
+        self.assertAlmostEqual(float(ctx_slot_10_repeat["mock_influence_effective"]), 0.7, places=9)
+        self.assertAlmostEqual(float(ctx_slot_11["mock_influence_effective"]), 0.6, places=9)
+        self.assertAlmostEqual(float(ctx_slot_12_reset["mock_influence_effective"]), 0.8, places=9)
+        self.assertAlmostEqual(float(ctx_slot_13["mock_influence_effective"]), 0.7, places=9)
+
+    def test_mock_influence_is_clamped_to_zero(self):
+        shared_state = SharedSchedulerState()
+        scheduler = BatchScheduler(shared_state)
+
+        original_mode = config.INFEASIBILITY_RECOVERY_MODE
+        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
+        original_decay = getattr(config, "INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP", 0.10)
+        original_threshold = config.MAX_ERROR_THRESHOLD
+        try:
+            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
+            config.INFEASIBILITY_MOCK_INFLUENCE = 0.15
+            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.10
+            config.MAX_ERROR_THRESHOLD = 4.0
+
+            _, _, ctx_slot_20 = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=20,
+                error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
+            )
+            _, _, ctx_slot_21 = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=21,
+                error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
+            )
+            _, _, ctx_slot_22 = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=22,
+                error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
+            )
+        finally:
+            config.INFEASIBILITY_RECOVERY_MODE = original_mode
+            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
+            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = original_decay
+            config.MAX_ERROR_THRESHOLD = original_threshold
+
+        self.assertAlmostEqual(float(ctx_slot_20["mock_influence_effective"]), 0.05, places=9)
+        self.assertAlmostEqual(float(ctx_slot_21["mock_influence_effective"]), 0.0, places=9)
+        self.assertAlmostEqual(float(ctx_slot_22["mock_influence_effective"]), 0.0, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()

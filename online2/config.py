@@ -113,7 +113,13 @@ INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
 # Scales the number of mock requests used in carryover/forecast recovery modes.
 # Range [0, 1]: lower means less mock influence (more pessimistic).
 # 1.0 = full mock influence, 0.0 = disable mock contribution.
-INFEASIBILITY_MOCK_INFLUENCE = 0.8
+INFEASIBILITY_MOCK_INFLUENCE = 0.2
+
+# Consecutive above-threshold window slots decay the effective mock influence:
+# effective = max(0, base_influence - streak * decay_step)
+# where streak counts consecutive slots whose baseline window avg error at slot
+# start is above MAX_ERROR_THRESHOLD.
+INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.20
 
 # ============================================================================
 # REQUEST GENERATION PARAMETERS
