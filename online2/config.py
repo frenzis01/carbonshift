@@ -56,6 +56,9 @@ PREHISTORY_USE_VIRTUAL_PAST = True
 PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 0.75  # avg error = threshold * ratio
 PREHISTORY_STOCHASTIC_COUNTS = True
 PREHISTORY_RANDOM_SEED = 4242
+# Separate scaling factor for synthetic prehistory request counts used in
+# benchmark scenario generation (independent from runtime infeasibility mocks).
+PREHISTORY_MOCK_INFLUENCE = 0.2
 
 # ============================================================================
 # CAPACITY TIERS (REBOUND EFFECT)
@@ -113,7 +116,7 @@ INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
 # Scales the number of mock requests used in carryover/forecast recovery modes.
 # Range [0, 1]: lower means less mock influence (more pessimistic).
 # 1.0 = full mock influence, 0.0 = disable mock contribution.
-INFEASIBILITY_MOCK_INFLUENCE = 0.2
+INFEASIBILITY_MOCK_INFLUENCE = 0.6
 
 # Consecutive above-threshold window slots decay the effective mock influence:
 # effective = max(0, base_influence - streak * decay_step)

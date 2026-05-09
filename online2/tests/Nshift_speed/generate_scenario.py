@@ -33,7 +33,7 @@ def generate_and_save_scenario(
     prehistory_mock_influence: Optional[float] = None,
 ) -> Dict[str, Any]:
     if prehistory_mock_influence is None:
-        prehistory_mock_influence = float(getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0))
+        prehistory_mock_influence = float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0))
     scenario = generate_scenario_data(
         seed=seed,
         total_slots=total_slots,
@@ -81,7 +81,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--prehistory-mock-influence",
         type=float,
-        default=float(getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0)),
+        default=float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0)),
         help="Scale factor [0..1] applied to synthetic prehistory request counts.",
     )
     return parser

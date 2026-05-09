@@ -153,6 +153,7 @@ REQUEST_RATE_STD_FACTOR = 0.3
 # Startup pre-history: virtual past slots with avg error = threshold * 0.5
 PREHISTORY_USE_VIRTUAL_PAST = True
 PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 0.5
+PREHISTORY_MOCK_INFLUENCE = 0.8
 ```
 
 ## Running
@@ -283,6 +284,12 @@ Visualize and compare metrics across N:
 ```bash
 cd online2
 jupyter notebook notebooks/nshift_speed_analysis.ipynb
+```
+
+Visualize current assignments for a specific N run (solver-logs style):
+```bash
+cd online2
+jupyter notebook notebooks/nshift_assignment_analysis.ipynb
 ```
 
 ## Future Enhancements

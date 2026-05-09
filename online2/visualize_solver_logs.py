@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 import matplotlib.patheffects as pe
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -325,6 +326,26 @@ def plot_solver_execution_stacked(
     slots = all_slots
 
     fig, ax = plt.subplots(figsize=(17, 7))
+    history_by_slot = pd.DataFrame()
+    if not runs_df.empty:
+        history_src = runs_df.copy()
+        for col in ["current_slot", "error_window_avg_after", "error_window_avg_after_real", "solver_start_ts"]:
+            if col in history_src.columns:
+                history_src[col] = pd.to_numeric(history_src[col], errors="coerce")
+        history_src = history_src.dropna(subset=["current_slot"])
+        history_src["current_slot"] = history_src["current_slot"].astype(int)
+        history_src = history_src[history_src["current_slot"] <= current_slot]
+
+        if "run_sequence" in history_src.columns and run_sequence is not None:
+            history_src["run_sequence"] = pd.to_numeric(history_src["run_sequence"], errors="coerce")
+            history_src = history_src[history_src["run_sequence"] <= float(run_sequence)]
+            history_src = history_src.sort_values(["current_slot", "run_sequence"])
+        else:
+            history_src = history_src[history_src["solver_start_ts"] <= float(run_info["solver_start_ts"])]
+            history_src = history_src.sort_values(["current_slot", "solver_start_ts"])
+
+        if not history_src.empty:
+            history_by_slot = history_src.groupby("current_slot", as_index=False).last()
 
     run_slots = pd.DataFrame()
     if slot_metrics_df is not None and not slot_metrics_df.empty:
@@ -452,67 +473,66 @@ def plot_solver_execution_stacked(
             color="dimgray",
         )
 
-    if not run_slots.empty:
-        ax2 = ax.twinx()
-        if "slot_has_assignments_after" in run_slots.columns:
-            raw_has_data = run_slots["slot_has_assignments_after"].fillna(False)
-            has_data = raw_has_data.apply(_as_bool)
-        else:
-            has_data = run_slots["total_slot_count_after"].fillna(0) > 0
-
-        error_col = "avg_error_in_slot"
-        avg_errors = pd.to_numeric(run_slots[error_col], errors="coerce").where(has_data)
-        ax2.plot(
-            slots,
-            avg_errors,
-            color="#af79e2",
-            marker=".",
-            linewidth=1.2,
-            linestyle="-",
-            alpha=0.45,
-            label="Avg error per slot (total after run, not window avg)",
+    history_has_error = (
+        not history_by_slot.empty
+        and (
+            history_by_slot["error_window_avg_after"].notna().any()
+            or history_by_slot["error_window_avg_after_real"].notna().any()
         )
+    )
+    need_ax2 = (
+        not run_slots.empty
+        or history_has_error
+        or window_avg_modeled is not None
+        or window_avg_real is not None
+    )
 
-        if not run_assignments.empty:
-            t_values = list(range(0, max(0, current_slot) + 1))
-            window_avg_series_real = []
-            for t in t_values:
-                lo = max(0, t - int(config.ERROR_WINDOW_PAST))
-                hi = min(int(config.TOTAL_SLOTS) - 1, t + int(config.ERROR_WINDOW_FUTURE))
-                in_window = run_assignments[
-                    (run_assignments["scheduled_slot"] >= lo)
-                    & (run_assignments["scheduled_slot"] <= hi)
-                ]
-                if in_window.empty:
-                    window_avg_series_real.append(float("nan"))
-                else:
-                    window_avg_series_real.append(float(in_window["error"].astype(float).mean()))
+    if need_ax2:
+        ax2 = ax.twinx()
+        if not run_slots.empty:
+            if "slot_has_assignments_after" in run_slots.columns:
+                raw_has_data = run_slots["slot_has_assignments_after"].fillna(False)
+                has_data = raw_has_data.apply(_as_bool)
+            else:
+                has_data = run_slots["total_slot_count_after"].fillna(0) > 0
 
-            window_avg_series_modeled = list(window_avg_series_real)
-            if (
-                window_avg_modeled is not None
-                and window_avg_real is not None
-                and pd.notna(window_avg_modeled)
-                and pd.notna(window_avg_real)
-            ):
-                modeled_delta = float(window_avg_modeled) - float(window_avg_real)
-                window_avg_series_modeled = [
-                    (v + modeled_delta) if pd.notna(v) else float("nan")
-                    for v in window_avg_series_real
-                ]
-
+            error_col = "avg_error_in_slot"
+            avg_errors = pd.to_numeric(run_slots[error_col], errors="coerce").where(has_data)
             ax2.plot(
-                t_values,
-                window_avg_series_modeled,
-                color="#7700ff",
-                marker="o",
+                slots,
+                avg_errors,
+                color="#af79e2",
+                marker=".",
+                linewidth=1.2,
                 linestyle="-",
-                linewidth=1.4,
-                alpha=0.6,
-                label="Window avg by timeslot (0..current, modeled)",
+                alpha=0.45,
+                label="Avg error per slot (total after run, not window avg)",
             )
 
-        if window_avg_modeled is not None:
+        if history_has_error:
+            hx = history_by_slot["current_slot"].astype(int).tolist()
+            h_real = pd.to_numeric(history_by_slot["error_window_avg_after_real"], errors="coerce")
+            h_modeled = pd.to_numeric(history_by_slot["error_window_avg_after"], errors="coerce")
+            ax2.plot(
+                hx,
+                h_real,
+                color="#2ca02c",
+                marker="o",
+                linestyle="None",
+                alpha=0.75,
+                label="Window avg history (real, no mock)",
+            )
+            ax2.plot(
+                hx,
+                h_modeled,
+                color="#7700ff",
+                marker="x",
+                linestyle="None",
+                alpha=0.75,
+                label="Window avg history (modeled, with mock)",
+            )
+
+        if window_avg_modeled is not None and pd.notna(window_avg_modeled):
             ax2.plot(
                 [window_start, window_end],
                 [window_avg_modeled, window_avg_modeled],
@@ -521,7 +541,7 @@ def plot_solver_execution_stacked(
                 alpha=0.45,
                 label=f"Window avg (modeled) [{window_start},{window_end}]",
             )
-        if window_avg_real is not None:
+        if window_avg_real is not None and pd.notna(window_avg_real):
             ax2.plot(
                 [window_start, window_end],
                 [window_avg_real, window_avg_real],
@@ -584,7 +604,22 @@ def plot_solver_execution_stacked(
             else ""
         )
     )
-    ax.legend(loc="upper left")
+    handles, labels = ax.get_legend_handles_labels()
+    legend_map = {label: handle for handle, label in zip(handles, labels)}
+    fixed_strategies = ["Fast", "Balanced", "Accurate"]
+    for fixed_strategy in fixed_strategies:
+        if fixed_strategy not in legend_map:
+            legend_map[fixed_strategy] = mpatches.Patch(
+                facecolor=strategy_colors.get(fixed_strategy, "#7f7f7f"),
+                edgecolor="black",
+                label=fixed_strategy,
+            )
+    ordered_labels = list(fixed_strategies)
+    for label in labels:
+        if label not in ordered_labels:
+            ordered_labels.append(label)
+    ordered_handles = [legend_map[label] for label in ordered_labels]
+    ax.legend(ordered_handles, ordered_labels, loc="upper left")
     ax.grid(True, axis="y", alpha=0.2)
     plt.tight_layout()
     return fig
