@@ -18,12 +18,16 @@ def min_max_avg(values: List[float]) -> Dict[str, float]:
 def flatten_summary_for_csv(summary: Dict[str, float]) -> Dict[str, float]:
     return {
         "batch_size": summary["batch_size"],
+        "realtime_slots": summary.get("realtime_slots", False),
+        "realtime_speed_scale": summary.get("realtime_speed_scale", 1.0),
         "requests_total": summary["requests_total"],
         "requests_scheduled": summary["requests_scheduled"],
         "requests_unscheduled": summary["requests_unscheduled"],
         "batches_executed": summary["batches_executed"],
         "total_carbon_cost": summary["total_carbon_cost"],
         "global_average_error": summary["global_average_error"],
+        "global_average_error_real": summary.get("global_average_error_real", summary["global_average_error"]),
+        "global_average_error_modeled": summary.get("global_average_error_modeled", summary["global_average_error"]),
         "solver_time_ms_min": summary["solver_time_ms_min"],
         "solver_time_ms_max": summary["solver_time_ms_max"],
         "solver_time_ms_avg": summary["solver_time_ms_avg"],
@@ -34,4 +38,3 @@ def flatten_summary_for_csv(summary: Dict[str, float]) -> Dict[str, float]:
         "final_wait_seconds_max": summary["final_wait_seconds_max"],
         "final_wait_seconds_avg": summary["final_wait_seconds_avg"],
     }
-

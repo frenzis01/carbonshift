@@ -8,3 +8,4 @@ venv/
 env/
 
 online2/tests/Nshift_speed/output
+online2/notebooks/html

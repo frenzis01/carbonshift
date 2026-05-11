@@ -273,6 +273,20 @@ cd online2
 python tests/Nshift_speed/run_nshift_speed.py --config tests/Nshift_speed/config.json
 ```
 
+Optional real-time slot progression (wall-clock), with override from CLI:
+```bash
+cd online2
+python tests/Nshift_speed/run_nshift_speed.py \
+  --config tests/Nshift_speed/config.json \
+  --realtime-slots \
+  --realtime-speed-scale 0.5
+```
+
+`realtime_speed_scale` must be in `[0.0, 1.0]`:
+- `1.0`: full slot duration (for example 10s -> 10s wall-clock)
+- `0.5`: half-speed wall-clock (for example 10s -> 5s)
+- `0.0`: no waiting (effectively fast simulation)
+
 Outputs are written under:
 `online2/tests/Nshift_speed/output/`
 - `summary_by_n.json` / `summary_by_n.csv`

@@ -55,6 +55,8 @@ class TestRunnerOutputSchema(unittest.TestCase):
             summary_row = summary_payload["rows"][0]
             for field in [
                 "batch_size",
+                "realtime_slots",
+                "realtime_speed_scale",
                 "solver_time_ms_min",
                 "solver_time_ms_max",
                 "solver_time_ms_avg",
@@ -66,6 +68,8 @@ class TestRunnerOutputSchema(unittest.TestCase):
                 "final_wait_seconds_avg",
                 "total_carbon_cost",
                 "global_average_error",
+                "global_average_error_real",
+                "global_average_error_modeled",
             ]:
                 self.assertIn(field, summary_row)
 
@@ -108,7 +112,40 @@ class TestRunnerOutputSchema(unittest.TestCase):
                 expected = {"batch_sequence", "solver_elapsed_ms", "effective_batch_size", "flush_partial_batch"}
                 self.assertTrue(expected.issubset(set(rows[0].keys())))
 
+    def test_runner_realtime_scale_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            scenario_path = base / "scenario.json"
+            output_dir = base / "output"
+            config_path = base / "config.json"
+
+            generate_and_save_scenario(
+                output_path=scenario_path,
+                seed=2028,
+                total_slots=4,
+                slot_duration_seconds=1.0,
+                requests_per_slot=2.0,
+                request_rate_std_factor=0.2,
+                deadline_min_slack=0,
+                deadline_max_slack=2,
+                error_window_past=2,
+                error_window_future=2,
+                max_error_threshold=4.0,
+                prehistory_error_ratio=0.75,
+            )
+            save_json(
+                config_path,
+                {
+                    "batch_sizes": [2],
+                    "scenario_path": str(scenario_path),
+                    "output_dir": str(output_dir),
+                    "runner": {"flush_partial_batch": True},
+                },
+            )
+
+            with self.assertRaises(ValueError):
+                run_benchmark_from_config(config_path, realtime_speed_scale_override=1.1)
+
 
 if __name__ == "__main__":
     unittest.main()
-

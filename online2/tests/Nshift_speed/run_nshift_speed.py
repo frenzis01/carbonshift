@@ -90,7 +90,19 @@ def _write_single_run_outputs(
     )
 
 
-def run_benchmark_from_config(config_path: Path) -> List[Dict[str, Any]]:
+def _validate_realtime_speed_scale(value: float) -> float:
+    numeric = float(value)
+    if numeric < 0.0 or numeric > 1.0:
+        raise ValueError("realtime_speed_scale must be in [0.0, 1.0].")
+    return numeric
+
+
+def run_benchmark_from_config(
+    config_path: Path,
+    *,
+    realtime_slots_override: Optional[bool] = None,
+    realtime_speed_scale_override: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     cfg = load_runner_config(config_path)
     scenario = load_json(cfg["scenario_path"])
     output_root: Path = cfg["output_dir"]
@@ -98,11 +110,22 @@ def run_benchmark_from_config(config_path: Path) -> List[Dict[str, Any]]:
 
     summaries: List[Dict[str, Any]] = []
     flush_partial_batch = bool(cfg["runner"].get("flush_partial_batch", True))
+    realtime_slots = bool(cfg["runner"].get("realtime_slots", False))
+    realtime_speed_scale = _validate_realtime_speed_scale(
+        cfg["runner"].get("realtime_speed_scale", 1.0)
+    )
+    if realtime_slots_override is not None:
+        realtime_slots = bool(realtime_slots_override)
+    if realtime_speed_scale_override is not None:
+        realtime_speed_scale = _validate_realtime_speed_scale(realtime_speed_scale_override)
+
     for batch_size in cfg["batch_sizes"]:
         result = run_single_batch_size(
             scenario,
             batch_size=batch_size,
             flush_partial_batch=flush_partial_batch,
+            realtime_slots=realtime_slots,
+            realtime_speed_scale=realtime_speed_scale,
             output_csv_path=str(output_root / f"N{batch_size}" / "assignments_runtime.csv"),
         )
         _write_single_run_outputs(output_root, batch_size, result)
@@ -110,7 +133,8 @@ def run_benchmark_from_config(config_path: Path) -> List[Dict[str, Any]]:
         print(
             "Completed N="
             f"{batch_size}: solver_ms_avg={result.summary['solver_time_ms_avg']:.3f}, "
-            f"total_carbon={result.summary['total_carbon_cost']:.3f}"
+            f"total_carbon={result.summary['total_carbon_cost']:.3f}, "
+            f"realtime_slots={str(realtime_slots).lower()}, scale={realtime_speed_scale:.2f}"
         )
 
     save_json(output_root / SUMMARY_JSON_NAME, {"rows": summaries})
@@ -129,13 +153,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parent / "config.json",
         help="Path to N-shift runner config JSON.",
     )
+    parser.add_argument(
+        "--realtime-slots",
+        action="store_true",
+        help="Override config and run with wall-clock slot progression.",
+    )
+    parser.add_argument(
+        "--no-realtime-slots",
+        action="store_true",
+        help="Override config and force fast simulation without wall-clock waiting.",
+    )
+    parser.add_argument(
+        "--realtime-speed-scale",
+        type=_validate_realtime_speed_scale,
+        default=None,
+        help="Override realtime speed scale in [0.0, 1.0] (1.0=full slot duration).",
+    )
     return parser
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    summaries = run_benchmark_from_config(args.config)
+    if args.realtime_slots and args.no_realtime_slots:
+        parser.error("Use at most one of --realtime-slots and --no-realtime-slots.")
+
+    realtime_slots_override: Optional[bool] = None
+    if args.realtime_slots:
+        realtime_slots_override = True
+    elif args.no_realtime_slots:
+        realtime_slots_override = False
+
+    summaries = run_benchmark_from_config(
+        args.config,
+        realtime_slots_override=realtime_slots_override,
+        realtime_speed_scale_override=args.realtime_speed_scale,
+    )
     print(f"Wrote benchmark output for {len(summaries)} batch sizes.")
     return 0
 

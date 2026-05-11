@@ -126,6 +126,8 @@ def run_single_batch_size(
     batch_size: int,
     *,
     flush_partial_batch: bool = True,
+    realtime_slots: bool = False,
+    realtime_speed_scale: float = 1.0,
     output_csv_path: str = "/tmp/nshift_dummy_assignments.csv",
 ) -> SimulationResult:
     """
@@ -134,6 +136,9 @@ def run_single_batch_size(
     This uses BatchScheduler internals synchronously (no threads) so the same
     static scenario can be replayed across multiple batch sizes.
     """
+    if not (0.0 <= float(realtime_speed_scale) <= 1.0):
+        raise ValueError("realtime_speed_scale must be in [0.0, 1.0].")
+
     output_csv = Path(output_csv_path)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     original_cfg = _patch_online2_config(scenario, batch_size, str(output_csv))
@@ -169,8 +174,18 @@ def run_single_batch_size(
         batch_timings: List[Dict[str, Any]] = []
         total_slots = int(scenario["metadata"]["total_slots"])
         slot_duration = float(scenario["metadata"]["slot_duration_seconds"])
+        elapsed_slot_seconds = (
+            slot_duration * float(realtime_speed_scale) if realtime_slots else slot_duration
+        )
+        realtime_t0 = time.monotonic() if realtime_slots else 0.0
 
         for slot in range(total_slots):
+            if realtime_slots:
+                target_time = realtime_t0 + (slot * elapsed_slot_seconds)
+                remaining = target_time - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+
             shared_state.set_current_slot(slot)
             for request_data in requests_by_slot.get(slot, []):
                 shared_state.add_request(
@@ -272,7 +287,7 @@ def run_single_batch_size(
                 queue_wait_slots = None
             else:
                 queue_wait_slots = int(included_slot - request_info["arrival_slot"])
-                queue_wait_seconds = float(queue_wait_slots * slot_duration)
+                queue_wait_seconds = float(queue_wait_slots * elapsed_slot_seconds)
                 queue_wait_samples.append(queue_wait_seconds)
 
             if assignment is None:
@@ -288,7 +303,7 @@ def run_single_batch_size(
                 error = float(assignment.error)
                 carbon_cost = float(assignment.carbon_cost)
                 final_wait_slots = int(scheduled_slot - request_info["arrival_slot"])
-                final_wait_seconds = float(final_wait_slots * slot_duration + scheduling_sec)
+                final_wait_seconds = float(final_wait_slots * elapsed_slot_seconds + scheduling_sec)
                 final_wait_samples.append(final_wait_seconds)
 
             per_request_rows.append(
@@ -328,14 +343,21 @@ def run_single_batch_size(
         final_stats = min_max_avg(final_wait_samples)
 
         total_carbon_cost = sum(float(a.carbon_cost) for a in real_assignments)
-        global_average_error = (
+        global_average_error_real = (
             sum(float(a.error) for a in real_assignments) / len(real_assignments)
             if real_assignments
+            else 0.0
+        )
+        global_average_error_modeled = (
+            sum(float(a.error) for a in modeled_assignments) / len(modeled_assignments)
+            if modeled_assignments
             else 0.0
         )
 
         summary = {
             "batch_size": int(batch_size),
+            "realtime_slots": bool(realtime_slots),
+            "realtime_speed_scale": float(realtime_speed_scale),
             "requests_total": len(request_rows),
             "requests_scheduled": len(real_assignments),
             "requests_unscheduled": len(request_rows) - len(real_assignments),
@@ -350,7 +372,11 @@ def run_single_batch_size(
             "final_wait_seconds_max": final_stats["max"],
             "final_wait_seconds_avg": final_stats["avg"],
             "total_carbon_cost": float(total_carbon_cost),
-            "global_average_error": float(global_average_error),
+            # Keep global_average_error as modeled (with synthetic prehistory)
+            # for direct comparison with modeled window-history charts.
+            "global_average_error": float(global_average_error_modeled),
+            "global_average_error_real": float(global_average_error_real),
+            "global_average_error_modeled": float(global_average_error_modeled),
         }
 
         return SimulationResult(
