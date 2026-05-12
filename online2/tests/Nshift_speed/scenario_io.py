@@ -68,8 +68,8 @@ def generate_scenario_data(
 
     forecast: List[float] = []
     cycle = 6
-    base_carbon = 500.0
-    amplitude = 400.0
+    base_carbon = 50.0
+    amplitude = 200.0
     noise = max(0.0, float(carbon_random_noise_amplitude))
     for slot in range(total_slots):
         phase = 2.0 * math.pi * (slot % cycle) / cycle

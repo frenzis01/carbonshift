@@ -262,10 +262,19 @@ jupyter notebook notebooks/solver_logs_analysis.ipynb
 ## Reproducible multi-N benchmark harness (`tests/Nshift_speed`)
 
 Generate one static scenario (reused across all N values):
+
+**Option A: Use CLI hardcoded defaults**
 ```bash
 cd online2
 python tests/Nshift_speed/generate_scenario.py --seed 2026
 ```
+
+**Option B: Use config.py defaults** (recommended for consistency with running benchmark)
+```bash
+cd online2
+python tests/Nshift_speed/generate_scenario.py --use-config-defaults --seed 2026
+```
+When `--use-config-defaults` is set, the generator will read `PREDICTED_REQUESTS_PER_SLOT`, `SLOT_DURATION_SECONDS`, `TOTAL_SLOTS`, `ERROR_WINDOW_PAST`, `ERROR_WINDOW_FUTURE`, `MAX_ERROR_THRESHOLD`, `ASSIGNMENT_MAX_FUTURE_SLOTS`, `REQUEST_RATE_STD_FACTOR`, `PREHISTORY_MOCK_INFLUENCE` from `config.py` instead of CLI hardcoded values. CLI arguments still override config values if provided explicitly.
 
 Run benchmark for all configured batch sizes:
 ```bash

@@ -67,10 +67,10 @@ PREHISTORY_MOCK_INFLUENCE = 0.2
 # Capacity tiers: (max_requests, carbon_multiplier)
 # If slot receives more than this many requests, carbon emissions multiply
 CAPACITY_TIERS = [
-    {"max_requests": 10, "multiplier": 1.5},
-    {"max_requests": 20, "multiplier": 2.0},
-    {"max_requests": 30, "multiplier": 5.0},
-    {"max_requests": float('inf'), "multiplier": 3.0},
+    {"max_requests": 30, "multiplier": 1.5},
+    {"max_requests": 50, "multiplier": 2.0},
+    {"max_requests": 80, "multiplier": 5.0},
+    {"max_requests": float('inf'), "multiplier": 2.5},
 ]
 
 # ============================================================================
@@ -116,13 +116,13 @@ INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
 # Scales the number of mock requests used in carryover/forecast recovery modes.
 # Range [0, 1]: lower means less mock influence (more pessimistic).
 # 1.0 = full mock influence, 0.0 = disable mock contribution.
-INFEASIBILITY_MOCK_INFLUENCE = 0.6
+INFEASIBILITY_MOCK_INFLUENCE = 0.4
 
 # Consecutive above-threshold window slots decay the effective mock influence:
 # effective = max(0, base_influence - streak * decay_step)
 # where streak counts consecutive slots whose baseline window avg error at slot
 # start is above MAX_ERROR_THRESHOLD.
-INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.20
+INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.2
 
 # ============================================================================
 # REQUEST GENERATION PARAMETERS
@@ -131,7 +131,7 @@ INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.20
 # Predicted/known arrival rate (requests per slot), used by:
 # - request generator
 # - virtual pre-history baseline
-PREDICTED_REQUESTS_PER_SLOT = 20.0
+PREDICTED_REQUESTS_PER_SLOT = 60.0
 
 # Backward-compatible alias used across the codebase.
 REQUESTS_PER_SLOT = PREDICTED_REQUESTS_PER_SLOT

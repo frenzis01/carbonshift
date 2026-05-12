@@ -742,8 +742,8 @@ class BatchScheduler:
         """
         forecast = []
         num_slots = config.TOTAL_SLOTS
-        base_carbon = 500
-        amplitude = 400
+        base_carbon = 250
+        amplitude = 200
         
         K = 6
 
