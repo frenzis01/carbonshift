@@ -292,7 +292,7 @@ class RollingWindowDPScheduler:
     ) -> List[RequestAssignment]:
         """
         Fallback greedy scheduler when DP fails.
-        Assigns each request to the earliest available slot with the fastest strategy.
+        Assigns each request to the earliest available slot with the slowest strategy.
         """
         assignments = []
         if capacity_tiers is None:
@@ -310,20 +310,23 @@ class RollingWindowDPScheduler:
             deadline = deadlines[req_idx]
 
             best_choice = None
-            for strategy in self.strategies:
-                duration = int(strategy["duration"])
-                for slot in range(current_slot, deadline + 1):
-                    delta_cost = self._incremental_carbon_cost(
-                        slot=slot,
-                        add_duration=duration,
-                        base_counts=base_counts,
-                        base_durations=base_durations,
-                        inc_counts=inc_counts,
-                        inc_durations=inc_durations,
-                        capacity_tiers=capacity_tiers,
-                    )
-                    if best_choice is None or delta_cost < best_choice[0]:
-                        best_choice = (delta_cost, slot, strategy)
+
+            # select slowest - most accurate strategy for fallback
+            strategy = max(self.strategies, key=lambda s: int(s["duration"]))
+            duration = int(strategy["duration"])
+            for slot in range(current_slot, deadline + 1):
+                delta_cost = self._incremental_carbon_cost(
+                    slot=slot,
+                    add_duration=duration,
+                    base_counts=base_counts,
+                    base_durations=base_durations,
+                    inc_counts=inc_counts,
+                    inc_durations=inc_durations,
+                    capacity_tiers=capacity_tiers,
+                )
+                if best_choice is None or delta_cost < best_choice[0]:
+                    best_choice = (delta_cost, slot, strategy)
+
 
             if best_choice is None:
                 continue

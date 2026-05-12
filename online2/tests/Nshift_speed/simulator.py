@@ -121,6 +121,44 @@ def _compute_window_rows(
     return rows
 
 
+def _select_greedy_baseline_strategy() -> Tuple[str, int]:
+    strategies = list(getattr(config, "STRATEGIES", []))
+    if not strategies:
+        return "Accurate", 0
+    selected = min(
+        strategies,
+        key=lambda strategy: (
+            float(strategy.get("error", 0.0)),
+            -int(strategy.get("duration", 0)),
+        ),
+    )
+    return str(selected.get("name", "Accurate")), int(selected.get("duration", 0))
+
+
+def _get_capacity_multiplier(capacity_tiers: List[Dict[str, Any]], request_count: int) -> float:
+    for tier in capacity_tiers:
+        if request_count <= float(tier["max_requests"]):
+            return float(tier["multiplier"])
+    return float(capacity_tiers[-1]["multiplier"])
+
+
+def _incremental_carbon_cost(
+    *,
+    slot_carbon: float,
+    add_duration: int,
+    before_count: int,
+    before_duration: int,
+    capacity_tiers: List[Dict[str, Any]],
+) -> float:
+    after_count = before_count + 1
+    after_duration = before_duration + add_duration
+    before_mult = _get_capacity_multiplier(capacity_tiers, before_count)
+    after_mult = _get_capacity_multiplier(capacity_tiers, after_count)
+    before_cost = slot_carbon * before_mult * before_duration
+    after_cost = slot_carbon * after_mult * after_duration
+    return after_cost - before_cost
+
+
 def run_single_batch_size(
     scenario: Dict[str, Any],
     batch_size: int,
@@ -355,9 +393,13 @@ def run_single_batch_size(
         )
 
         summary = {
+            "execution_mode": "nshift_dp",
             "batch_size": int(batch_size),
             "realtime_slots": bool(realtime_slots),
             "realtime_speed_scale": float(realtime_speed_scale),
+            "baseline_strategy_name": "",
+            "baseline_strategy_duration": 0,
+            "baseline_strategy_error": 0.0,
             "requests_total": len(request_rows),
             "requests_scheduled": len(real_assignments),
             "requests_unscheduled": len(request_rows) - len(real_assignments),
@@ -387,3 +429,185 @@ def run_single_batch_size(
         )
     finally:
         _restore_online2_config(original_cfg)
+
+
+def run_greedy_baseline(
+    scenario: Dict[str, Any],
+    *,
+    realtime_slots: bool = False,
+    realtime_speed_scale: float = 1.0,
+) -> SimulationResult:
+    """
+    Run immediate per-request baseline without carbon-shifting decisions.
+
+    Each request is scheduled as soon as it arrives (scheduled_slot=arrival_slot),
+    with zero modeled error to represent maximum-accuracy processing.
+    Carbon cost still applies using Online2 capacity tiers and strategy duration.
+    """
+    if not (0.0 <= float(realtime_speed_scale) <= 1.0):
+        raise ValueError("realtime_speed_scale must be in [0.0, 1.0].")
+
+    metadata = scenario["metadata"]
+    total_slots = int(metadata["total_slots"])
+    slot_duration = float(metadata["slot_duration_seconds"])
+    elapsed_slot_seconds = (
+        slot_duration * float(realtime_speed_scale) if realtime_slots else slot_duration
+    )
+    realtime_t0 = time.monotonic() if realtime_slots else 0.0
+
+    prehistory_assignments, _ = _build_prehistory_assignments(scenario.get("prehistory_slots", []))
+    baseline_strategy_name, baseline_strategy_duration = _select_greedy_baseline_strategy()
+    baseline_strategy_error = 0.0
+
+    requests_by_slot: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    request_rows: Dict[int, Dict[str, Any]] = {}
+    for request in scenario["requests"]:
+        request_id = int(request["request_id"])
+        request_obj = {
+            "request_id": request_id,
+            "arrival_slot": int(request["arrival_slot"]),
+            "arrival_time": float(request["arrival_time"]),
+            "deadline_slot": int(request["deadline_slot"]),
+        }
+        requests_by_slot[request_obj["arrival_slot"]].append(request_obj)
+        request_rows[request_id] = request_obj
+
+    slot_counts = [0 for _ in range(total_slots)]
+    slot_durations = [0 for _ in range(total_slots)]
+    capacity_tiers = list(config.CAPACITY_TIERS)
+    carbon_forecast = [float(v) for v in scenario["carbon_forecast"]]
+
+    per_request_rows: List[Dict[str, Any]] = []
+    real_assignments: List[Assignment] = []
+    batch_timings: List[Dict[str, Any]] = []
+    queue_wait_samples: List[float] = []
+    final_wait_samples: List[float] = []
+
+    for slot in range(total_slots):
+        if realtime_slots:
+            target_time = realtime_t0 + (slot * elapsed_slot_seconds)
+            remaining = target_time - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+
+        slot_requests = requests_by_slot.get(slot, [])
+        if not slot_requests:
+            continue
+
+        for request in slot_requests:
+            before_count = slot_counts[slot]
+            before_duration = slot_durations[slot]
+            delta_cost = _incremental_carbon_cost(
+                slot_carbon=carbon_forecast[slot],
+                add_duration=baseline_strategy_duration,
+                before_count=before_count,
+                before_duration=before_duration,
+                capacity_tiers=capacity_tiers,
+            )
+            slot_counts[slot] += 1
+            slot_durations[slot] += baseline_strategy_duration
+
+            assignment = Assignment(
+                request_id=int(request["request_id"]),
+                scheduled_slot=slot,
+                strategy_name=baseline_strategy_name,
+                carbon_cost=float(delta_cost),
+                error=float(baseline_strategy_error),
+                strategy_duration=baseline_strategy_duration,
+                arrival_slot=int(request["arrival_slot"]),
+                deadline_slot=int(request["deadline_slot"]),
+            )
+            real_assignments.append(assignment)
+
+            queue_wait_samples.append(0.0)
+            final_wait_samples.append(0.0)
+            per_request_rows.append(
+                {
+                    "request_id": int(request["request_id"]),
+                    "arrival_time": float(request["arrival_time"]),
+                    "arrival_slot": int(request["arrival_slot"]),
+                    "deadline_slot": int(request["deadline_slot"]),
+                    "included_in_batch_slot": slot,
+                    "batch_sequence": slot + 1,
+                    "scheduled_slot": slot,
+                    "queue_wait_slots": 0,
+                    "queue_wait_seconds": 0.0,
+                    "final_wait_slots": 0,
+                    "final_wait_seconds": 0.0,
+                    "strategy_name": baseline_strategy_name,
+                    "error": float(baseline_strategy_error),
+                    "carbon_cost": float(delta_cost),
+                }
+            )
+
+        batch_timings.append(
+            {
+                "batch_sequence": slot + 1,
+                "batch_size_n": 1,
+                "effective_batch_size": len(slot_requests),
+                "slot": slot,
+                "pending_before": len(slot_requests),
+                "solver_elapsed_ms": 0.0,
+                "scheduled": True,
+                "flush_partial_batch": False,
+            }
+        )
+
+    modeled_assignments = list(real_assignments) + prehistory_assignments
+    window_rows = _compute_window_rows(
+        total_slots=total_slots,
+        window_past=int(metadata["error_window_past"]),
+        window_future=int(metadata["error_window_future"]),
+        real_assignments=real_assignments,
+        modeled_assignments=modeled_assignments,
+    )
+
+    solver_stats = min_max_avg([0.0 for _ in batch_timings])
+    queue_stats = min_max_avg(queue_wait_samples)
+    final_stats = min_max_avg(final_wait_samples)
+
+    total_carbon_cost = sum(float(a.carbon_cost) for a in real_assignments)
+    global_average_error_real = (
+        sum(float(a.error) for a in real_assignments) / len(real_assignments)
+        if real_assignments
+        else 0.0
+    )
+    global_average_error_modeled = (
+        sum(float(a.error) for a in modeled_assignments) / len(modeled_assignments)
+        if modeled_assignments
+        else 0.0
+    )
+
+    summary = {
+        "execution_mode": "greedy_baseline_immediate",
+        "batch_size": 0,
+        "realtime_slots": bool(realtime_slots),
+        "realtime_speed_scale": float(realtime_speed_scale),
+        "baseline_strategy_name": baseline_strategy_name,
+        "baseline_strategy_duration": int(baseline_strategy_duration),
+        "baseline_strategy_error": float(baseline_strategy_error),
+        "requests_total": len(request_rows),
+        "requests_scheduled": len(real_assignments),
+        "requests_unscheduled": len(request_rows) - len(real_assignments),
+        "batches_executed": len(batch_timings),
+        "solver_time_ms_min": solver_stats["min"],
+        "solver_time_ms_max": solver_stats["max"],
+        "solver_time_ms_avg": solver_stats["avg"],
+        "queue_wait_seconds_min": queue_stats["min"],
+        "queue_wait_seconds_max": queue_stats["max"],
+        "queue_wait_seconds_avg": queue_stats["avg"],
+        "final_wait_seconds_min": final_stats["min"],
+        "final_wait_seconds_max": final_stats["max"],
+        "final_wait_seconds_avg": final_stats["avg"],
+        "total_carbon_cost": float(total_carbon_cost),
+        "global_average_error": float(global_average_error_modeled),
+        "global_average_error_real": float(global_average_error_real),
+        "global_average_error_modeled": float(global_average_error_modeled),
+    }
+
+    return SimulationResult(
+        summary=summary,
+        per_request=per_request_rows,
+        per_timeslot=window_rows,
+        batch_timings=batch_timings,
+    )

@@ -282,6 +282,17 @@ cd online2
 python tests/Nshift_speed/run_nshift_speed.py --config tests/Nshift_speed/config.json
 ```
 
+The runner also executes a greedy immediate baseline (`baseline_greedy`) by default:
+- each request is processed at arrival slot
+- baseline error is forced to `0.0` (max-accuracy reference)
+- capacity tiers are still applied to carbon cost
+- set `runner.include_greedy_baseline=false` in `tests/Nshift_speed/config.json` to disable it
+
+Per-N summaries include:
+- `baseline_total_carbon_cost`
+- `carbon_cost_saving_vs_baseline`
+- `carbon_cost_saving_vs_baseline_pct`
+
 Optional real-time slot progression (wall-clock), with override from CLI:
 ```bash
 cd online2
@@ -299,6 +310,8 @@ python tests/Nshift_speed/run_nshift_speed.py \
 Outputs are written under:
 `online2/tests/Nshift_speed/output/`
 - `summary_by_n.json` / `summary_by_n.csv`
+- `baseline_summary.json` / `baseline_summary.csv`
+- `baseline_greedy/*`
 - `N*/per_request.*`
 - `N*/per_timeslot.*`
 - `N*/batch_timings.*`

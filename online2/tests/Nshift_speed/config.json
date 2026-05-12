@@ -4,6 +4,7 @@
   "output_dir": "output",
   "runner": {
     "flush_partial_batch": true,
+    "include_greedy_baseline": true,
     "realtime_slots": false,
     "realtime_speed_scale": 1.0
   }

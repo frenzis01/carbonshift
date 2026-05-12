@@ -17,9 +17,13 @@ def min_max_avg(values: List[float]) -> Dict[str, float]:
 
 def flatten_summary_for_csv(summary: Dict[str, float]) -> Dict[str, float]:
     return {
+        "execution_mode": summary.get("execution_mode", "nshift_dp"),
         "batch_size": summary["batch_size"],
         "realtime_slots": summary.get("realtime_slots", False),
         "realtime_speed_scale": summary.get("realtime_speed_scale", 1.0),
+        "baseline_strategy_name": summary.get("baseline_strategy_name", ""),
+        "baseline_strategy_duration": summary.get("baseline_strategy_duration", 0),
+        "baseline_strategy_error": summary.get("baseline_strategy_error", 0.0),
         "requests_total": summary["requests_total"],
         "requests_scheduled": summary["requests_scheduled"],
         "requests_unscheduled": summary["requests_unscheduled"],
@@ -37,4 +41,7 @@ def flatten_summary_for_csv(summary: Dict[str, float]) -> Dict[str, float]:
         "final_wait_seconds_min": summary["final_wait_seconds_min"],
         "final_wait_seconds_max": summary["final_wait_seconds_max"],
         "final_wait_seconds_avg": summary["final_wait_seconds_avg"],
+        "baseline_total_carbon_cost": summary.get("baseline_total_carbon_cost", 0.0),
+        "carbon_cost_saving_vs_baseline": summary.get("carbon_cost_saving_vs_baseline", 0.0),
+        "carbon_cost_saving_vs_baseline_pct": summary.get("carbon_cost_saving_vs_baseline_pct", 0.0),
     }

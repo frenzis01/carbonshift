@@ -38,7 +38,7 @@ class TestRunnerOutputSchema(unittest.TestCase):
                     "batch_sizes": [2, 3],
                     "scenario_path": str(scenario_path),
                     "output_dir": str(output_dir),
-                    "runner": {"flush_partial_batch": True},
+                    "runner": {"flush_partial_batch": True, "include_greedy_baseline": True},
                 },
             )
 
@@ -55,8 +55,12 @@ class TestRunnerOutputSchema(unittest.TestCase):
             summary_row = summary_payload["rows"][0]
             for field in [
                 "batch_size",
+                "execution_mode",
                 "realtime_slots",
                 "realtime_speed_scale",
+                "baseline_strategy_name",
+                "baseline_strategy_duration",
+                "baseline_strategy_error",
                 "solver_time_ms_min",
                 "solver_time_ms_max",
                 "solver_time_ms_avg",
@@ -70,15 +74,25 @@ class TestRunnerOutputSchema(unittest.TestCase):
                 "global_average_error",
                 "global_average_error_real",
                 "global_average_error_modeled",
+                "baseline_total_carbon_cost",
+                "carbon_cost_saving_vs_baseline",
+                "carbon_cost_saving_vs_baseline_pct",
             ]:
                 self.assertIn(field, summary_row)
+            self.assertGreater(summary_row["baseline_total_carbon_cost"], 0.0)
 
             per_request_csv = output_dir / "N2" / "per_request.csv"
             per_timeslot_csv = output_dir / "N2" / "per_timeslot.csv"
             batch_timings_csv = output_dir / "N2" / "batch_timings.csv"
+            baseline_summary_json = output_dir / "baseline_summary.json"
+            baseline_summary_csv = output_dir / "baseline_summary.csv"
+            baseline_per_request_csv = output_dir / "baseline_greedy" / "per_request.csv"
             self.assertTrue(per_request_csv.exists())
             self.assertTrue(per_timeslot_csv.exists())
             self.assertTrue(batch_timings_csv.exists())
+            self.assertTrue(baseline_summary_json.exists())
+            self.assertTrue(baseline_summary_csv.exists())
+            self.assertTrue(baseline_per_request_csv.exists())
 
             with per_request_csv.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
@@ -139,7 +153,7 @@ class TestRunnerOutputSchema(unittest.TestCase):
                     "batch_sizes": [2],
                     "scenario_path": str(scenario_path),
                     "output_dir": str(output_dir),
-                    "runner": {"flush_partial_batch": True},
+                    "runner": {"flush_partial_batch": True, "include_greedy_baseline": True},
                 },
             )
 

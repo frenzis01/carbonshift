@@ -18,19 +18,21 @@ from tests.Nshift_speed.scenario_io import (
     save_json,
     save_rows_as_csv,
 )
-from tests.Nshift_speed.simulator import run_single_batch_size
+from tests.Nshift_speed.simulator import run_greedy_baseline, run_single_batch_size
 
 
 SUMMARY_JSON_NAME = "summary_by_n.json"
 SUMMARY_CSV_NAME = "summary_by_n.csv"
+BASELINE_SUMMARY_JSON_NAME = "baseline_summary.json"
+BASELINE_SUMMARY_CSV_NAME = "baseline_summary.csv"
 
 
-def _write_single_run_outputs(
+def _write_run_outputs(
     output_root: Path,
-    batch_size: int,
+    run_name: str,
     result,
 ) -> None:
-    run_dir = output_root / f"N{batch_size}"
+    run_dir = output_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     save_json(run_dir / "summary.json", result.summary)
@@ -90,6 +92,14 @@ def _write_single_run_outputs(
     )
 
 
+def _write_single_run_outputs(
+    output_root: Path,
+    batch_size: int,
+    result,
+) -> None:
+    _write_run_outputs(output_root, f"N{batch_size}", result)
+
+
 def _validate_realtime_speed_scale(value: float) -> float:
     numeric = float(value)
     if numeric < 0.0 or numeric > 1.0:
@@ -110,6 +120,7 @@ def run_benchmark_from_config(
 
     summaries: List[Dict[str, Any]] = []
     flush_partial_batch = bool(cfg["runner"].get("flush_partial_batch", True))
+    include_greedy_baseline = bool(cfg["runner"].get("include_greedy_baseline", True))
     realtime_slots = bool(cfg["runner"].get("realtime_slots", False))
     realtime_speed_scale = _validate_realtime_speed_scale(
         cfg["runner"].get("realtime_speed_scale", 1.0)
@@ -118,6 +129,29 @@ def run_benchmark_from_config(
         realtime_slots = bool(realtime_slots_override)
     if realtime_speed_scale_override is not None:
         realtime_speed_scale = _validate_realtime_speed_scale(realtime_speed_scale_override)
+
+    baseline_cost: Optional[float] = None
+    if include_greedy_baseline:
+        baseline_result = run_greedy_baseline(
+            scenario,
+            realtime_slots=realtime_slots,
+            realtime_speed_scale=realtime_speed_scale,
+        )
+        _write_run_outputs(output_root, "baseline_greedy", baseline_result)
+        baseline_summary = flatten_summary_for_csv(baseline_result.summary)
+        save_json(output_root / BASELINE_SUMMARY_JSON_NAME, baseline_summary)
+        save_rows_as_csv(
+            output_root / BASELINE_SUMMARY_CSV_NAME,
+            [baseline_summary],
+            list(baseline_summary.keys()),
+        )
+        baseline_cost = float(baseline_result.summary["total_carbon_cost"])
+        print(
+            "Completed baseline: "
+            f"mode={baseline_result.summary.get('execution_mode', 'greedy_baseline_immediate')}, "
+            f"total_carbon={baseline_cost:.3f}, "
+            f"strategy={baseline_result.summary.get('baseline_strategy_name', 'Accurate')}"
+        )
 
     for batch_size in cfg["batch_sizes"]:
         result = run_single_batch_size(
@@ -129,11 +163,19 @@ def run_benchmark_from_config(
             output_csv_path=str(output_root / f"N{batch_size}" / "assignments_runtime.csv"),
         )
         _write_single_run_outputs(output_root, batch_size, result)
-        summaries.append(flatten_summary_for_csv(result.summary))
+        summary_row = flatten_summary_for_csv(result.summary)
+        if baseline_cost is not None:
+            savings = baseline_cost - float(summary_row["total_carbon_cost"])
+            savings_pct = (savings / baseline_cost * 100.0) if baseline_cost > 0.0 else 0.0
+            summary_row["baseline_total_carbon_cost"] = baseline_cost
+            summary_row["carbon_cost_saving_vs_baseline"] = savings
+            summary_row["carbon_cost_saving_vs_baseline_pct"] = savings_pct
+        summaries.append(summary_row)
         print(
             "Completed N="
             f"{batch_size}: solver_ms_avg={result.summary['solver_time_ms_avg']:.3f}, "
             f"total_carbon={result.summary['total_carbon_cost']:.3f}, "
+            f"saving_vs_baseline={(summary_row.get('carbon_cost_saving_vs_baseline', 0.0)):.3f}, "
             f"realtime_slots={str(realtime_slots).lower()}, scale={realtime_speed_scale:.2f}"
         )
 
