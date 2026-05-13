@@ -32,6 +32,8 @@ def flatten_summary_for_csv(summary: Dict[str, float]) -> Dict[str, float]:
         "global_average_error": summary["global_average_error"],
         "global_average_error_real": summary.get("global_average_error_real", summary["global_average_error"]),
         "global_average_error_modeled": summary.get("global_average_error_modeled", summary["global_average_error"]),
+        "requests_assigned_with_greedy_fallback": summary.get("requests_assigned_with_greedy_fallback", 0),
+        "requests_assigned_with_relaxed_retry": summary.get("requests_assigned_with_relaxed_retry", 0),
         "solver_time_ms_min": summary["solver_time_ms_min"],
         "solver_time_ms_max": summary["solver_time_ms_max"],
         "solver_time_ms_avg": summary["solver_time_ms_avg"],

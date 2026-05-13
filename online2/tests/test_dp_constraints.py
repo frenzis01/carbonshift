@@ -220,6 +220,75 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
         self.assertEqual(len(debug_rows), 1)
         self.assertEqual(debug_rows[0]["current_slot"], "3")
 
+    def test_strict_infeasible_forces_greedy_when_relaxed_disabled_or_min_error_mode(self):
+        shared_state = SharedSchedulerState()
+        shared_state.set_current_slot(3)
+
+        # Build a strict-infeasible baseline in the active window.
+        high_error_assignments = []
+        for req_id in range(200, 212):
+            high_error_assignments.append(
+                Assignment(
+                    request_id=req_id,
+                    scheduled_slot=3,
+                    strategy_name="Fast",
+                    carbon_cost=100.0,
+                    error=5.0,
+                    strategy_duration=30,
+                    arrival_slot=2,
+                    deadline_slot=6,
+                )
+            )
+        shared_state.add_assignments(high_error_assignments)
+
+        pending_batch = [
+            Request(id=11, arrival_slot=3, deadline_slot=6),
+            Request(id=12, arrival_slot=3, deadline_slot=6),
+            Request(id=13, arrival_slot=3, deadline_slot=6),
+        ]
+
+        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
+        original_verbose = config.VERBOSE
+        original_threshold = config.MAX_ERROR_THRESHOLD
+        original_solver_logging = config.ENABLE_SOLVER_LOGGING
+        original_prehistory_use = config.PREHISTORY_USE_VIRTUAL_PAST
+        original_relaxed_retry = config.DP_ALLOW_RELAXED_ERROR_RETRY
+        original_infeasibility_mode = config.INFEASIBILITY_RECOVERY_MODE
+        original_debug_enabled = config.ENABLE_INFEASIBILITY_DEBUG_LOGGING
+        try:
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
+            config.VERBOSE = False
+            config.MAX_ERROR_THRESHOLD = 3.0
+            config.ENABLE_SOLVER_LOGGING = False
+            config.PREHISTORY_USE_VIRTUAL_PAST = False
+            config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = False
+
+            cases = [
+                (False, "forecast_mock_current_slot"),
+                (True, "min_error_recovery"),
+            ]
+            for allow_relaxed_retry, recovery_mode in cases:
+                with self.subTest(
+                    allow_relaxed_retry=allow_relaxed_retry,
+                    recovery_mode=recovery_mode,
+                ):
+                    config.DP_ALLOW_RELAXED_ERROR_RETRY = allow_relaxed_retry
+                    config.INFEASIBILITY_RECOVERY_MODE = recovery_mode
+                    scheduler = BatchScheduler(shared_state)
+                    assignments, context = scheduler._solve_dp(pending_batch, current_slot=3)
+                    self.assertEqual(len(assignments), 3)
+                    self.assertEqual(context.get("status"), "ok_greedy_after_infeasible")
+                    self.assertEqual(context.get("mode"), "greedy_after_infeasible")
+        finally:
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
+            config.VERBOSE = original_verbose
+            config.MAX_ERROR_THRESHOLD = original_threshold
+            config.ENABLE_SOLVER_LOGGING = original_solver_logging
+            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory_use
+            config.DP_ALLOW_RELAXED_ERROR_RETRY = original_relaxed_retry
+            config.INFEASIBILITY_RECOVERY_MODE = original_infeasibility_mode
+            config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = original_debug_enabled
+
     def test_virtual_prehistory_baseline_is_configurable_and_applied(self):
         shared_state = SharedSchedulerState()
         shared_state.set_current_slot(1)

@@ -258,6 +258,7 @@ def plot_solver_execution_stacked(
     assignments_df: pd.DataFrame,
     slot_metrics_df: Optional[pd.DataFrame] = None,
     strategy_colors: Optional[Dict[str, str]] = None,
+    show_req_text: bool = True,
 ):
     """
     Stacked bar chart for one solver execution:
@@ -437,29 +438,30 @@ def plot_solver_execution_stacked(
             )
             text_color = "white" if is_new else "black"
             text_effects = [pe.withStroke(linewidth=1.1, foreground="black")] if is_new else []
-            ax.text(
-                slot,
-                bottom + 0.5,
-                f"{int(row.request_id)}",
-                ha="right",
-                va="center",
-                fontsize=11.5,
-                color=text_color,
-                path_effects=text_effects,
-                zorder=4,
-            )
-            if pd.notna(row.deadline_slot):
+            if show_req_text:
                 ax.text(
-                    slot + 0.12,
+                    slot,
                     bottom + 0.5,
-                    f"/{int(row.deadline_slot)}",
-                    ha="left",
+                    f"{int(row.request_id)}",
+                    ha="right",
                     va="center",
-                    fontsize=8,
+                    fontsize=11.5,
                     color=text_color,
                     path_effects=text_effects,
                     zorder=4,
                 )
+                if pd.notna(row.deadline_slot):
+                    ax.text(
+                        slot + 0.12,
+                        bottom + 0.5,
+                        f"/{int(row.deadline_slot)}",
+                        ha="left",
+                        va="center",
+                        fontsize=8,
+                        color=text_color,
+                        path_effects=text_effects,
+                        zorder=4,
+                    )
             slot_stack_height[slot] = bottom + 1
     else:
         ax.text(

@@ -57,6 +57,10 @@ def _write_run_outputs(
             "strategy_name",
             "error",
             "carbon_cost",
+            "assignment_solver_mode",
+            "assignment_solver_status",
+            "assigned_with_greedy_fallback",
+            "assigned_with_relaxed_retry",
         ],
     )
 

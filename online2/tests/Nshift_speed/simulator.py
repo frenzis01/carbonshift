@@ -23,6 +23,14 @@ class SimulationResult:
     batch_timings: List[Dict[str, Any]]
 
 
+def _is_greedy_fallback_mode(mode: str) -> bool:
+    return str(mode).strip().lower() in {"greedy_after_infeasible", "greedy_fallback"}
+
+
+def _is_relaxed_retry_mode(mode: str) -> bool:
+    return str(mode).strip().lower().startswith("dp_relaxed")
+
+
 def _patch_online2_config(scenario: Dict[str, Any], batch_size: int, output_csv_path: str) -> Dict[str, Any]:
     metadata = scenario["metadata"]
     original = {
@@ -187,6 +195,27 @@ def run_single_batch_size(
         scheduler.dp_solver.carbon_forecast = list(scheduler.carbon_forecast)
         scheduler.dp_solver.window_size = int(scenario["metadata"]["total_slots"])
 
+        request_assignment_mode: Dict[int, str] = {}
+        request_assignment_status: Dict[int, str] = {}
+        original_solve_dp = scheduler._solve_dp
+
+        def _solve_dp_with_trace(
+            pending: List[Request],
+            current_slot: int,
+        ) -> Tuple[List[Assignment], Dict[str, Any]]:
+            assignments, solve_context = original_solve_dp(pending, current_slot)
+            mode = str(solve_context.get("mode", ""))
+            status = str(solve_context.get("status", ""))
+            pending_ids = {int(req.id) for req in pending}
+            for assignment in assignments:
+                request_id = int(assignment.request_id)
+                if request_id in pending_ids:
+                    request_assignment_mode[request_id] = mode
+                    request_assignment_status[request_id] = status
+            return assignments, solve_context
+
+        scheduler._solve_dp = _solve_dp_with_trace
+
         prehistory_assignments, synthetic_ids = _build_prehistory_assignments(scenario.get("prehistory_slots", []))
         if prehistory_assignments:
             shared_state.add_assignments(prehistory_assignments)
@@ -335,6 +364,10 @@ def run_single_batch_size(
                 carbon_cost = None
                 final_wait_slots = None
                 final_wait_seconds = None
+                assignment_mode = ""
+                assignment_status = ""
+                assigned_with_greedy_fallback = False
+                assigned_with_relaxed_retry = False
             else:
                 scheduled_slot = int(assignment.scheduled_slot)
                 strategy_name = str(assignment.strategy_name)
@@ -343,6 +376,10 @@ def run_single_batch_size(
                 final_wait_slots = int(scheduled_slot - request_info["arrival_slot"])
                 final_wait_seconds = float(final_wait_slots * elapsed_slot_seconds + scheduling_sec)
                 final_wait_samples.append(final_wait_seconds)
+                assignment_mode = request_assignment_mode.get(request_id, "")
+                assignment_status = request_assignment_status.get(request_id, "")
+                assigned_with_greedy_fallback = _is_greedy_fallback_mode(assignment_mode)
+                assigned_with_relaxed_retry = _is_relaxed_retry_mode(assignment_mode)
 
             per_request_rows.append(
                 {
@@ -360,6 +397,10 @@ def run_single_batch_size(
                     "strategy_name": strategy_name,
                     "error": error if error is not None else "",
                     "carbon_cost": carbon_cost if carbon_cost is not None else "",
+                    "assignment_solver_mode": assignment_mode,
+                    "assignment_solver_status": assignment_status,
+                    "assigned_with_greedy_fallback": assigned_with_greedy_fallback,
+                    "assigned_with_relaxed_retry": assigned_with_relaxed_retry,
                 }
             )
 
@@ -391,6 +432,16 @@ def run_single_batch_size(
             if modeled_assignments
             else 0.0
         )
+        requests_assigned_with_greedy_fallback = sum(
+            1
+            for row in per_request_rows
+            if bool(row.get("assigned_with_greedy_fallback", False))
+        )
+        requests_assigned_with_relaxed_retry = sum(
+            1
+            for row in per_request_rows
+            if bool(row.get("assigned_with_relaxed_retry", False))
+        )
 
         summary = {
             "execution_mode": "nshift_dp",
@@ -419,6 +470,8 @@ def run_single_batch_size(
             "global_average_error": float(global_average_error_modeled),
             "global_average_error_real": float(global_average_error_real),
             "global_average_error_modeled": float(global_average_error_modeled),
+            "requests_assigned_with_greedy_fallback": int(requests_assigned_with_greedy_fallback),
+            "requests_assigned_with_relaxed_retry": int(requests_assigned_with_relaxed_retry),
         }
 
         return SimulationResult(
@@ -537,6 +590,10 @@ def run_greedy_baseline(
                     "strategy_name": baseline_strategy_name,
                     "error": float(baseline_strategy_error),
                     "carbon_cost": float(delta_cost),
+                    "assignment_solver_mode": "baseline_immediate",
+                    "assignment_solver_status": "ok",
+                    "assigned_with_greedy_fallback": False,
+                    "assigned_with_relaxed_retry": False,
                 }
             )
 
@@ -603,6 +660,8 @@ def run_greedy_baseline(
         "global_average_error": float(global_average_error_modeled),
         "global_average_error_real": float(global_average_error_real),
         "global_average_error_modeled": float(global_average_error_modeled),
+        "requests_assigned_with_greedy_fallback": 0,
+        "requests_assigned_with_relaxed_retry": 0,
     }
 
     return SimulationResult(

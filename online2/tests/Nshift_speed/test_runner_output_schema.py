@@ -74,6 +74,8 @@ class TestRunnerOutputSchema(unittest.TestCase):
                 "global_average_error",
                 "global_average_error_real",
                 "global_average_error_modeled",
+                "requests_assigned_with_greedy_fallback",
+                "requests_assigned_with_relaxed_retry",
                 "baseline_total_carbon_cost",
                 "carbon_cost_saving_vs_baseline",
                 "carbon_cost_saving_vs_baseline_pct",
@@ -105,6 +107,10 @@ class TestRunnerOutputSchema(unittest.TestCase):
                     "scheduled_slot",
                     "queue_wait_seconds",
                     "final_wait_seconds",
+                    "assignment_solver_mode",
+                    "assignment_solver_status",
+                    "assigned_with_greedy_fallback",
+                    "assigned_with_relaxed_retry",
                 }
                 self.assertTrue(expected.issubset(set(rows[0].keys())))
 

@@ -462,10 +462,6 @@ class BatchScheduler:
                 dp_assignments = relaxed_assignments
                 solve_context["status"] = "ok_relaxed"
                 solve_context["mode"] = relaxed_mode
-            elif relaxed_mode == "dp_relaxed_disabled":
-                solve_context["status"] = "infeasible_strict"
-                solve_context["mode"] = "dp_strict_only"
-                dp_assignments = []
             else:
                 if config.VERBOSE:
                     print("[Scheduler] ⚠ Still infeasible: forcing greedy scheduling for pending requests.")
@@ -832,9 +828,11 @@ class BatchScheduler:
         dynamic_mock_pool: Dict[str, float],
         recovery_mode: str,
     ) -> Tuple[List, str]:
+        # If relaxed retry is disabled, or recovery mode explicitly requests
+        # min-error recovery semantics, skip relaxed DP and force greedy.
         if (
             not getattr(config, "DP_ALLOW_RELAXED_ERROR_RETRY", True)
-            and recovery_mode != "min_error_recovery"
+            or recovery_mode == "min_error_recovery"
         ):
             return [], "dp_relaxed_disabled"
 

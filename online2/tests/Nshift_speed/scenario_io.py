@@ -67,14 +67,14 @@ def generate_scenario_data(
     sigma = max(1.0, requests_per_slot * request_rate_std_factor)
 
     forecast: List[float] = []
-    cycle = 6
-    base_carbon = 50.0
-    amplitude = 200.0
+    cycle = 12
+    base_carbon = 40.0
+    amplitude = 100.0
     noise = max(0.0, float(carbon_random_noise_amplitude))
     for slot in range(total_slots):
         phase = 2.0 * math.pi * (slot % cycle) / cycle
         value = base_carbon + amplitude * (1.0 + 0.8 * math.cos(phase)) + rng.uniform(-noise, noise)
-        forecast.append(round(max(100.0, value), 6))
+        forecast.append(round(max(base_carbon, value), 6))
 
     requests: List[Dict[str, Any]] = []
     request_id = 0
