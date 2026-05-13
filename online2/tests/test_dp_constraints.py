@@ -1,5 +1,8 @@
 import csv
 import tempfile
+import threading
+import time
+import types
 import unittest
 from pathlib import Path
 
@@ -488,6 +491,91 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         self.assertAlmostEqual(float(ctx_slot_20["mock_influence_effective"]), 0.05, places=9)
         self.assertAlmostEqual(float(ctx_slot_21["mock_influence_effective"]), 0.0, places=9)
         self.assertAlmostEqual(float(ctx_slot_22["mock_influence_effective"]), 0.0, places=9)
+
+
+class TestSchedulerBatchWorkerParallelism(unittest.TestCase):
+    def test_process_batch_requeues_claimed_requests_on_failure(self):
+        shared_state = SharedSchedulerState()
+        shared_state.set_current_slot(0)
+        shared_state.add_request(Request(id=1, arrival_slot=0, deadline_slot=1))
+        shared_state.add_request(Request(id=2, arrival_slot=0, deadline_slot=1))
+
+        original_batch_size = config.BATCH_SIZE
+        original_verbose = config.VERBOSE
+        try:
+            config.BATCH_SIZE = 2
+            config.VERBOSE = False
+            scheduler = BatchScheduler(shared_state)
+
+            def fail_solve_dp(_self, requests, current_slot):
+                return [], {"status": "infeasible", "mode": "dp"}
+
+            scheduler._solve_dp = types.MethodType(fail_solve_dp, scheduler)
+
+            scheduled = scheduler._process_batch(current_slot=0)
+        finally:
+            config.BATCH_SIZE = original_batch_size
+            config.VERBOSE = original_verbose
+
+        self.assertFalse(scheduled)
+        pending = shared_state.get_pending_requests(10)
+        self.assertEqual([req.id for req in pending], [1, 2])
+
+    def test_scheduler_respects_max_batch_parallelism(self):
+        shared_state = SharedSchedulerState()
+        for req_id in range(8):
+            shared_state.add_request(Request(id=req_id, arrival_slot=0, deadline_slot=2))
+
+        original_batch_size = config.BATCH_SIZE
+        original_slot_duration = config.SLOT_DURATION_SECONDS
+        original_verbose = config.VERBOSE
+        original_parallel = getattr(
+            config,
+            "MAX_BATCH_SOLVER_PARALLELISM",
+            getattr(config, "NUM_SCHEDULER_THREADS", 1),
+        )
+        try:
+            config.BATCH_SIZE = 1
+            config.SLOT_DURATION_SECONDS = 1
+            config.MAX_BATCH_SOLVER_PARALLELISM = 2
+            config.VERBOSE = False
+
+            scheduler = BatchScheduler(shared_state)
+
+            tracker_lock = threading.Lock()
+            active_workers = 0
+            max_active_workers = 0
+            calls = 0
+            done_event = threading.Event()
+
+            def fake_process_batch(_self, current_slot, pending_override=None):
+                nonlocal active_workers, max_active_workers, calls
+                with tracker_lock:
+                    active_workers += 1
+                    max_active_workers = max(max_active_workers, active_workers)
+                    calls += 1
+                time.sleep(0.05)
+                with tracker_lock:
+                    active_workers -= 1
+                    if _self.shared_state.get_pending_count() == 0:
+                        done_event.set()
+                return True
+
+            scheduler._process_batch = types.MethodType(fake_process_batch, scheduler)
+
+            scheduler.start()
+            done_event.wait(timeout=3.0)
+            scheduler.stop()
+        finally:
+            config.BATCH_SIZE = original_batch_size
+            config.SLOT_DURATION_SECONDS = original_slot_duration
+            config.MAX_BATCH_SOLVER_PARALLELISM = original_parallel
+            config.VERBOSE = original_verbose
+
+        self.assertEqual(shared_state.get_pending_count(), 0)
+        self.assertGreaterEqual(calls, 8)
+        self.assertGreaterEqual(max_active_workers, 2)
+        self.assertLessEqual(max_active_workers, 2)
 
 
 if __name__ == "__main__":

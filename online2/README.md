@@ -61,7 +61,9 @@ Thread-safe state container managing:
 **Key methods**:
 - `add_request()` - Add new request
 - `get_pending_requests()` - Peek at batch without removing
+- `claim_pending_requests()` - Atomically reserve a batch for one worker
 - `pop_pending_requests()` - Remove scheduled requests
+- `requeue_pending_requests_front()` - Push back failed claimed batch for retry
 - `add_assignments()` - Record scheduling decisions
 - `get_average_error_in_window()` - Validate error budget
 - `get_requests_in_slot()` - Count requests in slot (for capacity tiers)
@@ -109,6 +111,10 @@ SLOT_DURATION_SECONDS = 10
 
 # Schedule 3 requests at a time
 BATCH_SIZE = 3
+
+# Run each batch solve in a short-lived worker thread,
+# with at most N batch workers executing in parallel.
+MAX_BATCH_SOLVER_PARALLELISM = 2
 
 # Maximum weighted average error in sliding window
 MAX_ERROR_THRESHOLD = 3.0

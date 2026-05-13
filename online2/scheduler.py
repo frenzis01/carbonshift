@@ -53,6 +53,7 @@ class BatchScheduler:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._active_batch_workers: Set[threading.Thread] = set()
 
         # Statistics
         self._batches_processed = 0
@@ -112,13 +113,18 @@ class BatchScheduler:
         self._thread.start()
 
         if config.VERBOSE:
-            print(f"[Scheduler] Started (batch_size={config.BATCH_SIZE})")
+            print(
+                "[Scheduler] Started "
+                f"(batch_size={config.BATCH_SIZE}, "
+                f"max_parallel={self._get_max_batch_parallelism()})"
+            )
 
     def stop(self) -> None:
         """Stop scheduler thread"""
         self._running = False
         if self._thread:
             self._thread.join(timeout=5.0)
+        self._join_active_batch_workers(timeout=5.0)
 
         if config.VERBOSE:
             print(f"[Scheduler] Stopped (processed {self._batches_processed} batches)")
@@ -129,6 +135,7 @@ class BatchScheduler:
         slot_start_time = time.time()
 
         while self._running:
+            self._cleanup_completed_batch_workers()
             now = time.time()
             elapsed = now - slot_start_time
             slot = int(elapsed / slot_duration)
@@ -138,44 +145,148 @@ class BatchScheduler:
 
             # Check if we have enough pending requests
             pending_count = self.shared_state.get_pending_count()
+            active_workers = self._get_active_batch_worker_count()
+            max_parallel = self._get_max_batch_parallelism()
 
-            if pending_count >= config.BATCH_SIZE:
+            if pending_count >= config.BATCH_SIZE and active_workers < max_parallel:
                 if config.VERBOSE:
-                    print(f"\n[Scheduler] Slot {slot}: {pending_count} pending, scheduling batch...")
-
-                # Avoid retry storm: if same slot and same pending count were just
-                # infeasible, wait for slot/pending change before retrying.
-                if (
-                    self._last_infeasible_slot == slot
-                    and self._last_infeasible_pending == pending_count
-                ):
-                    time.sleep(0.1)
-                    continue
-
-                scheduled = self._process_batch(slot)
-                if scheduled:
-                    self._last_infeasible_slot = None
-                    self._last_infeasible_pending = None
-                else:
-                    self._last_infeasible_slot = slot
-                    self._last_infeasible_pending = pending_count
+                    print(
+                        f"\n[Scheduler] Slot {slot}: {pending_count} pending, "
+                        f"active_workers={active_workers}/{max_parallel}"
+                    )
+                self._dispatch_batch_workers_for_slot(slot)
 
             # Small sleep
             time.sleep(0.1)
 
-    def _process_batch(self, current_slot: int) -> bool:
+    def _dispatch_batch_workers_for_slot(self, slot: int) -> None:
+        """
+        Dispatch as many batch workers as possible for the current slot,
+        constrained by pending queue size and max parallelism.
+        """
+        while self._running:
+            self._cleanup_completed_batch_workers()
+            pending_count = self.shared_state.get_pending_count()
+            active_workers = self._get_active_batch_worker_count()
+            max_parallel = self._get_max_batch_parallelism()
+
+            if pending_count < config.BATCH_SIZE or active_workers >= max_parallel:
+                return
+
+            # Avoid retry storm: if same slot and same pending count were just
+            # infeasible, wait for slot/pending change before retrying.
+            if (
+                self._last_infeasible_slot == slot
+                and self._last_infeasible_pending == pending_count
+            ):
+                return
+
+            pending = self.shared_state.claim_pending_requests(config.BATCH_SIZE)
+            if len(pending) < config.BATCH_SIZE:
+                self.shared_state.requeue_pending_requests_front(pending)
+                return
+
+            self._start_batch_worker(slot, pending)
+
+    def _start_batch_worker(self, current_slot: int, pending: List[Request]) -> None:
+        """
+        Start one short-lived worker thread for a claimed batch.
+        """
+        worker = threading.Thread(
+            target=self._batch_worker_entry,
+            args=(current_slot, pending),
+            daemon=False,
+        )
+        with self._lock:
+            self._active_batch_workers.add(worker)
+        worker.start()
+
+    def _batch_worker_entry(self, current_slot: int, pending: List[Request]) -> None:
+        """
+        Worker body for one claimed batch.
+        """
+        try:
+            if config.VERBOSE:
+                print(
+                    f"[Scheduler] Worker start: slot={current_slot}, "
+                    f"batch_size={len(pending)}"
+                )
+
+            scheduled = self._process_batch(current_slot, pending_override=pending)
+
+            with self._lock:
+                if scheduled:
+                    self._last_infeasible_slot = None
+                    self._last_infeasible_pending = None
+                else:
+                    self._last_infeasible_slot = current_slot
+                    self._last_infeasible_pending = len(pending)
+        finally:
+            self._cleanup_completed_batch_workers()
+
+    def _cleanup_completed_batch_workers(self) -> None:
+        """
+        Drop finished worker threads from the active set.
+        """
+        with self._lock:
+            completed = [worker for worker in self._active_batch_workers if not worker.is_alive()]
+            for worker in completed:
+                self._active_batch_workers.discard(worker)
+
+    def _join_active_batch_workers(self, timeout: float = 5.0) -> None:
+        """
+        Join all active batch workers, then clean up the active set.
+        """
+        with self._lock:
+            workers = list(self._active_batch_workers)
+
+        for worker in workers:
+            worker.join(timeout=timeout)
+
+        self._cleanup_completed_batch_workers()
+
+    def _get_active_batch_worker_count(self) -> int:
+        with self._lock:
+            return len(self._active_batch_workers)
+
+    def _get_max_batch_parallelism(self) -> int:
+        configured = int(
+            getattr(
+                config,
+                "MAX_BATCH_SOLVER_PARALLELISM",
+                getattr(config, "NUM_SCHEDULER_THREADS", 1),
+            )
+        )
+        return max(1, configured)
+
+    def _process_batch(
+        self,
+        current_slot: int,
+        pending_override: Optional[List[Request]] = None,
+    ) -> bool:
         """
         Process a batch of pending requests.
         
         Args:
             current_slot: Current time slot
         """
-        # Get requests to schedule
-        pending = self.shared_state.get_pending_requests(config.BATCH_SIZE)
+        if pending_override is None:
+            pending = self.shared_state.claim_pending_requests(config.BATCH_SIZE)
+        else:
+            pending = list(pending_override)
 
         if not pending:
             return False
 
+        scheduled = self._process_claimed_batch(current_slot=current_slot, pending=pending)
+        if not scheduled:
+            self.shared_state.requeue_pending_requests_front(pending)
+        return scheduled
+
+    def _process_claimed_batch(self, current_slot: int, pending: List[Request]) -> bool:
+        """
+        Process a pre-claimed batch of pending requests.
+        """
         if config.VERBOSE:
             print(f"[Scheduler] Processing {len(pending)} requests...")
 
@@ -200,10 +311,6 @@ class BatchScheduler:
 
             # Add assignments to shared state
             self.shared_state.add_assignments(assignments)
-
-            # Remove only newly scheduled pending requests from queue.
-            # Re-planned future assignments (if enabled) are not in pending.
-            self.shared_state.pop_pending_requests(len(pending))
 
             with self._lock:
                 self._batches_processed += 1
@@ -319,7 +426,7 @@ class BatchScheduler:
             Tuple (assignments, context)
         """
         effective_pruning = self._get_effective_pruning_mode(len(requests))
-        self.dp_solver.pruning = effective_pruning
+        solver = self._create_batch_solver(pruning_mode=effective_pruning)
 
         pending_ids: Set[int] = {req.id for req in requests}
         solve_context: Dict = {
@@ -406,7 +513,7 @@ class BatchScheduler:
             )
 
         try:
-            dp_assignments = self.dp_solver.solve_batch(
+            dp_assignments = solver.solve_batch(
                 requests=dp_requests,
                 current_slot=current_slot,
                 capacity_tiers=config.CAPACITY_TIERS,
@@ -423,7 +530,7 @@ class BatchScheduler:
             if config.VERBOSE:
                 print(f"[Scheduler] ✗ DP solver error: {e}, falling back to greedy")
             solve_context["mode"] = "greedy_fallback"
-            dp_assignments = self.dp_solver._greedy_fallback(
+            dp_assignments = solver._greedy_fallback(
                 requests=dp_requests,
                 deadlines=[max(current_slot, min(r["deadline_slot"], config.TOTAL_SLOTS - 1)) for r in dp_requests],
                 current_slot=current_slot,
@@ -436,6 +543,7 @@ class BatchScheduler:
                 print("[Scheduler] ⚠ Infeasible with strict error window: retry with relaxed window.")
 
             relaxed_assignments, relaxed_mode = self._solve_relaxed_retry(
+                solver=solver,
                 dp_requests=dp_requests,
                 current_slot=current_slot,
                 baseline_slot_counts=baseline_slot_counts,
@@ -480,7 +588,7 @@ class BatchScheduler:
                     _cap_deadline(req.deadline_slot)
                     for req in requests
                 ]
-                dp_assignments = self.dp_solver._greedy_fallback(
+                dp_assignments = solver._greedy_fallback(
                     requests=pending_only_requests,
                     deadlines=pending_only_deadlines,
                     current_slot=current_slot,
@@ -538,6 +646,21 @@ class BatchScheduler:
         solve_context["modeled_window_request_count_after"] = modeled_request_count
 
         return assignments, solve_context
+
+    def _create_batch_solver(self, pruning_mode: str) -> RollingWindowDPScheduler:
+        """
+        Build an isolated solver instance for one batch.
+
+        This avoids shared mutable solver state across concurrent batch workers.
+        """
+        return RollingWindowDPScheduler(
+            strategies=[dict(strategy) for strategy in self.dp_solver.strategies],
+            carbon_forecast=list(self.dp_solver.carbon_forecast),
+            window_size=int(self.dp_solver.window_size),
+            pruning=str(pruning_mode),
+            pruning_k=int(self.dp_solver.pruning_k),
+            timeout=float(self.dp_solver.timeout),
+        )
 
     def _get_effective_pruning_mode(self, pending_batch_size: int) -> str:
         """
@@ -755,6 +878,7 @@ class BatchScheduler:
         with self._lock:
             avg_solver_ms_per_batch = self._solver_total_time_ms / self._solver_total_runs if self._solver_total_runs else 0.0
             avg_solver_ms_per_request = self._solver_total_time_ms / self._solver_total_requests if self._solver_total_requests else 0.0
+            active_batch_workers = len(self._active_batch_workers)
             return {
                 "batches_processed": self._batches_processed,
                 "total_scheduled": self._total_scheduled,
@@ -762,6 +886,8 @@ class BatchScheduler:
                 "last_solver_elapsed_ms": self._last_solver_elapsed_ms,
                 "avg_solver_ms_per_batch": avg_solver_ms_per_batch,
                 "avg_solver_ms_per_request": avg_solver_ms_per_request,
+                "active_batch_workers": active_batch_workers,
+                "max_batch_parallelism": self._get_max_batch_parallelism(),
             }
 
     def _get_capacity_tier_info(self, request_count: int):
@@ -819,6 +945,7 @@ class BatchScheduler:
 
     def _solve_relaxed_retry(
         self,
+        solver: RollingWindowDPScheduler,
         dp_requests: List[Dict],
         current_slot: int,
         baseline_slot_counts: Dict[int, int],
@@ -837,7 +964,7 @@ class BatchScheduler:
             return [], "dp_relaxed_disabled"
 
         preferred_mode = "dp_relaxed_error"
-        original_strategies = self.dp_solver.strategies
+        original_strategies = solver.strategies
         relaxed_strategies = original_strategies
 
         prefer_min_error = (
@@ -853,8 +980,8 @@ class BatchScheduler:
                 preferred_mode = "dp_relaxed_min_error"
 
         try:
-            self.dp_solver.strategies = relaxed_strategies
-            relaxed_assignments = self.dp_solver.solve_batch(
+            solver.strategies = relaxed_strategies
+            relaxed_assignments = solver.solve_batch(
                 requests=dp_requests,
                 current_slot=current_slot,
                 capacity_tiers=config.CAPACITY_TIERS,
@@ -873,7 +1000,7 @@ class BatchScheduler:
             relaxed_assignments = []
             preferred_mode = "dp_relaxed_failed"
         finally:
-            self.dp_solver.strategies = original_strategies
+            solver.strategies = original_strategies
 
         return relaxed_assignments, preferred_mode
 

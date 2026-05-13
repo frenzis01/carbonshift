@@ -29,7 +29,7 @@ def generate_and_save_scenario(
     error_window_future: int,
     max_error_threshold: float,
     prehistory_error_ratio: float,
-    carbon_random_noise_amplitude: float = 120.0,
+    carbon_random_noise_amplitude: float = 60.0,
     prehistory_mock_influence: Optional[float] = None,
 ) -> Dict[str, Any]:
     if prehistory_mock_influence is None:
@@ -83,7 +83,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "error_window_future": int(getattr(config, "ERROR_WINDOW_FUTURE", 8)),
         "max_error_threshold": float(getattr(config, "MAX_ERROR_THRESHOLD", 4.0)),
         "prehistory_error_ratio": 0.75,
-        "carbon_random_noise_amplitude": 120.0,
+        "carbon_random_noise_amplitude": 60.0,
         "prehistory_mock_influence": float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0)),
     }
     

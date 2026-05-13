@@ -81,6 +81,17 @@ class SharedSchedulerState:
         with self._lock:
             return self._pending_requests[:batch_size]
 
+    def claim_pending_requests(self, count: int) -> List[Request]:
+        """
+        Atomically claim (remove) up to count pending requests.
+        Intended for worker-based schedulers to avoid duplicate batch claims.
+        (thread-safe)
+        """
+        with self._lock:
+            claimed = self._pending_requests[:count]
+            self._pending_requests = self._pending_requests[count:]
+            return claimed
+
     def pop_pending_requests(self, count: int) -> List[Request]:
         """
         Remove and return up to count pending requests.
@@ -91,6 +102,17 @@ class SharedSchedulerState:
             requests = self._pending_requests[:count]
             self._pending_requests = self._pending_requests[count:]
             return requests
+
+    def requeue_pending_requests_front(self, requests: List[Request]) -> None:
+        """
+        Put requests back at the head of pending queue preserving input order.
+        Used when a claimed batch cannot be scheduled and must be retried.
+        (thread-safe)
+        """
+        if not requests:
+            return
+        with self._lock:
+            self._pending_requests = list(requests) + self._pending_requests
 
     def add_assignments(self, assignments: List[Assignment]) -> None:
         """

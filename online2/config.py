@@ -148,7 +148,12 @@ DEADLINE_MAX_SLACK = 8
 # THREADING & CONCURRENCY
 # ============================================================================
 
-# Number of worker threads for scheduling
+# Maximum number of per-batch solver workers that can run simultaneously.
+# Each worker thread is created for one batch and terminated when done.
+MAX_BATCH_SOLVER_PARALLELISM = 5
+
+# Legacy alias retained for compatibility in older scripts.
+# New code should use MAX_BATCH_SOLVER_PARALLELISM.
 NUM_SCHEDULER_THREADS = 1
 
 # Timeout for queue operations (seconds)

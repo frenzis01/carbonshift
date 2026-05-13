@@ -54,6 +54,10 @@ class Online2System:
         print("="*80)
         print(f"\nConfiguration:")
         print(f"  - Batch Size: {config.BATCH_SIZE}")
+        print(
+            "  - Max Batch Parallelism: "
+            f"{getattr(config, 'MAX_BATCH_SOLVER_PARALLELISM', getattr(config, 'NUM_SCHEDULER_THREADS', 1))}"
+        )
         print(f"  - Slot Duration: {config.SLOT_DURATION_SECONDS}s")
         print(f"  - Total Slots: {config.TOTAL_SLOTS}")
         print(f"  - Max Error: {config.MAX_ERROR_THRESHOLD}%")
@@ -115,6 +119,11 @@ class Online2System:
         print(f"  Current Slot: {stats['current_slot']}")
         print(f"  Batches: {sched_stats['batches_processed']}")
         print(f"  Solver Runs: {sched_stats['solver_runs']}")
+        print(
+            "  Active Batch Workers: "
+            f"{sched_stats.get('active_batch_workers', 0)}/"
+            f"{sched_stats.get('max_batch_parallelism', 1)}"
+        )
         print(f"  Last Solver Time: {sched_stats['last_solver_elapsed_ms']:.2f} ms")
         print(f"  Avg Solver Time/Batch: {sched_stats['avg_solver_ms_per_batch']:.2f} ms")
         print(f"  Avg Solver Time/Request: {sched_stats['avg_solver_ms_per_request']:.2f} ms")

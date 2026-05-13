@@ -52,7 +52,7 @@ def generate_scenario_data(
     error_window_future: int,
     max_error_threshold: float,
     prehistory_error_ratio: float,
-    carbon_random_noise_amplitude: float = 200.0,
+    carbon_random_noise_amplitude: float = 60.0,
     prehistory_mock_influence: float = 1.0,
 ) -> Dict[str, Any]:
     """
@@ -67,7 +67,7 @@ def generate_scenario_data(
     sigma = max(1.0, requests_per_slot * request_rate_std_factor)
 
     forecast: List[float] = []
-    cycle = 12
+    cycle = 10
     base_carbon = 40.0
     amplitude = 100.0
     noise = max(0.0, float(carbon_random_noise_amplitude))
