@@ -106,6 +106,7 @@ def _compute_window_rows(
     total_slots: int,
     window_past: int,
     window_future: int,
+    window_past_decay_slots: int,
     real_assignments: List[Assignment],
     modeled_assignments: List[Assignment],
 ) -> List[Dict[str, Any]]:
@@ -115,15 +116,38 @@ def _compute_window_rows(
         end = center + window_future
         real_errors = [a.error for a in real_assignments if start <= a.scheduled_slot <= end]
         modeled_errors = [a.error for a in modeled_assignments if start <= a.scheduled_slot <= end]
+
+        real_error_sum = float(sum(real_errors))
+        real_count = float(len(real_errors))
+        modeled_error_sum = float(sum(modeled_errors))
+        modeled_count = float(len(modeled_errors))
+
+        for offset in range(1, max(0, int(window_past_decay_slots)) + 1):
+            decay_slot = int(start) - offset
+            decay_weight = float(window_past_decay_slots - offset + 1) / float(window_past_decay_slots + 1)
+
+            slot_real = [a.error for a in real_assignments if a.scheduled_slot == decay_slot]
+            if slot_real:
+                avg_real = float(sum(slot_real)) / float(len(slot_real))
+                weighted_real_count = float(len(slot_real)) * decay_weight
+                real_count += weighted_real_count
+                real_error_sum += avg_real * weighted_real_count
+
+            slot_modeled = [a.error for a in modeled_assignments if a.scheduled_slot == decay_slot]
+            if slot_modeled:
+                avg_modeled = float(sum(slot_modeled)) / float(len(slot_modeled))
+                weighted_modeled_count = float(len(slot_modeled)) * decay_weight
+                modeled_count += weighted_modeled_count
+                modeled_error_sum += avg_modeled * weighted_modeled_count
         rows.append(
             {
                 "timeslot": center,
                 "window_start": start,
                 "window_end": end,
-                "real_request_count": len(real_errors),
-                "modeled_request_count": len(modeled_errors),
-                "window_avg_error_real": (sum(real_errors) / len(real_errors)) if real_errors else 0.0,
-                "window_avg_error_modeled": (sum(modeled_errors) / len(modeled_errors)) if modeled_errors else 0.0,
+                "real_request_count": real_count,
+                "modeled_request_count": modeled_count,
+                "window_avg_error_real": (real_error_sum / real_count) if real_count > 0.0 else 0.0,
+                "window_avg_error_modeled": (modeled_error_sum / modeled_count) if modeled_count > 0.0 else 0.0,
             }
         )
     return rows
@@ -175,6 +199,7 @@ def run_single_batch_size(
     realtime_slots: bool = False,
     realtime_speed_scale: float = 1.0,
     output_csv_path: str = "/tmp/nshift_dummy_assignments.csv",
+    skip_first_k_slots: int = 0,
 ) -> SimulationResult:
     """
     Run one deterministic benchmark simulation for a specific batch size.
@@ -408,6 +433,12 @@ def run_single_batch_size(
             total_slots=total_slots,
             window_past=int(scenario["metadata"]["error_window_past"]),
             window_future=int(scenario["metadata"]["error_window_future"]),
+            window_past_decay_slots=int(
+                scenario["metadata"].get(
+                    "error_window_past_decay_slots",
+                    getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0),
+                )
+            ),
             real_assignments=real_assignments,
             modeled_assignments=modeled_assignments,
         )
@@ -432,6 +463,27 @@ def run_single_batch_size(
             if modeled_assignments
             else 0.0
         )
+        
+        # Compute skip-first-K variant (steady-state, excluding startup transient)
+        global_average_error_real_skip_first_k = 0.0
+        global_average_error_modeled_skip_first_k = 0.0
+        if skip_first_k_slots > 0:
+            real_skip = [
+                a for a in real_assignments
+                if int(a.scheduled_slot) >= skip_first_k_slots
+            ]
+            modeled_skip = [
+                a for a in modeled_assignments
+                if int(a.scheduled_slot) >= skip_first_k_slots
+            ]
+            global_average_error_real_skip_first_k = (
+                sum(float(a.error) for a in real_skip) / len(real_skip)
+                if real_skip else 0.0
+            )
+            global_average_error_modeled_skip_first_k = (
+                sum(float(a.error) for a in modeled_skip) / len(modeled_skip)
+                if modeled_skip else 0.0
+            )
         requests_assigned_with_greedy_fallback = sum(
             1
             for row in per_request_rows
@@ -470,6 +522,8 @@ def run_single_batch_size(
             "global_average_error": float(global_average_error_modeled),
             "global_average_error_real": float(global_average_error_real),
             "global_average_error_modeled": float(global_average_error_modeled),
+            "global_average_error_real_skip_first_k": float(global_average_error_real_skip_first_k),
+            "global_average_error_modeled_skip_first_k": float(global_average_error_modeled_skip_first_k),
             "requests_assigned_with_greedy_fallback": int(requests_assigned_with_greedy_fallback),
             "requests_assigned_with_relaxed_retry": int(requests_assigned_with_relaxed_retry),
         }
@@ -489,6 +543,7 @@ def run_greedy_baseline(
     *,
     realtime_slots: bool = False,
     realtime_speed_scale: float = 1.0,
+    skip_first_k_slots: int = 0,
 ) -> SimulationResult:
     """
     Run immediate per-request baseline without carbon-shifting decisions.
@@ -615,6 +670,12 @@ def run_greedy_baseline(
         total_slots=total_slots,
         window_past=int(metadata["error_window_past"]),
         window_future=int(metadata["error_window_future"]),
+        window_past_decay_slots=int(
+            metadata.get(
+                "error_window_past_decay_slots",
+                getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0),
+            )
+        ),
         real_assignments=real_assignments,
         modeled_assignments=modeled_assignments,
     )
@@ -634,6 +695,27 @@ def run_greedy_baseline(
         if modeled_assignments
         else 0.0
     )
+    
+    # Compute skip-first-K variant (steady-state, excluding startup transient)
+    global_average_error_real_skip_first_k = 0.0
+    global_average_error_modeled_skip_first_k = 0.0
+    if skip_first_k_slots > 0:
+        real_skip = [
+            a for a in real_assignments
+            if int(a.scheduled_slot) >= skip_k
+        ]
+        modeled_skip = [
+            a for a in modeled_assignments
+            if int(a.scheduled_slot) >= skip_k
+        ]
+        global_average_error_real_skip_first_k = (
+            sum(float(a.error) for a in real_skip) / len(real_skip)
+            if real_skip else 0.0
+        )
+        global_average_error_modeled_skip_first_k = (
+            sum(float(a.error) for a in modeled_skip) / len(modeled_skip)
+            if modeled_skip else 0.0
+        )
 
     summary = {
         "execution_mode": "greedy_baseline_immediate",
@@ -660,6 +742,8 @@ def run_greedy_baseline(
         "global_average_error": float(global_average_error_modeled),
         "global_average_error_real": float(global_average_error_real),
         "global_average_error_modeled": float(global_average_error_modeled),
+        "global_average_error_real_skip_first_k": float(global_average_error_real_skip_first_k),
+        "global_average_error_modeled_skip_first_k": float(global_average_error_modeled_skip_first_k),
         "requests_assigned_with_greedy_fallback": 0,
         "requests_assigned_with_relaxed_retry": 0,
     }

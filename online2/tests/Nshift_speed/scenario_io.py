@@ -52,8 +52,9 @@ def generate_scenario_data(
     error_window_future: int,
     max_error_threshold: float,
     prehistory_error_ratio: float,
-    carbon_random_noise_amplitude: float = 60.0,
+    carbon_random_noise_amplitude: float = 40.0,
     prehistory_mock_influence: float = 1.0,
+    error_window_past_decay_slots: int = 0,
 ) -> Dict[str, Any]:
     """
     Build a deterministic scenario payload.
@@ -120,6 +121,7 @@ def generate_scenario_data(
             "deadline_max_slack": int(deadline_max_slack),
             "error_window_past": int(error_window_past),
             "error_window_future": int(error_window_future),
+            "error_window_past_decay_slots": int(error_window_past_decay_slots),
             "max_error_threshold": float(max_error_threshold),
             "prehistory_error_ratio": float(prehistory_error_ratio),
             "carbon_random_noise_amplitude": noise,

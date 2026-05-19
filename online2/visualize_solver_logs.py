@@ -327,6 +327,13 @@ def plot_solver_execution_stacked(
     slots = all_slots
 
     fig, ax = plt.subplots(figsize=(17, 7))
+    _draw_window_decay_overlay(
+        ax=ax,
+        current_slot=current_slot,
+        window_start=window_start,
+        window_end=window_end,
+        total_slots=int(config.TOTAL_SLOTS),
+    )
     history_by_slot = pd.DataFrame()
     if not runs_df.empty:
         history_src = runs_df.copy()
@@ -482,11 +489,12 @@ def plot_solver_execution_stacked(
             or history_by_slot["error_window_avg_after_real"].notna().any()
         )
     )
+    show_window_avg_real_line = bool(getattr(config, "SHOW_WINDOW_AVG_REAL_LINE", True))
     need_ax2 = (
         not run_slots.empty
         or history_has_error
         or window_avg_modeled is not None
-        or window_avg_real is not None
+        or (show_window_avg_real_line and window_avg_real is not None)
     )
 
     if need_ax2:
@@ -536,16 +544,20 @@ def plot_solver_execution_stacked(
 
         if window_avg_modeled is not None and pd.notna(window_avg_modeled):
             ax2.plot(
-                [window_start, window_end],
+                [window_start - 0.5, window_end + 0.5],
                 [window_avg_modeled, window_avg_modeled],
                 color="#e30eff",
                 linewidth=2.0,
                 alpha=0.45,
                 label=f"Window avg (modeled) [{window_start},{window_end}]",
             )
-        if window_avg_real is not None and pd.notna(window_avg_real):
+        if (
+            show_window_avg_real_line
+            and window_avg_real is not None
+            and pd.notna(window_avg_real)
+        ):
             ax2.plot(
-                [window_start, window_end],
+                [window_start - 0.5, window_end + 0.5],
                 [window_avg_real, window_avg_real],
                 color="#2ca02c",
                 linewidth=1.8,
@@ -625,6 +637,48 @@ def plot_solver_execution_stacked(
     ax.grid(True, axis="y", alpha=0.2)
     plt.tight_layout()
     return fig
+
+
+def _draw_window_decay_overlay(
+    ax,
+    current_slot: int,
+    window_start: int,
+    window_end: int,
+    total_slots: int,
+) -> None:
+    window_color = "#f4a261"
+    full_window_alpha = 0.3
+    clipped_start = max(0, int(window_start))
+    clipped_end = min(int(total_slots) - 1, int(window_end))
+    if clipped_end >= clipped_start:
+        ax.axvspan(
+            clipped_start - 0.5,
+            clipped_end + 0.5,
+            color=window_color,
+            alpha=full_window_alpha,
+            zorder=0,
+            label="Error window",
+        )
+
+    full_weight_past = max(0, int(getattr(config, "ERROR_WINDOW_PAST", 0)))
+    decay_slots = max(0, int(getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0)))
+    shown_decay_legend = False
+    for offset in range(1, decay_slots + 1):
+        slot = int(current_slot) - full_weight_past - offset
+        if slot < 0 or slot >= int(total_slots):
+            continue
+        # Nearest decayed slot has weight K/(K+1), farthest has 1/(K+1).
+        decay_weight = float(decay_slots - offset + 1) / float(decay_slots + 1)
+        label = "Past window (decayed)" if not shown_decay_legend else "_nolegend_"
+        shown_decay_legend = True
+        ax.axvspan(
+            slot - 0.5,
+            slot + 0.5,
+            color=window_color,
+            alpha=full_window_alpha * decay_weight,
+            zorder=0,
+            label=label,
+        )
 
 
 def plot_infeasibility_overview(debug_df: pd.DataFrame):

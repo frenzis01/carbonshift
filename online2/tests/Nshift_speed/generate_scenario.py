@@ -29,11 +29,14 @@ def generate_and_save_scenario(
     error_window_future: int,
     max_error_threshold: float,
     prehistory_error_ratio: float,
-    carbon_random_noise_amplitude: float = 60.0,
+    carbon_random_noise_amplitude: float = 40.0,
     prehistory_mock_influence: Optional[float] = None,
+    error_window_past_decay_slots: Optional[int] = None,
 ) -> Dict[str, Any]:
     if prehistory_mock_influence is None:
         prehistory_mock_influence = float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0))
+    if error_window_past_decay_slots is None:
+        error_window_past_decay_slots = int(getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0))
     scenario = generate_scenario_data(
         seed=seed,
         total_slots=total_slots,
@@ -44,6 +47,7 @@ def generate_and_save_scenario(
         deadline_max_slack=deadline_max_slack,
         error_window_past=error_window_past,
         error_window_future=error_window_future,
+        error_window_past_decay_slots=error_window_past_decay_slots,
         max_error_threshold=max_error_threshold,
         prehistory_error_ratio=prehistory_error_ratio,
         carbon_random_noise_amplitude=carbon_random_noise_amplitude,
@@ -81,10 +85,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "deadline_max_slack": int(getattr(config, "ASSIGNMENT_MAX_FUTURE_SLOTS", 8)),
         "error_window_past": int(getattr(config, "ERROR_WINDOW_PAST", 5)),
         "error_window_future": int(getattr(config, "ERROR_WINDOW_FUTURE", 8)),
+        "error_window_past_decay_slots": int(getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 6)),
         "max_error_threshold": float(getattr(config, "MAX_ERROR_THRESHOLD", 4.0)),
-        "prehistory_error_ratio": 0.75,
-        "carbon_random_noise_amplitude": 60.0,
-        "prehistory_mock_influence": float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0)),
+        "prehistory_error_ratio": float(getattr(config, "PREHISTORY_ERROR_RATIO_OF_THRESHOLD", 1.0)),
+        "carbon_random_noise_amplitude": float(getattr(config, "CARBON_RANDOM_NOISE_AMPLITUDE", 40.0)),
+        "prehistory_mock_influence": float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 0.4)),
     }
     
     if not use_config:
@@ -96,6 +101,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "deadline_max_slack": 8,
             "error_window_past": 5,
             "error_window_future": 8,
+            "error_window_past_decay_slots": 6,
             "max_error_threshold": 4.0,
         })
     
@@ -108,6 +114,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deadline-max-slack", type=int, default=defaults_dict["deadline_max_slack"])
     parser.add_argument("--error-window-past", type=int, default=defaults_dict["error_window_past"])
     parser.add_argument("--error-window-future", type=int, default=defaults_dict["error_window_future"])
+    parser.add_argument(
+        "--error-window-past-decay-slots",
+        type=int,
+        default=defaults_dict["error_window_past_decay_slots"],
+    )
     parser.add_argument("--max-error-threshold", type=float, default=defaults_dict["max_error_threshold"])
     parser.add_argument("--prehistory-error-ratio", type=float, default=defaults_dict["prehistory_error_ratio"])
     parser.add_argument(
@@ -145,6 +156,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Deadline Max Slack (slots):        {args.deadline_max_slack}")
     print(f"  Error Window Past (slots):         {args.error_window_past}")
     print(f"  Error Window Future (slots):       {args.error_window_future}")
+    print(f"  Error Window Past Decay Slots:     {args.error_window_past_decay_slots}")
     print(f"  Max Error Threshold (%):           {args.max_error_threshold}")
     print(f"  Prehistory Error Ratio:            {args.prehistory_error_ratio}")
     print(f"  Carbon Random Noise Amplitude:     {args.carbon_random_noise_amplitude}")
@@ -164,6 +176,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         deadline_max_slack=args.deadline_max_slack,
         error_window_past=args.error_window_past,
         error_window_future=args.error_window_future,
+        error_window_past_decay_slots=args.error_window_past_decay_slots,
         max_error_threshold=args.max_error_threshold,
         prehistory_error_ratio=args.prehistory_error_ratio,
         carbon_random_noise_amplitude=args.carbon_random_noise_amplitude,

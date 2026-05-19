@@ -39,9 +39,15 @@ STRATEGIES = [
 MAX_ERROR_THRESHOLD = 4.0  # %
 
 # Window size for error calculation (symmetric around current slot)
-ERROR_WINDOW_PAST = 5
+ERROR_WINDOW_PAST = 8
 ERROR_WINDOW_FUTURE = 8
 ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE
+
+# Additional past slots with linearly decayed influence in error baseline.
+# For K slots, weights are:
+#   K/(K+1), (K-1)/(K+1), ..., 1/(K+1)
+# Example K=6 => 6/7, 5/7, ..., 1/7
+ERROR_WINDOW_PAST_DECAY_SLOTS = 12
 
 # Requests cannot be placed beyond current_slot + ASSIGNMENT_MAX_FUTURE_SLOTS.
 # Keep this aligned with ERROR_WINDOW_FUTURE unless you explicitly want a smaller
@@ -53,12 +59,18 @@ ASSIGNMENT_MAX_FUTURE_SLOTS = 8
 # with request counts tied to the known arrival rate.
 # This avoids an empty baseline at startup.
 PREHISTORY_USE_VIRTUAL_PAST = True
-PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 0.75  # avg error = threshold * ratio
+PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 1.0  # avg error = threshold * ratio
+# Forecast-policy synthetic error ratio for infeasibility recovery.
+# Used only by INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot":
+# mock_error = MAX_ERROR_THRESHOLD * FORECAST_ERROR_RATIO_OF_THRESHOLD
+FORECAST_ERROR_RATIO_OF_THRESHOLD = 1.0
 PREHISTORY_STOCHASTIC_COUNTS = True
 PREHISTORY_RANDOM_SEED = 4242
 # Separate scaling factor for synthetic prehistory request counts used in
 # benchmark scenario generation (independent from runtime infeasibility mocks).
-PREHISTORY_MOCK_INFLUENCE = 0.2
+PREHISTORY_MOCK_INFLUENCE = 0.4
+CARBON_RANDOM_NOISE_AMPLITUDE = 40.0
+
 
 # ============================================================================
 # CAPACITY TIERS (REBOUND EFFECT)
@@ -100,7 +112,7 @@ DP_LOCK_FUTURE_ASSIGNMENTS = True
 
 # If strict error-window DP is infeasible, allow one relaxed retry.
 # Disable to enforce hard-threshold behavior only.
-DP_ALLOW_RELAXED_ERROR_RETRY = True
+DP_ALLOW_RELAXED_ERROR_RETRY = False
 
 # When relaxed retry is enabled, prefer the minimum-error strategy(ies) so the
 # system can recover from a violated baseline instead of drifting to high error.
@@ -117,6 +129,11 @@ INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
 # Range [0, 1]: lower means less mock influence (more pessimistic).
 # 1.0 = full mock influence, 0.0 = disable mock contribution.
 INFEASIBILITY_MOCK_INFLUENCE = 0.4
+4
+# Optional fixed per-request error (%) for infeasibility synthetic mocks.
+# - None: use policy-derived value (carryover slot average, or threshold*ratio).
+# - >= 0: override policy-derived value with a fixed error.
+INFEASIBILITY_MOCK_ERROR_PER_REQUEST = None
 
 # Consecutive above-threshold window slots decay the effective mock influence:
 # effective = max(0, base_influence - streak * decay_step)
@@ -176,6 +193,10 @@ ENABLE_SOLVER_LOGGING = True
 SOLVER_RUNS_FILE = "/tmp/online2_solver_runs.csv"
 SOLVER_ASSIGNMENTS_FILE = "/tmp/online2_solver_assignments.csv"
 SOLVER_SLOT_METRICS_FILE = "/tmp/online2_solver_slot_metrics.csv"
+
+# Visualization flags (used by visualize_solver_logs.py)
+# If False, hide only the horizontal "Window avg (real)" line.
+SHOW_WINDOW_AVG_REAL_LINE = True
 
 # Strict-infeasibility debug log:
 # captures the state when strict error-window constraints reject a batch

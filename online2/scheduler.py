@@ -70,6 +70,10 @@ class BatchScheduler:
         self._mock_influence_effective = self._mock_influence_base
         self._mock_influence_above_threshold_streak = 0
         self._mock_influence_last_eval_slot: Optional[int] = None
+        self._persistent_mock_slot: Optional[int] = None
+        self._persistent_mock_mode: Optional[str] = None
+        self._persistent_mock_remaining = 0
+        self._persistent_mock_error = 0.0
 
         # Initialize DP solver
         self.carbon_forecast = self._get_carbon_forecast()
@@ -494,6 +498,12 @@ class BatchScheduler:
             window_future=config.ERROR_WINDOW_FUTURE,
             exclude_request_ids=movable_future_ids,
         )
+        error_baseline, decayed_past_ctx = self._augment_error_baseline_with_decayed_past(
+            current_slot=current_slot,
+            error_baseline=error_baseline,
+            exclude_request_ids=movable_future_ids,
+        )
+        solve_context.update(decayed_past_ctx)
         error_baseline, prehistory_ctx = self._augment_error_baseline_with_virtual_past(
             current_slot=current_slot,
             error_baseline=error_baseline,
@@ -629,17 +639,25 @@ class BatchScheduler:
         solve_context["window_start_slot"] = window_start
         solve_context["window_end_slot"] = window_end
         modeled_error_sum = float(error_baseline.get("error_sum", 0.0))
-        modeled_request_count = int(error_baseline.get("request_count", 0))
-        mock_remaining = int(dynamic_mock_pool.get("initial_count", 0))
+        modeled_request_count = float(error_baseline.get("request_count", 0.0))
+        initial_mock_count = int(dynamic_mock_pool.get("initial_count", 0))
+        mock_remaining = initial_mock_count
         mock_error = float(dynamic_mock_pool.get("error_per_request", 0.0))
         for assignment in assignments:
             if window_start <= int(assignment.scheduled_slot) <= window_end:
                 modeled_error_sum += float(assignment.error)
-                modeled_request_count += 1
+                modeled_request_count += 1.0
                 if mock_remaining > 0 and mock_error > 0.0:
                     modeled_error_sum -= mock_error
-                    modeled_request_count = max(0, modeled_request_count - 1)
+                    modeled_request_count = max(0.0, modeled_request_count - 1.0)
                     mock_remaining -= 1
+        mock_consumed = max(0, initial_mock_count - mock_remaining)
+        solve_context["mock_recovery_consumed_in_run"] = mock_consumed
+        solve_context["mock_recovery_remaining_after"] = self._consume_persistent_mock_pool(
+            current_slot=current_slot,
+            recovery_mode=solve_context.get("infeasibility_recovery_mode", "min_error_recovery"),
+            consumed_count=mock_consumed,
+        )
         solve_context["modeled_window_avg_after"] = (
             modeled_error_sum / modeled_request_count if modeled_request_count > 0 else 0.0
         )
@@ -691,7 +709,7 @@ class BatchScheduler:
         predicted arrival rate and a mean error equal to half threshold.
         """
         base_error_sum = float(error_baseline.get("error_sum", 0.0))
-        base_request_count = int(error_baseline.get("request_count", 0))
+        base_request_count = float(error_baseline.get("request_count", 0.0))
         context = {
             "virtual_past_slots_used": 0,
             "virtual_past_requests": 0,
@@ -721,10 +739,11 @@ class BatchScheduler:
 
         augmented = {
             "error_sum": base_error_sum + (virtual_requests * virtual_avg_error),
-            "request_count": base_request_count + virtual_requests,
+            "request_count": base_request_count + float(virtual_requests),
             "average_error": (
-                (base_error_sum + (virtual_requests * virtual_avg_error)) / (base_request_count + virtual_requests)
-                if (base_request_count + virtual_requests) > 0
+                (base_error_sum + (virtual_requests * virtual_avg_error))
+                / (base_request_count + float(virtual_requests))
+                if (base_request_count + float(virtual_requests)) > 0
                 else 0.0
             ),
         }
@@ -736,6 +755,78 @@ class BatchScheduler:
             }
         )
         return augmented, context
+
+    def _augment_error_baseline_with_decayed_past(
+        self,
+        current_slot: int,
+        error_baseline: Dict[str, float],
+        exclude_request_ids: Optional[Set[int]] = None,
+    ) -> Tuple[Dict[str, float], Dict]:
+        """
+        Extend past horizon with decayed influence on older slots.
+
+        Slots added:
+            [current_slot - ERROR_WINDOW_PAST - 1, ..., current_slot - ERROR_WINDOW_PAST - K]
+        where K = ERROR_WINDOW_PAST_DECAY_SLOTS.
+
+        Weight for i-th additional slot (i=1 nearest, i=K farthest):
+            (K - i + 1) / (K + 1)
+        """
+        base_error_sum = float(error_baseline.get("error_sum", 0.0))
+        base_request_count = float(error_baseline.get("request_count", 0.0))
+        decay_slots = max(0, int(getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0)))
+        context = {
+            "decayed_past_slots_configured": decay_slots,
+            "decayed_past_slots_used": 0,
+            "decayed_past_weighted_requests": 0.0,
+            "decayed_past_weighted_error_sum": 0.0,
+        }
+        if decay_slots <= 0:
+            return error_baseline, context
+
+        excluded = exclude_request_ids or set()
+        weighted_request_count = 0.0
+        weighted_error_sum = 0.0
+        used_slots = 0
+        denominator = float(decay_slots + 1)
+
+        for idx in range(1, decay_slots + 1):
+            slot = int(current_slot) - int(config.ERROR_WINDOW_PAST) - idx
+            slot_assignments = [
+                a
+                for a in self.shared_state.get_requests_in_slot(slot)
+                if a.request_id not in excluded
+            ]
+            slot_count = len(slot_assignments)
+            if slot_count <= 0:
+                continue
+
+            slot_avg_error = sum(float(a.error) for a in slot_assignments) / float(slot_count)
+            weight = float(decay_slots - idx + 1) / denominator
+            slot_weighted_count = float(slot_count) * weight
+            weighted_request_count += slot_weighted_count
+            weighted_error_sum += slot_avg_error * slot_weighted_count
+            used_slots += 1
+
+        if weighted_request_count <= 0.0:
+            return error_baseline, context
+
+        augmented_error_sum = base_error_sum + weighted_error_sum
+        augmented_request_count = base_request_count + weighted_request_count
+        context.update(
+            {
+                "decayed_past_slots_used": used_slots,
+                "decayed_past_weighted_requests": weighted_request_count,
+                "decayed_past_weighted_error_sum": weighted_error_sum,
+            }
+        )
+        return {
+            "error_sum": augmented_error_sum,
+            "request_count": augmented_request_count,
+            "average_error": (
+                augmented_error_sum / augmented_request_count if augmented_request_count > 0.0 else 0.0
+            ),
+        }, context
 
     def _apply_infeasibility_recovery_policy(
         self,
@@ -758,6 +849,8 @@ class BatchScheduler:
             "infeasibility_recovery_mode": mode,
             "mock_recovery_count": 0,
             "mock_recovery_error": 0.0,
+            "mock_recovery_remaining_before": 0,
+            "mock_recovery_source": "none",
             "mock_influence_base": self._mock_influence_base,
             "mock_influence_effective": self._mock_influence_effective,
             "mock_influence_decay_step": self._get_mock_influence_decay_step(),
@@ -767,35 +860,20 @@ class BatchScheduler:
         dynamic_mock_pool = {"initial_count": 0, "error_per_request": 0.0}
 
         if mode == "min_error_recovery":
+            self._reset_persistent_mock_pool()
             return error_baseline, dynamic_mock_pool, context
 
         augmented = dict(error_baseline)
-        mock_count = 0
-        mock_error = 0.0
-
-        if mode == "carryover_last_slot":
-            window_start = max(0, current_slot - int(config.ERROR_WINDOW_PAST))
-            dropped_slot = window_start - 1
-            if dropped_slot >= 0:
-                dropped_assignments = self.shared_state.get_requests_in_slot(dropped_slot)
-                mock_count = len(dropped_assignments)
-                if mock_count > 0:
-                    mock_error = sum(a.error for a in dropped_assignments) / mock_count
-
-        elif mode == "forecast_mock_current_slot":
-            expected_rate = float(config.PREDICTED_REQUESTS_PER_SLOT)
-            sigma = max(1.0, expected_rate * float(config.REQUEST_RATE_STD_FACTOR))
-            rng = random.Random(int(config.PREHISTORY_RANDOM_SEED) + int(current_slot))
-            mock_count = max(0, int(rng.gauss(expected_rate, sigma)))
-            mock_error = float(config.MAX_ERROR_THRESHOLD) * float(config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD)
-
-        if mode in {"carryover_last_slot", "forecast_mock_current_slot"} and mock_count > 0:
-            influence = self._mock_influence_effective
-            mock_count = int(round(mock_count * influence))
+        mock_count, mock_error, source = self._get_persistent_mock_pool(
+            current_slot=current_slot,
+            mode=mode,
+        )
+        context["mock_recovery_source"] = source
+        context["mock_recovery_remaining_before"] = mock_count
 
         if mock_count > 0 and mock_error > 0.0:
             augmented_error_sum = float(augmented.get("error_sum", 0.0)) + mock_count * mock_error
-            augmented_request_count = int(augmented.get("request_count", 0)) + mock_count
+            augmented_request_count = float(augmented.get("request_count", 0.0)) + float(mock_count)
             augmented = {
                 "error_sum": augmented_error_sum,
                 "request_count": augmented_request_count,
@@ -811,8 +889,101 @@ class BatchScheduler:
 
         return augmented, dynamic_mock_pool, context
 
+    def _compute_mock_seed_for_mode(self, current_slot: int, mode: str) -> Tuple[int, float]:
+        mock_count = 0
+        mock_error = 0.0
+
+        if mode == "carryover_last_slot":
+            window_start = max(0, current_slot - int(config.ERROR_WINDOW_PAST))
+            dropped_slot = window_start - 1
+            if dropped_slot >= 0:
+                dropped_assignments = self.shared_state.get_requests_in_slot(dropped_slot)
+                mock_count = len(dropped_assignments)
+                if mock_count > 0:
+                    carryover_avg_error = sum(a.error for a in dropped_assignments) / mock_count
+                    mock_error = self._resolve_infeasibility_mock_error(carryover_avg_error)
+
+        elif mode == "forecast_mock_current_slot":
+            expected_rate = float(config.PREDICTED_REQUESTS_PER_SLOT)
+            sigma = max(1.0, expected_rate * float(config.REQUEST_RATE_STD_FACTOR))
+            rng = random.Random(int(config.PREHISTORY_RANDOM_SEED) + int(current_slot))
+            mock_count = max(0, int(rng.gauss(expected_rate, sigma)))
+            forecast_default_error = (
+                float(config.MAX_ERROR_THRESHOLD)
+                * float(getattr(config, "FORECAST_ERROR_RATIO_OF_THRESHOLD", 1.0))
+            )
+            mock_error = self._resolve_infeasibility_mock_error(forecast_default_error)
+
+        if mode in {"carryover_last_slot", "forecast_mock_current_slot"} and mock_count > 0:
+            influence = self._mock_influence_effective
+            mock_count = int(round(mock_count * influence))
+
+        return mock_count, mock_error
+
+    def _get_persistent_mock_pool(
+        self,
+        current_slot: int,
+        mode: str,
+    ) -> Tuple[int, float, str]:
+        with self._lock:
+            same_window = (
+                self._persistent_mock_slot == int(current_slot)
+                and self._persistent_mock_mode == str(mode)
+            )
+            if same_window:
+                return (
+                    int(self._persistent_mock_remaining),
+                    float(self._persistent_mock_error),
+                    "persistent_remaining",
+                )
+
+        mock_count, mock_error = self._compute_mock_seed_for_mode(current_slot=current_slot, mode=mode)
+        with self._lock:
+            self._persistent_mock_slot = int(current_slot)
+            self._persistent_mock_mode = str(mode)
+            self._persistent_mock_remaining = max(0, int(mock_count))
+            self._persistent_mock_error = max(0.0, float(mock_error))
+            return (
+                int(self._persistent_mock_remaining),
+                float(self._persistent_mock_error),
+                "new_window_seed",
+            )
+
+    def _consume_persistent_mock_pool(
+        self,
+        current_slot: int,
+        recovery_mode: str,
+        consumed_count: int,
+    ) -> int:
+        if str(recovery_mode) == "min_error_recovery":
+            return 0
+        with self._lock:
+            if (
+                self._persistent_mock_slot != int(current_slot)
+                or self._persistent_mock_mode != str(recovery_mode)
+            ):
+                return 0
+            self._persistent_mock_remaining = max(
+                0,
+                int(self._persistent_mock_remaining) - max(0, int(consumed_count)),
+            )
+            return int(self._persistent_mock_remaining)
+
+    def _reset_persistent_mock_pool(self) -> None:
+        with self._lock:
+            self._persistent_mock_slot = None
+            self._persistent_mock_mode = None
+            self._persistent_mock_remaining = 0
+            self._persistent_mock_error = 0.0
+
     def _clamp_mock_influence(self, value: float) -> float:
         return max(0.0, min(1.0, float(value)))
+
+    def _resolve_infeasibility_mock_error(self, fallback_error: float) -> float:
+        configured = getattr(config, "INFEASIBILITY_MOCK_ERROR_PER_REQUEST", None)
+        if configured is None:
+            return max(0.0, float(fallback_error))
+        return max(0.0, float(configured))
 
     def _get_mock_influence_decay_step(self) -> float:
         return max(
@@ -1052,13 +1223,13 @@ class BatchScheduler:
         max_strategy_error = max((s.error for s in self.strategies), default=0.0)
 
         baseline_error_sum = float(error_baseline.get("error_sum", 0.0))
-        baseline_request_count = int(error_baseline.get("request_count", 0))
+        baseline_request_count = float(error_baseline.get("request_count", 0.0))
         baseline_average_error = (
             baseline_error_sum / baseline_request_count if baseline_request_count > 0 else 0.0
         )
 
         pending_count = len(pending_requests)
-        denominator = baseline_request_count + pending_count
+        denominator = baseline_request_count + float(pending_count)
         min_possible_avg = (
             (baseline_error_sum + pending_count * min_strategy_error) / denominator
             if denominator > 0

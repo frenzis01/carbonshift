@@ -492,6 +492,156 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         self.assertAlmostEqual(float(ctx_slot_21["mock_influence_effective"]), 0.0, places=9)
         self.assertAlmostEqual(float(ctx_slot_22["mock_influence_effective"]), 0.0, places=9)
 
+    def test_infeasibility_mock_error_can_be_overridden_from_config(self):
+        shared_state = SharedSchedulerState()
+        scheduler = BatchScheduler(shared_state)
+
+        original_mode = config.INFEASIBILITY_RECOVERY_MODE
+        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
+        original_pred_rate = config.PREDICTED_REQUESTS_PER_SLOT
+        original_std = config.REQUEST_RATE_STD_FACTOR
+        original_seed = config.PREHISTORY_RANDOM_SEED
+        original_threshold = config.MAX_ERROR_THRESHOLD
+        original_ratio = config.FORECAST_ERROR_RATIO_OF_THRESHOLD
+        original_mock_error = getattr(config, "INFEASIBILITY_MOCK_ERROR_PER_REQUEST", None)
+        try:
+            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
+            config.INFEASIBILITY_MOCK_INFLUENCE = 1.0
+            config.PREDICTED_REQUESTS_PER_SLOT = 40.0
+            config.REQUEST_RATE_STD_FACTOR = 0.0
+            config.PREHISTORY_RANDOM_SEED = 4242
+            config.MAX_ERROR_THRESHOLD = 4.0
+            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = 0.5
+            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = 1.23
+
+            _, _, ctx = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=5,
+                error_baseline={"error_sum": 0.0, "request_count": 0, "average_error": 0.0},
+            )
+        finally:
+            config.INFEASIBILITY_RECOVERY_MODE = original_mode
+            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
+            config.PREDICTED_REQUESTS_PER_SLOT = original_pred_rate
+            config.REQUEST_RATE_STD_FACTOR = original_std
+            config.PREHISTORY_RANDOM_SEED = original_seed
+            config.MAX_ERROR_THRESHOLD = original_threshold
+            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = original_ratio
+            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = original_mock_error
+
+        self.assertGreater(int(ctx.get("mock_recovery_count", 0)), 0)
+        self.assertAlmostEqual(float(ctx.get("mock_recovery_error", 0.0)), 1.23, places=9)
+
+    def test_forecast_mock_uses_forecast_error_ratio(self):
+        shared_state = SharedSchedulerState()
+        scheduler = BatchScheduler(shared_state)
+
+        original_mode = config.INFEASIBILITY_RECOVERY_MODE
+        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
+        original_pred_rate = config.PREDICTED_REQUESTS_PER_SLOT
+        original_std = config.REQUEST_RATE_STD_FACTOR
+        original_seed = config.PREHISTORY_RANDOM_SEED
+        original_threshold = config.MAX_ERROR_THRESHOLD
+        original_ratio = config.FORECAST_ERROR_RATIO_OF_THRESHOLD
+        original_mock_error = getattr(config, "INFEASIBILITY_MOCK_ERROR_PER_REQUEST", None)
+        try:
+            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
+            config.INFEASIBILITY_MOCK_INFLUENCE = 1.0
+            config.PREDICTED_REQUESTS_PER_SLOT = 40.0
+            config.REQUEST_RATE_STD_FACTOR = 0.0
+            config.PREHISTORY_RANDOM_SEED = 4242
+            config.MAX_ERROR_THRESHOLD = 4.0
+            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = 0.25
+            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = None
+
+            _, _, ctx = scheduler._apply_infeasibility_recovery_policy(
+                current_slot=5,
+                error_baseline={"error_sum": 0.0, "request_count": 0, "average_error": 0.0},
+            )
+        finally:
+            config.INFEASIBILITY_RECOVERY_MODE = original_mode
+            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
+            config.PREDICTED_REQUESTS_PER_SLOT = original_pred_rate
+            config.REQUEST_RATE_STD_FACTOR = original_std
+            config.PREHISTORY_RANDOM_SEED = original_seed
+            config.MAX_ERROR_THRESHOLD = original_threshold
+            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = original_ratio
+            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = original_mock_error
+
+        self.assertGreater(int(ctx.get("mock_recovery_count", 0)), 0)
+        self.assertAlmostEqual(float(ctx.get("mock_recovery_error", 0.0)), 1.0, places=9)
+
+    def test_mock_decay_persists_across_runs_in_same_slot(self):
+        shared_state = SharedSchedulerState()
+        shared_state.set_current_slot(0)
+        scheduler = BatchScheduler(shared_state)
+
+        original_mode = config.INFEASIBILITY_RECOVERY_MODE
+        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
+        original_pred_rate = config.PREDICTED_REQUESTS_PER_SLOT
+        original_std = config.REQUEST_RATE_STD_FACTOR
+        original_seed = config.PREHISTORY_RANDOM_SEED
+        original_threshold = config.MAX_ERROR_THRESHOLD
+        original_ratio = config.FORECAST_ERROR_RATIO_OF_THRESHOLD
+        original_mock_error = getattr(config, "INFEASIBILITY_MOCK_ERROR_PER_REQUEST", None)
+        original_prehistory = config.PREHISTORY_USE_VIRTUAL_PAST
+        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
+        original_verbose = config.VERBOSE
+        try:
+            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
+            config.INFEASIBILITY_MOCK_INFLUENCE = 1.0
+            config.PREDICTED_REQUESTS_PER_SLOT = 40.0
+            config.REQUEST_RATE_STD_FACTOR = 0.0
+            config.PREHISTORY_RANDOM_SEED = 4242
+            config.MAX_ERROR_THRESHOLD = 20.0
+            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = 0.25
+            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = None
+            config.PREHISTORY_USE_VIRTUAL_PAST = False
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
+            config.VERBOSE = False
+
+            batch_a = [
+                Request(id=1001, arrival_slot=0, deadline_slot=0),
+                Request(id=1002, arrival_slot=0, deadline_slot=0),
+                Request(id=1003, arrival_slot=0, deadline_slot=0),
+            ]
+            assignments_a, ctx_a = scheduler._solve_dp(batch_a, current_slot=0)
+
+            batch_b = [
+                Request(id=1004, arrival_slot=0, deadline_slot=0),
+                Request(id=1005, arrival_slot=0, deadline_slot=0),
+                Request(id=1006, arrival_slot=0, deadline_slot=0),
+            ]
+            assignments_b, ctx_b = scheduler._solve_dp(batch_b, current_slot=0)
+        finally:
+            config.INFEASIBILITY_RECOVERY_MODE = original_mode
+            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
+            config.PREDICTED_REQUESTS_PER_SLOT = original_pred_rate
+            config.REQUEST_RATE_STD_FACTOR = original_std
+            config.PREHISTORY_RANDOM_SEED = original_seed
+            config.MAX_ERROR_THRESHOLD = original_threshold
+            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = original_ratio
+            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = original_mock_error
+            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory
+            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
+            config.VERBOSE = original_verbose
+
+        self.assertEqual(len(assignments_a), 3)
+        self.assertEqual(len(assignments_b), 3)
+        self.assertEqual(ctx_a.get("mock_recovery_source"), "new_window_seed")
+        self.assertEqual(ctx_b.get("mock_recovery_source"), "persistent_remaining")
+        self.assertEqual(
+            int(ctx_b.get("mock_recovery_remaining_before", 0)),
+            max(0, int(ctx_a.get("mock_recovery_remaining_after", 0))),
+        )
+        self.assertEqual(
+            int(ctx_a.get("mock_recovery_remaining_after", 0)),
+            max(
+                0,
+                int(ctx_a.get("mock_recovery_remaining_before", 0))
+                - int(ctx_a.get("mock_recovery_consumed_in_run", 0)),
+            ),
+        )
+
 
 class TestSchedulerBatchWorkerParallelism(unittest.TestCase):
     def test_process_batch_requeues_claimed_requests_on_failure(self):
@@ -576,6 +726,62 @@ class TestSchedulerBatchWorkerParallelism(unittest.TestCase):
         self.assertGreaterEqual(calls, 8)
         self.assertGreaterEqual(max_active_workers, 2)
         self.assertLessEqual(max_active_workers, 2)
+
+
+class TestSchedulerDecayedPastWindow(unittest.TestCase):
+    def test_decayed_past_slots_extend_window_with_weighted_influence(self):
+        shared_state = SharedSchedulerState()
+        scheduler = BatchScheduler(shared_state)
+
+        current_slot = 20
+        # Extra past range for ERROR_WINDOW_PAST=5 and decay slots=6:
+        # [14, 13, 12, 11, 10, 9] with weights [6/7, 5/7, ..., 1/7].
+        old_slots = [14, 13, 12, 11, 10, 9]
+        errors = [7.0, 6.0, 5.0, 4.0, 3.0, 2.0]
+        for req_id, (slot, err) in enumerate(zip(old_slots, errors), start=4000):
+            shared_state.add_assignments(
+                [
+                    Assignment(
+                        request_id=req_id,
+                        scheduled_slot=slot,
+                        strategy_name="Balanced",
+                        carbon_cost=0.0,
+                        error=err,
+                        strategy_duration=30,
+                        arrival_slot=slot - 1,
+                        deadline_slot=slot,
+                    )
+                ]
+            )
+
+        original_past = config.ERROR_WINDOW_PAST
+        original_decay = getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0)
+        try:
+            config.ERROR_WINDOW_PAST = 5
+            config.ERROR_WINDOW_PAST_DECAY_SLOTS = 6
+            baseline = {"error_sum": 0.0, "request_count": 0.0, "average_error": 0.0}
+            augmented, ctx = scheduler._augment_error_baseline_with_decayed_past(
+                current_slot=current_slot,
+                error_baseline=baseline,
+                exclude_request_ids=set(),
+            )
+        finally:
+            config.ERROR_WINDOW_PAST = original_past
+            config.ERROR_WINDOW_PAST_DECAY_SLOTS = original_decay
+
+        weights = [6.0 / 7.0, 5.0 / 7.0, 4.0 / 7.0, 3.0 / 7.0, 2.0 / 7.0, 1.0 / 7.0]
+        expected_count = sum(weights)
+        expected_error_sum = sum(err * w for err, w in zip(errors, weights))
+
+        self.assertEqual(int(ctx.get("decayed_past_slots_used", 0)), 6)
+        self.assertAlmostEqual(float(ctx.get("decayed_past_weighted_requests", 0.0)), expected_count, places=9)
+        self.assertAlmostEqual(float(augmented.get("request_count", 0.0)), expected_count, places=9)
+        self.assertAlmostEqual(float(augmented.get("error_sum", 0.0)), expected_error_sum, places=9)
+        self.assertAlmostEqual(
+            float(augmented.get("average_error", 0.0)),
+            expected_error_sum / expected_count,
+            places=9,
+        )
 
 
 if __name__ == "__main__":

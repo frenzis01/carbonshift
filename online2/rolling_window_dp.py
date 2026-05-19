@@ -145,13 +145,13 @@ class RollingWindowDPScheduler:
                 legacy_error_count += 1
 
         initial_error_sum_bp = int(round((error_window_baseline.get("error_sum", 0.0) + legacy_error_sum) * 100))
-        initial_error_count = int(error_window_baseline.get("request_count", 0)) + legacy_error_count
+        initial_error_count = float(error_window_baseline.get("request_count", 0.0)) + float(legacy_error_count)
         initial_mock_count = max(0, int(dynamic_mock_pool.get("initial_count", 0)))
         mock_error_bp = int(round(float(dynamic_mock_pool.get("error_per_request", 0.0)) * 100))
 
         # DP state fields:
         # - error_sum_bp: total error in the active window (basis points)
-        # - error_count: number of requests counted in that window
+        # - error_count: weighted number of requests counted in that window
         # - mock_remaining: synthetic requests still counted in baseline
         # - inc_counts / inc_durations: incremental slot load introduced by this batch
         init_state = (
@@ -201,14 +201,14 @@ class RollingWindowDPScheduler:
                         new_mock_remaining = mock_remaining
                         if window_start <= slot <= window_end:
                             new_error_sum_bp += strategy_error_bp
-                            new_error_count += 1
+                            new_error_count += 1.0
 
                             # Optional synthetic baseline decay:
                             # each new in-window assignment can "replace" one mock
                             # request injected by the recovery policy.
                             if new_mock_remaining > 0 and mock_error_bp > 0:
                                 new_error_sum_bp -= mock_error_bp
-                                new_error_count = max(0, new_error_count - 1)
+                                new_error_count = max(0.0, new_error_count - 1.0)
                                 new_mock_remaining -= 1
 
                         new_inc_counts = inc_counts.copy()
