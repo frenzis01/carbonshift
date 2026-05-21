@@ -32,11 +32,14 @@ def generate_and_save_scenario(
     carbon_random_noise_amplitude: float = 40.0,
     prehistory_mock_influence: Optional[float] = None,
     error_window_past_decay_slots: Optional[int] = None,
+    include_prehistory: Optional[bool] = None,
 ) -> Dict[str, Any]:
     if prehistory_mock_influence is None:
         prehistory_mock_influence = float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0))
     if error_window_past_decay_slots is None:
         error_window_past_decay_slots = int(getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0))
+    if include_prehistory is None:
+        include_prehistory = True
     scenario = generate_scenario_data(
         seed=seed,
         total_slots=total_slots,
@@ -52,6 +55,7 @@ def generate_and_save_scenario(
         prehistory_error_ratio=prehistory_error_ratio,
         carbon_random_noise_amplitude=carbon_random_noise_amplitude,
         prehistory_mock_influence=prehistory_mock_influence,
+        include_prehistory=bool(include_prehistory),
     )
     save_json(output_path, scenario)
     return scenario
@@ -90,6 +94,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "prehistory_error_ratio": float(getattr(config, "PREHISTORY_ERROR_RATIO_OF_THRESHOLD", 1.0)),
         "carbon_random_noise_amplitude": float(getattr(config, "CARBON_RANDOM_NOISE_AMPLITUDE", 40.0)),
         "prehistory_mock_influence": float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 0.4)),
+        "include_prehistory": bool(getattr(config, "PREHISTORY_USE_VIRTUAL_PAST", True)),
     }
     
     if not use_config:
@@ -128,6 +133,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Uniform random amplitude added to carbon intensity (+/- value).",
     )
     parser.add_argument(
+        "--include-prehistory",
+        action=argparse.BooleanOptionalAction,
+        default=defaults_dict["include_prehistory"],
+        help="Include synthetic prehistory slots in the scenario (use --no-include-prehistory to disable).",
+    )
+    parser.add_argument(
         "--prehistory-mock-influence",
         type=float,
         default=defaults_dict["prehistory_mock_influence"],
@@ -159,6 +170,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Error Window Past Decay Slots:     {args.error_window_past_decay_slots}")
     print(f"  Max Error Threshold (%):           {args.max_error_threshold}")
     print(f"  Prehistory Error Ratio:            {args.prehistory_error_ratio}")
+    print(f"  Include Prehistory:                {args.include_prehistory}")
     print(f"  Carbon Random Noise Amplitude:     {args.carbon_random_noise_amplitude}")
     print(f"  Prehistory Mock Influence:         {args.prehistory_mock_influence}")
     print(f"  Use Config Defaults:               {args.use_config_defaults}")
@@ -181,6 +193,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         prehistory_error_ratio=args.prehistory_error_ratio,
         carbon_random_noise_amplitude=args.carbon_random_noise_amplitude,
         prehistory_mock_influence=args.prehistory_mock_influence,
+        include_prehistory=args.include_prehistory,
     )
     
     print(f"\nScenario saved to {args.output}")

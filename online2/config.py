@@ -26,7 +26,7 @@ TOTAL_SLOTS = 24
 # ============================================================================
 
 STRATEGIES = [
-    {"name": "Accurate", "error": 1.0, "duration": 60},    # 1 min
+    {"name": "Accurate", "error": 0.0, "duration": 60},    # 1 min
     {"name": "Balanced", "error": 2.5, "duration": 30},    # 1/2 min
     {"name": "Fast", "error": 5.0, "duration": 10},         # 10 sec
 ]
@@ -39,7 +39,7 @@ STRATEGIES = [
 MAX_ERROR_THRESHOLD = 4.0  # %
 
 # Window size for error calculation (symmetric around current slot)
-ERROR_WINDOW_PAST = 8
+ERROR_WINDOW_PAST = 24
 ERROR_WINDOW_FUTURE = 8
 ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE
 
@@ -47,7 +47,7 @@ ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE
 # For K slots, weights are:
 #   K/(K+1), (K-1)/(K+1), ..., 1/(K+1)
 # Example K=6 => 6/7, 5/7, ..., 1/7
-ERROR_WINDOW_PAST_DECAY_SLOTS = 12
+ERROR_WINDOW_PAST_DECAY_SLOTS = 24
 
 # Requests cannot be placed beyond current_slot + ASSIGNMENT_MAX_FUTURE_SLOTS.
 # Keep this aligned with ERROR_WINDOW_FUTURE unless you explicitly want a smaller
@@ -58,7 +58,7 @@ ASSIGNMENT_MAX_FUTURE_SLOTS = 8
 # for current_slot < ERROR_WINDOW_PAST, we assume virtual past slots (-W..-1)
 # with request counts tied to the known arrival rate.
 # This avoids an empty baseline at startup.
-PREHISTORY_USE_VIRTUAL_PAST = True
+PREHISTORY_USE_VIRTUAL_PAST = False
 PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 1.0  # avg error = threshold * ratio
 # Forecast-policy synthetic error ratio for infeasibility recovery.
 # Used only by INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot":

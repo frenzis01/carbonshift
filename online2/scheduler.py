@@ -444,10 +444,12 @@ class BatchScheduler:
             req.id: {"arrival_slot": req.arrival_slot, "deadline_slot": req.deadline_slot}
             for req in requests
         }
-        assignment_cap_slot = min(
+        window_end = min(
             int(config.TOTAL_SLOTS) - 1,
-            current_slot + int(getattr(config, "ASSIGNMENT_MAX_FUTURE_SLOTS", config.ERROR_WINDOW_FUTURE)),
+            current_slot + int(config.ERROR_WINDOW_FUTURE),
         )
+        # Enforce assignment cap at the end of the error window.
+        assignment_cap_slot = window_end
 
         def _cap_deadline(deadline_slot: Optional[int]) -> int:
             raw = int(deadline_slot) if deadline_slot is not None else assignment_cap_slot

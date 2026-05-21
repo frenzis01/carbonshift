@@ -336,6 +336,8 @@ def plot_solver_execution_stacked(
     )
     history_by_slot = pd.DataFrame()
     if not runs_df.empty:
+        # Build "history so far": only runs up to this run_id (by sequence or timestamp).
+        # This is NOT a recomputation from final assignments; it uses per-run metrics.
         history_src = runs_df.copy()
         for col in ["current_slot", "error_window_avg_after", "error_window_avg_after_real", "solver_start_ts"]:
             if col in history_src.columns:
@@ -353,10 +355,12 @@ def plot_solver_execution_stacked(
             history_src = history_src.sort_values(["current_slot", "solver_start_ts"])
 
         if not history_src.empty:
+            # For each slot, keep only the last run that occurred in that slot (up to this run).
             history_by_slot = history_src.groupby("current_slot", as_index=False).last()
 
     run_slots = pd.DataFrame()
     if slot_metrics_df is not None and not slot_metrics_df.empty:
+        # Slot metrics are per run_id (post-run state), not recomputed globally.
         run_slots = slot_metrics_df[slot_metrics_df["run_id"].astype(str) == run_id].copy()
         if not run_slots.empty:
             run_slots["scheduled_slot"] = run_slots["scheduled_slot"].astype(int)
@@ -542,6 +546,7 @@ def plot_solver_execution_stacked(
                 label="Window avg history (modeled, with mock)",
             )
 
+        # Per-run window averages computed by the solver for this specific run_id.
         if window_avg_modeled is not None and pd.notna(window_avg_modeled):
             ax2.plot(
                 [window_start - 0.5, window_end + 0.5],

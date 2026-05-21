@@ -179,6 +179,7 @@ def run_benchmark_from_config(
             "Completed N="
             f"{batch_size}: solver_ms_avg={result.summary['solver_time_ms_avg']:.3f}, "
             f"total_carbon={result.summary['total_carbon_cost']:.3f}, "
+            f"global_error={result.summary.get('global_average_error', 0.0):.3f}, "
             f"saving_vs_baseline={(summary_row.get('carbon_cost_saving_vs_baseline', 0.0)):.3f}, "
             f"realtime_slots={str(realtime_slots).lower()}, scale={realtime_speed_scale:.2f}"
         )

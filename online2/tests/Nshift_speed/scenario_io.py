@@ -55,6 +55,7 @@ def generate_scenario_data(
     carbon_random_noise_amplitude: float = 40.0,
     prehistory_mock_influence: float = 1.0,
     error_window_past_decay_slots: int = 0,
+    include_prehistory: bool = True,
 ) -> Dict[str, Any]:
     """
     Build a deterministic scenario payload.
@@ -68,7 +69,7 @@ def generate_scenario_data(
     sigma = max(1.0, requests_per_slot * request_rate_std_factor)
 
     forecast: List[float] = []
-    cycle = 10
+    cycle = 24
     base_carbon = 40.0
     amplitude = 100.0
     noise = max(0.0, float(carbon_random_noise_amplitude))
@@ -97,16 +98,19 @@ def generate_scenario_data(
     prehistory_slots: List[Dict[str, Any]] = []
     synthetic_error = max_error_threshold * prehistory_error_ratio
     prehistory_influence = max(0.0, min(1.0, float(prehistory_mock_influence)))
-    for slot in range(-error_window_past, 0):
-        raw_count = max(0, int(round(rng.gauss(requests_per_slot, sigma))))
-        count = int(round(raw_count * prehistory_influence))
-        prehistory_slots.append(
-            {
-                "slot": slot,
-                "request_count": count,
-                "error_per_request": round(synthetic_error, 6),
-            }
-        )
+    if include_prehistory:
+        for slot in range(-error_window_past, 0):
+            raw_count = max(0, int(round(rng.gauss(requests_per_slot, sigma))))
+            count = int(round(raw_count * prehistory_influence))
+            prehistory_slots.append(
+                {
+                    "slot": slot,
+                    "request_count": count,
+                    "error_per_request": round(synthetic_error, 6),
+                }
+            )
+    else:
+        prehistory_influence = 0.0
 
     requests.sort(key=lambda item: (int(item["arrival_slot"]), int(item["request_id"])))
 
@@ -126,6 +130,7 @@ def generate_scenario_data(
             "prehistory_error_ratio": float(prehistory_error_ratio),
             "carbon_random_noise_amplitude": noise,
             "prehistory_mock_influence": prehistory_influence,
+            "prehistory_enabled": bool(include_prehistory),
         },
         "carbon_forecast": forecast,
         "requests": requests,
