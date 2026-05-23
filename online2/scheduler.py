@@ -524,6 +524,32 @@ class BatchScheduler:
                 f"avg_error={solve_context['virtual_past_avg_error']:.2f}%"
             )
 
+        # Global error constraint: if global avg > threshold, filter strategies.
+        global_stats = self.shared_state.get_global_error_stats()
+        global_avg_before = global_stats["avg"]
+        global_count_before = int(global_stats["count"])
+        global_constraint_active = False
+        _gc_enabled = bool(getattr(config, "GLOBAL_ERROR_CONSTRAINT_ENABLED", False))
+        _gc_hard = bool(getattr(config, "GLOBAL_ERROR_CONSTRAINT_HARD", True))
+        solve_context["global_error_before"] = global_avg_before
+        solve_context["global_error_count_before"] = global_count_before
+        if _gc_enabled and global_count_before > 0 and global_avg_before > float(config.MAX_ERROR_THRESHOLD):
+            global_constraint_active = True
+            if _gc_hard:
+                allowed = [
+                    s for s in solver.strategies
+                    if float(s.get("error", 0.0)) <= float(config.MAX_ERROR_THRESHOLD)
+                ]
+                if allowed:
+                    solver.strategies = allowed
+            if config.VERBOSE:
+                mode_label = "(HARD)" if _gc_hard else "(soft)"
+                print(
+                    f"[Scheduler] ⚠ Global error constraint {mode_label} active: "
+                    f"global_avg={global_avg_before:.4f}% > threshold={config.MAX_ERROR_THRESHOLD:.2f}%"
+                )
+        solve_context["global_error_constraint_active"] = global_constraint_active
+
         try:
             dp_assignments = solver.solve_batch(
                 requests=dp_requests,

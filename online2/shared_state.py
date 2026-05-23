@@ -66,6 +66,10 @@ class SharedSchedulerState:
         self._total_requests_received = 0
         self._total_requests_scheduled = 0
 
+        # Global error tracking: running totals across all ever-assigned requests.
+        self._global_error_sum = 0.0
+        self._global_assignment_count = 0
+
     def add_request(self, request: Request) -> None:
         """Add a new request to pending queue (thread-safe)"""
         with self._lock:
@@ -125,6 +129,8 @@ class SharedSchedulerState:
                 self._assignments[assignment.request_id] = assignment
                 if is_new_request:
                     self._total_requests_scheduled += 1
+                    self._global_error_sum += float(assignment.error)
+                    self._global_assignment_count += 1
 
             # Move old assignments to history
             self._archive_old_assignments()
@@ -228,6 +234,18 @@ class SharedSchedulerState:
         """Get number of pending requests (thread-safe)"""
         with self._lock:
             return len(self._pending_requests)
+
+    def get_global_error_stats(self) -> Dict[str, float]:
+        """
+        Return cumulative error stats across all ever-assigned requests.
+        Running totals updated in add_assignments(); not affected by archiving.
+        (thread-safe)
+        """
+        with self._lock:
+            count = self._global_assignment_count
+            error_sum = self._global_error_sum
+            avg = (error_sum / count) if count > 0 else 0.0
+            return {"error_sum": error_sum, "count": count, "avg": avg}
 
     def get_statistics(self) -> Dict:
         """Get current statistics (thread-safe)"""

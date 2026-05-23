@@ -39,7 +39,7 @@ STRATEGIES = [
 MAX_ERROR_THRESHOLD = 4.0  # %
 
 # Window size for error calculation (symmetric around current slot)
-ERROR_WINDOW_PAST = 24
+ERROR_WINDOW_PAST = 12
 ERROR_WINDOW_FUTURE = 8
 ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE
 
@@ -47,12 +47,20 @@ ERROR_WINDOW_SIZE = ERROR_WINDOW_PAST + 1 + ERROR_WINDOW_FUTURE
 # For K slots, weights are:
 #   K/(K+1), (K-1)/(K+1), ..., 1/(K+1)
 # Example K=6 => 6/7, 5/7, ..., 1/7
-ERROR_WINDOW_PAST_DECAY_SLOTS = 24
+ERROR_WINDOW_PAST_DECAY_SLOTS = 0
 
 # Requests cannot be placed beyond current_slot + ASSIGNMENT_MAX_FUTURE_SLOTS.
 # Keep this aligned with ERROR_WINDOW_FUTURE unless you explicitly want a smaller
 # placement horizon.
 ASSIGNMENT_MAX_FUTURE_SLOTS = 8
+
+# Global error constraint: in addition to the window constraint, enforce that
+# the cumulative average error across ALL ever-assigned requests stays under
+# MAX_ERROR_THRESHOLD.
+# When HARD=True: filter strategies to those with error <= threshold when violated.
+# When HARD=False: log a warning only.
+GLOBAL_ERROR_CONSTRAINT_ENABLED = True
+GLOBAL_ERROR_CONSTRAINT_HARD = True
 
 # Virtual pre-history for early iterations:
 # for current_slot < ERROR_WINDOW_PAST, we assume virtual past slots (-W..-1)

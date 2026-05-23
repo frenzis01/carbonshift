@@ -40,6 +40,9 @@ class SolverMetricsLogger:
         "error_window_violated_after_real",
         "batches_processed_after",
         "total_scheduled_after",
+        "global_error_before",
+        "global_error_count_before",
+        "global_error_constraint_active",
     ]
 
     ASSIGNMENT_FIELDS = [
