@@ -257,7 +257,7 @@ def plot_solver_execution_stacked(
     runs_df: pd.DataFrame,
     assignments_df: pd.DataFrame,
     slot_metrics_df: Optional[pd.DataFrame] = None,
-    strategy_colors: Optional[Dict[str, str]] = None,
+    flavour_colors: Optional[Dict[str, str]] = None,
     show_req_text: bool = True,
 ):
     """
@@ -269,8 +269,8 @@ def plot_solver_execution_stacked(
     - avg slot error line
     - capacity level horizontal lines
     """
-    if strategy_colors is None:
-        strategy_colors = {
+    if flavour_colors is None:
+        flavour_colors = {
             "Fast": "#1f77b4",
             "Balanced": "#2ca02c",
             "Accurate": "#ff7f0e",
@@ -408,24 +408,24 @@ def plot_solver_execution_stacked(
         else:
             run_assignments["is_new_assignment_in_run"] = True
 
-        run_assignments = run_assignments.sort_values(["scheduled_slot", "strategy_name", "request_id"])
+        run_assignments = run_assignments.sort_values(["scheduled_slot", "flavour_name", "request_id"])
 
         slot_stack_height = {slot: 0 for slot in slots}
-        strategy_with_label = set()
+        flavour_with_label = set()
         shown_new_legend = False
         shown_old_legend = False
 
         for row in run_assignments.itertuples(index=False):
             slot = int(row.scheduled_slot)
-            strategy = str(row.strategy_name)
-            color = strategy_colors.get(strategy, "#7f7f7f")
+            flavour = str(row.flavour_name)
+            color = flavour_colors.get(flavour, "#7f7f7f")
             bottom = slot_stack_height.get(slot, 0)
             is_new = bool(row.is_new_assignment_in_run)
 
             label = "_nolegend_"
-            if strategy not in strategy_with_label and is_new:
-                label = strategy
-                strategy_with_label.add(strategy)
+            if flavour not in flavour_with_label and is_new:
+                label = flavour
+                flavour_with_label.add(flavour)
             elif is_new and not shown_new_legend:
                 label = "New in this run"
                 shown_new_legend = True
@@ -629,7 +629,7 @@ def plot_solver_execution_stacked(
     for fixed_strategy in fixed_strategies:
         if fixed_strategy not in legend_map:
             legend_map[fixed_strategy] = mpatches.Patch(
-                facecolor=strategy_colors.get(fixed_strategy, "#7f7f7f"),
+                facecolor=flavour_colors.get(fixed_strategy, "#7f7f7f"),
                 edgecolor="black",
                 label=fixed_strategy,
             )
