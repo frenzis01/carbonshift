@@ -259,6 +259,7 @@ def plot_solver_execution_stacked(
     slot_metrics_df: Optional[pd.DataFrame] = None,
     flavour_colors: Optional[Dict[str, str]] = None,
     show_req_text: bool = True,
+    total_slots: Optional[int] = None,
 ):
     """
     Stacked bar chart for one solver execution:
@@ -275,6 +276,13 @@ def plot_solver_execution_stacked(
             "Balanced": "#2ca02c",
             "Accurate": "#ff7f0e",
         }
+
+    # Resolve total_slots: caller can pass it explicitly (e.g. from scenario metadata);
+    # fall back to config value so existing callers are unaffected.
+    if total_slots is None:
+        total_slots = int(config.TOTAL_SLOTS)
+    else:
+        total_slots = int(total_slots)
 
     run_id = str(run_id)
     run_row = runs_df[runs_df["run_id"].astype(str) == run_id]
@@ -301,7 +309,7 @@ def plot_solver_execution_stacked(
     window_end = int(
         run_info["error_window_end_slot"]
         if "error_window_end_slot" in run_info
-        else min(int(config.TOTAL_SLOTS) - 1, current_slot + int(config.ERROR_WINDOW_FUTURE))
+        else min(total_slots - 1, current_slot + int(config.ERROR_WINDOW_FUTURE))
     )
     window_avg_modeled = (
         float(run_info["error_window_avg_after"])
@@ -323,7 +331,7 @@ def plot_solver_execution_stacked(
         if "carbon_cost_per_new_request" in run_info and pd.notna(run_info["carbon_cost_per_new_request"])
         else None
     )
-    all_slots = list(range(int(config.TOTAL_SLOTS)))
+    all_slots = list(range(total_slots))
     slots = all_slots
 
     fig, ax = plt.subplots(figsize=(17, 7))
@@ -332,7 +340,7 @@ def plot_solver_execution_stacked(
         current_slot=current_slot,
         window_start=window_start,
         window_end=window_end,
-        total_slots=int(config.TOTAL_SLOTS),
+        total_slots=total_slots,
     )
     history_by_slot = pd.DataFrame()
     if not runs_df.empty:
@@ -602,9 +610,9 @@ def plot_solver_execution_stacked(
         )
 
     ax.axvline(current_slot, linestyle=":", color="red", alpha=0.7, label=f"Current slot={current_slot}")
-    ax.set_xlim(-0.6, config.TOTAL_SLOTS - 0.4)
-    tick_step = max(1, config.TOTAL_SLOTS // 12)
-    ax.set_xticks(list(range(0, config.TOTAL_SLOTS, tick_step)))
+    ax.set_xlim(-0.6, total_slots - 0.4)
+    tick_step = max(1, total_slots // 12)
+    ax.set_xticks(list(range(0, total_slots, tick_step)))
     ax.set_xlabel("Scheduled slot")
     ax.set_ylabel("Assignments count")
     ax.set_title(
