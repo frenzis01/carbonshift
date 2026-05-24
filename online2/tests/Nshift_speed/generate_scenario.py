@@ -33,6 +33,7 @@ def generate_and_save_scenario(
     prehistory_mock_influence: Optional[float] = None,
     error_window_past_decay_slots: Optional[int] = None,
     include_prehistory: Optional[bool] = None,
+    carbon_intensity_cycle_slots: Optional[int] = None,
 ) -> Dict[str, Any]:
     if prehistory_mock_influence is None:
         prehistory_mock_influence = float(config.PREHISTORY_MOCK_INFLUENCE)
@@ -40,6 +41,8 @@ def generate_and_save_scenario(
         error_window_past_decay_slots = int(config.ERROR_WINDOW_PAST_DECAY_SLOTS)
     if include_prehistory is None:
         include_prehistory = True
+    if carbon_intensity_cycle_slots is None:
+        carbon_intensity_cycle_slots = int(config.CARBON_INTENSITY_CYCLE_SLOTS)
     scenario = generate_scenario_data(
         seed=seed,
         total_slots=total_slots,
@@ -56,6 +59,7 @@ def generate_and_save_scenario(
         carbon_random_noise_amplitude=carbon_random_noise_amplitude,
         prehistory_mock_influence=prehistory_mock_influence,
         include_prehistory=bool(include_prehistory),
+        carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
     )
     save_json(output_path, scenario)
     return scenario
@@ -108,6 +112,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=float(config.PREHISTORY_MOCK_INFLUENCE),
         help="Scale factor [0..1] applied to synthetic prehistory request counts.",
     )
+    parser.add_argument(
+        "--carbon-intensity-cycle-slots",
+        type=int,
+        default=int(config.CARBON_INTENSITY_CYCLE_SLOTS),
+        help="Period (slots) of the sinusoidal carbon-intensity wave.",
+    )
     return parser
 
 
@@ -136,6 +146,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Include Prehistory:                {args.include_prehistory}")
     print(f"  Carbon Random Noise Amplitude:     {args.carbon_random_noise_amplitude}")
     print(f"  Prehistory Mock Influence:         {args.prehistory_mock_influence}")
+    print(f"  Carbon Intensity Cycle Slots:      {args.carbon_intensity_cycle_slots}")
     print(f"  Output Path:                       {args.output}")
     print("=" * 70)
 
@@ -156,6 +167,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         carbon_random_noise_amplitude=args.carbon_random_noise_amplitude,
         prehistory_mock_influence=args.prehistory_mock_influence,
         include_prehistory=args.include_prehistory,
+        carbon_intensity_cycle_slots=args.carbon_intensity_cycle_slots,
     )
 
     print(f"\nScenario saved to {args.output}")

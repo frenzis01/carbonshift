@@ -78,6 +78,9 @@ PREHISTORY_RANDOM_SEED = 4242
 # benchmark scenario generation (independent from runtime infeasibility mocks).
 PREHISTORY_MOCK_INFLUENCE = 0.4
 CARBON_RANDOM_NOISE_AMPLITUDE = 40.0
+# Period (in slots) of the sinusoidal carbon-intensity wave used in scenario
+# generation.  A value of 24 models a 24-slot daily cycle.
+CARBON_INTENSITY_CYCLE_SLOTS = 24
 
 
 # ============================================================================

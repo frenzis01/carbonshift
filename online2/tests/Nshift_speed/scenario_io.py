@@ -56,6 +56,7 @@ def generate_scenario_data(
     prehistory_mock_influence: float = 1.0,
     error_window_past_decay_slots: int = 0,
     include_prehistory: bool = True,
+    carbon_intensity_cycle_slots: int = 24,
 ) -> Dict[str, Any]:
     """
     Build a deterministic scenario payload.
@@ -69,7 +70,7 @@ def generate_scenario_data(
     sigma = max(1.0, requests_per_slot * request_rate_std_factor)
 
     forecast: List[float] = []
-    cycle = 24
+    cycle = max(1, int(carbon_intensity_cycle_slots))
     base_carbon = 40.0
     amplitude = 100.0
     noise = max(0.0, float(carbon_random_noise_amplitude))
@@ -131,6 +132,7 @@ def generate_scenario_data(
             "carbon_random_noise_amplitude": noise,
             "prehistory_mock_influence": prehistory_influence,
             "prehistory_enabled": bool(include_prehistory),
+            "carbon_intensity_cycle_slots": int(cycle),
         },
         "carbon_forecast": forecast,
         "requests": requests,
