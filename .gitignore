@@ -9,5 +9,8 @@ env/
 
 online2/tests/Nshift_speed/output
 online2/notebooks/html
+online2/AGENT_CONTEXT.md
+online2/notebooks/2028
+online2/notebooks/20*
 
 **/scenario_seed_*.json
