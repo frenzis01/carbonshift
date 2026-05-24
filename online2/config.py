@@ -22,10 +22,10 @@ SLOT_DURATION_SECONDS = 10
 TOTAL_SLOTS = 24
 
 # ============================================================================
-# STRATEGY PARAMETERS
+# FLAVOUR PARAMETERS
 # ============================================================================
 
-STRATEGIES = [
+FLAVOURS = [
     {"name": "Accurate", "error": 0.0, "duration": 60},    # 1 min
     {"name": "Balanced", "error": 2.5, "duration": 30},    # 1/2 min
     {"name": "Fast", "error": 5.0, "duration": 10},         # 10 sec
@@ -57,7 +57,7 @@ ASSIGNMENT_MAX_FUTURE_SLOTS = 8
 # Global error constraint: in addition to the window constraint, enforce that
 # the cumulative average error across ALL ever-assigned requests stays under
 # MAX_ERROR_THRESHOLD.
-# When HARD=True: filter strategies to those with error <= threshold when violated.
+# When HARD=True: filter flavours to those with error <= threshold when violated.
 # When HARD=False: log a warning only.
 GLOBAL_ERROR_CONSTRAINT_ENABLED = True
 GLOBAL_ERROR_CONSTRAINT_HARD = True
@@ -97,12 +97,11 @@ CAPACITY_TIERS = [
 # DP SOLVER PARAMETERS
 # ============================================================================
 
-# Pruning strategy: 'kbest' or 'beam' or 'None' (no pruning)
-# DP_PRUNING_STRATEGY = 'beam'
-DP_PRUNING_STRATEGY = 'beam'
+# Pruning method: 'kbest' or 'beam' or 'None' (no pruning)
+DP_PRUNING_METHOD = 'beam'
 
 # Apply DP pruning only when pending batch size is >= this threshold.
-# - 0: disable pruning entirely (even if DP_PRUNING_STRATEGY is set)
+# - 0: disable pruning entirely (even if DP_PRUNING_METHOD is set)
 # - N>0: enable pruning only for batches with size >= N
 DP_PRUNING_MIN_BATCH_SIZE = 5
 
@@ -122,13 +121,13 @@ DP_LOCK_FUTURE_ASSIGNMENTS = True
 # Disable to enforce hard-threshold behavior only.
 DP_ALLOW_RELAXED_ERROR_RETRY = False
 
-# When relaxed retry is enabled, prefer the minimum-error strategy(ies) so the
+# When relaxed retry is enabled, prefer the minimum-error flavour(s) so the
 # system can recover from a violated baseline instead of drifting to high error.
 DP_RELAXED_RETRY_PREFER_MIN_ERROR = True
 
 # Behavior when strict infeasibility is caused by an error baseline that is
 # difficult to recover right after the window slides:
-# - "min_error_recovery": assign with minimum-error strategy on recovery steps
+# - "min_error_recovery": assign with minimum-error flavour on recovery steps
 # - "carryover_last_slot": use mock carryover from the slot that just left window
 # - "forecast_mock_current_slot": use mock expected arrivals for current slot
 INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
@@ -137,7 +136,7 @@ INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
 # Range [0, 1]: lower means less mock influence (more pessimistic).
 # 1.0 = full mock influence, 0.0 = disable mock contribution.
 INFEASIBILITY_MOCK_INFLUENCE = 0.4
-4
+
 # Optional fixed per-request error (%) for infeasibility synthetic mocks.
 # - None: use policy-derived value (carryover slot average, or threshold*ratio).
 # - >= 0: override policy-derived value with a fixed error.

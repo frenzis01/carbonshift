@@ -10,12 +10,13 @@ import config
 from rolling_window_dp import RollingWindowDPScheduler
 from scheduler import BatchScheduler
 from shared_state import Assignment, Request, SharedSchedulerState
+from tests.conftest import config_override
 
 
 class TestDPSolverConstraints(unittest.TestCase):
     def test_never_schedules_before_current_slot(self):
         solver = RollingWindowDPScheduler(
-            strategies=[{"name": "S", "error": 1.0, "duration": 10}],
+            flavours=[{"name": "S", "error": 1.0, "duration": 10}],
             carbon_forecast=[100.0] * 8,
             window_size=8,
             pruning="beam",
@@ -31,7 +32,7 @@ class TestDPSolverConstraints(unittest.TestCase):
 
     def test_capacity_tier_reprices_entire_slot(self):
         solver = RollingWindowDPScheduler(
-            strategies=[{"name": "S", "error": 0.0, "duration": 1}],
+            flavours=[{"name": "S", "error": 0.0, "duration": 1}],
             carbon_forecast=[10.0],
             window_size=1,
             pruning="none",
@@ -50,7 +51,7 @@ class TestDPSolverConstraints(unittest.TestCase):
 
     def test_weighted_error_window_uses_total_error_over_total_requests(self):
         solver = RollingWindowDPScheduler(
-            strategies=[{"name": "S", "error": 5.0, "duration": 1}],
+            flavours=[{"name": "S", "error": 5.0, "duration": 1}],
             carbon_forecast=[10.0],
             window_size=1,
             pruning="none",
@@ -74,7 +75,7 @@ class TestDPSolverConstraints(unittest.TestCase):
     def test_strict_threshold_checks_final_window_average_even_if_new_requests_outside_window(self):
         forecast = [1000.0] * 6 + [1.0] * 6
         solver = RollingWindowDPScheduler(
-            strategies=[{"name": "S", "error": 1.0, "duration": 1}],
+            flavours=[{"name": "S", "error": 1.0, "duration": 1}],
             carbon_forecast=forecast,
             window_size=12,
             pruning="none",
@@ -92,7 +93,7 @@ class TestDPSolverConstraints(unittest.TestCase):
 
     def test_assignment_max_slot_limits_deadline_domain(self):
         solver = RollingWindowDPScheduler(
-            strategies=[{"name": "S", "error": 1.0, "duration": 1}],
+            flavours=[{"name": "S", "error": 1.0, "duration": 1}],
             carbon_forecast=[10.0] * 12,
             window_size=12,
             pruning="none",
@@ -116,10 +117,10 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
                 Assignment(
                     request_id=99,
                     scheduled_slot=4,
-                    strategy_name="Fast",
+                    flavour_name="Fast",
                     carbon_cost=100.0,
                     error=5.0,
-                    strategy_duration=30,
+                    flavour_duration=30,
                     arrival_slot=1,
                     deadline_slot=6,
                 )
@@ -127,32 +128,20 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
         )
         pending = Request(id=1, arrival_slot=2, deadline_slot=6)
 
-        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
-        original_verbose = config.VERBOSE
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        try:
-            config.VERBOSE = False
-            config.MAX_ERROR_THRESHOLD = 10.0
-
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
+        with config_override(VERBOSE=False, MAX_ERROR_THRESHOLD=10.0, DP_LOCK_FUTURE_ASSIGNMENTS=True):
             scheduler_locked = BatchScheduler(shared_state)
             locked_assignments, _ = scheduler_locked._solve_dp([pending], current_slot=2)
             locked_ids = {a.request_id for a in locked_assignments}
 
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = False
+        with config_override(VERBOSE=False, MAX_ERROR_THRESHOLD=10.0, DP_LOCK_FUTURE_ASSIGNMENTS=False):
             scheduler_unlocked = BatchScheduler(shared_state)
             unlocked_assignments, _ = scheduler_unlocked._solve_dp([pending], current_slot=2)
             unlocked_ids = {a.request_id for a in unlocked_assignments}
-        finally:
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
-            config.VERBOSE = original_verbose
-            config.MAX_ERROR_THRESHOLD = original_threshold
 
         self.assertIn(1, locked_ids)
         self.assertNotIn(99, locked_ids)
         self.assertIn(1, unlocked_ids)
         self.assertIn(99, unlocked_ids)
-
     def test_infeasible_with_locked_future_falls_back_without_loop(self):
         shared_state = SharedSchedulerState()
         shared_state.set_current_slot(3)
@@ -165,10 +154,10 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
                 Assignment(
                     request_id=req_id,
                     scheduled_slot=3,
-                    strategy_name="Fast",
+                    flavour_name="Fast",
                     carbon_cost=100.0,
                     error=5.0,
-                    strategy_duration=30,
+                    flavour_duration=30,
                     arrival_slot=2,
                     deadline_slot=6,
                 )
@@ -181,38 +170,22 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
             Request(id=3, arrival_slot=3, deadline_slot=6),
         ]
 
-        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
-        original_verbose = config.VERBOSE
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        original_debug_enabled = config.ENABLE_INFEASIBILITY_DEBUG_LOGGING
-        original_debug_file = config.SOLVER_INFEASIBLE_DEBUG_FILE
-        original_solver_logging = config.ENABLE_SOLVER_LOGGING
-        original_prehistory_use = config.PREHISTORY_USE_VIRTUAL_PAST
-        original_relaxed_retry = config.DP_ALLOW_RELAXED_ERROR_RETRY
         debug_rows = []
-        try:
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
-            config.VERBOSE = False
-            config.MAX_ERROR_THRESHOLD = 3.0
-            config.ENABLE_SOLVER_LOGGING = True
-            config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = True
-            config.PREHISTORY_USE_VIRTUAL_PAST = False
-            config.DP_ALLOW_RELAXED_ERROR_RETRY = True
-            with tempfile.TemporaryDirectory() as tmp:
-                config.SOLVER_INFEASIBLE_DEBUG_FILE = str(Path(tmp) / "strict_debug.csv")
+        with tempfile.TemporaryDirectory() as tmp:
+            with config_override(
+                DP_LOCK_FUTURE_ASSIGNMENTS=True,
+                VERBOSE=False,
+                MAX_ERROR_THRESHOLD=3.0,
+                ENABLE_SOLVER_LOGGING=True,
+                ENABLE_INFEASIBILITY_DEBUG_LOGGING=True,
+                PREHISTORY_USE_VIRTUAL_PAST=False,
+                DP_ALLOW_RELAXED_ERROR_RETRY=True,
+                SOLVER_INFEASIBLE_DEBUG_FILE=str(Path(tmp) / "strict_debug.csv"),
+            ):
                 scheduler = BatchScheduler(shared_state)
                 assignments, context = scheduler._solve_dp(pending_batch, current_slot=3)
                 with open(config.SOLVER_INFEASIBLE_DEBUG_FILE, newline="") as f:
                     debug_rows = list(csv.DictReader(f))
-        finally:
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
-            config.VERBOSE = original_verbose
-            config.MAX_ERROR_THRESHOLD = original_threshold
-            config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = original_debug_enabled
-            config.SOLVER_INFEASIBLE_DEBUG_FILE = original_debug_file
-            config.ENABLE_SOLVER_LOGGING = original_solver_logging
-            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory_use
-            config.DP_ALLOW_RELAXED_ERROR_RETRY = original_relaxed_retry
 
         self.assertEqual(len(assignments), 3)
         self.assertIn(
@@ -234,10 +207,10 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
                 Assignment(
                     request_id=req_id,
                     scheduled_slot=3,
-                    strategy_name="Fast",
+                    flavour_name="Fast",
                     carbon_cost=100.0,
                     error=5.0,
-                    strategy_duration=30,
+                    flavour_duration=30,
                     arrival_slot=2,
                     deadline_slot=6,
                 )
@@ -250,22 +223,14 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
             Request(id=13, arrival_slot=3, deadline_slot=6),
         ]
 
-        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
-        original_verbose = config.VERBOSE
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        original_solver_logging = config.ENABLE_SOLVER_LOGGING
-        original_prehistory_use = config.PREHISTORY_USE_VIRTUAL_PAST
-        original_relaxed_retry = config.DP_ALLOW_RELAXED_ERROR_RETRY
-        original_infeasibility_mode = config.INFEASIBILITY_RECOVERY_MODE
-        original_debug_enabled = config.ENABLE_INFEASIBILITY_DEBUG_LOGGING
-        try:
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
-            config.VERBOSE = False
-            config.MAX_ERROR_THRESHOLD = 3.0
-            config.ENABLE_SOLVER_LOGGING = False
-            config.PREHISTORY_USE_VIRTUAL_PAST = False
-            config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = False
-
+        with config_override(
+            DP_LOCK_FUTURE_ASSIGNMENTS=True,
+            VERBOSE=False,
+            MAX_ERROR_THRESHOLD=3.0,
+            ENABLE_SOLVER_LOGGING=False,
+            PREHISTORY_USE_VIRTUAL_PAST=False,
+            ENABLE_INFEASIBILITY_DEBUG_LOGGING=False,
+        ):
             cases = [
                 (False, "forecast_mock_current_slot"),
                 (True, "min_error_recovery"),
@@ -275,22 +240,15 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
                     allow_relaxed_retry=allow_relaxed_retry,
                     recovery_mode=recovery_mode,
                 ):
-                    config.DP_ALLOW_RELAXED_ERROR_RETRY = allow_relaxed_retry
-                    config.INFEASIBILITY_RECOVERY_MODE = recovery_mode
-                    scheduler = BatchScheduler(shared_state)
-                    assignments, context = scheduler._solve_dp(pending_batch, current_slot=3)
-                    self.assertEqual(len(assignments), 3)
-                    self.assertEqual(context.get("status"), "ok_greedy_after_infeasible")
-                    self.assertEqual(context.get("mode"), "greedy_after_infeasible")
-        finally:
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
-            config.VERBOSE = original_verbose
-            config.MAX_ERROR_THRESHOLD = original_threshold
-            config.ENABLE_SOLVER_LOGGING = original_solver_logging
-            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory_use
-            config.DP_ALLOW_RELAXED_ERROR_RETRY = original_relaxed_retry
-            config.INFEASIBILITY_RECOVERY_MODE = original_infeasibility_mode
-            config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = original_debug_enabled
+                    with config_override(
+                        DP_ALLOW_RELAXED_ERROR_RETRY=allow_relaxed_retry,
+                        INFEASIBILITY_RECOVERY_MODE=recovery_mode,
+                    ):
+                        scheduler = BatchScheduler(shared_state)
+                        assignments, context = scheduler._solve_dp(pending_batch, current_slot=3)
+                        self.assertEqual(len(assignments), 3)
+                        self.assertEqual(context.get("status"), "ok_greedy_after_infeasible")
+                        self.assertEqual(context.get("mode"), "greedy_after_infeasible")
 
     def test_virtual_prehistory_baseline_is_configurable_and_applied(self):
         shared_state = SharedSchedulerState()
@@ -302,35 +260,18 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
             Request(id=3, arrival_slot=1, deadline_slot=5),
         ]
 
-        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
-        original_verbose = config.VERBOSE
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        original_prehistory_use = config.PREHISTORY_USE_VIRTUAL_PAST
-        original_prehistory_stochastic = config.PREHISTORY_STOCHASTIC_COUNTS
-        original_prehistory_seed = config.PREHISTORY_RANDOM_SEED
-        original_ratio = config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD
-        original_pred_rate = config.PREDICTED_REQUESTS_PER_SLOT
-        try:
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
-            config.VERBOSE = False
-            config.MAX_ERROR_THRESHOLD = 3.0
-            config.PREHISTORY_USE_VIRTUAL_PAST = True
-            config.PREHISTORY_STOCHASTIC_COUNTS = False
-            config.PREHISTORY_RANDOM_SEED = 123
-            config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 0.5
-            config.PREDICTED_REQUESTS_PER_SLOT = 8.0
-
+        with config_override(
+            DP_LOCK_FUTURE_ASSIGNMENTS=True,
+            VERBOSE=False,
+            MAX_ERROR_THRESHOLD=3.0,
+            PREHISTORY_USE_VIRTUAL_PAST=True,
+            PREHISTORY_STOCHASTIC_COUNTS=False,
+            PREHISTORY_RANDOM_SEED=123,
+            PREHISTORY_ERROR_RATIO_OF_THRESHOLD=0.5,
+            PREDICTED_REQUESTS_PER_SLOT=8.0,
+        ):
             scheduler = BatchScheduler(shared_state)
             assignments, context = scheduler._solve_dp(pending_batch, current_slot=1)
-        finally:
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
-            config.VERBOSE = original_verbose
-            config.MAX_ERROR_THRESHOLD = original_threshold
-            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory_use
-            config.PREHISTORY_STOCHASTIC_COUNTS = original_prehistory_stochastic
-            config.PREHISTORY_RANDOM_SEED = original_prehistory_seed
-            config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD = original_ratio
-            config.PREDICTED_REQUESTS_PER_SLOT = original_pred_rate
 
         self.assertEqual(len(assignments), 3)
         self.assertEqual(context.get("virtual_past_slots_used"), config.ERROR_WINDOW_PAST - 1)
@@ -347,20 +288,14 @@ class TestSchedulerPruningThreshold(unittest.TestCase):
         shared_state = SharedSchedulerState()
         shared_state.set_current_slot(0)
 
-        original_strategy = config.DP_PRUNING_STRATEGY
-        original_threshold = getattr(config, "DP_PRUNING_MIN_BATCH_SIZE", 0)
-        original_verbose = config.VERBOSE
-        original_threshold_error = config.MAX_ERROR_THRESHOLD
-        original_prehistory = config.PREHISTORY_USE_VIRTUAL_PAST
-        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
-        try:
-            config.DP_PRUNING_STRATEGY = "beam"
-            config.DP_PRUNING_MIN_BATCH_SIZE = 5
-            config.VERBOSE = False
-            config.MAX_ERROR_THRESHOLD = 10.0
-            config.PREHISTORY_USE_VIRTUAL_PAST = False
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
-
+        with config_override(
+            DP_PRUNING_METHOD="beam",
+            DP_PRUNING_MIN_BATCH_SIZE=5,
+            VERBOSE=False,
+            MAX_ERROR_THRESHOLD=10.0,
+            PREHISTORY_USE_VIRTUAL_PAST=False,
+            DP_LOCK_FUTURE_ASSIGNMENTS=True,
+        ):
             scheduler = BatchScheduler(shared_state)
 
             small_batch = [Request(id=i, arrival_slot=0, deadline_slot=0) for i in range(1, 4)]
@@ -370,43 +305,23 @@ class TestSchedulerPruningThreshold(unittest.TestCase):
             large_batch = [Request(id=i, arrival_slot=0, deadline_slot=0) for i in range(10, 15)]
             _, large_ctx = scheduler._solve_dp(large_batch, current_slot=0)
             self.assertEqual(large_ctx.get("pruning_mode"), "beam")
-        finally:
-            config.DP_PRUNING_STRATEGY = original_strategy
-            config.DP_PRUNING_MIN_BATCH_SIZE = original_threshold
-            config.VERBOSE = original_verbose
-            config.MAX_ERROR_THRESHOLD = original_threshold_error
-            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
 
     def test_pruning_threshold_zero_disables_pruning(self):
         shared_state = SharedSchedulerState()
         shared_state.set_current_slot(0)
 
-        original_strategy = config.DP_PRUNING_STRATEGY
-        original_threshold = getattr(config, "DP_PRUNING_MIN_BATCH_SIZE", 0)
-        original_verbose = config.VERBOSE
-        original_threshold_error = config.MAX_ERROR_THRESHOLD
-        original_prehistory = config.PREHISTORY_USE_VIRTUAL_PAST
-        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
-        try:
-            config.DP_PRUNING_STRATEGY = "beam"
-            config.DP_PRUNING_MIN_BATCH_SIZE = 0
-            config.VERBOSE = False
-            config.MAX_ERROR_THRESHOLD = 10.0
-            config.PREHISTORY_USE_VIRTUAL_PAST = False
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
-
+        with config_override(
+            DP_PRUNING_METHOD="beam",
+            DP_PRUNING_MIN_BATCH_SIZE=0,
+            VERBOSE=False,
+            MAX_ERROR_THRESHOLD=10.0,
+            PREHISTORY_USE_VIRTUAL_PAST=False,
+            DP_LOCK_FUTURE_ASSIGNMENTS=True,
+        ):
             scheduler = BatchScheduler(shared_state)
             batch = [Request(id=i, arrival_slot=0, deadline_slot=0) for i in range(20, 26)]
             _, solve_ctx = scheduler._solve_dp(batch, current_slot=0)
             self.assertEqual(solve_ctx.get("pruning_mode"), "none")
-        finally:
-            config.DP_PRUNING_STRATEGY = original_strategy
-            config.DP_PRUNING_MIN_BATCH_SIZE = original_threshold
-            config.VERBOSE = original_verbose
-            config.MAX_ERROR_THRESHOLD = original_threshold_error
-            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
 
 
 class TestSchedulerMockInfluenceDecay(unittest.TestCase):
@@ -414,16 +329,12 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         shared_state = SharedSchedulerState()
         scheduler = BatchScheduler(shared_state)
 
-        original_mode = config.INFEASIBILITY_RECOVERY_MODE
-        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
-        original_decay = getattr(config, "INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP", 0.10)
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        try:
-            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
-            config.INFEASIBILITY_MOCK_INFLUENCE = 0.8
-            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.10
-            config.MAX_ERROR_THRESHOLD = 4.0
-
+        with config_override(
+            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_MOCK_INFLUENCE=0.8,
+            INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP=0.10,
+            MAX_ERROR_THRESHOLD=4.0,
+        ):
             _, _, ctx_slot_10 = scheduler._apply_infeasibility_recovery_policy(
                 current_slot=10,
                 error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
@@ -444,11 +355,6 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
                 current_slot=13,
                 error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
             )
-        finally:
-            config.INFEASIBILITY_RECOVERY_MODE = original_mode
-            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
-            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = original_decay
-            config.MAX_ERROR_THRESHOLD = original_threshold
 
         self.assertAlmostEqual(float(ctx_slot_10["mock_influence_effective"]), 0.7, places=9)
         self.assertAlmostEqual(float(ctx_slot_10_repeat["mock_influence_effective"]), 0.7, places=9)
@@ -460,16 +366,12 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         shared_state = SharedSchedulerState()
         scheduler = BatchScheduler(shared_state)
 
-        original_mode = config.INFEASIBILITY_RECOVERY_MODE
-        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
-        original_decay = getattr(config, "INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP", 0.10)
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        try:
-            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
-            config.INFEASIBILITY_MOCK_INFLUENCE = 0.15
-            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.10
-            config.MAX_ERROR_THRESHOLD = 4.0
-
+        with config_override(
+            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_MOCK_INFLUENCE=0.15,
+            INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP=0.10,
+            MAX_ERROR_THRESHOLD=4.0,
+        ):
             _, _, ctx_slot_20 = scheduler._apply_infeasibility_recovery_policy(
                 current_slot=20,
                 error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
@@ -482,11 +384,6 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
                 current_slot=22,
                 error_baseline={"error_sum": 50.0, "request_count": 10, "average_error": 5.0},
             )
-        finally:
-            config.INFEASIBILITY_RECOVERY_MODE = original_mode
-            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
-            config.INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = original_decay
-            config.MAX_ERROR_THRESHOLD = original_threshold
 
         self.assertAlmostEqual(float(ctx_slot_20["mock_influence_effective"]), 0.05, places=9)
         self.assertAlmostEqual(float(ctx_slot_21["mock_influence_effective"]), 0.0, places=9)
@@ -496,37 +393,20 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         shared_state = SharedSchedulerState()
         scheduler = BatchScheduler(shared_state)
 
-        original_mode = config.INFEASIBILITY_RECOVERY_MODE
-        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
-        original_pred_rate = config.PREDICTED_REQUESTS_PER_SLOT
-        original_std = config.REQUEST_RATE_STD_FACTOR
-        original_seed = config.PREHISTORY_RANDOM_SEED
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        original_ratio = config.FORECAST_ERROR_RATIO_OF_THRESHOLD
-        original_mock_error = getattr(config, "INFEASIBILITY_MOCK_ERROR_PER_REQUEST", None)
-        try:
-            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
-            config.INFEASIBILITY_MOCK_INFLUENCE = 1.0
-            config.PREDICTED_REQUESTS_PER_SLOT = 40.0
-            config.REQUEST_RATE_STD_FACTOR = 0.0
-            config.PREHISTORY_RANDOM_SEED = 4242
-            config.MAX_ERROR_THRESHOLD = 4.0
-            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = 0.5
-            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = 1.23
-
+        with config_override(
+            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_MOCK_INFLUENCE=1.0,
+            PREDICTED_REQUESTS_PER_SLOT=40.0,
+            REQUEST_RATE_STD_FACTOR=0.0,
+            PREHISTORY_RANDOM_SEED=4242,
+            MAX_ERROR_THRESHOLD=4.0,
+            FORECAST_ERROR_RATIO_OF_THRESHOLD=0.5,
+            INFEASIBILITY_MOCK_ERROR_PER_REQUEST=1.23,
+        ):
             _, _, ctx = scheduler._apply_infeasibility_recovery_policy(
                 current_slot=5,
                 error_baseline={"error_sum": 0.0, "request_count": 0, "average_error": 0.0},
             )
-        finally:
-            config.INFEASIBILITY_RECOVERY_MODE = original_mode
-            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
-            config.PREDICTED_REQUESTS_PER_SLOT = original_pred_rate
-            config.REQUEST_RATE_STD_FACTOR = original_std
-            config.PREHISTORY_RANDOM_SEED = original_seed
-            config.MAX_ERROR_THRESHOLD = original_threshold
-            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = original_ratio
-            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = original_mock_error
 
         self.assertGreater(int(ctx.get("mock_recovery_count", 0)), 0)
         self.assertAlmostEqual(float(ctx.get("mock_recovery_error", 0.0)), 1.23, places=9)
@@ -535,37 +415,20 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         shared_state = SharedSchedulerState()
         scheduler = BatchScheduler(shared_state)
 
-        original_mode = config.INFEASIBILITY_RECOVERY_MODE
-        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
-        original_pred_rate = config.PREDICTED_REQUESTS_PER_SLOT
-        original_std = config.REQUEST_RATE_STD_FACTOR
-        original_seed = config.PREHISTORY_RANDOM_SEED
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        original_ratio = config.FORECAST_ERROR_RATIO_OF_THRESHOLD
-        original_mock_error = getattr(config, "INFEASIBILITY_MOCK_ERROR_PER_REQUEST", None)
-        try:
-            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
-            config.INFEASIBILITY_MOCK_INFLUENCE = 1.0
-            config.PREDICTED_REQUESTS_PER_SLOT = 40.0
-            config.REQUEST_RATE_STD_FACTOR = 0.0
-            config.PREHISTORY_RANDOM_SEED = 4242
-            config.MAX_ERROR_THRESHOLD = 4.0
-            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = 0.25
-            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = None
-
+        with config_override(
+            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_MOCK_INFLUENCE=1.0,
+            PREDICTED_REQUESTS_PER_SLOT=40.0,
+            REQUEST_RATE_STD_FACTOR=0.0,
+            PREHISTORY_RANDOM_SEED=4242,
+            MAX_ERROR_THRESHOLD=4.0,
+            FORECAST_ERROR_RATIO_OF_THRESHOLD=0.25,
+            INFEASIBILITY_MOCK_ERROR_PER_REQUEST=None,
+        ):
             _, _, ctx = scheduler._apply_infeasibility_recovery_policy(
                 current_slot=5,
                 error_baseline={"error_sum": 0.0, "request_count": 0, "average_error": 0.0},
             )
-        finally:
-            config.INFEASIBILITY_RECOVERY_MODE = original_mode
-            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
-            config.PREDICTED_REQUESTS_PER_SLOT = original_pred_rate
-            config.REQUEST_RATE_STD_FACTOR = original_std
-            config.PREHISTORY_RANDOM_SEED = original_seed
-            config.MAX_ERROR_THRESHOLD = original_threshold
-            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = original_ratio
-            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = original_mock_error
 
         self.assertGreater(int(ctx.get("mock_recovery_count", 0)), 0)
         self.assertAlmostEqual(float(ctx.get("mock_recovery_error", 0.0)), 1.0, places=9)
@@ -575,30 +438,19 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         shared_state.set_current_slot(0)
         scheduler = BatchScheduler(shared_state)
 
-        original_mode = config.INFEASIBILITY_RECOVERY_MODE
-        original_influence = config.INFEASIBILITY_MOCK_INFLUENCE
-        original_pred_rate = config.PREDICTED_REQUESTS_PER_SLOT
-        original_std = config.REQUEST_RATE_STD_FACTOR
-        original_seed = config.PREHISTORY_RANDOM_SEED
-        original_threshold = config.MAX_ERROR_THRESHOLD
-        original_ratio = config.FORECAST_ERROR_RATIO_OF_THRESHOLD
-        original_mock_error = getattr(config, "INFEASIBILITY_MOCK_ERROR_PER_REQUEST", None)
-        original_prehistory = config.PREHISTORY_USE_VIRTUAL_PAST
-        original_lock = config.DP_LOCK_FUTURE_ASSIGNMENTS
-        original_verbose = config.VERBOSE
-        try:
-            config.INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
-            config.INFEASIBILITY_MOCK_INFLUENCE = 1.0
-            config.PREDICTED_REQUESTS_PER_SLOT = 40.0
-            config.REQUEST_RATE_STD_FACTOR = 0.0
-            config.PREHISTORY_RANDOM_SEED = 4242
-            config.MAX_ERROR_THRESHOLD = 20.0
-            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = 0.25
-            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = None
-            config.PREHISTORY_USE_VIRTUAL_PAST = False
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = True
-            config.VERBOSE = False
-
+        with config_override(
+            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_MOCK_INFLUENCE=1.0,
+            PREDICTED_REQUESTS_PER_SLOT=40.0,
+            REQUEST_RATE_STD_FACTOR=0.0,
+            PREHISTORY_RANDOM_SEED=4242,
+            MAX_ERROR_THRESHOLD=20.0,
+            FORECAST_ERROR_RATIO_OF_THRESHOLD=0.25,
+            INFEASIBILITY_MOCK_ERROR_PER_REQUEST=None,
+            PREHISTORY_USE_VIRTUAL_PAST=False,
+            DP_LOCK_FUTURE_ASSIGNMENTS=True,
+            VERBOSE=False,
+        ):
             batch_a = [
                 Request(id=1001, arrival_slot=0, deadline_slot=0),
                 Request(id=1002, arrival_slot=0, deadline_slot=0),
@@ -612,18 +464,6 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
                 Request(id=1006, arrival_slot=0, deadline_slot=0),
             ]
             assignments_b, ctx_b = scheduler._solve_dp(batch_b, current_slot=0)
-        finally:
-            config.INFEASIBILITY_RECOVERY_MODE = original_mode
-            config.INFEASIBILITY_MOCK_INFLUENCE = original_influence
-            config.PREDICTED_REQUESTS_PER_SLOT = original_pred_rate
-            config.REQUEST_RATE_STD_FACTOR = original_std
-            config.PREHISTORY_RANDOM_SEED = original_seed
-            config.MAX_ERROR_THRESHOLD = original_threshold
-            config.FORECAST_ERROR_RATIO_OF_THRESHOLD = original_ratio
-            config.INFEASIBILITY_MOCK_ERROR_PER_REQUEST = original_mock_error
-            config.PREHISTORY_USE_VIRTUAL_PAST = original_prehistory
-            config.DP_LOCK_FUTURE_ASSIGNMENTS = original_lock
-            config.VERBOSE = original_verbose
 
         self.assertEqual(len(assignments_a), 3)
         self.assertEqual(len(assignments_b), 3)
@@ -650,11 +490,7 @@ class TestSchedulerBatchWorkerParallelism(unittest.TestCase):
         shared_state.add_request(Request(id=1, arrival_slot=0, deadline_slot=1))
         shared_state.add_request(Request(id=2, arrival_slot=0, deadline_slot=1))
 
-        original_batch_size = config.BATCH_SIZE
-        original_verbose = config.VERBOSE
-        try:
-            config.BATCH_SIZE = 2
-            config.VERBOSE = False
+        with config_override(BATCH_SIZE=2, VERBOSE=False):
             scheduler = BatchScheduler(shared_state)
 
             def fail_solve_dp(_self, requests, current_slot):
@@ -663,9 +499,6 @@ class TestSchedulerBatchWorkerParallelism(unittest.TestCase):
             scheduler._solve_dp = types.MethodType(fail_solve_dp, scheduler)
 
             scheduled = scheduler._process_batch(current_slot=0)
-        finally:
-            config.BATCH_SIZE = original_batch_size
-            config.VERBOSE = original_verbose
 
         self.assertFalse(scheduled)
         pending = shared_state.get_pending_requests(10)
@@ -676,20 +509,12 @@ class TestSchedulerBatchWorkerParallelism(unittest.TestCase):
         for req_id in range(8):
             shared_state.add_request(Request(id=req_id, arrival_slot=0, deadline_slot=2))
 
-        original_batch_size = config.BATCH_SIZE
-        original_slot_duration = config.SLOT_DURATION_SECONDS
-        original_verbose = config.VERBOSE
-        original_parallel = getattr(
-            config,
-            "MAX_BATCH_SOLVER_PARALLELISM",
-            getattr(config, "NUM_SCHEDULER_THREADS", 1),
-        )
-        try:
-            config.BATCH_SIZE = 1
-            config.SLOT_DURATION_SECONDS = 1
-            config.MAX_BATCH_SOLVER_PARALLELISM = 2
-            config.VERBOSE = False
-
+        with config_override(
+            BATCH_SIZE=1,
+            SLOT_DURATION_SECONDS=1,
+            MAX_BATCH_SOLVER_PARALLELISM=2,
+            VERBOSE=False,
+        ):
             scheduler = BatchScheduler(shared_state)
 
             tracker_lock = threading.Lock()
@@ -716,11 +541,6 @@ class TestSchedulerBatchWorkerParallelism(unittest.TestCase):
             scheduler.start()
             done_event.wait(timeout=3.0)
             scheduler.stop()
-        finally:
-            config.BATCH_SIZE = original_batch_size
-            config.SLOT_DURATION_SECONDS = original_slot_duration
-            config.MAX_BATCH_SOLVER_PARALLELISM = original_parallel
-            config.VERBOSE = original_verbose
 
         self.assertEqual(shared_state.get_pending_count(), 0)
         self.assertGreaterEqual(calls, 8)
@@ -744,30 +564,23 @@ class TestSchedulerDecayedPastWindow(unittest.TestCase):
                     Assignment(
                         request_id=req_id,
                         scheduled_slot=slot,
-                        strategy_name="Balanced",
+                        flavour_name="Balanced",
                         carbon_cost=0.0,
                         error=err,
-                        strategy_duration=30,
+                        flavour_duration=30,
                         arrival_slot=slot - 1,
                         deadline_slot=slot,
                     )
                 ]
             )
 
-        original_past = config.ERROR_WINDOW_PAST
-        original_decay = getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0)
-        try:
-            config.ERROR_WINDOW_PAST = 5
-            config.ERROR_WINDOW_PAST_DECAY_SLOTS = 6
+        with config_override(ERROR_WINDOW_PAST=5, ERROR_WINDOW_PAST_DECAY_SLOTS=6):
             baseline = {"error_sum": 0.0, "request_count": 0.0, "average_error": 0.0}
             augmented, ctx = scheduler._augment_error_baseline_with_decayed_past(
                 current_slot=current_slot,
                 error_baseline=baseline,
                 exclude_request_ids=set(),
             )
-        finally:
-            config.ERROR_WINDOW_PAST = original_past
-            config.ERROR_WINDOW_PAST_DECAY_SLOTS = original_decay
 
         weights = [6.0 / 7.0, 5.0 / 7.0, 4.0 / 7.0, 3.0 / 7.0, 2.0 / 7.0, 1.0 / 7.0]
         expected_count = sum(weights)

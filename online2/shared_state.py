@@ -29,10 +29,10 @@ class Assignment:
     """Represents a scheduling decision"""
     request_id: int
     scheduled_slot: int
-    strategy_name: str
+    flavour_name: str
     carbon_cost: float
     error: float
-    strategy_duration: int = 0
+    flavour_duration: int = 0
     arrival_slot: Optional[int] = None
     deadline_slot: Optional[int] = None
     assignment_time: float = field(default_factory=time.time)
@@ -102,10 +102,7 @@ class SharedSchedulerState:
         Call this after successfully scheduling.
         (thread-safe)
         """
-        with self._lock:
-            requests = self._pending_requests[:count]
-            self._pending_requests = self._pending_requests[count:]
-            return requests
+        return self.claim_pending_requests(count)
 
     def requeue_pending_requests_front(self, requests: List[Request]) -> None:
         """
@@ -157,19 +154,8 @@ class SharedSchedulerState:
         Used for error budget validation.
         (thread-safe)
         """
-        with self._lock:
-            all_errors = []
-            window_start = center_slot - window_past
-            window_end = center_slot + window_future
-
-            for assignment in self._assignments.values():
-                if window_start <= assignment.scheduled_slot <= window_end:
-                    all_errors.append(assignment.error)
-
-            if not all_errors:
-                return None
-
-            return sum(all_errors) / len(all_errors)
+        stats = self.get_window_error_stats(center_slot, window_past, window_future)
+        return stats["average_error"] if stats["request_count"] > 0 else None
 
     def get_window_error_stats(
         self,
@@ -283,13 +269,13 @@ class SharedSchedulerState:
 
             with open(filename, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['request_id', 'scheduled_slot', 'strategy', 'carbon_cost', 'error', 'assignment_time'])
+                writer.writerow(['request_id', 'scheduled_slot', 'flavour', 'carbon_cost', 'error', 'assignment_time'])
 
                 for assignment in self._assignments.values():
                     writer.writerow([
                         assignment.request_id,
                         assignment.scheduled_slot,
-                        assignment.strategy_name,
+                        assignment.flavour_name,
                         assignment.carbon_cost,
                         assignment.error,
                         assignment.assignment_time,

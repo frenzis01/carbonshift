@@ -6,11 +6,11 @@ in Online2. It handles:
 - Batch scheduling (N requests at a time)
 - Capacity tiers with rebound effect multipliers
 - Error budget windows (sliding 11-slot window)
-- Beam Search and K-Best pruning strategies
+- Beam Search and K-Best pruning methods
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 import time
 
 
@@ -18,7 +18,7 @@ import time
 class RequestAssignment:
     """Result of a single request assignment"""
     request_id: str
-    strategy_name: str
+    flavour_name: str
     slot: int
     carbon_cost: float
     error: float
@@ -28,7 +28,7 @@ class RollingWindowDPScheduler:
     """
     DP-based batch scheduler with rolling window optimization and pruning.
     
-    Solves: Assign N requests to time slots and strategies to minimize carbon cost
+    Solves: Assign N requests to time slots and flavours to minimize carbon cost
     while respecting:
     - Deadline constraints
     - Error budget window (t-Wpast to t+Wfuture)
@@ -37,7 +37,7 @@ class RollingWindowDPScheduler:
     """
     
     def __init__(self, 
-                 strategies: List[dict],
+                 flavours: List[dict],
                  carbon_forecast: List[float],
                  window_size: int = 24,
                  pruning: str = 'beam',
@@ -47,14 +47,14 @@ class RollingWindowDPScheduler:
         Initialize the DP scheduler.
         
         Args:
-            strategies: List of strategy dicts with 'name', 'error', 'duration'
+            flavours: List of flavour dicts with 'name', 'error', 'duration'
             carbon_forecast: Carbon intensity per time slot [0..window_size-1]
             window_size: Total number of time slots (default 24)
-            pruning: Pruning strategy - 'beam', 'kbest', or 'none' (default 'beam')
+            pruning: Pruning method - 'beam', 'kbest', or 'none' (default 'beam')
             pruning_k: Number of states to keep when pruning (default 150)
             timeout: Maximum execution time in seconds (default 5.0)
         """
-        self.strategies = strategies
+        self.flavours = flavours
         self.carbon_forecast = carbon_forecast
         self.window_size = window_size
         self.pruning = pruning
@@ -149,11 +149,14 @@ class RollingWindowDPScheduler:
         initial_mock_count = max(0, int(dynamic_mock_pool.get("initial_count", 0)))
         mock_error_bp = int(round(float(dynamic_mock_pool.get("error_per_request", 0.0)) * 100))
 
-        # DP state fields:
-        # - error_sum_bp: total error in the active window (basis points)
-        # - error_count: weighted number of requests counted in that window
-        # - mock_remaining: synthetic requests still counted in baseline
-        # - inc_counts / inc_durations: incremental slot load introduced by this batch
+        # ── DP state representation ──────────────────────────────────────────
+        # Each state is a 5-tuple:
+        #   (error_sum_bp, error_count, mock_remaining, inc_counts_t, inc_durations_t)
+        # • error_sum_bp     – total error in window (multiplied by 100 for int arith.)
+        # • error_count      – number of requests counted in that sum
+        # • mock_remaining   – synthetic baseline requests not yet "consumed"
+        # • inc_counts_t     – per-slot request count delta introduced by this batch
+        # • inc_durations_t  – per-slot total duration delta introduced by this batch
         init_state = (
             initial_error_sum_bp,
             initial_error_count,
@@ -164,6 +167,11 @@ class RollingWindowDPScheduler:
         dp_prev = {init_state: (0.0, [])}
 
         start_ts = time.time()
+
+        # ── DP expansion loop ────────────────────────────────────────────────
+        # One layer per request; each layer expands every live state by trying
+        # every feasible (flavour, slot) pair.  States with the same key are
+        # merged by keeping the minimum-cost path (optimal substructure).
 
         # Expand request-by-request: each DP layer schedules exactly one request.
         for req_idx, req in enumerate(requests):
@@ -176,11 +184,11 @@ class RollingWindowDPScheduler:
                 inc_counts = list(inc_counts_t)
                 inc_durations = list(inc_durations_t)
 
-                # Try every strategy and every feasible slot for the current request.
-                for strategy in self.strategies:
-                    strategy_error = float(strategy["error"])
-                    strategy_error_bp = int(round(strategy_error * 100))
-                    strategy_duration = int(strategy["duration"])
+                # Try every feasible flavour and slot for the current request.
+                for flavour in self.flavours:
+                    flavour_error = float(flavour["error"])
+                    flavour_error_bp = int(round(flavour_error * 100))
+                    flavour_duration = int(flavour["duration"])
 
                     for slot in range(current_slot, deadline + 1):
                         # Incremental cost is computed with dynamic repricing:
@@ -188,7 +196,7 @@ class RollingWindowDPScheduler:
                         # cost is repriced, not only the marginal request.
                         delta_cost = self._incremental_carbon_cost(
                             slot=slot,
-                            add_duration=strategy_duration,
+                            add_duration=flavour_duration,
                             base_counts=base_counts,
                             base_durations=base_durations,
                             inc_counts=inc_counts,
@@ -200,7 +208,7 @@ class RollingWindowDPScheduler:
                         new_error_count = error_count
                         new_mock_remaining = mock_remaining
                         if window_start <= slot <= window_end:
-                            new_error_sum_bp += strategy_error_bp
+                            new_error_sum_bp += flavour_error_bp
                             new_error_count += 1.0
 
                             # Optional synthetic baseline decay:
@@ -214,14 +222,14 @@ class RollingWindowDPScheduler:
                         new_inc_counts = inc_counts.copy()
                         new_inc_durations = inc_durations.copy()
                         new_inc_counts[slot] += 1
-                        new_inc_durations[slot] += strategy_duration
+                        new_inc_durations[slot] += flavour_duration
 
                         assignment = RequestAssignment(
                             request_id=req_id,
-                            strategy_name=strategy["name"],
+                            flavour_name=flavour["name"],
                             slot=slot,
                             carbon_cost=delta_cost,
-                            error=strategy_error,
+                            error=flavour_error,
                         )
                         new_assignments = prev_assignments + [assignment]
                         new_cost = prev_cost + delta_cost
@@ -240,6 +248,10 @@ class RollingWindowDPScheduler:
                 # No feasible expansion for this request layer.
                 return []
 
+            # ── Pruning ──────────────────────────────────────────────────────
+            # After each layer, the state space is pruned to at most pruning_k
+            # states.  Beam keeps the cheapest states; kbest also considers avg
+            # error (helps diversity when many states have identical cost).
             if self.pruning in {"beam", "kbest"} and len(dp_curr) > self.pruning_k:
                 if self.pruning == "beam":
                     sorted_states = sorted(dp_curr.items(), key=lambda x: x[1][0])
@@ -267,6 +279,10 @@ class RollingWindowDPScheduler:
 
             dp_prev = dp_curr
 
+        # ── Feasibility filter ───────────────────────────────────────────────
+        # Drop final states that violate the error-window constraint.  This is
+        # evaluated only once at the end (not layer-by-layer) to avoid over-pruning
+        # paths whose error improves in later layers.
         if max_error_threshold is not None:
             # Enforce strict window constraint on complete assignments only.
             feasible_states = {
@@ -292,7 +308,7 @@ class RollingWindowDPScheduler:
     ) -> List[RequestAssignment]:
         """
         Fallback greedy scheduler when DP fails.
-        Assigns each request to the earliest available slot with the slowest strategy.
+        Assigns each request to the earliest available slot with the most accurate (slowest) flavour.
         """
         assignments = []
         if capacity_tiers is None:
@@ -311,9 +327,9 @@ class RollingWindowDPScheduler:
 
             best_choice = None
 
-            # select slowest - most accurate strategy for fallback
-            strategy = max(self.strategies, key=lambda s: int(s["duration"]))
-            duration = int(strategy["duration"])
+            # select most accurate (slowest) flavour for fallback
+            flavour = max(self.flavours, key=lambda s: int(s["duration"]))
+            duration = int(flavour["duration"])
             for slot in range(current_slot, deadline + 1):
                 delta_cost = self._incremental_carbon_cost(
                     slot=slot,
@@ -325,22 +341,22 @@ class RollingWindowDPScheduler:
                     capacity_tiers=capacity_tiers,
                 )
                 if best_choice is None or delta_cost < best_choice[0]:
-                    best_choice = (delta_cost, slot, strategy)
+                    best_choice = (delta_cost, slot, flavour)
 
 
             if best_choice is None:
                 continue
 
-            carbon_cost, best_slot, strategy = best_choice
+            carbon_cost, best_slot, flavour = best_choice
             inc_counts[best_slot] += 1
-            inc_durations[best_slot] += int(strategy["duration"])
+            inc_durations[best_slot] += int(flavour["duration"])
 
             assignment = RequestAssignment(
                 request_id=req_id,
-                strategy_name=strategy["name"],
+                flavour_name=flavour["name"],
                 slot=best_slot,
                 carbon_cost=carbon_cost,
-                error=float(strategy["error"]),
+                error=float(flavour["error"]),
             )
             assignments.append(assignment)
 
@@ -362,6 +378,15 @@ class RollingWindowDPScheduler:
         inc_durations: List[int],
         capacity_tiers: List[dict],
     ) -> float:
+        """
+        Compute the marginal carbon cost of placing one request in a slot.
+
+        Because capacity multipliers are tier-based (step functions of request
+        count), adding one request can shift the whole slot into a higher tier.
+        The cost is therefore computed as the difference between the full slot
+        cost after and before the addition — not just the marginal request cost.
+        This is the "rebound effect" repricing.
+        """
         before_count = base_counts[slot] + inc_counts[slot]
         after_count = before_count + 1
 
@@ -375,55 +400,3 @@ class RollingWindowDPScheduler:
         before_cost = slot_carbon * before_mult * before_duration
         after_cost = slot_carbon * after_mult * after_duration
         return after_cost - before_cost
-
-    def solve_with_error_window(
-        self,
-        requests: List[dict],
-        current_slot: int,
-        capacity_multiplier: float = 1.0,
-        max_error_threshold: float = 3.0,
-        error_window_data: Dict[int, float] = None,
-    ) -> Tuple[List[RequestAssignment], float]:
-        """
-        Solve batch problem while respecting error budget window constraint.
-        
-        Error window: average error in slots [current_slot-5, ..., current_slot+5]
-        must be ≤ max_error_threshold
-        
-        Args:
-            requests: List of requests
-            current_slot: Current time slot
-            capacity_multiplier: Capacity tier multiplier
-            max_error_threshold: Maximum average error allowed (as percentage)
-            error_window_data: Dict of {slot: current_error} in the window
-            
-        Returns:
-            (assignments, average_error_in_window)
-        """
-        assignments = self.solve_batch(
-            requests=requests,
-            current_slot=current_slot,
-            capacity_multiplier=capacity_multiplier,
-            error_window_errors=error_window_data,
-            max_error_threshold=max_error_threshold,
-        )
-
-        window_start = max(0, current_slot - 5)
-        window_end = min(self.window_size - 1, current_slot + 5)
-
-        # Best-effort weighted average reconstruction.
-        error_sum = 0.0
-        request_count = 0
-        if error_window_data:
-            for slot, avg_err in error_window_data.items():
-                if window_start <= slot <= window_end:
-                    error_sum += avg_err
-                    request_count += 1
-
-        for assignment in assignments:
-            if window_start <= assignment.slot <= window_end:
-                error_sum += assignment.error
-                request_count += 1
-
-        avg_error = (error_sum / request_count) if request_count else 0.0
-        return assignments, avg_error

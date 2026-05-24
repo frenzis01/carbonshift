@@ -61,7 +61,7 @@ class Online2System:
         print(f"  - Slot Duration: {config.SLOT_DURATION_SECONDS}s")
         print(f"  - Total Slots: {config.TOTAL_SLOTS}")
         print(f"  - Max Error: {config.MAX_ERROR_THRESHOLD}%")
-        print(f"  - DP Pruning: {config.DP_PRUNING_STRATEGY}")
+        print(f"  - DP Pruning: {config.DP_PRUNING_METHOD}")
         print(f"  - Predicted Requests/Slot: {config.PREDICTED_REQUESTS_PER_SLOT}")
         print()
 

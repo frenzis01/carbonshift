@@ -5,6 +5,7 @@ from pathlib import Path
 
 import config
 from tests.Nshift_speed.generate_scenario import generate_and_save_scenario
+from tests.conftest import config_override
 
 
 class TestScenarioDeterminism(unittest.TestCase):
@@ -83,30 +84,23 @@ class TestScenarioDeterminism(unittest.TestCase):
             base = Path(tmp)
             out = base / "scenario.json"
 
-            original_prehistory_influence = getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0)
-            original_infeasibility_influence = getattr(config, "INFEASIBILITY_MOCK_INFLUENCE", 1.0)
-            try:
-                config.PREHISTORY_MOCK_INFLUENCE = 0.35
-                config.INFEASIBILITY_MOCK_INFLUENCE = 0.95
-                scenario = generate_and_save_scenario(
-                    output_path=out,
-                    seed=42,
-                    total_slots=10,
-                    slot_duration_seconds=10.0,
-                    requests_per_slot=5.0,
-                    request_rate_std_factor=0.2,
-                    deadline_min_slack=0,
-                    deadline_max_slack=4,
-                    error_window_past=5,
-                    error_window_future=8,
-                    max_error_threshold=4.0,
-                    prehistory_error_ratio=0.75,
-                    carbon_random_noise_amplitude=100.0,
-                    prehistory_mock_influence=None,
-                )
-            finally:
-                config.PREHISTORY_MOCK_INFLUENCE = original_prehistory_influence
-                config.INFEASIBILITY_MOCK_INFLUENCE = original_infeasibility_influence
+        with config_override(PREHISTORY_MOCK_INFLUENCE=0.35, INFEASIBILITY_MOCK_INFLUENCE=0.95):
+            scenario = generate_and_save_scenario(
+                output_path=out,
+                seed=42,
+                total_slots=10,
+                slot_duration_seconds=10.0,
+                requests_per_slot=5.0,
+                request_rate_std_factor=0.2,
+                deadline_min_slack=0,
+                deadline_max_slack=4,
+                error_window_past=5,
+                error_window_future=8,
+                max_error_threshold=4.0,
+                prehistory_error_ratio=0.75,
+                carbon_random_noise_amplitude=100.0,
+                prehistory_mock_influence=None,
+            )
 
             self.assertAlmostEqual(
                 float(scenario["metadata"]["prehistory_mock_influence"]),

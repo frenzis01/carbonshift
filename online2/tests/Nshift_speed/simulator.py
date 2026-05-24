@@ -88,10 +88,10 @@ def _build_prehistory_assignments(prehistory_slots: List[Dict[str, Any]]) -> Tup
                 Assignment(
                     request_id=synthetic_request_id,
                     scheduled_slot=slot,
-                    strategy_name="SyntheticPrehistory",
+                    flavour_name="SyntheticPrehistory",
                     carbon_cost=0.0,
                     error=error,
-                    strategy_duration=0,
+                    flavour_duration=0,
                     arrival_slot=slot,
                     deadline_slot=slot,
                 )
@@ -153,15 +153,15 @@ def _compute_window_rows(
     return rows
 
 
-def _select_greedy_baseline_strategy() -> Tuple[str, int]:
-    strategies = list(getattr(config, "STRATEGIES", []))
+def _select_greedy_baseline_flavour() -> Tuple[str, int]:
+    strategies = list(getattr(config, "FLAVOURS", []))
     if not strategies:
         return "Accurate", 0
     selected = min(
         strategies,
-        key=lambda strategy: (
-            float(strategy.get("error", 0.0)),
-            -int(strategy.get("duration", 0)),
+        key=lambda f: (
+            float(f.get("error", 0.0)),
+            -int(f.get("duration", 0)),
         ),
     )
     return str(selected.get("name", "Accurate")), int(selected.get("duration", 0))
@@ -384,7 +384,7 @@ def run_single_batch_size(
 
             if assignment is None:
                 scheduled_slot = None
-                strategy_name = ""
+                flavour_name = ""
                 error = None
                 carbon_cost = None
                 final_wait_slots = None
@@ -395,7 +395,7 @@ def run_single_batch_size(
                 assigned_with_relaxed_retry = False
             else:
                 scheduled_slot = int(assignment.scheduled_slot)
-                strategy_name = str(assignment.strategy_name)
+                flavour_name = str(assignment.flavour_name)
                 error = float(assignment.error)
                 carbon_cost = float(assignment.carbon_cost)
                 final_wait_slots = int(scheduled_slot - request_info["arrival_slot"])
@@ -419,7 +419,7 @@ def run_single_batch_size(
                     "queue_wait_seconds": queue_wait_seconds if queue_wait_seconds is not None else "",
                     "final_wait_slots": final_wait_slots if final_wait_slots is not None else "",
                     "final_wait_seconds": final_wait_seconds if final_wait_seconds is not None else "",
-                    "strategy_name": strategy_name,
+                    "flavour_name": flavour_name,
                     "error": error if error is not None else "",
                     "carbon_cost": carbon_cost if carbon_cost is not None else "",
                     "assignment_solver_mode": assignment_mode,
@@ -500,9 +500,9 @@ def run_single_batch_size(
             "batch_size": int(batch_size),
             "realtime_slots": bool(realtime_slots),
             "realtime_speed_scale": float(realtime_speed_scale),
-            "baseline_strategy_name": "",
-            "baseline_strategy_duration": 0,
-            "baseline_strategy_error": 0.0,
+            "baseline_flavour_name": "",
+            "baseline_flavour_duration": 0,
+            "baseline_flavour_error": 0.0,
             "requests_total": len(request_rows),
             "requests_scheduled": len(real_assignments),
             "requests_unscheduled": len(request_rows) - len(real_assignments),
@@ -550,7 +550,7 @@ def run_greedy_baseline(
 
     Each request is scheduled as soon as it arrives (scheduled_slot=arrival_slot),
     with zero modeled error to represent maximum-accuracy processing.
-    Carbon cost still applies using Online2 capacity tiers and strategy duration.
+    Carbon cost still applies using Online2 capacity tiers and flavour duration.
     """
     if not (0.0 <= float(realtime_speed_scale) <= 1.0):
         raise ValueError("realtime_speed_scale must be in [0.0, 1.0].")
@@ -564,8 +564,8 @@ def run_greedy_baseline(
     realtime_t0 = time.monotonic() if realtime_slots else 0.0
 
     prehistory_assignments, _ = _build_prehistory_assignments(scenario.get("prehistory_slots", []))
-    baseline_strategy_name, baseline_strategy_duration = _select_greedy_baseline_strategy()
-    baseline_strategy_error = 0.0
+    baseline_flavour_name, baseline_flavour_duration = _select_greedy_baseline_flavour()
+    baseline_flavour_error = 0.0
 
     requests_by_slot: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     request_rows: Dict[int, Dict[str, Any]] = {}
@@ -607,21 +607,21 @@ def run_greedy_baseline(
             before_duration = slot_durations[slot]
             delta_cost = _incremental_carbon_cost(
                 slot_carbon=carbon_forecast[slot],
-                add_duration=baseline_strategy_duration,
+                add_duration=baseline_flavour_duration,
                 before_count=before_count,
                 before_duration=before_duration,
                 capacity_tiers=capacity_tiers,
             )
             slot_counts[slot] += 1
-            slot_durations[slot] += baseline_strategy_duration
+            slot_durations[slot] += baseline_flavour_duration
 
             assignment = Assignment(
                 request_id=int(request["request_id"]),
                 scheduled_slot=slot,
-                strategy_name=baseline_strategy_name,
+                flavour_name=baseline_flavour_name,
                 carbon_cost=float(delta_cost),
-                error=float(baseline_strategy_error),
-                strategy_duration=baseline_strategy_duration,
+                error=float(baseline_flavour_error),
+                flavour_duration=baseline_flavour_duration,
                 arrival_slot=int(request["arrival_slot"]),
                 deadline_slot=int(request["deadline_slot"]),
             )
@@ -642,8 +642,8 @@ def run_greedy_baseline(
                     "queue_wait_seconds": 0.0,
                     "final_wait_slots": 0,
                     "final_wait_seconds": 0.0,
-                    "strategy_name": baseline_strategy_name,
-                    "error": float(baseline_strategy_error),
+                    "flavour_name": baseline_flavour_name,
+                    "error": float(baseline_flavour_error),
                     "carbon_cost": float(delta_cost),
                     "assignment_solver_mode": "baseline_immediate",
                     "assignment_solver_status": "ok",
@@ -722,9 +722,9 @@ def run_greedy_baseline(
         "batch_size": 0,
         "realtime_slots": bool(realtime_slots),
         "realtime_speed_scale": float(realtime_speed_scale),
-        "baseline_strategy_name": baseline_strategy_name,
-        "baseline_strategy_duration": int(baseline_strategy_duration),
-        "baseline_strategy_error": float(baseline_strategy_error),
+        "baseline_flavour_name": baseline_flavour_name,
+        "baseline_flavour_duration": int(baseline_flavour_duration),
+        "baseline_flavour_error": float(baseline_flavour_error),
         "requests_total": len(request_rows),
         "requests_scheduled": len(real_assignments),
         "requests_unscheduled": len(request_rows) - len(real_assignments),

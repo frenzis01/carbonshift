@@ -47,8 +47,8 @@ class TestSolverMetricsLogger(unittest.TestCase):
                         "request_id": 1,
                         "is_pending_request": True,
                         "scheduled_slot": 3,
-                        "strategy_name": "Fast",
-                        "strategy_duration": 30,
+                        "flavour_name": "Fast",
+                        "flavour_duration": 30,
                         "error": 5.0,
                         "carbon_cost": 10.0,
                         "arrival_slot": 3,
@@ -65,7 +65,7 @@ class TestSolverMetricsLogger(unittest.TestCase):
                         "capacity_multiplier_after": 1.0,
                         "capacity_level_max_requests": 10,
                         "request_ids": "1",
-                        "strategy_breakdown": "Fast:1",
+                        "flavour_breakdown": "Fast:1",
                     }
                 ],
             )
@@ -84,13 +84,13 @@ class TestSolverMetricsLogger(unittest.TestCase):
                 rows = list(csv.DictReader(f))
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["run_id"], run_id)
-                self.assertEqual(rows[0]["strategy_name"], "Fast")
+                self.assertEqual(rows[0]["flavour_name"], "Fast")
 
             with open(slot_file, newline="") as f:
                 rows = list(csv.DictReader(f))
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["run_id"], run_id)
-                self.assertEqual(rows[0]["strategy_breakdown"], "Fast:1")
+                self.assertEqual(rows[0]["flavour_breakdown"], "Fast:1")
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ def _write_run_outputs(
             "queue_wait_seconds",
             "final_wait_slots",
             "final_wait_seconds",
-            "strategy_name",
+            "flavour_name",
             "error",
             "carbon_cost",
             "assignment_solver_mode",
@@ -154,7 +154,7 @@ def run_benchmark_from_config(
             "Completed baseline: "
             f"mode={baseline_result.summary.get('execution_mode', 'greedy_baseline_immediate')}, "
             f"total_carbon={baseline_cost:.3f}, "
-            f"strategy={baseline_result.summary.get('baseline_strategy_name', 'Accurate')}"
+            f"flavour={baseline_result.summary.get('baseline_flavour_name', 'Accurate')}"
         )
 
     for batch_size in cfg["batch_sizes"]:

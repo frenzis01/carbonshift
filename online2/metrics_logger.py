@@ -54,8 +54,8 @@ class SolverMetricsLogger:
         "is_pending_request",
         "is_new_assignment_in_run",
         "scheduled_slot",
-        "strategy_name",
-        "strategy_duration",
+        "flavour_name",
+        "flavour_duration",
         "error",
         "carbon_cost",
         "arrival_slot",
@@ -75,7 +75,7 @@ class SolverMetricsLogger:
         "capacity_multiplier_after",
         "capacity_level_max_requests",
         "request_ids",
-        "strategy_breakdown",
+        "flavour_breakdown",
     ]
 
     INFEASIBLE_DEBUG_FIELDS = [
@@ -88,8 +88,8 @@ class SolverMetricsLogger:
         "baseline_error_sum",
         "baseline_request_count",
         "baseline_average_error",
-        "min_strategy_error",
-        "max_strategy_error",
+        "min_flavour_error",
+        "max_flavour_error",
         "min_possible_avg_error_pending_only",
         "max_possible_avg_error_pending_only",
         "strict_infeasible_by_error_bound",
