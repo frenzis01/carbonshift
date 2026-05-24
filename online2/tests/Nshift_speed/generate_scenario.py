@@ -35,9 +35,9 @@ def generate_and_save_scenario(
     include_prehistory: Optional[bool] = None,
 ) -> Dict[str, Any]:
     if prehistory_mock_influence is None:
-        prehistory_mock_influence = float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 1.0))
+        prehistory_mock_influence = float(config.PREHISTORY_MOCK_INFLUENCE)
     if error_window_past_decay_slots is None:
-        error_window_past_decay_slots = int(getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 0))
+        error_window_past_decay_slots = int(config.ERROR_WINDOW_PAST_DECAY_SLOTS)
     if include_prehistory is None:
         include_prehistory = True
     scenario = generate_scenario_data(
@@ -62,86 +62,50 @@ def generate_and_save_scenario(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser. All defaults come directly from config.py."""
     parser = argparse.ArgumentParser(description="Generate deterministic N-shift benchmark scenario.")
-    parser.add_argument(
-        "--use-config-defaults",
-        action="store_true",
-        help="If set, use default values from config.py instead of CLI hardcoded defaults.",
-    )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Path for generated scenario JSON. If not specified, defaults to scenario_seed_<SEED>.json.",
+        help="Path for generated scenario JSON. Defaults to scenario_seed_<SEED>.json.",
     )
-    
-    # Parser will set defaults after checking --use-config-defaults flag
-    # We do this by reading sys.argv first and checking for the flag
-    use_config = "--use-config-defaults" in (sys.argv if len(sys.argv) > 1 else [])
-    
-    defaults_dict = {
-        "seed": 2026,
-        "total_slots": int(getattr(config, "TOTAL_SLOTS", 24)),
-        "slot_duration_seconds": float(getattr(config, "SLOT_DURATION_SECONDS", 10.0)),
-        "requests_per_slot": float(getattr(config, "PREDICTED_REQUESTS_PER_SLOT", 8.0)),
-        "request_rate_std_factor": float(getattr(config, "REQUEST_RATE_STD_FACTOR", 0.35)),
-        "deadline_min_slack": 0,
-        "deadline_max_slack": int(getattr(config, "ASSIGNMENT_MAX_FUTURE_SLOTS", 8)),
-        "error_window_past": int(getattr(config, "ERROR_WINDOW_PAST", 5)),
-        "error_window_future": int(getattr(config, "ERROR_WINDOW_FUTURE", 8)),
-        "error_window_past_decay_slots": int(getattr(config, "ERROR_WINDOW_PAST_DECAY_SLOTS", 6)),
-        "max_error_threshold": float(getattr(config, "MAX_ERROR_THRESHOLD", 4.0)),
-        "prehistory_error_ratio": float(getattr(config, "PREHISTORY_ERROR_RATIO_OF_THRESHOLD", 1.0)),
-        "carbon_random_noise_amplitude": float(getattr(config, "CARBON_RANDOM_NOISE_AMPLITUDE", 40.0)),
-        "prehistory_mock_influence": float(getattr(config, "PREHISTORY_MOCK_INFLUENCE", 0.4)),
-        "include_prehistory": bool(getattr(config, "PREHISTORY_USE_VIRTUAL_PAST", True)),
-    }
-    
-    if not use_config:
-        defaults_dict.update({
-            "total_slots": 24,
-            "slot_duration_seconds": 10.0,
-            "requests_per_slot": 8.0,
-            "request_rate_std_factor": 0.35,
-            "deadline_max_slack": 8,
-            "error_window_past": 5,
-            "error_window_future": 8,
-            "error_window_past_decay_slots": 6,
-            "max_error_threshold": 4.0,
-        })
-    
-    parser.add_argument("--seed", type=int, default=defaults_dict["seed"])
-    parser.add_argument("--total-slots", type=int, default=defaults_dict["total_slots"])
-    parser.add_argument("--slot-duration-seconds", type=float, default=defaults_dict["slot_duration_seconds"])
-    parser.add_argument("--requests-per-slot", type=float, default=defaults_dict["requests_per_slot"])
-    parser.add_argument("--request-rate-std-factor", type=float, default=defaults_dict["request_rate_std_factor"])
-    parser.add_argument("--deadline-min-slack", type=int, default=defaults_dict["deadline_min_slack"])
-    parser.add_argument("--deadline-max-slack", type=int, default=defaults_dict["deadline_max_slack"])
-    parser.add_argument("--error-window-past", type=int, default=defaults_dict["error_window_past"])
-    parser.add_argument("--error-window-future", type=int, default=defaults_dict["error_window_future"])
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--total-slots", type=int, default=int(config.TOTAL_SLOTS))
+    parser.add_argument("--slot-duration-seconds", type=float, default=float(config.SLOT_DURATION_SECONDS))
+    parser.add_argument("--requests-per-slot", type=float, default=float(config.PREDICTED_REQUESTS_PER_SLOT))
+    parser.add_argument("--request-rate-std-factor", type=float, default=float(config.REQUEST_RATE_STD_FACTOR))
+    parser.add_argument("--deadline-min-slack", type=int, default=0)
+    parser.add_argument("--deadline-max-slack", type=int, default=int(config.ASSIGNMENT_MAX_FUTURE_SLOTS))
+    parser.add_argument("--error-window-past", type=int, default=int(config.ERROR_WINDOW_PAST))
+    parser.add_argument("--error-window-future", type=int, default=int(config.ERROR_WINDOW_FUTURE))
     parser.add_argument(
         "--error-window-past-decay-slots",
         type=int,
-        default=defaults_dict["error_window_past_decay_slots"],
+        default=int(config.ERROR_WINDOW_PAST_DECAY_SLOTS),
     )
-    parser.add_argument("--max-error-threshold", type=float, default=defaults_dict["max_error_threshold"])
-    parser.add_argument("--prehistory-error-ratio", type=float, default=defaults_dict["prehistory_error_ratio"])
+    parser.add_argument("--max-error-threshold", type=float, default=float(config.MAX_ERROR_THRESHOLD))
+    parser.add_argument(
+        "--prehistory-error-ratio",
+        type=float,
+        default=float(config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
+    )
     parser.add_argument(
         "--carbon-random-noise-amplitude",
         type=float,
-        default=defaults_dict["carbon_random_noise_amplitude"],
+        default=float(config.CARBON_RANDOM_NOISE_AMPLITUDE),
         help="Uniform random amplitude added to carbon intensity (+/- value).",
     )
     parser.add_argument(
         "--include-prehistory",
         action=argparse.BooleanOptionalAction,
-        default=defaults_dict["include_prehistory"],
-        help="Include synthetic prehistory slots in the scenario (use --no-include-prehistory to disable).",
+        default=bool(config.PREHISTORY_USE_VIRTUAL_PAST),
+        help="Include synthetic prehistory slots (use --no-include-prehistory to disable).",
     )
     parser.add_argument(
         "--prehistory-mock-influence",
         type=float,
-        default=defaults_dict["prehistory_mock_influence"],
+        default=float(config.PREHISTORY_MOCK_INFLUENCE),
         help="Scale factor [0..1] applied to synthetic prehistory request counts.",
     )
     return parser
@@ -150,8 +114,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    
-    # If output not specified, generate default path using the provided seed
+
     if args.output is None:
         args.output = Path(__file__).resolve().parent / f"scenario_seed_{args.seed}.json"
 
@@ -173,7 +136,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Include Prehistory:                {args.include_prehistory}")
     print(f"  Carbon Random Noise Amplitude:     {args.carbon_random_noise_amplitude}")
     print(f"  Prehistory Mock Influence:         {args.prehistory_mock_influence}")
-    print(f"  Use Config Defaults:               {args.use_config_defaults}")
     print(f"  Output Path:                       {args.output}")
     print("=" * 70)
 
@@ -195,7 +157,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         prehistory_mock_influence=args.prehistory_mock_influence,
         include_prehistory=args.include_prehistory,
     )
-    
+
     print(f"\nScenario saved to {args.output}")
     print(f"  Total Requests:                    {len(scenario['requests'])}")
     print(f"  Total Slots:                       {scenario['metadata']['total_slots']}")
