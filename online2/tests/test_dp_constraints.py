@@ -47,7 +47,11 @@ class TestDPSolverConstraints(unittest.TestCase):
             ],
         )
         self.assertEqual(len(assignments), 2)
-        self.assertAlmostEqual(sum(a.carbon_cost for a in assignments), 40.0)
+        # Expected: tier-repriced cost = 40 raw units × CARBON_COST_DURATION_SCALE.
+        # Tier 1 (1 req): cost = 10*1.0*1; Tier 2 (2 reqs): total = 10*2.0*2, delta = 30.
+        import config as _cfg
+        expected = 40.0 * getattr(_cfg, "CARBON_COST_DURATION_SCALE", 1.0)
+        self.assertAlmostEqual(sum(a.carbon_cost for a in assignments), expected)
 
     def test_weighted_error_window_uses_total_error_over_total_requests(self):
         solver = RollingWindowDPScheduler(

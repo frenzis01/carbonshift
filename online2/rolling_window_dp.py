@@ -12,6 +12,7 @@ in Online2. It handles:
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 import time
+import config
 
 
 @dataclass
@@ -397,6 +398,7 @@ class RollingWindowDPScheduler:
         after_mult = self._get_capacity_multiplier(capacity_tiers, after_count)
 
         slot_carbon = self.carbon_forecast[slot]
-        before_cost = slot_carbon * before_mult * before_duration
-        after_cost = slot_carbon * after_mult * after_duration
+        scale = getattr(config, "CARBON_COST_DURATION_SCALE", 1.0)
+        before_cost = slot_carbon * before_mult * before_duration * scale
+        after_cost = slot_carbon * after_mult * after_duration * scale
         return after_cost - before_cost

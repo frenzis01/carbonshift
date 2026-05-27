@@ -25,11 +25,17 @@ TOTAL_SLOTS = 24
 # FLAVOUR PARAMETERS
 # ============================================================================
 
+# duration is expressed in seconds (integer) and used as a relative cost weight in the DP.
+# Carbon cost is reported in gCO2 by applying CARBON_COST_DURATION_SCALE below.
 FLAVOURS = [
-    {"name": "Accurate", "error": 0.0, "duration": 60},    # 1 min
-    {"name": "Balanced", "error": 2.5, "duration": 30},    # 1/2 min
-    {"name": "Fast", "error": 5.0, "duration": 10},         # 10 sec
+    {"name": "Accurate", "error": 0.0, "duration": 60},    # 60 s
+    {"name": "Balanced", "error": 2.5, "duration": 30},    # 30 s
+    {"name": "Fast", "error": 5.0,  "duration": 10},       # 10 s
 ]
+
+# Scale factor applied to (carbon_intensity × duration_seconds) to obtain gCO2.
+# Derivation: carbon_intensity [gCO2/kWh] × (duration_seconds / 3600) [h] = gCO2 (at 1 kW load).
+CARBON_COST_DURATION_SCALE: float = 1.0 / 3600.0
 
 # ============================================================================
 # ERROR BUDGET PARAMETERS
@@ -77,7 +83,7 @@ PREHISTORY_RANDOM_SEED = 4242
 # Separate scaling factor for synthetic prehistory request counts used in
 # benchmark scenario generation (independent from runtime infeasibility mocks).
 PREHISTORY_MOCK_INFLUENCE = 0.4
-CARBON_RANDOM_NOISE_AMPLITUDE = 40.0
+CARBON_RANDOM_NOISE_AMPLITUDE = 20.0
 # Period (in slots) of the sinusoidal carbon-intensity wave used in scenario
 # generation.  A value of 24 models a 24-slot daily cycle.
 CARBON_INTENSITY_CYCLE_SLOTS = 24

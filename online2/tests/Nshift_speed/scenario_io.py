@@ -71,13 +71,16 @@ def generate_scenario_data(
 
     forecast: List[float] = []
     cycle = max(1, int(carbon_intensity_cycle_slots))
-    base_carbon = 40.0
-    amplitude = 100.0
+    # Valley (~65) at slot 0 (midnight), peak (~160) at slot cycle/2 (noon).
+    # Derived from: base + amplitude*0.2 = 65, base + amplitude*1.8 = 160
+    base_carbon = 53.125
+    amplitude = 59.375
     noise = max(0.0, float(carbon_random_noise_amplitude))
     for slot in range(total_slots):
         phase = 2.0 * math.pi * (slot % cycle) / cycle
-        value = base_carbon + amplitude * (1.0 + 0.8 * math.cos(phase)) + rng.uniform(-noise, noise)
-        forecast.append(round(max(base_carbon, value), 6))
+        # Negate cosine so minimum is at phase=0 (slot 0) and maximum at phase=π (slot cycle/2)
+        value = base_carbon + amplitude * (1.0 - 0.8 * math.cos(phase)) + rng.uniform(-noise, noise)
+        forecast.append(round(max(1.0, value), 6))
 
     requests: List[Dict[str, Any]] = []
     request_id = 0

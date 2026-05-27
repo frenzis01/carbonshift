@@ -186,8 +186,9 @@ def _incremental_carbon_cost(
     after_duration = before_duration + add_duration
     before_mult = _get_capacity_multiplier(capacity_tiers, before_count)
     after_mult = _get_capacity_multiplier(capacity_tiers, after_count)
-    before_cost = slot_carbon * before_mult * before_duration
-    after_cost = slot_carbon * after_mult * after_duration
+    scale = getattr(config, "CARBON_COST_DURATION_SCALE", 1.0)
+    before_cost = slot_carbon * before_mult * before_duration * scale
+    after_cost = slot_carbon * after_mult * after_duration * scale
     return after_cost - before_cost
 
 
