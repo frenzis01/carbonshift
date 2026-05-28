@@ -13,4 +13,8 @@ online2/AGENT_CONTEXT.md
 online2/notebooks/2028
 online2/notebooks/20*
 
+**/placeholder
+
 **/scenario_seed_*.json
+
+rust/target/

@@ -1,0 +1,425 @@
+/// Thread-safe shared state for the CarbonShift scheduler.
+///
+/// Mirrors `shared_state.py::SharedSchedulerState`.
+///
+/// All public methods acquire an internal `Mutex` and perform the operation
+/// atomically.  Callers never need to manage locks themselves.
+///
+/// # Concurrency model
+/// A single `Mutex<SharedStateInner>` wraps all mutable fields.  This matches
+/// the Python `RLock` pattern: every public method takes the lock, does its
+/// work, and releases it.  Lock granularity is deliberately coarse for
+/// simplicity and correctness; hot-path profiling can guide future
+/// optimisations without changing the public API.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::types::{Assignment, Request};
+
+// ─── inner (lock-guarded) data ────────────────────────────────────────────────
+
+struct Inner {
+    /// Requests waiting to be processed by a batch solver.
+    pending: Vec<Request>,
+    /// Active assignments (request_id → Assignment).
+    assignments: HashMap<u64, Assignment>,
+    /// Current time slot (updated by the scheduler loop).
+    current_slot: i32,
+    /// Cumulative statistics (never reset by archiving).
+    total_received: u64,
+    total_scheduled: u64,
+    /// Running global error totals across all ever-assigned requests.
+    global_error_sum: f64,
+    global_assignment_count: u64,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            assignments: HashMap::new(),
+            current_slot: 0,
+            total_received: 0,
+            total_scheduled: 0,
+            global_error_sum: 0.0,
+            global_assignment_count: 0,
+        }
+    }
+}
+
+// ─── public handle ────────────────────────────────────────────────────────────
+
+/// Cloneable, cheaply-sharable handle to the shared scheduler state.
+///
+/// Clone this to share ownership across threads — each clone holds a reference
+/// to the same underlying mutex.
+///
+/// `virtual_elapsed_ms` is a lock-free counter driven by the scheduler loop.
+/// In normal mode it tracks wall-clock time; when `skip_empty_slots` is
+/// enabled the scheduler advances it to the next slot boundary as soon as the
+/// queue is empty, so the generator and monitor also "see" the jump.
+#[derive(Clone)]
+pub struct SharedState {
+    inner: Arc<Mutex<Inner>>,
+    /// Virtual elapsed time in milliseconds since the run started.
+    /// Written only by the scheduler loop; read by generator and monitor.
+    pub virtual_elapsed_ms: Arc<AtomicU64>,
+    /// Last slot index fully processed by the generator.
+    /// Used by the scheduler's skip-empty-slots logic to avoid skipping a slot
+    /// before the generator has had a chance to add its requests.
+    generator_processed_slot: Arc<AtomicI32>,
+}
+
+impl SharedState {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner::new())),
+            virtual_elapsed_ms: Arc::new(AtomicU64::new(0)),
+            generator_processed_slot: Arc::new(AtomicI32::new(-1)),
+        }
+    }
+
+    // ── virtual clock ────────────────────────────────────────────────────
+
+    /// Set the virtual elapsed time (called every scheduler loop tick).
+    #[inline]
+    pub fn set_virtual_elapsed_ms(&self, ms: u64) {
+        self.virtual_elapsed_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Read virtual elapsed time in seconds.
+    #[inline]
+    pub fn virtual_elapsed_secs(&self) -> f64 {
+        self.virtual_elapsed_ms.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    /// Record that the generator has finished processing `slot`.
+    /// Called by the generator thread after adding all requests for a slot.
+    #[inline]
+    pub fn set_generator_processed_slot(&self, slot: i32) {
+        self.generator_processed_slot.store(slot, Ordering::Release);
+    }
+
+    /// Return the last slot index confirmed processed by the generator.
+    #[inline]
+    pub fn generator_processed_slot(&self) -> i32 {
+        self.generator_processed_slot.load(Ordering::Acquire)
+    }
+
+    // ── request queue ─────────────────────────────────────────────────────
+
+    /// Append a new request to the pending queue.
+    pub fn add_request(&self, request: Request) {
+        let mut g = self.inner.lock().unwrap();
+        g.pending.push(request);
+        g.total_received += 1;
+    }
+
+    /// Atomically claim (remove) the first `count` pending requests.
+    ///
+    /// Returns fewer than `count` elements if the queue is shorter.
+    pub fn claim_pending_requests(&self, count: usize) -> Vec<Request> {
+        let mut g = self.inner.lock().unwrap();
+        let n = count.min(g.pending.len());
+        g.pending.drain(..n).collect()
+    }
+
+    /// Return `requests` to the front of the pending queue (preserving order).
+    ///
+    /// Used when a claimed batch could not be scheduled and must be retried.
+    pub fn requeue_pending_requests_front(&self, mut requests: Vec<Request>) {
+        if requests.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        // Prepend: append existing queue to the end of `requests`, then replace.
+        requests.extend(g.pending.drain(..));
+        g.pending = requests;
+    }
+
+    /// Number of pending requests currently in the queue.
+    pub fn get_pending_count(&self) -> usize {
+        self.inner.lock().unwrap().pending.len()
+    }
+
+    // ── assignments ───────────────────────────────────────────────────────
+
+    /// Record a batch of scheduling decisions.
+    ///
+    /// - Overwrites any existing assignment for the same request_id.
+    /// - Increments global error totals only for *new* request ids (not
+    ///   re-planned ones, to avoid double-counting).
+    pub fn add_assignments(&self, assignments: Vec<Assignment>) {
+        let mut g = self.inner.lock().unwrap();
+        for a in assignments {
+            let is_new = !g.assignments.contains_key(&a.request_id);
+            if is_new {
+                g.total_scheduled += 1;
+                g.global_error_sum += a.error;
+                g.global_assignment_count += 1;
+            }
+            g.assignments.insert(a.request_id, a);
+        }
+    }
+
+    /// Snapshot of all active assignments.
+    pub fn get_current_assignments(&self) -> HashMap<u64, Assignment> {
+        self.inner.lock().unwrap().assignments.clone()
+    }
+
+    /// All assignments whose `scheduled_slot >= current_slot`.
+    pub fn get_future_assignments(&self, current_slot: i32) -> Vec<Assignment> {
+        self.inner
+            .lock()
+            .unwrap()
+            .assignments
+            .values()
+            .filter(|a| a.scheduled_slot >= current_slot)
+            .cloned()
+            .collect()
+    }
+
+    // ── error stats ───────────────────────────────────────────────────────
+
+    /// Weighted error statistics for a sliding window
+    /// `[center_slot − window_past, center_slot + window_future]`.
+    ///
+    /// Assignments whose `request_id` is in `exclude` are skipped (used when
+    /// re-planning movable future assignments).
+    pub fn get_window_error_stats(
+        &self,
+        center_slot: i32,
+        window_past: i32,
+        window_future: i32,
+        exclude: &std::collections::HashSet<u64>,
+    ) -> WindowErrorStats {
+        let g = self.inner.lock().unwrap();
+        let start = center_slot - window_past;
+        let end = center_slot + window_future;
+        let mut error_sum = 0.0f64;
+        let mut count = 0u64;
+        for a in g.assignments.values() {
+            if exclude.contains(&a.request_id) {
+                continue;
+            }
+            if a.scheduled_slot >= start && a.scheduled_slot <= end {
+                error_sum += a.error;
+                count += 1;
+            }
+        }
+        let average = if count > 0 { error_sum / count as f64 } else { 0.0 };
+        WindowErrorStats { error_sum, count, average }
+    }
+
+    /// Cumulative error stats across all ever-assigned requests.
+    pub fn get_global_error_stats(&self) -> GlobalErrorStats {
+        let g = self.inner.lock().unwrap();
+        let count = g.global_assignment_count;
+        let error_sum = g.global_error_sum;
+        let avg = if count > 0 { error_sum / count as f64 } else { 0.0 };
+        GlobalErrorStats { error_sum, count, avg }
+    }
+
+    // ── slot management ───────────────────────────────────────────────────
+
+    pub fn set_current_slot(&self, slot: i32) {
+        self.inner.lock().unwrap().current_slot = slot;
+    }
+
+    pub fn get_current_slot(&self) -> i32 {
+        self.inner.lock().unwrap().current_slot
+    }
+
+    // ── statistics ────────────────────────────────────────────────────────
+
+    pub fn get_statistics(&self) -> Statistics {
+        let g = self.inner.lock().unwrap();
+        Statistics {
+            total_received: g.total_received,
+            total_scheduled: g.total_scheduled,
+            pending: g.pending.len(),
+            current_slot: g.current_slot,
+        }
+    }
+
+    /// All assignments whose `scheduled_slot == slot`.
+    pub fn get_requests_in_slot(&self, slot: i32) -> Vec<Assignment> {
+        self.inner
+            .lock()
+            .unwrap()
+            .assignments
+            .values()
+            .filter(|a| a.scheduled_slot == slot)
+            .cloned()
+            .collect()
+    }
+
+    // ── CSV export ────────────────────────────────────────────────────────
+
+    /// Export all current assignments to a CSV file.
+    pub fn export_to_csv(&self, path: &str) -> std::io::Result<()> {
+        let g = self.inner.lock().unwrap();
+        let mut wtr = csv::Writer::from_path(path)?;
+        wtr.write_record([
+            "request_id",
+            "scheduled_slot",
+            "flavour",
+            "carbon_cost",
+            "error",
+            "assignment_time",
+        ])?;
+        for a in g.assignments.values() {
+            wtr.write_record(&[
+                a.request_id.to_string(),
+                a.scheduled_slot.to_string(),
+                a.flavour_name.clone(),
+                a.carbon_cost.to_string(),
+                a.error.to_string(),
+                a.assignment_time.to_string(),
+            ])?;
+        }
+        wtr.flush()?;
+        Ok(())
+    }
+}
+
+impl Default for SharedState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── result structs ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct WindowErrorStats {
+    pub error_sum: f64,
+    pub count: u64,
+    pub average: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalErrorStats {
+    pub error_sum: f64,
+    pub count: u64,
+    pub avg: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Statistics {
+    pub total_received: u64,
+    pub total_scheduled: u64,
+    pub pending: usize,
+    pub current_slot: i32,
+}
+
+// ─── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Assignment, Request};
+    use std::collections::HashSet;
+
+    fn make_request(id: u64, arrival: i32, deadline: i32) -> Request {
+        Request { id, arrival_slot: arrival, deadline_slot: deadline, arrival_time: 0.0 }
+    }
+
+    fn make_assignment(id: u64, slot: i32, error: f64) -> Assignment {
+        Assignment::new(id, slot, "Accurate".to_string(), 1.0, error, 60, None, None)
+    }
+
+    #[test]
+    fn add_and_claim_requests() {
+        let state = SharedState::new();
+        state.add_request(make_request(1, 0, 5));
+        state.add_request(make_request(2, 0, 5));
+        state.add_request(make_request(3, 0, 5));
+        assert_eq!(state.get_pending_count(), 3);
+        let claimed = state.claim_pending_requests(2);
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(state.get_pending_count(), 1);
+    }
+
+    #[test]
+    fn claim_returns_at_most_available() {
+        let state = SharedState::new();
+        state.add_request(make_request(1, 0, 5));
+        let claimed = state.claim_pending_requests(10);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(state.get_pending_count(), 0);
+    }
+
+    #[test]
+    fn requeue_preserves_order() {
+        let state = SharedState::new();
+        state.add_request(make_request(5, 0, 5));
+        let r1 = make_request(1, 0, 5);
+        let r2 = make_request(2, 0, 5);
+        state.requeue_pending_requests_front(vec![r1.clone(), r2.clone()]);
+        let claimed = state.claim_pending_requests(3);
+        assert_eq!(claimed[0].id, 1);
+        assert_eq!(claimed[1].id, 2);
+        assert_eq!(claimed[2].id, 5);
+    }
+
+    #[test]
+    fn add_assignments_updates_global_error() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(1, 0, 4.0), make_assignment(2, 0, 2.0)]);
+        let g = state.get_global_error_stats();
+        assert_eq!(g.count, 2);
+        assert!((g.error_sum - 6.0).abs() < 1e-9);
+        assert!((g.avg - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replanned_request_not_double_counted() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(1, 0, 4.0)]);
+        // Replan request 1 (same id, different slot/cost)
+        state.add_assignments(vec![make_assignment(1, 1, 0.0)]);
+        let g = state.get_global_error_stats();
+        // Only counted once
+        assert_eq!(g.count, 1);
+        assert!((g.error_sum - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn window_error_stats_excludes_out_of_window() {
+        let state = SharedState::new();
+        // slot 5 is in window [3,7], slot 10 is outside
+        state.add_assignments(vec![make_assignment(1, 5, 4.0), make_assignment(2, 10, 2.0)]);
+        let stats = state.get_window_error_stats(5, 2, 2, &HashSet::new());
+        assert_eq!(stats.count, 1);
+        assert!((stats.error_sum - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn window_error_stats_respects_exclude_set() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(1, 5, 4.0), make_assignment(2, 5, 2.0)]);
+        let mut exclude = HashSet::new();
+        exclude.insert(1u64);
+        let stats = state.get_window_error_stats(5, 2, 2, &exclude);
+        assert_eq!(stats.count, 1);
+        assert!((stats.error_sum - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn future_assignments_filtered_by_slot() {
+        let state = SharedState::new();
+        state.add_assignments(vec![
+            make_assignment(1, 3, 0.0),
+            make_assignment(2, 5, 0.0),
+            make_assignment(3, 7, 0.0),
+        ]);
+        let future = state.get_future_assignments(5);
+        let ids: Vec<u64> = future.iter().map(|a| a.request_id).collect();
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+        assert!(!ids.contains(&1));
+    }
+}
