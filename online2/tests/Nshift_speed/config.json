@@ -2,6 +2,7 @@
   "batch_sizes": [1, 4, 6, 8, 10],
   "scenario_path": "scenario_seed_2030.json",
   "output_dir": "output",
+  "rust_output_dir": "output_rust",
   "runner": {
     "flush_partial_batch": true,
     "include_greedy_baseline": true,

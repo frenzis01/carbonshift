@@ -7,7 +7,7 @@ venv/
 .venv/
 env/
 
-online2/tests/Nshift_speed/output
+online2/tests/Nshift_speed/output**
 online2/notebooks/html
 online2/AGENT_CONTEXT.md
 online2/notebooks/2028
