@@ -3,6 +3,7 @@
 /// These mirror the Python dataclasses in `shared_state.py` and the flavour /
 /// capacity-tier dicts in `config.py`.
 
+use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -108,10 +109,11 @@ pub struct Flavour {
 /// A single tier in the step-function capacity/rebound multiplier.
 ///
 /// A slot with `count` requests uses the multiplier of the first tier whose
-/// `max_requests >= count`.  The last tier's `max_requests` should be `i64::MAX`
-/// to act as a catch-all.
-#[derive(Debug, Clone)]
+/// `max_requests >= count`.  A tier with `max_requests = null` (JSON) / `None`
+/// (Rust) is the overflow tier and matches all counts above the previous tier.
+/// The implicit baseline multiplier 1.0 applies for counts up to the first tier.
+#[derive(Debug, Clone, Deserialize)]
 pub struct CapacityTier {
-    pub max_requests: i64,
+    pub max_requests: Option<i64>,
     pub multiplier: f64,
 }

@@ -1,6 +1,6 @@
 {
   "batch_sizes": [1, 4, 6, 8, 10],
-  "scenario_path": "scenario_seed_2030.json",
+  "scenario_path": "scenario_seed_2028.json",
   "output_dir": "output",
   "rust_output_dir": "output_rust",
   "runner": {

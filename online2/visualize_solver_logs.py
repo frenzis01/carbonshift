@@ -591,7 +591,7 @@ def plot_solver_execution_stacked(
 
     for tier in config.CAPACITY_TIERS:
         max_req = tier["max_requests"]
-        if max_req == float("inf"):
+        if max_req is None:
             continue
         ax.axhline(
             y=max_req,

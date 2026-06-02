@@ -49,6 +49,7 @@ def _patch_online2_config(scenario: Dict[str, Any], batch_size: int, output_csv_
         "ENABLE_INFEASIBILITY_DEBUG_LOGGING": config.ENABLE_INFEASIBILITY_DEBUG_LOGGING,
         "VERBOSE": config.VERBOSE,
         "OUTPUT_FILE": config.OUTPUT_FILE,
+        "CAPACITY_TIERS": config.CAPACITY_TIERS,
     }
 
     config.BATCH_SIZE = int(batch_size)
@@ -66,6 +67,8 @@ def _patch_online2_config(scenario: Dict[str, Any], batch_size: int, output_csv_
     config.ENABLE_INFEASIBILITY_DEBUG_LOGGING = False
     config.VERBOSE = False
     config.OUTPUT_FILE = output_csv_path
+    if "capacity_tiers" in metadata:
+        config.CAPACITY_TIERS = list(metadata["capacity_tiers"])
 
     return original
 
@@ -169,7 +172,8 @@ def _select_greedy_baseline_flavour() -> Tuple[str, int]:
 
 def _get_capacity_multiplier(capacity_tiers: List[Dict[str, Any]], request_count: int) -> float:
     for tier in capacity_tiers:
-        if request_count <= float(tier["max_requests"]):
+        max_req = tier["max_requests"]
+        if max_req is None or request_count <= int(max_req):
             return float(tier["multiplier"])
     return float(capacity_tiers[-1]["multiplier"])
 
@@ -410,7 +414,7 @@ def run_single_batch_size(
             per_request_rows.append(
                 {
                     "request_id": request_id,
-                    "arrival_time": float(request_info["arrival_time"]),
+                    "arrival_time": float(request_info["arrival_slot"]) * slot_duration,
                     "arrival_slot": int(request_info["arrival_slot"]),
                     "deadline_slot": int(request_info["deadline_slot"]),
                     "included_in_batch_slot": included_slot if included_slot is not None else "",
@@ -583,7 +587,7 @@ def run_greedy_baseline(
 
     slot_counts = [0 for _ in range(total_slots)]
     slot_durations = [0 for _ in range(total_slots)]
-    capacity_tiers = list(config.CAPACITY_TIERS)
+    capacity_tiers = list(scenario.get("metadata", {}).get("capacity_tiers") or config.CAPACITY_TIERS)
     carbon_forecast = [float(v) for v in scenario["carbon_forecast"]]
 
     per_request_rows: List[Dict[str, Any]] = []
@@ -633,7 +637,7 @@ def run_greedy_baseline(
             per_request_rows.append(
                 {
                     "request_id": int(request["request_id"]),
-                    "arrival_time": float(request["arrival_time"]),
+                    "arrival_time": float(request["arrival_slot"]) * slot_duration,
                     "arrival_slot": int(request["arrival_slot"]),
                     "deadline_slot": int(request["deadline_slot"]),
                     "included_in_batch_slot": slot,

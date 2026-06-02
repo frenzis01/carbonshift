@@ -60,6 +60,7 @@ def generate_and_save_scenario(
         prehistory_mock_influence=prehistory_mock_influence,
         include_prehistory=bool(include_prehistory),
         carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
+        capacity_tiers=list(config.CAPACITY_TIERS),
     )
     save_json(output_path, scenario)
     return scenario

@@ -1102,9 +1102,11 @@ class BatchScheduler:
 
     def _get_capacity_tier_info(self, request_count: int):
         for tier in config.CAPACITY_TIERS:
-            if request_count <= tier["max_requests"]:
-                return float(tier["multiplier"]), tier["max_requests"]
-        return float(config.CAPACITY_TIERS[-1]["multiplier"]), config.CAPACITY_TIERS[-1]["max_requests"]
+            max_req = tier["max_requests"]
+            if max_req is None or request_count <= max_req:
+                return float(tier["multiplier"]), max_req
+        last = config.CAPACITY_TIERS[-1]
+        return float(last["multiplier"]), last["max_requests"]
 
     def _build_slot_metrics(
         self,

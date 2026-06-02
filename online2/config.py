@@ -93,14 +93,20 @@ CARBON_INTENSITY_CYCLE_SLOTS = 24
 # CAPACITY TIERS (REBOUND EFFECT)
 # ============================================================================
 
-# Capacity tiers: (max_requests, carbon_multiplier)
-# If slot receives more than this many requests, carbon emissions multiply
+# Capacity tiers: step-function carbon multiplier based on slot request count.
+# Semantics: the first tier whose max_requests >= count applies.
+# The baseline multiplier 1.0 applies implicitly for counts up to the first tier.
+# A tier with max_requests=None is the overflow tier (applies to all higher counts).
 CAPACITY_TIERS = [
-    {"max_requests": 30, "multiplier": 1.5},
-    {"max_requests": 50, "multiplier": 2.0},
-    {"max_requests": 80, "multiplier": 5.0},
-    {"max_requests": float('inf'), "multiplier": 2.5},
+    {"max_requests": 30,  "multiplier": 1.0},  # 0–30:  normal
+    {"max_requests": 50,  "multiplier": 1.5},  # 31–50: moderate load
+    {"max_requests": 80,  "multiplier": 2.0},  # 51–80: high load
+    {"max_requests": None, "multiplier": 5.0}, # 81+:   overload
 ]
+
+# Hard cap on requests per slot (None = no cap).
+# When set, the scheduler rejects any assignment that would exceed this count.
+SLOT_CAPACITY_HARD_CAP: int | None = None
 
 # ============================================================================
 # DP SOLVER PARAMETERS

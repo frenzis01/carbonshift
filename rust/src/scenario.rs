@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use crate::types::Request;
+use crate::types::{CapacityTier, Request};
 
 // ─── ScenarioMetadata ────────────────────────────────────────────────────────
 
@@ -41,6 +41,11 @@ pub struct ScenarioMetadata {
     pub carbon_random_noise_amplitude: f64,
     /// RNG seed used during generation — stored in `Config::prehistory_random_seed`.
     pub seed: u64,
+    /// Capacity tiers recorded at generation time.  When present, these
+    /// override the runtime config so that benchmark replays use exactly the
+    /// tiers that were in effect when the scenario was created.
+    #[serde(default)]
+    pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
 
 // ─── ScenarioRequest ─────────────────────────────────────────────────────────

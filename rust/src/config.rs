@@ -139,20 +139,21 @@ impl Default for Config {
             carbon_random_noise_amplitude: 20.0,
             carbon_intensity_cycle_slots: 24,
             capacity_tiers: vec![
-                CapacityTier { max_requests: 30,           multiplier: 1.5 },
-                CapacityTier { max_requests: 50,           multiplier: 2.0 },
-                CapacityTier { max_requests: 80,           multiplier: 5.0 },
-                CapacityTier { max_requests: i64::MAX,     multiplier: 2.5 },
+                CapacityTier { max_requests: Some(30),  multiplier: 1.0 },
+                CapacityTier { max_requests: Some(50),  multiplier: 1.5 },
+                CapacityTier { max_requests: Some(80),  multiplier: 2.0 },
+                CapacityTier { max_requests: None,      multiplier: 5.0 }, // 81+: overload
             ],
             dp_pruning_method: "beam".to_string(),
             dp_pruning_min_batch_size: 5,
             dp_pruning_k: 600,
             dp_timeout: 7.0,
             dp_lock_future_assignments: true,
-            dp_allow_relaxed_error_retry: false,
+            dp_allow_relaxed_error_retry: true,
             dp_relaxed_retry_prefer_min_error: true,
-            infeasibility_recovery_mode: "forecast_mock_current_slot".to_string(),
-            infeasibility_mock_influence: 0.4,
+            // infeasibility_recovery_mode: "forecast_mock_current_slot".to_string(),
+            infeasibility_recovery_mode: "carryover_last_slot".to_string(),
+            infeasibility_mock_influence: 0.6,
             infeasibility_mock_error_per_request: None,
             infeasibility_mock_influence_decay_step: 0.2,
             predicted_requests_per_slot: 60.0,
@@ -218,6 +219,9 @@ impl Config {
         self.carbon_intensity_cycle_slots = meta.carbon_intensity_cycle_slots;
         self.carbon_random_noise_amplitude = meta.carbon_random_noise_amplitude;
         self.prehistory_random_seed = meta.seed;
+        if let Some(tiers) = meta.capacity_tiers.as_ref() {
+            self.capacity_tiers = tiers.clone();
+        }
     }
 }
 
@@ -239,9 +243,9 @@ mod tests {
         assert_eq!(cfg.flavours.len(), 3);
         assert_eq!(cfg.flavours[0].name, "Accurate");
         assert_eq!(cfg.capacity_tiers.len(), 4);
-        assert_eq!(cfg.capacity_tiers[0].max_requests, 30);
-        // Last tier is the catch-all
-        assert_eq!(cfg.capacity_tiers[3].max_requests, i64::MAX);
+        assert_eq!(cfg.capacity_tiers[0].max_requests, Some(30));
+        // Last tier is the overflow catch-all
+        assert_eq!(cfg.capacity_tiers[3].max_requests, None);
     }
 
     #[test]

@@ -72,6 +72,7 @@ use carbonshift_rs::metrics_logger::MetricsLogger;
 use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
+use carbonshift_rs::types::CapacityTier;
 
 use serde_json::Value;
 
@@ -480,6 +481,17 @@ fn compute_summary(
 
 // ─── greedy baseline ──────────────────────────────────────────────────────────
 
+fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
+    for tier in tiers {
+        match tier.max_requests {
+            None => return tier.multiplier,          // overflow tier
+            Some(max) if count <= max => return tier.multiplier,
+            _ => {}
+        }
+    }
+    tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
+}
+
 /// Greedy baseline: assign each request immediately on arrival to the "best"
 /// flavour (lowest error; mirrors Python's `run_greedy_baseline`).
 fn run_greedy_baseline(
@@ -493,6 +505,8 @@ fn run_greedy_baseline(
     let slot_dur = cfg.slot_duration_seconds;
     let carbon   = &scenario.carbon_forecast;
     let by_slot  = scenario.requests_by_slot();
+    let tiers    = &cfg.capacity_tiers;
+    let scale    = cfg.carbon_cost_duration_scale;
 
     let mut per_req: Vec<PerRequest> = Vec::new();
     let mut batch_timings: Vec<BatchTiming> = Vec::new();
@@ -500,10 +514,18 @@ fn run_greedy_baseline(
 
     for (slot, requests) in by_slot.iter().enumerate() {
         if requests.is_empty() { continue; }
+        let ci = carbon.get(slot).copied().unwrap_or(1.0);
+        let mut before_count: i64 = 0;
+        let mut before_dur: i64 = 0;
         for req in requests {
             seq += 1;
-            let ci = carbon.get(slot).copied().unwrap_or(1.0);
-            let cost = ci * (flav.duration as f64 / 3600.0);
+            let after_count = before_count + 1;
+            let after_dur = before_dur + flav.duration as i64;
+            let before_mult = get_capacity_multiplier(tiers, before_count);
+            let after_mult = get_capacity_multiplier(tiers, after_count);
+            let cost = (ci * after_mult * after_dur as f64 - ci * before_mult * before_dur as f64) * scale;
+            before_count = after_count;
+            before_dur = after_dur;
             per_req.push(PerRequest {
                 request_id:             req.id,
                 arrival_time:           req.arrival_slot as f64 * slot_dur,
@@ -827,6 +849,11 @@ fn run_single_n(
     let cfg         = Arc::new(cfg);
 
     std::fs::create_dir_all(run_dir).unwrap();
+    // Remove any stale temp files from a previous interrupted run so the
+    // MetricsLogger (which appends) starts with a clean slate.
+    let _ = std::fs::remove_file(&tmp_runs);
+    let _ = std::fs::remove_file(&tmp_assignments);
+    let _ = std::fs::remove_file(&tmp_slot_mets);
 
     let shared_state = SharedState::new();
     let ml = Arc::new(MetricsLogger::new(

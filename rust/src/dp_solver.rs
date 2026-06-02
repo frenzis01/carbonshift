@@ -159,7 +159,7 @@ impl DpSolver {
 
         // Resolve capacity tiers: fall back to flat multiplier if empty.
         let tiers: Vec<CapacityTier> = if input.capacity_tiers.is_empty() {
-            vec![CapacityTier { max_requests: i64::MAX, multiplier: input.capacity_multiplier }]
+            vec![CapacityTier { max_requests: None, multiplier: input.capacity_multiplier }]
         } else {
             input.capacity_tiers.to_vec()
         };
@@ -454,8 +454,10 @@ impl DpSolver {
 
     fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
         for tier in tiers {
-            if count <= tier.max_requests {
-                return tier.multiplier;
+            match tier.max_requests {
+                None => return tier.multiplier,
+                Some(max) if count <= max => return tier.multiplier,
+                _ => {}
             }
         }
         tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
@@ -479,7 +481,7 @@ mod tests {
     }
 
     fn no_tiers() -> Vec<CapacityTier> {
-        vec![CapacityTier { max_requests: i64::MAX, multiplier: 1.0 }]
+        vec![CapacityTier { max_requests: None, multiplier: 1.0 }]
     }
 
     fn make_input_with_maps<'a>(
@@ -541,8 +543,8 @@ mod tests {
     fn capacity_tier_reprices_entire_slot() {
         // Tier threshold at 1 request: >1 request triggers multiplier 2.0.
         let tiers = vec![
-            CapacityTier { max_requests: 1, multiplier: 1.0 },
-            CapacityTier { max_requests: i64::MAX, multiplier: 2.0 },
+            CapacityTier { max_requests: Some(1), multiplier: 1.0 },
+            CapacityTier { max_requests: None,    multiplier: 2.0 },
         ];
         let forecast = vec![40.0; 5]; // flat carbon
         let solver = DpSolver {

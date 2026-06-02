@@ -6,7 +6,19 @@ import json
 import math
 import random
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+
+def _serialize_capacity_tiers(tiers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return a JSON-safe copy of capacity tiers (None max_requests stays null)."""
+    result = []
+    for tier in tiers:
+        max_req = tier["max_requests"]
+        result.append({
+            "max_requests": None if max_req is None else int(max_req),
+            "multiplier": float(tier["multiplier"]),
+        })
+    return result
 
 
 def _resolve_path(path_value: str, base_dir: Path) -> Path:
@@ -57,6 +69,7 @@ def generate_scenario_data(
     error_window_past_decay_slots: int = 0,
     include_prehistory: bool = True,
     carbon_intensity_cycle_slots: int = 24,
+    capacity_tiers: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Build a deterministic scenario payload.
@@ -93,11 +106,19 @@ def generate_scenario_data(
                 {
                     "request_id": request_id,
                     "arrival_slot": slot,
-                    "arrival_time": round(slot * slot_duration_seconds, 6),
+                    "arrival_time": slot * slot_duration_seconds,  # fractional offset added below
                     "deadline_slot": deadline_slot,
                 }
             )
             request_id += 1
+
+    # Add a sub-slot fractional offset to each arrival_time using a separate RNG
+    # so the main rng sequence (counts, deadlines) is unaffected by this change.
+    arrival_rng = random.Random(seed ^ 0xA1B2C3D4)
+    for req in requests:
+        req["arrival_time"] = round(
+            req["arrival_time"] + arrival_rng.uniform(0.0, slot_duration_seconds), 6
+        )
 
     prehistory_slots: List[Dict[str, Any]] = []
     synthetic_error = max_error_threshold * prehistory_error_ratio
@@ -116,7 +137,7 @@ def generate_scenario_data(
     else:
         prehistory_influence = 0.0
 
-    requests.sort(key=lambda item: (int(item["arrival_slot"]), int(item["request_id"])))
+    requests.sort(key=lambda item: (int(item["arrival_slot"]), float(item["arrival_time"]), int(item["request_id"])))
 
     return {
         "metadata": {
@@ -136,6 +157,7 @@ def generate_scenario_data(
             "prehistory_mock_influence": prehistory_influence,
             "prehistory_enabled": bool(include_prehistory),
             "carbon_intensity_cycle_slots": int(cycle),
+            **({"capacity_tiers": _serialize_capacity_tiers(capacity_tiers)} if capacity_tiers is not None else {}),
         },
         "carbon_forecast": forecast,
         "requests": requests,
