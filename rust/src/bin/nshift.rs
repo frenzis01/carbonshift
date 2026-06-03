@@ -22,8 +22,8 @@
 //! |-------------------------|---------|--------------------------------------------------|
 //! | `--config <path>`       | `config.json` | Path to JSON config file             |
 //! | `--speed-scale <f>`     | `1.0`   | Slot speed multiplier (only used with `--realtime-slots`) |
-//! | `--realtime-slots`      | off     | Wait real slot durations (for live-like testing) |
-//! | `--verbose`             | off     | Print per-batch solver logs                      |
+//! | `--realtime-slots`      | off     | Wait real slot durations (for live-like testing)          |
+//! | `--verbose`             | off     | Print per-batch solver logs                               |
 //!
 //! # Config file format
 //! ```json
@@ -33,13 +33,18 @@
 //!   "output_dir":       "output",
 //!   "rust_output_dir":  "output_rust",
 //!   "runner": {
-//!     "flush_partial_batch":    true,
-//!     "include_greedy_baseline": true,
-//!     "realtime_slots":         false,
-//!     "realtime_speed_scale":   1.0
+//!     "flush_partial_batch":          true,
+//!     "include_greedy_baseline":      true,
+//!     "realtime_slots":               false,
+//!     "realtime_speed_scale":         1.0,
+//!     "dp_allow_relaxed_error_retry": true
 //!   }
 //! }
 //! ```
+//!
+//! **Key runner fields:**
+//! - `dp_allow_relaxed_error_retry` (default: `true`): when `false`, the scheduler skips the
+//!   relaxed-window DP retry and falls back directly to greedy on infeasibility.
 //!
 //! **Key fields:**
 //! - `batch_sizes`: list of N values to benchmark.
@@ -85,6 +90,8 @@ struct BenchmarkConfig {
     realtime_slots: bool,
     realtime_speed_scale: f64,
     include_greedy_baseline: bool,
+    /// When false, skip relaxed-window DP retry on infeasibility and go straight to greedy.
+    dp_allow_relaxed_error_retry: bool,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -122,8 +129,10 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         runner.get("realtime_speed_scale").and_then(|x| x.as_f64()).unwrap_or(1.0);
     let include_greedy_baseline =
         runner.get("include_greedy_baseline").and_then(|x| x.as_bool()).unwrap_or(true);
+    let dp_allow_relaxed_error_retry =
+        runner.get("dp_allow_relaxed_error_retry").and_then(|x| x.as_bool()).unwrap_or(true);
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline }
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -962,6 +971,7 @@ fn main() {
     // Build a base config that has all scenario parameters applied.
     let mut base_cfg = Config::default();
     base_cfg.apply_scenario_metadata(&scenario.metadata);
+    base_cfg.dp_allow_relaxed_error_retry = bcfg.dp_allow_relaxed_error_retry;
 
     println!(
         "Loaded scenario: {} slots, {} requests ({})",

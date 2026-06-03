@@ -19,3 +19,6 @@ online2/DEVELOPMENT.md
 **/scenario_seed_*.json
 
 rust/target/
+tests/battery/results
+
+**.bk
