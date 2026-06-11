@@ -160,7 +160,7 @@ impl Default for Config {
             request_rate_std_factor: 0.5,
             deadline_min_slack: 0,
             deadline_max_slack: 8,
-            max_batch_solver_parallelism: 5,
+            max_batch_solver_parallelism: 8,
             queue_timeout: 1.0,
             skip_empty_slots: true,
             slot_speed_scale: 1.0,

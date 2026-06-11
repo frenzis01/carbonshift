@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -59,6 +60,8 @@ RESULT_COLUMNS = [
     "baseline_total_carbon_cost",
     "carbon_cost_saving_vs_baseline_pct",
 ]
+
+TIMING_COLUMNS = ["scenario_id", "elapsed_seconds"]
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -315,6 +318,8 @@ def run_battery(config_path: Path) -> None:
             rust_binary = None
 
     all_rows: List[Dict[str, Any]] = []
+    timing_rows: List[Dict[str, Any]] = []
+    battery_t0 = time.monotonic()
 
     for scenario_def in cfg["scenarios"]:
         sid: str = scenario_def["id"]
@@ -326,6 +331,7 @@ def run_battery(config_path: Path) -> None:
         print(f"Scenario: {sid}  (seed={seed}, slots={total_slots}, req/slot={req_per_slot})")
         print("=" * 60)
 
+        scenario_t0 = time.monotonic()
         scenario_dir = output_dir / sid
         scenario_dir.mkdir(parents=True, exist_ok=True)
         scenario_path = scenario_dir / f"scenario_seed_{seed}.json"
@@ -345,14 +351,28 @@ def run_battery(config_path: Path) -> None:
             rows = _run_rust_scenario(scenario_path, sid, batch_sizes, modes, scenario_dir, rust_binary)
             all_rows.extend(rows)
 
+        scenario_elapsed = time.monotonic() - scenario_t0
+        timing_rows.append({"scenario_id": sid, "elapsed_seconds": round(scenario_elapsed, 3)})
+        print(f"  Scenario {sid} completed in {scenario_elapsed:.1f}s")
+
+    battery_elapsed = time.monotonic() - battery_t0
+    timing_rows.append({"scenario_id": "__battery_total__", "elapsed_seconds": round(battery_elapsed, 3)})
+
     results_csv = output_dir / f"battery_results_{battery_id}.csv"
     with open(results_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS)
         writer.writeheader()
         writer.writerows(all_rows)
 
+    timings_csv = output_dir / f"battery_timings_{battery_id}.csv"
+    with open(timings_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TIMING_COLUMNS)
+        writer.writeheader()
+        writer.writerows(timing_rows)
+
     print(f"\n{'='*60}")
-    print(f"Battery complete: {len(all_rows)} rows written to {results_csv}")
+    print(f"Battery complete in {battery_elapsed:.1f}s: {len(all_rows)} rows written to {results_csv}")
+    print(f"Timings written to {timings_csv}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:

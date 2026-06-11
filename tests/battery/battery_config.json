@@ -8,7 +8,29 @@
   "output_dir": "tests/battery/results",
   "scenarios": [
     {
-      "id": "high_load_38",
+      "id": "low_load_2028",
+      "seed": 2028,
+      "requests_per_slot": 20.0,
+      "total_slots": 24,
+      "capacity_tiers": [
+        {"max_requests": 10,   "multiplier": 1.5},
+        {"max_requests": 20,   "multiplier": 2.0},
+        {"max_requests": null, "multiplier": 5.0}
+      ]
+    },
+    {
+      "id": "medium_load_2028",
+      "seed": 2028,
+      "requests_per_slot": 60.0,
+      "total_slots": 48,
+      "capacity_tiers": [
+        {"max_requests": 30,   "multiplier": 1.5},
+        {"max_requests": 60,   "multiplier": 2.0},
+        {"max_requests": null, "multiplier": 5.0}
+      ]
+    },
+    {
+      "id": "medium_load_38",
       "seed": 38,
       "requests_per_slot": 60.0,
       "total_slots": 72,
@@ -19,7 +41,7 @@
       ]
     },
     {
-      "id": "high_load_56",
+      "id": "medium_load_56",
       "seed": 56,
       "requests_per_slot": 60.0,
       "total_slots": 72,
@@ -55,7 +77,7 @@
       "id": "high_load_105",
       "seed": 105,
       "requests_per_slot": 90.0,
-      "total_slots": 48,
+      "total_slots": 72,
       "capacity_tiers": [
         {"max_requests": 50,   "multiplier": 1.5},
         {"max_requests": 90,   "multiplier": 2.0},
