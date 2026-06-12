@@ -560,4 +560,171 @@ mod tests {
         assert!(ids.contains(&3));
         assert!(!ids.contains(&1));
     }
+
+    // ── Rollback / try_add_assignments_checked tests ───────────────────────────
+
+    fn tiers_with_implicit_one() -> Vec<CapacityTier> {
+        // [{30,1.0}, {50,1.5}, {null,2.0}] — explicit 1.0 first tier
+        vec![
+            CapacityTier { max_requests: Some(30), multiplier: 1.0 },
+            CapacityTier { max_requests: Some(50), multiplier: 1.5 },
+            CapacityTier { max_requests: None,     multiplier: 2.0 },
+        ]
+    }
+
+    fn tiers_no_implicit_one() -> Vec<CapacityTier> {
+        // [{30,1.5}, {50,2.0}, {null,5.0}] — battery-style (no explicit 1.0)
+        vec![
+            CapacityTier { max_requests: Some(30), multiplier: 1.5 },
+            CapacityTier { max_requests: Some(50), multiplier: 2.0 },
+            CapacityTier { max_requests: None,     multiplier: 5.0 },
+        ]
+    }
+
+    /// Commit `count` dummy assignments to `slot`, using sequential request IDs
+    /// starting from `id_start`.
+    fn prefill_slot(state: &SharedState, slot: i32, count: usize, id_start: u64) {
+        let assignments: Vec<Assignment> = (0..count as u64)
+            .map(|i| make_assignment(id_start + i, slot, 0.0))
+            .collect();
+        state.add_assignments(assignments);
+    }
+
+    #[test]
+    fn rollback_no_race_commits() {
+        // No concurrent writes: current_before == baseline => actual_after == expected => no rollback.
+        let state = SharedState::new();
+        let tiers = tiers_with_implicit_one();
+
+        // Pre-fill slot 5 with 25 requests (baseline the solver will have observed).
+        prefill_slot(&state, 5, 25, 1000);
+
+        // Batch of 5 new requests for slot 5.
+        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
+        // expected = baseline(25) + batch_adds(5) = 30
+        let mut expected = HashMap::new();
+        expected.insert(5i32, 30i32);
+
+        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
+        assert_eq!(outcome, CommitOutcome::Committed);
+    }
+
+    #[test]
+    fn rollback_race_same_tier_commits() {
+        // Race occurred but both expected and actual_after land in the same tier => no rollback.
+        let state = SharedState::new();
+        let tiers = tiers_with_implicit_one();
+
+        // Baseline solver saw: slot 5 has 31 requests (already past the 30-threshold → tier 1.5).
+        // Race: 3 more were committed in the meantime → now 34.
+        prefill_slot(&state, 5, 34, 1000);
+
+        // Batch adds 5 more.
+        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
+        // expected = baseline(31) + batch_adds(5) = 36
+        let mut expected = HashMap::new();
+        expected.insert(5i32, 36i32);
+
+        // actual_after = 34 + 5 = 39; expected = 36
+        // Both in tier 1.5 (31-50) => same tier => Committed.
+        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
+        assert_eq!(outcome, CommitOutcome::Committed);
+    }
+
+    #[test]
+    fn rollback_race_tier_breach_rolls_back() {
+        // Race pushed slot past a tier boundary that the solver did NOT intend to cross.
+        let state = SharedState::new();
+        let tiers = tiers_with_implicit_one();
+
+        // Baseline solver saw: slot 5 has 25 requests (tier 1.0, ≤30).
+        // Race: 8 more were committed → now 33 (tier 1.5, >30).
+        prefill_slot(&state, 5, 33, 1000);
+
+        // Batch adds 5 more.
+        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
+        // expected = baseline(25) + batch_adds(5) = 30 → capacity_multiplier(30) = 1.0
+        // actual_after = 33 + 5 = 38 → capacity_multiplier(38) = 1.5
+        // 1.5 > 1.0 => RolledBack
+        let mut expected = HashMap::new();
+        expected.insert(5i32, 30i32);
+
+        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
+        assert_eq!(outcome, CommitOutcome::RolledBack);
+
+        // Nothing should have been committed.
+        assert_eq!(state.get_current_assignments().len(), 33);
+    }
+
+    #[test]
+    fn rollback_force_commit_bypasses_tier_check() {
+        // Even with a tier breach, force_commit=true always commits.
+        let state = SharedState::new();
+        let tiers = tiers_with_implicit_one();
+
+        prefill_slot(&state, 5, 33, 1000);
+
+        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
+        let mut expected = HashMap::new();
+        expected.insert(5i32, 30i32); // same breach scenario as above
+
+        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, true, 0);
+        assert_eq!(outcome, CommitOutcome::Committed);
+        assert_eq!(state.get_current_assignments().len(), 38);
+    }
+
+    #[test]
+    fn rollback_increments_stats_correctly() {
+        // Each RolledBack outcome increments total_rollbacks and updates max_consecutive.
+        let state = SharedState::new();
+        let tiers = tiers_with_implicit_one();
+
+        prefill_slot(&state, 5, 33, 1000);
+
+        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
+        let mut expected = HashMap::new();
+        expected.insert(5i32, 30i32);
+
+        // First rollback (consecutive_before = 0)
+        let _ = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
+        // Second rollback (consecutive_before = 1)
+        let _ = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 1);
+
+        let stats = state.get_rollback_stats();
+        assert_eq!(stats.total_rollbacks, 2);
+        assert_eq!(stats.max_consecutive_rollbacks, 2); // max(0+1, 1+1) = 2
+    }
+
+    #[test]
+    fn rollback_battery_style_tiers_work() {
+        // Battery config tiers don't have the explicit 1.0 first entry.
+        // Test that tier-breach detection still functions correctly.
+        let state = SharedState::new();
+        let tiers = tiers_no_implicit_one(); // [{30,1.5}, {50,2.0}, {null,5.0}]
+
+        // Baseline: slot 5 has 28 requests (tier 1.5, ≤30).
+        // Race: 5 more committed → now 33 (tier 2.0, >30).
+        prefill_slot(&state, 5, 33, 1000);
+
+        // Batch adds 3 more.
+        let batch: Vec<Assignment> = (0..3u64).map(|i| make_assignment(i, 5, 0.0)).collect();
+        // expected = baseline(28) + batch_adds(3) = 31 → capacity_multiplier(31) = 2.0 (>30, ≤50)
+        // actual_after = 33 + 3 = 36 → capacity_multiplier(36) = 2.0
+        // Same tier → Committed (race didn't push to a NEW tier).
+        let mut expected = HashMap::new();
+        expected.insert(5i32, 31i32);
+        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
+        assert_eq!(outcome, CommitOutcome::Committed, "same tier should not rollback");
+
+        // Reset: now a breach scenario.
+        let state2 = SharedState::new();
+        prefill_slot(&state2, 5, 33, 1000);
+        // expected = baseline(28) + batch(3) = 31, but we choose baseline=27 batch=3 → expected=30
+        // expected=30 → tier 1.5 (30<=30); actual_after=36 → tier 2.0 (36>30, 36<=50) → BREACH
+        let mut expected2 = HashMap::new();
+        expected2.insert(5i32, 30i32); // baseline=27, batch=3
+        let batch2: Vec<Assignment> = (3..6u64).map(|i| make_assignment(i, 5, 0.0)).collect();
+        let outcome2 = state2.try_add_assignments_checked(&batch2, &expected2, &tiers, false, 0);
+        assert_eq!(outcome2, CommitOutcome::RolledBack, "tier breach should rollback");
+    }
 }

@@ -36,6 +36,8 @@ struct SchedulerStats {
     solver_total_time_ms: f64,
     solver_total_requests: u64,
     last_solver_elapsed_ms: f64,
+    peak_concurrent_workers: usize,
+    sum_active_workers_at_dispatch: u64,
 }
 
 /// Persistent mock-pool for infeasibility recovery.
@@ -94,6 +96,8 @@ pub struct SchedulerStatistics {
     pub avg_solver_ms_per_request: f64,
     pub active_batch_workers: usize,
     pub max_batch_parallelism: usize,
+    pub peak_concurrent_workers: usize,
+    pub avg_concurrent_workers: f64,
 }
 
 // ─── Simple error baseline (internal) ────────────────────────────────────────
@@ -217,6 +221,7 @@ impl BatchScheduler {
         let runs = m.stats.solver_runs;
         let time_ms = m.stats.solver_total_time_ms;
         let reqs = m.stats.solver_total_requests;
+        let dispatches = m.stats.solver_runs; // one dispatch per solver run
         SchedulerStatistics {
             batches_processed: m.stats.batches_processed,
             total_scheduled: m.stats.total_scheduled,
@@ -226,6 +231,12 @@ impl BatchScheduler {
             avg_solver_ms_per_request: if reqs > 0 { time_ms / reqs as f64 } else { 0.0 },
             active_batch_workers: m.active_workers,
             max_batch_parallelism: self.cfg.max_batch_solver_parallelism,
+            peak_concurrent_workers: m.stats.peak_concurrent_workers,
+            avg_concurrent_workers: if dispatches > 0 {
+                m.stats.sum_active_workers_at_dispatch as f64 / dispatches as f64
+            } else {
+                0.0
+            },
         }
     }
 
@@ -381,7 +392,16 @@ fn dispatch_batch_workers(
         }
 
         // Increment active-worker counter before spawning so the main loop sees it.
-        mutable.lock().unwrap().active_workers += 1;
+        {
+            let mut g = mutable.lock().unwrap();
+            let new_count = g.active_workers + 1;
+            g.active_workers = new_count;
+            // Track peak and sum-for-average.
+            if new_count > g.stats.peak_concurrent_workers {
+                g.stats.peak_concurrent_workers = new_count;
+            }
+            g.stats.sum_active_workers_at_dispatch += new_count as u64;
+        }
 
         let pending_len = pending.len();
         let ss = shared_state.clone();

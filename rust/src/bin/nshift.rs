@@ -236,6 +236,8 @@ struct RunSummary {
     total_rollbacks: u64,
     max_consecutive_rollbacks: u64,
     requests_assigned_with_rollback: usize,
+    peak_concurrent_workers: usize,
+    avg_concurrent_workers: f64,
     solver_time_ms_min: f64,
     solver_time_ms_max: f64,
     solver_time_ms_avg: f64,
@@ -449,6 +451,8 @@ fn compute_summary(
     total_rollbacks: u64,
     max_consecutive_rollbacks: u64,
     requests_assigned_with_rollback: usize,
+    peak_concurrent_workers: usize,
+    avg_concurrent_workers: f64,
 ) -> RunSummary {
     let scheduled = per_req.len();
     let total_carbon: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
@@ -490,6 +494,8 @@ fn compute_summary(
         total_rollbacks,
         max_consecutive_rollbacks,
         requests_assigned_with_rollback,
+        peak_concurrent_workers,
+        avg_concurrent_workers,
         solver_time_ms_min:      st_min,
         solver_time_ms_max:      st_max,
         solver_time_ms_avg:      st_avg,
@@ -601,6 +607,8 @@ fn run_greedy_baseline(
         0,
         0,
         0,
+        0,   // peak_concurrent_workers
+        0.0, // avg_concurrent_workers
     );
     (per_req, batch_timings, summary)
 }
@@ -616,6 +624,7 @@ const SUMMARY_CSV_HEADER: &[&str] = &[
     "global_average_error_modeled_skip_first_k",
     "requests_assigned_with_greedy_fallback", "requests_assigned_with_relaxed_retry",
     "total_rollbacks", "max_consecutive_rollbacks", "requests_assigned_with_rollback",
+    "peak_concurrent_workers", "avg_concurrent_workers",
     "solver_time_ms_min", "solver_time_ms_max", "solver_time_ms_avg",
     "queue_wait_seconds_min", "queue_wait_seconds_max", "queue_wait_seconds_avg",
     "final_wait_seconds_min", "final_wait_seconds_max", "final_wait_seconds_avg",
@@ -647,6 +656,8 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "total_rollbacks":                         s.total_rollbacks,
         "max_consecutive_rollbacks":               s.max_consecutive_rollbacks,
         "requests_assigned_with_rollback":         s.requests_assigned_with_rollback,
+        "peak_concurrent_workers":                 s.peak_concurrent_workers,
+        "avg_concurrent_workers":                  s.avg_concurrent_workers,
         "solver_time_ms_min":                      s.solver_time_ms_min,
         "solver_time_ms_max":                      s.solver_time_ms_max,
         "solver_time_ms_avg":                      s.solver_time_ms_avg,
@@ -680,6 +691,8 @@ fn summary_csv_row(s: &RunSummary) -> Vec<String> {
         s.total_rollbacks.to_string(),
         s.max_consecutive_rollbacks.to_string(),
         s.requests_assigned_with_rollback.to_string(),
+        s.peak_concurrent_workers.to_string(),
+        s.avg_concurrent_workers.to_string(),
         s.solver_time_ms_min.to_string(), s.solver_time_ms_max.to_string(),
         s.solver_time_ms_avg.to_string(),
         s.queue_wait_seconds_min.to_string(), s.queue_wait_seconds_max.to_string(),
@@ -924,6 +937,7 @@ fn run_single_n(
     }
 
     generator.stop();
+    let sched_stats = sched.get_statistics();
     sched.stop();
 
     let total_received = shared_state.get_statistics().total_received as usize;
@@ -952,6 +966,8 @@ fn run_single_n(
         rollback_stats.total_rollbacks,
         rollback_stats.max_consecutive_rollbacks as u64,
         rolled_back_ids.len(),
+        sched_stats.peak_concurrent_workers,
+        sched_stats.avg_concurrent_workers,
     );
 
     // Clean up temp files.

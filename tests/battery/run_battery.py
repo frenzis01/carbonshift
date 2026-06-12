@@ -61,6 +61,8 @@ RESULT_COLUMNS = [
     "max_consecutive_rollbacks",
     "baseline_total_carbon_cost",
     "carbon_cost_saving_vs_baseline_pct",
+    "peak_concurrent_workers",
+    "avg_concurrent_workers",
 ]
 
 TIMING_COLUMNS = ["scenario_id", "elapsed_seconds"]
@@ -172,6 +174,8 @@ def _run_python_mode(
                 "max_consecutive_rollbacks": 0,
                 "baseline_total_carbon_cost": baseline_cost,
                 "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                "peak_concurrent_workers": 0,
+                "avg_concurrent_workers": 0.0,
             })
             print(
                 f"    [python/{mode}] N={n}: "
@@ -284,6 +288,8 @@ def _run_rust_scenario(
                     "max_consecutive_rollbacks": int(row.get("max_consecutive_rollbacks", 0)),
                     "baseline_total_carbon_cost": bc,
                     "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                    "peak_concurrent_workers": int(row.get("peak_concurrent_workers", 0)),
+                    "avg_concurrent_workers": float(row.get("avg_concurrent_workers", 0.0)),
                 })
                 print(
                     f"    [rust/{mode}] N={n}: "
