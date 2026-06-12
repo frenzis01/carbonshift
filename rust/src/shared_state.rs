@@ -12,11 +12,11 @@
 /// simplicity and correctness; hot-path profiling can guide future
 /// optimisations without changing the public API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::types::{Assignment, Request};
+use crate::types::{Assignment, CapacityTier, Request};
 
 // ─── inner (lock-guarded) data ────────────────────────────────────────────────
 
@@ -33,6 +33,13 @@ struct Inner {
     /// Running global error totals across all ever-assigned requests.
     global_error_sum: f64,
     global_assignment_count: u64,
+    // ── rollback tracking ─────────────────────────────────────────────────
+    /// Total number of rollbacks (tier-breach detections) that occurred.
+    total_rollbacks: u64,
+    /// Highest consecutive-rollback count seen for a single batch.
+    max_consecutive_rollbacks_seen: u64,
+    /// Request IDs that were ultimately committed after ≥1 rollback attempt.
+    rolled_back_request_ids: HashSet<u64>,
 }
 
 impl Inner {
@@ -45,6 +52,9 @@ impl Inner {
             total_scheduled: 0,
             global_error_sum: 0.0,
             global_assignment_count: 0,
+            total_rollbacks: 0,
+            max_consecutive_rollbacks_seen: 0,
+            rolled_back_request_ids: HashSet::new(),
         }
     }
 }
@@ -283,6 +293,103 @@ impl SharedState {
         wtr.flush()?;
         Ok(())
     }
+    // ── rollback ──────────────────────────────────────────────────────────────
+
+    /// Atomically attempt to commit assignments, checking for unintended
+    /// capacity-tier breaches caused by concurrent thread activity.
+    ///
+    /// `expected_per_slot` maps each slot to the occupancy the solver assumed
+    /// after committing this batch:
+    ///   expected[s] = baseline_slot_counts[s] + (assignments in batch to slot s)
+    ///
+    /// If the actual occupancy (current shared_state count + batch additions) for
+    /// any slot would land in a *higher* capacity tier than the solver expected,
+    /// the commit is refused and `CommitOutcome::RolledBack` is returned —
+    /// nothing is written to the assignment map.
+    ///
+    /// `force_commit` bypasses the check (used once the per-batch rollback limit K
+    /// is reached, so the batch is committed even with a tier breach).
+    ///
+    /// `consecutive_before` is the number of rollbacks this batch has already
+    /// experienced; used to update `max_consecutive_rollbacks_seen`.
+    ///
+    /// Note: when `dp_lock_future_assignments=false` the check may be conservative
+    /// (occasional spurious rollbacks) because re-planned future requests still
+    /// appear at their old slots in the assignment map until overwritten.  The
+    /// K-limit ensures the batch is eventually committed.
+    pub fn try_add_assignments_checked(
+        &self,
+        assignments: &[Assignment],
+        expected_per_slot: &HashMap<i32, i32>,
+        tiers: &[CapacityTier],
+        force_commit: bool,
+        consecutive_before: usize,
+    ) -> CommitOutcome {
+        let mut g = self.inner.lock().unwrap();
+
+        if !force_commit {
+            for (&slot, &expected) in expected_per_slot {
+                let current_before = g.assignments.values()
+                    .filter(|a| a.scheduled_slot == slot)
+                    .count() as i32;
+                let batch_adds = assignments.iter()
+                    .filter(|a| a.scheduled_slot == slot)
+                    .count() as i32;
+                let actual_after = current_before + batch_adds;
+
+                if actual_after > expected {
+                    let expected_mult = capacity_multiplier_for_count(expected, tiers);
+                    let actual_mult   = capacity_multiplier_for_count(actual_after, tiers);
+                    if actual_mult > expected_mult {
+                        g.total_rollbacks += 1;
+                        let consec = (consecutive_before + 1) as u64;
+                        if consec > g.max_consecutive_rollbacks_seen {
+                            g.max_consecutive_rollbacks_seen = consec;
+                        }
+                        return CommitOutcome::RolledBack;
+                    }
+                }
+            }
+        }
+
+        // Commit the assignments.
+        for a in assignments {
+            let is_new = !g.assignments.contains_key(&a.request_id);
+            if is_new {
+                g.total_scheduled += 1;
+                g.global_error_sum += a.error;
+                g.global_assignment_count += 1;
+            }
+            g.assignments.insert(a.request_id, a.clone());
+        }
+        CommitOutcome::Committed
+    }
+
+    /// Mark request IDs as having been committed after ≥1 rollback.
+    pub fn mark_requests_rolled_back(&self, request_ids: &[u64]) {
+        if request_ids.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        for &id in request_ids {
+            g.rolled_back_request_ids.insert(id);
+        }
+    }
+
+    /// Cumulative rollback statistics for the entire scenario run.
+    pub fn get_rollback_stats(&self) -> RollbackStats {
+        let g = self.inner.lock().unwrap();
+        RollbackStats {
+            total_rollbacks: g.total_rollbacks,
+            max_consecutive_rollbacks: g.max_consecutive_rollbacks_seen,
+            requests_assigned_with_rollback: g.rolled_back_request_ids.len() as u64,
+        }
+    }
+
+    /// Set of request IDs that were committed after ≥1 rollback (for PerRequest tagging).
+    pub fn get_rolled_back_request_ids(&self) -> HashSet<u64> {
+        self.inner.lock().unwrap().rolled_back_request_ids.clone()
+    }
 }
 
 impl Default for SharedState {
@@ -291,7 +398,38 @@ impl Default for SharedState {
     }
 }
 
+// ─── capacity-tier helper (mirrors DpSolver::get_capacity_multiplier) ─────────
+
+fn capacity_multiplier_for_count(count: i32, tiers: &[CapacityTier]) -> f64 {
+    for tier in tiers {
+        match tier.max_requests {
+            None => return tier.multiplier,
+            Some(max) if (count as i64) <= max => return tier.multiplier,
+            _ => {}
+        }
+    }
+    tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
+}
+
 // ─── result structs ───────────────────────────────────────────────────────────
+
+/// Outcome of [`SharedState::try_add_assignments_checked`].
+#[derive(Debug, PartialEq)]
+pub enum CommitOutcome {
+    Committed,
+    RolledBack,
+}
+
+/// Aggregated rollback statistics for a completed scenario run.
+#[derive(Debug, Clone, Default)]
+pub struct RollbackStats {
+    /// Total number of tier-breach rollbacks detected across all batches.
+    pub total_rollbacks: u64,
+    /// Largest consecutive-rollback count seen for any single batch.
+    pub max_consecutive_rollbacks: u64,
+    /// Number of requests that were ultimately assigned after ≥1 rollback.
+    pub requests_assigned_with_rollback: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct WindowErrorStats {

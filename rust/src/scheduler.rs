@@ -23,7 +23,7 @@ use rand_distr::{Distribution, Normal};
 use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
-use crate::shared_state::SharedState;
+use crate::shared_state::{CommitOutcome, SharedState};
 use crate::types::{Assignment, Flavour, Request, RequestAssignment};
 
 // ─── internal state types ────────────────────────────────────────────────────
@@ -420,125 +420,174 @@ fn batch_worker_entry(
         println!("[Scheduler] Worker start: slot={slot}, batch_size={}", pending.len());
     }
 
-    let t0 = Instant::now();
-    let wall_start = unix_now_f64();
+    let mut consecutive_rollbacks: usize = 0;
 
-    let (assignments, ctx) =
-        solve_dp(slot, &pending, shared_state, cfg, carbon_forecast, fdb, mutable, ml);
+    loop {
+        let t0 = Instant::now();
+        let wall_start = unix_now_f64();
 
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let wall_end = unix_now_f64();
+        let (assignments, ctx, baseline_slot_counts) =
+            solve_dp(slot, &pending, shared_state, cfg, carbon_forecast, fdb, mutable, ml);
 
-    if assignments.is_empty() {
-        // Infeasible: return pending to the front of the queue.
-        shared_state.requeue_pending_requests_front(pending);
-        return false;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let wall_end = unix_now_f64();
+
+        if assignments.is_empty() {
+            // Infeasible: return pending to the front of the queue.
+            shared_state.requeue_pending_requests_front(pending);
+            return false;
+        }
+
+        // Compute the per-slot counts the solver assumed (baseline + batch).
+        let mut expected_per_slot = baseline_slot_counts.clone();
+        for a in &assignments {
+            *expected_per_slot.entry(a.scheduled_slot).or_insert(0) += 1;
+        }
+
+        // Attempt atomic commit; check for concurrent capacity-tier breach.
+        let force_commit = cfg.rollback_max_consecutive == 0
+            || consecutive_rollbacks >= cfg.rollback_max_consecutive;
+
+        let outcome = shared_state.try_add_assignments_checked(
+            &assignments,
+            &expected_per_slot,
+            &cfg.capacity_tiers,
+            force_commit,
+            consecutive_rollbacks,
+        );
+
+        match outcome {
+            CommitOutcome::RolledBack => {
+                consecutive_rollbacks += 1;
+                if cfg.verbose {
+                    println!(
+                        "[Scheduler] ↩ Rollback #{consecutive_rollbacks} for slot={slot} \
+                         (unintended capacity-tier breach); re-solving...",
+                    );
+                }
+                // Re-run solve_dp with the same pending batch but fresh shared_state view.
+                continue;
+            }
+            CommitOutcome::Committed => {
+                // If this batch went through rollbacks, flag the committed requests.
+                if consecutive_rollbacks > 0 {
+                    let req_ids: Vec<u64> = pending.iter().map(|r| r.id).collect();
+                    shared_state.mark_requests_rolled_back(&req_ids);
+                }
+
+                shared_state.export_to_csv(&cfg.output_file).ok();
+
+                let new_count = pending.len();
+                let total_count = assignments.len();
+                let replanned = total_count.saturating_sub(new_count);
+                let total_cost: f64 = assignments.iter().map(|a| a.carbon_cost).sum();
+
+                // Update stats and get run_sequence for logging.
+                let (run_sequence, batches_processed, total_scheduled) = {
+                    let mut g = mutable.lock().unwrap();
+                    g.stats.solver_runs += 1;
+                    g.stats.batches_processed += 1;
+                    g.stats.total_scheduled += new_count as u64;
+                    g.stats.solver_total_time_ms += elapsed_ms;
+                    g.stats.solver_total_requests += new_count as u64;
+                    g.stats.last_solver_elapsed_ms = elapsed_ms;
+                    (g.stats.solver_runs, g.stats.batches_processed, g.stats.total_scheduled)
+                };
+
+                if cfg.verbose {
+                    let avg_error: f64 = assignments.iter().map(|a| a.error).sum::<f64>()
+                        / assignments.len() as f64;
+                    let rollback_note = if consecutive_rollbacks > 0 {
+                        format!(" [after {consecutive_rollbacks} rollback(s)]")
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "[Scheduler] ✓ Scheduled {} new requests{}{} \
+                         (cost={total_cost:.2}, error={avg_error:.2}%, solver={elapsed_ms:.2}ms)",
+                        new_count,
+                        if replanned > 0 { format!(" + {replanned} re-planned") } else { String::new() },
+                        rollback_note,
+                    );
+                }
+
+                // Build and emit metrics log row.
+                if ml.enabled {
+                    let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
+                    let pending_ids_str: HashSet<u64> = new_ids.clone();
+                    let all_assignments = shared_state.get_current_assignments();
+
+                    let real_window_after = shared_state.get_window_error_stats(
+                        slot,
+                        cfg.error_window_past,
+                        cfg.error_window_future,
+                        &HashSet::new(),
+                    );
+
+                    let assignment_rows = build_assignment_rows(
+                        &all_assignments.values().cloned().collect::<Vec<_>>(),
+                        &new_ids,
+                        &pending_ids_str,
+                        slot,
+                        wall_start,
+                        wall_end,
+                    );
+
+                    let avg_ms_per_new = if new_count > 0 { elapsed_ms / new_count as f64 } else { 0.0 };
+                    let avg_ms_per_total = if total_count > 0 { elapsed_ms / total_count as f64 } else { 0.0 };
+                    let avg_cost_per_new = if new_count > 0 { total_cost / new_count as f64 } else { 0.0 };
+                    let avg_cost_per_total = if total_count > 0 { total_cost / total_count as f64 } else { 0.0 };
+                    let modeled_avg = ctx.modeled_window_avg_after;
+                    let real_avg = real_window_after.average;
+
+                    let mut run_row: HashMap<String, String> = HashMap::new();
+                    run_row.insert("run_sequence".into(), run_sequence.to_string());
+                    run_row.insert("current_slot".into(), slot.to_string());
+                    run_row.insert("pending_batch_size".into(), new_count.to_string());
+                    run_row.insert("total_assignments".into(), total_count.to_string());
+                    run_row.insert("new_assignments".into(), new_count.to_string());
+                    run_row.insert("replanned_assignments".into(), replanned.to_string());
+                    run_row.insert("solver_status".into(), ctx.status.clone());
+                    run_row.insert("solver_mode".into(), ctx.mode.clone());
+                    run_row.insert("consecutive_rollbacks".into(), consecutive_rollbacks.to_string());
+                    run_row.insert("lock_future_assignments".into(), cfg.dp_lock_future_assignments.to_string());
+                    run_row.insert("solver_start_ts".into(), wall_start.to_string());
+                    run_row.insert("solver_end_ts".into(), wall_end.to_string());
+                    run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
+                    run_row.insert("avg_ms_per_new_request".into(), avg_ms_per_new.to_string());
+                    run_row.insert("avg_ms_per_assignment".into(), avg_ms_per_total.to_string());
+                    run_row.insert("total_carbon_cost".into(), total_cost.to_string());
+                    run_row.insert("carbon_cost_per_new_request".into(), avg_cost_per_new.to_string());
+                    run_row.insert("carbon_cost_per_assignment".into(), avg_cost_per_total.to_string());
+                    run_row.insert("error_window_avg_after".into(), modeled_avg.to_string());
+                    run_row.insert("error_window_avg_after_real".into(), real_avg.to_string());
+                    run_row.insert("error_window_start_slot".into(), ctx.window_start_slot.to_string());
+                    run_row.insert("error_window_end_slot".into(), ctx.window_end_slot.to_string());
+                    run_row.insert("error_window_threshold".into(), cfg.max_error_threshold.to_string());
+                    run_row.insert(
+                        "error_window_violated_after".into(),
+                        (modeled_avg > cfg.max_error_threshold).to_string(),
+                    );
+                    run_row.insert(
+                        "error_window_violated_after_real".into(),
+                        (real_avg > cfg.max_error_threshold).to_string(),
+                    );
+                    run_row.insert("batches_processed_after".into(), batches_processed.to_string());
+                    run_row.insert("total_scheduled_after".into(), total_scheduled.to_string());
+                    run_row.insert("global_error_before".into(), ctx.global_error_before.to_string());
+                    run_row.insert("global_error_count_before".into(), ctx.global_error_count_before.to_string());
+                    run_row.insert(
+                        "global_error_constraint_active".into(),
+                        ctx.global_error_constraint_active.to_string(),
+                    );
+
+                    ml.log_solver_run(&run_row, &assignment_rows, &[]);
+                }
+
+                return true;
+            }
+        }
     }
-
-    let new_count = pending.len();
-    let total_count = assignments.len();
-    let replanned = total_count.saturating_sub(new_count);
-    let total_cost: f64 = assignments.iter().map(|a| a.carbon_cost).sum();
-
-    shared_state.add_assignments(assignments.clone());
-    shared_state.export_to_csv(&cfg.output_file).ok();
-
-    // Update stats and get run_sequence for logging.
-    let (run_sequence, batches_processed, total_scheduled) = {
-        let mut g = mutable.lock().unwrap();
-        g.stats.solver_runs += 1;
-        g.stats.batches_processed += 1;
-        g.stats.total_scheduled += new_count as u64;
-        g.stats.solver_total_time_ms += elapsed_ms;
-        g.stats.solver_total_requests += new_count as u64;
-        g.stats.last_solver_elapsed_ms = elapsed_ms;
-        (g.stats.solver_runs, g.stats.batches_processed, g.stats.total_scheduled)
-    };
-
-    if cfg.verbose {
-        let avg_error: f64 = assignments.iter().map(|a| a.error).sum::<f64>()
-            / assignments.len() as f64;
-        println!(
-            "[Scheduler] ✓ Scheduled {} new requests{} \
-             (cost={total_cost:.2}, error={avg_error:.2}%, solver={elapsed_ms:.2}ms)",
-            new_count,
-            if replanned > 0 { format!(" + {replanned} re-planned") } else { String::new() }
-        );
-    }
-
-    // Build and emit metrics log row.
-    if ml.enabled {
-        let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
-        let pending_ids_str: HashSet<u64> = new_ids.clone();
-        let all_assignments = shared_state.get_current_assignments();
-
-        let real_window_after = shared_state.get_window_error_stats(
-            slot,
-            cfg.error_window_past,
-            cfg.error_window_future,
-            &HashSet::new(),
-        );
-
-        let assignment_rows = build_assignment_rows(
-            &all_assignments.values().cloned().collect::<Vec<_>>(),
-            &new_ids,
-            &pending_ids_str,
-            slot,
-            wall_start,
-            wall_end,
-        );
-
-        let avg_ms_per_new = if new_count > 0 { elapsed_ms / new_count as f64 } else { 0.0 };
-        let avg_ms_per_total = if total_count > 0 { elapsed_ms / total_count as f64 } else { 0.0 };
-        let avg_cost_per_new = if new_count > 0 { total_cost / new_count as f64 } else { 0.0 };
-        let avg_cost_per_total = if total_count > 0 { total_cost / total_count as f64 } else { 0.0 };
-        let modeled_avg = ctx.modeled_window_avg_after;
-        let real_avg = real_window_after.average;
-
-        let mut run_row: HashMap<String, String> = HashMap::new();
-        run_row.insert("run_sequence".into(), run_sequence.to_string());
-        run_row.insert("current_slot".into(), slot.to_string());
-        run_row.insert("pending_batch_size".into(), new_count.to_string());
-        run_row.insert("total_assignments".into(), total_count.to_string());
-        run_row.insert("new_assignments".into(), new_count.to_string());
-        run_row.insert("replanned_assignments".into(), replanned.to_string());
-        run_row.insert("solver_status".into(), ctx.status.clone());
-        run_row.insert("solver_mode".into(), ctx.mode.clone());
-        run_row.insert("lock_future_assignments".into(), cfg.dp_lock_future_assignments.to_string());
-        run_row.insert("solver_start_ts".into(), wall_start.to_string());
-        run_row.insert("solver_end_ts".into(), wall_end.to_string());
-        run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
-        run_row.insert("avg_ms_per_new_request".into(), avg_ms_per_new.to_string());
-        run_row.insert("avg_ms_per_assignment".into(), avg_ms_per_total.to_string());
-        run_row.insert("total_carbon_cost".into(), total_cost.to_string());
-        run_row.insert("carbon_cost_per_new_request".into(), avg_cost_per_new.to_string());
-        run_row.insert("carbon_cost_per_assignment".into(), avg_cost_per_total.to_string());
-        run_row.insert("error_window_avg_after".into(), modeled_avg.to_string());
-        run_row.insert("error_window_avg_after_real".into(), real_avg.to_string());
-        run_row.insert("error_window_start_slot".into(), ctx.window_start_slot.to_string());
-        run_row.insert("error_window_end_slot".into(), ctx.window_end_slot.to_string());
-        run_row.insert("error_window_threshold".into(), cfg.max_error_threshold.to_string());
-        run_row.insert(
-            "error_window_violated_after".into(),
-            (modeled_avg > cfg.max_error_threshold).to_string(),
-        );
-        run_row.insert(
-            "error_window_violated_after_real".into(),
-            (real_avg > cfg.max_error_threshold).to_string(),
-        );
-        run_row.insert("batches_processed_after".into(), batches_processed.to_string());
-        run_row.insert("total_scheduled_after".into(), total_scheduled.to_string());
-        run_row.insert("global_error_before".into(), ctx.global_error_before.to_string());
-        run_row.insert("global_error_count_before".into(), ctx.global_error_count_before.to_string());
-        run_row.insert(
-            "global_error_constraint_active".into(),
-            ctx.global_error_constraint_active.to_string(),
-        );
-
-        ml.log_solver_run(&run_row, &assignment_rows, &[]);
-    }
-
-    true
 }
 
 // ─── core DP pipeline ─────────────────────────────────────────────────────────
@@ -552,7 +601,7 @@ fn solve_dp(
     fdb: &HashMap<String, i32>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     _ml: &MetricsLogger,
-) -> (Vec<Assignment>, SolveContext) {
+) -> (Vec<Assignment>, SolveContext, HashMap<i32, i32>) {
     let pending_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
 
     // Deadline cap = end of error window.
@@ -777,6 +826,7 @@ fn solve_dp(
         return (
             vec![],
             SolveContext { status: "infeasible".to_string(), mode: solve_mode, ..Default::default() },
+            HashMap::new(),
         );
     }
 
@@ -840,7 +890,7 @@ fn solve_dp(
         solver_elapsed_ms: 0.0, // filled by the caller
     };
 
-    (assignments, ctx)
+    (assignments, ctx, baseline_slot_counts)
 }
 
 // ─── error baseline augmentation helpers ─────────────────────────────────────
@@ -1338,7 +1388,8 @@ mod tests {
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mutable = make_mutable_state(cfg);
         let ml = disabled_logger();
-        solve_dp(current_slot, pending, &ss, cfg, &forecast, &fdb, &mutable, &ml)
+        let (a, c, _) = solve_dp(current_slot, pending, &ss, cfg, &forecast, &fdb, &mutable, &ml);
+        (a, c)
     }
 
     fn call_solve_dp_with_state(
@@ -1353,7 +1404,8 @@ mod tests {
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mutable = make_mutable_state(cfg);
         let ml = disabled_logger();
-        solve_dp(current_slot, pending, ss, cfg, &forecast, &fdb, &mutable, &ml)
+        let (a, c, _) = solve_dp(current_slot, pending, ss, cfg, &forecast, &fdb, &mutable, &ml);
+        (a, c)
     }
 
     // ── tests ─────────────────────────────────────────────────────────────────

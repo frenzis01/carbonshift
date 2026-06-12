@@ -86,6 +86,12 @@ pub struct Config {
     pub deadline_min_slack: i32,
     pub deadline_max_slack: i32,
 
+    // ── rollback (concurrent capacity-tier breach detection) ─────────────
+    /// Maximum number of consecutive rollbacks allowed for a single batch
+    /// before the assignment is forced regardless of tier breach.
+    /// 0 = rollback disabled entirely.
+    pub rollback_max_consecutive: usize,
+
     // ── threading & concurrency ───────────────────────────────────────────
     pub max_batch_solver_parallelism: usize,
     pub queue_timeout: f64,
@@ -160,8 +166,9 @@ impl Default for Config {
             request_rate_std_factor: 0.5,
             deadline_min_slack: 0,
             deadline_max_slack: 8,
-            max_batch_solver_parallelism: 8,
+            max_batch_solver_parallelism: 32,
             queue_timeout: 1.0,
+            rollback_max_consecutive: 3,
             skip_empty_slots: true,
             slot_speed_scale: 1.0,
             verbose: true,

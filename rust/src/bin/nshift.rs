@@ -68,7 +68,7 @@
 //!   N<n>/  { same files as above }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use carbonshift_rs::config::Config;
@@ -92,6 +92,8 @@ struct BenchmarkConfig {
     include_greedy_baseline: bool,
     /// When false, skip relaxed-window DP retry on infeasibility and go straight to greedy.
     dp_allow_relaxed_error_retry: bool,
+    /// Max consecutive rollbacks before force-committing (0 = rollback disabled).
+    rollback_max_consecutive: usize,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -131,8 +133,10 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         runner.get("include_greedy_baseline").and_then(|x| x.as_bool()).unwrap_or(true);
     let dp_allow_relaxed_error_retry =
         runner.get("dp_allow_relaxed_error_retry").and_then(|x| x.as_bool()).unwrap_or(true);
+    let rollback_max_consecutive =
+        runner.get("rollback_max_consecutive").and_then(|x| x.as_u64()).unwrap_or(3) as usize;
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry }
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -183,6 +187,7 @@ struct PerRequest {
     assignment_solver_status: String,
     assigned_with_greedy_fallback: bool,
     assigned_with_relaxed_retry: bool,
+    assigned_with_rollback: bool,
 }
 
 struct BatchTiming {
@@ -228,6 +233,9 @@ struct RunSummary {
     global_average_error_modeled_skip_first_k: f64,
     requests_assigned_with_greedy_fallback: usize,
     requests_assigned_with_relaxed_retry: usize,
+    total_rollbacks: u64,
+    max_consecutive_rollbacks: u64,
+    requests_assigned_with_rollback: usize,
     solver_time_ms_min: f64,
     solver_time_ms_max: f64,
     solver_time_ms_avg: f64,
@@ -328,6 +336,7 @@ fn compute_per_request(
     assignments: &[AssignmentRow],
     runs_by_id: &HashMap<String, &SolverRunRow>,
     slot_dur: f64,
+    rolled_back_ids: &HashSet<u64>,
 ) -> Vec<PerRequest> {
     let mut seen: HashMap<u64, PerRequest> = HashMap::new();
     for a in assignments.iter().filter(|a| a.is_new_assignment_in_run) {
@@ -338,6 +347,7 @@ fn compute_per_request(
             let solver_mode           = run.map(|r| r.solver_mode.clone()).unwrap_or_default();
             let assigned_with_relaxed  = solver_mode.contains("relaxed");
             let assigned_with_greedy   = solver_mode.contains("greedy_after_infeasible");
+            let assigned_with_rollback = rolled_back_ids.contains(&a.request_id);
             let queue_wait_slots       = (a.current_slot  - a.arrival_slot).max(0);
             let final_wait_slots      = (a.scheduled_slot - a.arrival_slot).max(0);
             PerRequest {
@@ -359,6 +369,7 @@ fn compute_per_request(
                 assignment_solver_status: solver_status,
                 assigned_with_greedy_fallback: assigned_with_greedy,
                 assigned_with_relaxed_retry:   assigned_with_relaxed,
+                assigned_with_rollback,
             }
         });
     }
@@ -435,6 +446,9 @@ fn compute_summary(
     baseline_flavour_name: &str,
     baseline_flavour_duration: i32,
     baseline_flavour_error: f64,
+    total_rollbacks: u64,
+    max_consecutive_rollbacks: u64,
+    requests_assigned_with_rollback: usize,
 ) -> RunSummary {
     let scheduled = per_req.len();
     let total_carbon: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
@@ -473,6 +487,9 @@ fn compute_summary(
         global_average_error_modeled_skip_first_k: 0.0,
         requests_assigned_with_greedy_fallback: 0,
         requests_assigned_with_relaxed_retry:   relaxed,
+        total_rollbacks,
+        max_consecutive_rollbacks,
+        requests_assigned_with_rollback,
         solver_time_ms_min:      st_min,
         solver_time_ms_max:      st_max,
         solver_time_ms_avg:      st_avg,
@@ -554,6 +571,7 @@ fn run_greedy_baseline(
                 assignment_solver_status: "ok".to_string(),
                 assigned_with_greedy_fallback: false,
                 assigned_with_relaxed_retry:   false,
+                assigned_with_rollback:        false,
             });
             batch_timings.push(BatchTiming {
                 batch_sequence:      seq,
@@ -580,6 +598,9 @@ fn run_greedy_baseline(
         &flav.name,
         flav.duration,
         flav.error,
+        0,
+        0,
+        0,
     );
     (per_req, batch_timings, summary)
 }
@@ -594,6 +615,7 @@ const SUMMARY_CSV_HEADER: &[&str] = &[
     "global_average_error_modeled", "global_average_error_real_skip_first_k",
     "global_average_error_modeled_skip_first_k",
     "requests_assigned_with_greedy_fallback", "requests_assigned_with_relaxed_retry",
+    "total_rollbacks", "max_consecutive_rollbacks", "requests_assigned_with_rollback",
     "solver_time_ms_min", "solver_time_ms_max", "solver_time_ms_avg",
     "queue_wait_seconds_min", "queue_wait_seconds_max", "queue_wait_seconds_avg",
     "final_wait_seconds_min", "final_wait_seconds_max", "final_wait_seconds_avg",
@@ -622,6 +644,9 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "global_average_error_modeled_skip_first_k": s.global_average_error_modeled_skip_first_k,
         "requests_assigned_with_greedy_fallback":  s.requests_assigned_with_greedy_fallback,
         "requests_assigned_with_relaxed_retry":    s.requests_assigned_with_relaxed_retry,
+        "total_rollbacks":                         s.total_rollbacks,
+        "max_consecutive_rollbacks":               s.max_consecutive_rollbacks,
+        "requests_assigned_with_rollback":         s.requests_assigned_with_rollback,
         "solver_time_ms_min":                      s.solver_time_ms_min,
         "solver_time_ms_max":                      s.solver_time_ms_max,
         "solver_time_ms_avg":                      s.solver_time_ms_avg,
@@ -652,6 +677,9 @@ fn summary_csv_row(s: &RunSummary) -> Vec<String> {
         s.global_average_error_modeled_skip_first_k.to_string(),
         s.requests_assigned_with_greedy_fallback.to_string(),
         s.requests_assigned_with_relaxed_retry.to_string(),
+        s.total_rollbacks.to_string(),
+        s.max_consecutive_rollbacks.to_string(),
+        s.requests_assigned_with_rollback.to_string(),
         s.solver_time_ms_min.to_string(), s.solver_time_ms_max.to_string(),
         s.solver_time_ms_avg.to_string(),
         s.queue_wait_seconds_min.to_string(), s.queue_wait_seconds_max.to_string(),
@@ -693,7 +721,7 @@ fn write_run_outputs(
             "queue_wait_slots","queue_wait_seconds","final_wait_slots","final_wait_seconds",
             "flavour_name","error","carbon_cost",
             "assignment_solver_mode","assignment_solver_status",
-            "assigned_with_greedy_fallback","assigned_with_relaxed_retry",
+            "assigned_with_greedy_fallback","assigned_with_relaxed_retry","assigned_with_rollback",
         ];
         let mut w = csv::Writer::from_path(run_dir.join("per_request.csv")).unwrap();
         w.write_record(header).unwrap();
@@ -710,6 +738,7 @@ fn write_run_outputs(
                 r.assignment_solver_mode.clone(), r.assignment_solver_status.clone(),
                 r.assigned_with_greedy_fallback.to_string(),
                 r.assigned_with_relaxed_retry.to_string(),
+                r.assigned_with_rollback.to_string(),
             ]).unwrap();
             jrows.push(serde_json::json!({
                 "request_id":r.request_id,"arrival_time":r.arrival_time,
@@ -725,6 +754,7 @@ fn write_run_outputs(
                 "assignment_solver_status":r.assignment_solver_status.clone(),
                 "assigned_with_greedy_fallback":r.assigned_with_greedy_fallback,
                 "assigned_with_relaxed_retry":r.assigned_with_relaxed_retry,
+                "assigned_with_rollback":r.assigned_with_rollback,
             }));
         }
         w.flush().unwrap();
@@ -897,6 +927,8 @@ fn run_single_n(
     sched.stop();
 
     let total_received = shared_state.get_statistics().total_received as usize;
+    let rollback_stats = shared_state.get_rollback_stats();
+    let rolled_back_ids = shared_state.get_rolled_back_request_ids();
 
     // Post-process Rust CSVs into Python-compatible tables.
     let runs = read_solver_runs(&tmp_runs);
@@ -904,7 +936,7 @@ fn run_single_n(
     let runs_by_id: HashMap<String, &SolverRunRow> =
         runs.iter().map(|r| (r.run_id.clone(), r)).collect();
 
-    let per_req      = compute_per_request(&assignment_rows, &runs_by_id, base_cfg.slot_duration_seconds);
+    let per_req      = compute_per_request(&assignment_rows, &runs_by_id, base_cfg.slot_duration_seconds, &rolled_back_ids);
     let batch_timings = compute_batch_timings(&runs, batch_size);
     let summary = compute_summary(
         "nshift_dp",
@@ -917,6 +949,9 @@ fn run_single_n(
         "",
         0,
         0.0,
+        rollback_stats.total_rollbacks,
+        rollback_stats.max_consecutive_rollbacks as u64,
+        rolled_back_ids.len(),
     );
 
     // Clean up temp files.
@@ -972,6 +1007,7 @@ fn main() {
     let mut base_cfg = Config::default();
     base_cfg.apply_scenario_metadata(&scenario.metadata);
     base_cfg.dp_allow_relaxed_error_retry = bcfg.dp_allow_relaxed_error_retry;
+    base_cfg.rollback_max_consecutive     = bcfg.rollback_max_consecutive;
 
     println!(
         "Loaded scenario: {} slots, {} requests ({})",

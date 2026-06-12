@@ -57,6 +57,8 @@ RESULT_COLUMNS = [
     "avg_global_error_per_slot",
     "requests_assigned_with_greedy_fallback",
     "requests_assigned_with_relaxed_retry",
+    "total_rollbacks",
+    "max_consecutive_rollbacks",
     "baseline_total_carbon_cost",
     "carbon_cost_saving_vs_baseline_pct",
 ]
@@ -166,6 +168,8 @@ def _run_python_mode(
                 "requests_assigned_with_relaxed_retry": int(
                     s.get("requests_assigned_with_relaxed_retry", 0)
                 ),
+                "total_rollbacks": 0,
+                "max_consecutive_rollbacks": 0,
                 "baseline_total_carbon_cost": baseline_cost,
                 "carbon_cost_saving_vs_baseline_pct": savings_pct,
             })
@@ -276,6 +280,8 @@ def _run_rust_scenario(
                     "requests_assigned_with_relaxed_retry": int(
                         row.get("requests_assigned_with_relaxed_retry", 0)
                     ),
+                    "total_rollbacks": int(row.get("total_rollbacks", 0)),
+                    "max_consecutive_rollbacks": int(row.get("max_consecutive_rollbacks", 0)),
                     "baseline_total_carbon_cost": bc,
                     "carbon_cost_saving_vs_baseline_pct": savings_pct,
                 })
