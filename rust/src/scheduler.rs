@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::SeedableRng;
+use rand::Rng;
 use rand_distr::{Distribution, Normal};
 
 use crate::config::Config;
@@ -485,6 +486,12 @@ fn batch_worker_entry(
                          (unintended capacity-tier breach); re-solving...",
                     );
                 }
+                // Wait a bit before retrying to avoid hot loop if the state is very contended
+                // Generate random backoff between 10-90 ms to reduce thundering herd risk if many workers are contending
+                // TODO
+                // let backoff_ms = 10 + rand::thread_rng().gen_range(0..80);
+                // std::thread::sleep(Duration::from_millis(backoff_ms));
+
                 // Re-run solve_dp with the same pending batch but fresh shared_state view.
                 continue;
             }

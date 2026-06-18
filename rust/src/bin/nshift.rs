@@ -133,6 +133,7 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         runner.get("include_greedy_baseline").and_then(|x| x.as_bool()).unwrap_or(true);
     let dp_allow_relaxed_error_retry =
         runner.get("dp_allow_relaxed_error_retry").and_then(|x| x.as_bool()).unwrap_or(true);
+    // TODO in run_battery this is set in a tmp config. ideally unify with the same param in config.rs
     let rollback_max_consecutive =
         runner.get("rollback_max_consecutive").and_then(|x| x.as_u64()).unwrap_or(3) as usize;
 
@@ -1032,10 +1033,11 @@ fn main() {
         bcfg.scenario_path.display(),
     );
     println!(
-        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, output={}",
+        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={}, output={}",
         bcfg.batch_sizes,
         realtime_slots,
         speed_scale,
+        bcfg.rollback_max_consecutive,
         bcfg.output_dir.display(),
     );
 

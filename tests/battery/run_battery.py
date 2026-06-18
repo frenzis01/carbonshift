@@ -210,9 +210,12 @@ def _write_rust_config(
                 "runner": {
                     "flush_partial_batch": True,
                     "include_greedy_baseline": include_baseline,
-                    "realtime_slots": False,
-                    "realtime_speed_scale": 1.0,
+                    "realtime_slots": True,
+                    "realtime_speed_scale": 0.05,
                     "dp_allow_relaxed_error_retry": dp_allow_relaxed,
+                    "rollback_max_consecutive": 0,
+                    # TODO betterify param setting to avoid duplicating and hardcoding defaults
+                    # "rollback_max_consecutive": 3,
                 },
             },
             f,
@@ -296,7 +299,8 @@ def _run_rust_scenario(
                     f"solver_ms={float(row['solver_time_ms_avg']):.1f}, "
                     f"carbon={carbon:.3f}, "
                     f"error={float(row['global_average_error']):.3f}, "
-                    f"saving={savings_pct:.1f}%"
+                    f"saving={savings_pct:.1f}%, ",
+                    f"total_rollbacks={row.get('total_rollbacks', 0)}, "
                 )
     return all_rows
 
@@ -316,6 +320,7 @@ def run_battery(config_path: Path) -> None:
 
     batch_sizes: List[int] = [int(n) for n in cfg["batch_sizes"]]
     modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback", "relaxed_retry"])
+    # modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback"])
     backend: str = cfg.get("backend", "python")
 
     rust_binary: Optional[Path] = None

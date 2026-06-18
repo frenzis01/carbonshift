@@ -20,5 +20,8 @@ online2/DEVELOPMENT.md
 
 rust/target/
 tests/battery/results
+tests/battery/output
 
 **.bk
+
+TODO.md
