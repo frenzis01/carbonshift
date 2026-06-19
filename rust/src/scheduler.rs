@@ -18,13 +18,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::SeedableRng;
-use rand::Rng;
 use rand_distr::{Distribution, Normal};
 
 use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
-use crate::shared_state::{CommitOutcome, SharedState};
+use crate::shared_state::{CommitOutcome, SharedState, SolverSnapshot};
 use crate::types::{Assignment, Flavour, Request, RequestAssignment};
 
 // ─── internal state types ────────────────────────────────────────────────────
@@ -644,10 +643,15 @@ fn solve_dp(
         d.max(current_slot).min(assignment_cap).min(cfg.total_slots - 1)
     };
 
+    // ── Step 1 (pre-solve): capture a consistent snapshot of shared state ────
+    // All reads from shared state happen here, under a single lock acquisition.
+    // The lock is released before the DP optimiser runs.
+    let snapshot = shared_state.snapshot_for_solver();
+
     // ── Step 2: time-shifting ────────────────────────────────────────────────
     // If DP_LOCK_FUTURE_ASSIGNMENTS=True, future assignments are pinned as
     // baseline load.  If False, they join the DP pool for joint re-planning.
-    let future_assignments = shared_state.get_future_assignments(current_slot);
+    let future_assignments = snapshot.get_future_assignments(current_slot);
 
     let mut dp_requests: Vec<(u64, i32)> = pending
         .iter()
@@ -689,8 +693,8 @@ fn solve_dp(
     }
 
     // ── Step 3: error baseline ──────────────────────────────────────────────
-    // 3a. Real window error from shared state.
-    let ws = shared_state.get_window_error_stats(
+    // 3a. Real window error from snapshot.
+    let ws = snapshot.get_window_error_stats(
         current_slot,
         cfg.error_window_past,
         cfg.error_window_future,
@@ -703,7 +707,7 @@ fn solve_dp(
         current_slot,
         error_baseline,
         cfg,
-        shared_state,
+        &snapshot,
         &movable_future_ids,
     );
 
@@ -712,11 +716,11 @@ fn solve_dp(
 
     // 3d. Infeasibility recovery: inject mock low-error requests to dilute the baseline.
     let (augmented_baseline, mock_pool_input) =
-        apply_infeasibility_recovery(current_slot, error_baseline.clone(), cfg, shared_state, mutable);
+        apply_infeasibility_recovery(current_slot, error_baseline.clone(), cfg, &snapshot, mutable);
     let error_baseline = augmented_baseline;
 
     // ── Step 4: global error constraint ────────────────────────────────────
-    let global_stats = shared_state.get_global_error_stats();
+    let global_stats = snapshot.get_global_error_stats();
     let mut solver_flavours = cfg.flavours.clone();
     let global_constraint_active;
 
@@ -933,7 +937,7 @@ fn augment_with_decayed_past(
     current_slot: i32,
     baseline: ErrorBaseline,
     cfg: &Config,
-    shared_state: &SharedState,
+    snapshot: &SolverSnapshot,
     exclude: &HashSet<u64>,
 ) -> ErrorBaseline {
     let decay_slots = cfg.error_window_past_decay_slots.max(0) as usize;
@@ -947,9 +951,11 @@ fn augment_with_decayed_past(
 
     for idx in 1..=decay_slots {
         let slot = current_slot - cfg.error_window_past - idx as i32;
-        let slot_assignments = shared_state.get_requests_in_slot(slot);
-        let slot_assignments: Vec<_> =
-            slot_assignments.iter().filter(|a| !exclude.contains(&a.request_id)).collect();
+        let slot_assignments: Vec<_> = snapshot
+            .get_requests_in_slot(slot)
+            .into_iter()
+            .filter(|a| !exclude.contains(&a.request_id))
+            .collect();
         let n = slot_assignments.len();
         if n == 0 {
             continue;
@@ -1020,7 +1026,7 @@ fn apply_infeasibility_recovery(
     current_slot: i32,
     baseline: ErrorBaseline,
     cfg: &Config,
-    shared_state: &SharedState,
+    snapshot: &SolverSnapshot,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) -> (ErrorBaseline, MockPool) {
     let mode = cfg.infeasibility_recovery_mode.trim().to_lowercase();
@@ -1036,7 +1042,7 @@ fn apply_infeasibility_recovery(
 
     // Retrieve (or seed) the persistent mock pool for this slot/mode.
     let (mock_count, mock_error, _source) =
-        get_or_seed_mock_pool(current_slot, &mode, cfg, shared_state, mutable);
+        get_or_seed_mock_pool(current_slot, &mode, cfg, snapshot, mutable);
 
     if mock_count <= 0 || mock_error <= 0.0 {
         return (baseline, MockPool::default());
@@ -1084,7 +1090,7 @@ fn get_or_seed_mock_pool(
     slot: i32,
     mode: &str,
     cfg: &Config,
-    shared_state: &SharedState,
+    snapshot: &SolverSnapshot,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) -> (i32, f64, &'static str) {
     // First lock: check if we already have this slot/mode cached.
@@ -1098,12 +1104,12 @@ fn get_or_seed_mock_pool(
         return (remaining, error, "persistent_remaining");
     }
 
-    // Compute outside the lock (may call shared_state for carryover mode).
+    // Compute outside the lock (reads snapshot for carryover mode).
     let influence = {
         let g = mutable.lock().unwrap();
         g.mock_influence.effective
     };
-    let (new_count, new_error) = compute_mock_seed(slot, mode, cfg, influence, shared_state);
+    let (new_count, new_error) = compute_mock_seed(slot, mode, cfg, influence, snapshot);
 
     // Second lock: store the new values.
     let mut g = mutable.lock().unwrap();
@@ -1119,7 +1125,7 @@ fn compute_mock_seed(
     mode: &str,
     cfg: &Config,
     influence: f64,
-    shared_state: &SharedState,
+    snapshot: &SolverSnapshot,
 ) -> (i32, f64) {
     let (mut count, error) = match mode {
         "carryover_last_slot" => {
@@ -1128,7 +1134,7 @@ fn compute_mock_seed(
             if dropped_slot < 0 {
                 return (0, 0.0);
             }
-            let dropped = shared_state.get_requests_in_slot(dropped_slot);
+            let dropped = snapshot.get_requests_in_slot(dropped_slot);
             let n = dropped.len() as i32;
             if n == 0 {
                 return (0, 0.0);

@@ -18,6 +18,74 @@ use std::sync::{Arc, Mutex};
 
 use crate::types::{Assignment, CapacityTier, Request};
 
+// ─── solver snapshot ─────────────────────────────────────────────────────────
+
+/// Immutable snapshot of all shared-state data needed by `solve_dp`.
+///
+/// Captured in a **single** lock acquisition before the solver starts, so
+/// every read inside the solver (future assignments, window error stats,
+/// per-slot requests, global stats) sees a consistent view of the world at
+/// the moment the batch was dispatched.  The lock is released before the DP
+/// optimiser runs.
+pub struct SolverSnapshot {
+    pub assignments: HashMap<u64, Assignment>,
+    pub global_error_sum: f64,
+    pub global_assignment_count: u64,
+}
+
+impl SolverSnapshot {
+    /// Assignments scheduled at or after `current_slot`.
+    pub fn get_future_assignments(&self, current_slot: i32) -> Vec<Assignment> {
+        self.assignments
+            .values()
+            .filter(|a| a.scheduled_slot >= current_slot)
+            .cloned()
+            .collect()
+    }
+
+    /// Weighted error stats for the window
+    /// `[center − window_past, center + window_future]`.
+    pub fn get_window_error_stats(
+        &self,
+        center_slot: i32,
+        window_past: i32,
+        window_future: i32,
+        exclude: &HashSet<u64>,
+    ) -> WindowErrorStats {
+        let start = center_slot - window_past;
+        let end   = center_slot + window_future;
+        let mut error_sum = 0.0f64;
+        let mut count = 0u64;
+        for a in self.assignments.values() {
+            if exclude.contains(&a.request_id) {
+                continue;
+            }
+            if a.scheduled_slot >= start && a.scheduled_slot <= end {
+                error_sum += a.error;
+                count += 1;
+            }
+        }
+        let average = if count > 0 { error_sum / count as f64 } else { 0.0 };
+        WindowErrorStats { error_sum, count, average }
+    }
+
+    /// All assignments in exactly `slot`.
+    pub fn get_requests_in_slot(&self, slot: i32) -> Vec<&Assignment> {
+        self.assignments
+            .values()
+            .filter(|a| a.scheduled_slot == slot)
+            .collect()
+    }
+
+    /// Cumulative error stats.
+    pub fn get_global_error_stats(&self) -> GlobalErrorStats {
+        let count = self.global_assignment_count;
+        let error_sum = self.global_error_sum;
+        let avg = if count > 0 { error_sum / count as f64 } else { 0.0 };
+        GlobalErrorStats { error_sum, count, avg }
+    }
+}
+
 // ─── inner (lock-guarded) data ────────────────────────────────────────────────
 
 struct Inner {
@@ -177,6 +245,20 @@ impl SharedState {
     /// Snapshot of all active assignments.
     pub fn get_current_assignments(&self) -> HashMap<u64, Assignment> {
         self.inner.lock().unwrap().assignments.clone()
+    }
+
+    /// Capture all data needed by `solve_dp` in a **single** lock acquisition.
+    ///
+    /// Call this once at the start of each solver invocation to get a
+    /// consistent view of the shared state.  The lock is not held after this
+    /// method returns.
+    pub fn snapshot_for_solver(&self) -> SolverSnapshot {
+        let g = self.inner.lock().unwrap();
+        SolverSnapshot {
+            assignments: g.assignments.clone(),
+            global_error_sum: g.global_error_sum,
+            global_assignment_count: g.global_assignment_count,
+        }
     }
 
     /// All assignments whose `scheduled_slot >= current_slot`.
@@ -726,5 +808,48 @@ mod tests {
         let batch2: Vec<Assignment> = (3..6u64).map(|i| make_assignment(i, 5, 0.0)).collect();
         let outcome2 = state2.try_add_assignments_checked(&batch2, &expected2, &tiers, false, 0);
         assert_eq!(outcome2, CommitOutcome::RolledBack, "tier breach should rollback");
+    }
+
+    #[test]
+    fn snapshot_captures_consistent_state() {
+        let state = SharedState::new();
+
+        // Pre-populate assignments across multiple slots.
+        state.add_assignments(vec![
+            make_assignment(1, 3, 0.1),
+            make_assignment(2, 4, 0.2),
+            make_assignment(3, 7, 0.3),
+        ]);
+
+        let snap = state.snapshot_for_solver();
+
+        // Future assignments from snapshot match those from direct call.
+        let mut direct = state.get_future_assignments(5);
+        let mut from_snap = snap.get_future_assignments(5);
+        direct.sort_by_key(|a| a.request_id);
+        from_snap.sort_by_key(|a| a.request_id);
+        assert_eq!(direct.len(), from_snap.len());
+        for (d, s) in direct.iter().zip(from_snap.iter()) {
+            assert_eq!(d.request_id, s.request_id);
+            assert_eq!(d.scheduled_slot, s.scheduled_slot);
+        }
+
+        // Window error stats match.
+        let excl = HashSet::new();
+        let direct_ws = state.get_window_error_stats(5, 3, 3, &excl);
+        let snap_ws   = snap.get_window_error_stats(5, 3, 3, &excl);
+        assert!((direct_ws.error_sum - snap_ws.error_sum).abs() < 1e-12);
+        assert_eq!(direct_ws.count, snap_ws.count);
+
+        // Global stats match.
+        let direct_gs = state.get_global_error_stats();
+        let snap_gs   = snap.get_global_error_stats();
+        assert!((direct_gs.error_sum - snap_gs.error_sum).abs() < 1e-12);
+        assert_eq!(direct_gs.count, snap_gs.count);
+
+        // Per-slot lookup.
+        assert_eq!(snap.get_requests_in_slot(3).len(), 1);
+        assert_eq!(snap.get_requests_in_slot(4).len(), 1);
+        assert_eq!(snap.get_requests_in_slot(99).len(), 0);
     }
 }
