@@ -465,6 +465,10 @@ fn batch_worker_entry(
             *expected_per_slot.entry(a.scheduled_slot).or_insert(0) += 1;
         }
 
+        // TODO verify if this is okay
+        // Limit expected_per_slot to only include the slots to which we are assigning requests in this batch.
+        expected_per_slot.retain(|slot, _| assignments.iter().any(|a| a.scheduled_slot == *slot));
+
         // Attempt atomic commit; check for concurrent capacity-tier breach.
         let force_commit = cfg.rollback_max_consecutive == 0
             || consecutive_rollbacks >= cfg.rollback_max_consecutive;

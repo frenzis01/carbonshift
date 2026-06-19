@@ -14,6 +14,9 @@ online2/notebooks/2028
 online2/notebooks/20*
 online2/DEVELOPMENT.md
 
+online2/tests/Nshift_speed/test_cbint.py
+online2/tests/Nshift_speed/*.png
+
 **/placeholder
 
 **/scenario_seed_*.json
@@ -21,6 +24,7 @@ online2/DEVELOPMENT.md
 rust/target/
 tests/battery/results
 tests/battery/output
+
 
 **.bk
 

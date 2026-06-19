@@ -50,6 +50,112 @@ def save_rows_as_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[st
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
+import math
+import random
+from typing import List
+
+
+def generate_carbon_intensity_forecast(
+    total_slots: int,
+    carbon_intensity_cycle_slots: int,
+    seed: int,
+    night_min: float = 70.0,
+    day_max: float = 160.0,
+    sunrise_fraction: float = 0.25,
+    sunset_fraction: float = 0.75,
+    transition_slope: float = 18.0,
+    noise_std: float = 2.0,
+    noise_persistence: float = 0.95,
+) -> List[float]:
+    """
+    Generate synthetic carbon intensity data with realistic day/night plateaus.
+
+    Parameters
+    ----------
+    total_slots:
+        Number of samples to generate.
+
+    carbon_intensity_cycle_slots:
+        Number of slots representing one full day.
+
+    seed:
+        Random seed.
+
+    night_min:
+        Typical carbon intensity during the night valley.
+
+    day_max:
+        Typical carbon intensity during the daytime peak.
+
+    sunrise_fraction:
+        Position of the morning transition within the cycle
+        (0.25 ≈ 06:00 if cycle represents 24h).
+
+    sunset_fraction:
+        Position of the evening transition within the cycle
+        (0.75 ≈ 18:00 if cycle represents 24h).
+
+    transition_slope:
+        Controls how sharp the transitions are.
+        Higher values -> steeper transitions.
+        Lower values -> smoother transitions.
+
+    noise_std:
+        Standard deviation of the short-term fluctuations.
+
+    noise_persistence:
+        Autocorrelation factor of the fluctuations.
+        Typical values: 0.90 - 0.99.
+
+    Returns
+    -------
+    List[float]
+        Synthetic carbon intensity forecast.
+    """
+
+    rng = random.Random(seed)
+
+    cycle = max(1, int(carbon_intensity_cycle_slots))
+
+    forecast: List[float] = []
+
+    noise_state = 0.0
+
+    for slot in range(total_slots):
+        x = (slot % cycle) / cycle
+
+        rise = 1.0 / (
+            1.0 + math.exp(
+                -transition_slope * (x - sunrise_fraction)
+            )
+        )
+
+        fall = 1.0 / (
+            1.0 + math.exp(
+                -transition_slope * (x - sunset_fraction)
+            )
+        )
+
+        daylight_factor = rise - fall
+
+        trend = (
+            night_min
+            + (day_max - night_min) * daylight_factor
+        )
+
+        noise_state = (
+            noise_persistence * noise_state
+            + rng.gauss(0.0, noise_std)
+        )
+
+        value = trend + noise_state
+
+        forecast.append(
+            round(max(1.0, value), 6)
+        )
+
+    return forecast
+
 
 def generate_scenario_data(
     *,
@@ -81,19 +187,22 @@ def generate_scenario_data(
     """
     rng = random.Random(seed)
     sigma = max(1.0, requests_per_slot * request_rate_std_factor)
+    noise_std = 1.5
+    noise_persistence = 0.97
+    noise = 0.0 # TODO make this represent std and persistence
 
-    forecast: List[float] = []
-    cycle = max(1, int(carbon_intensity_cycle_slots))
-    # Valley (~65) at slot 0 (midnight), peak (~160) at slot cycle/2 (noon).
-    # Derived from: base + amplitude*0.2 = 65, base + amplitude*1.8 = 160
-    base_carbon = 53.125
-    amplitude = 59.375
-    noise = max(0.0, float(carbon_random_noise_amplitude))
-    for slot in range(total_slots):
-        phase = 2.0 * math.pi * (slot % cycle) / cycle
-        # Negate cosine so minimum is at phase=0 (slot 0) and maximum at phase=π (slot cycle/2)
-        value = base_carbon + amplitude * (1.0 - 0.8 * math.cos(phase)) + rng.uniform(-noise, noise)
-        forecast.append(round(max(1.0, value), 6))
+    forecast = generate_carbon_intensity_forecast(
+        total_slots=72,
+        carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
+        seed=seed,
+        night_min=75,
+        day_max=170,
+        sunrise_fraction=0.30,
+        sunset_fraction=0.78,
+        transition_slope=20,
+        noise_std=noise_std,
+        noise_persistence=noise_persistence,
+    )
 
     requests: List[Dict[str, Any]] = []
     request_id = 0
@@ -156,7 +265,7 @@ def generate_scenario_data(
             "carbon_random_noise_amplitude": noise,
             "prehistory_mock_influence": prehistory_influence,
             "prehistory_enabled": bool(include_prehistory),
-            "carbon_intensity_cycle_slots": int(cycle),
+            "carbon_intensity_cycle_slots": int(carbon_intensity_cycle_slots),
             **({"capacity_tiers": _serialize_capacity_tiers(capacity_tiers)} if capacity_tiers is not None else {}),
         },
         "carbon_forecast": forecast,

@@ -106,6 +106,7 @@ def _generate_scenario(scenario_def: Dict[str, Any], output_path: Path) -> Dict[
         requests_per_slot=float(
             scenario_def.get("requests_per_slot", online2_config.PREDICTED_REQUESTS_PER_SLOT)
         ),
+        carbon_intensity_cycle_slots=24,
         request_rate_std_factor=float(online2_config.REQUEST_RATE_STD_FACTOR),
         deadline_min_slack=int(online2_config.DEADLINE_MIN_SLACK),
         deadline_max_slack=int(online2_config.DEADLINE_MAX_SLACK),
@@ -213,9 +214,8 @@ def _write_rust_config(
                     "realtime_slots": True,
                     "realtime_speed_scale": 0.05,
                     "dp_allow_relaxed_error_retry": dp_allow_relaxed,
-                    "rollback_max_consecutive": 0,
+                    "rollback_max_consecutive": 4,
                     # TODO betterify param setting to avoid duplicating and hardcoding defaults
-                    # "rollback_max_consecutive": 3,
                 },
             },
             f,
@@ -347,12 +347,17 @@ def run_battery(config_path: Path) -> None:
         print(f"\n{'='*60}")
         print(f"Scenario: {sid}  (seed={seed}, slots={total_slots}, req/slot={req_per_slot})")
         print("=" * 60)
+        
 
         scenario_t0 = time.monotonic()
         scenario_dir = output_dir / sid
         scenario_dir.mkdir(parents=True, exist_ok=True)
         scenario_path = scenario_dir / f"scenario_seed_{seed}.json"
         scenario = _generate_scenario(scenario_def, scenario_path)
+
+        # print first 24 values of carbon forecast for sanity check
+        # print("  Carbon intensity forecast (first 24 slots):")
+        # print("  ", scenario["carbon_forecast"][:24])
 
         if backend in ("python", "both"):
             print("  Computing Python greedy baseline …")
