@@ -77,7 +77,7 @@ use carbonshift_rs::metrics_logger::MetricsLogger;
 use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
-use carbonshift_rs::types::CapacityTier;
+use carbonshift_rs::types::{Assignment, CapacityTier};
 
 use serde_json::Value;
 
@@ -525,6 +525,58 @@ fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
     tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
 }
 
+/// Recompute per-request carbon costs from the final committed assignment state.
+///
+/// The DP solver uses incremental `after_cost - before_cost` deltas computed
+/// from a snapshot baseline taken before concurrent batches commit.  When
+/// multiple batches solve simultaneously, their baselines diverge from the true
+/// final slot occupancy, so the sum of incremental deltas does NOT equal the
+/// true total carbon cost (it over-counts when rollbacks cause batches to
+/// re-solve with a higher baseline that crosses a tier boundary).
+///
+/// This function replaces each per-request `carbon_cost` with a proportional
+/// fair share based on the actual final slot occupancy:
+///   fair_cost(r) = true_slot_cost(r.slot) * r.flavour_dur / total_slot_dur(r.slot)
+///
+/// This ensures `sum(per_req.carbon_cost) == true total carbon cost` regardless
+/// of concurrent scheduling order or rollback behaviour.
+fn recompute_carbon_costs(
+    per_req: &mut [PerRequest],
+    final_assignments: &HashMap<u64, Assignment>,
+    carbon_forecast: &[f64],
+    tiers: &[CapacityTier],
+    scale: f64,
+) {
+    // Aggregate final slot occupancy.
+    let mut slot_counts: HashMap<i32, i64> = HashMap::new();
+    let mut slot_durations: HashMap<i32, i64> = HashMap::new();
+    for a in final_assignments.values() {
+        *slot_counts.entry(a.scheduled_slot).or_insert(0) += 1;
+        *slot_durations.entry(a.scheduled_slot).or_insert(0) += a.flavour_duration as i64;
+    }
+
+    // True total cost per slot under the rebound/repricing model.
+    let slot_true_cost: HashMap<i32, f64> = slot_counts.iter().map(|(&s, &count)| {
+        let dur = slot_durations.get(&s).copied().unwrap_or(0);
+        let mult = get_capacity_multiplier(tiers, count);
+        let carbon = carbon_forecast.get(s as usize).copied().unwrap_or(0.0);
+        (s, carbon * mult * dur as f64 * scale)
+    }).collect();
+
+    // Distribute proportionally to each request's flavour duration.
+    for r in per_req.iter_mut() {
+        let s = final_assignments.get(&r.request_id)
+            .map(|a| a.scheduled_slot)
+            .unwrap_or(r.scheduled_slot);
+        let slot_total = slot_true_cost.get(&s).copied().unwrap_or(0.0);
+        let slot_dur = slot_durations.get(&s).copied().unwrap_or(1) as f64;
+        let flav_dur = final_assignments.get(&r.request_id)
+            .map(|a| a.flavour_duration as f64)
+            .unwrap_or(0.0);
+        r.carbon_cost = slot_total * flav_dur / slot_dur;
+    }
+}
+
 /// Greedy baseline: assign each request immediately on arrival to the "best"
 /// flavour (lowest error; mirrors Python's `run_greedy_baseline`).
 fn run_greedy_baseline(
@@ -951,7 +1003,17 @@ fn run_single_n(
     let runs_by_id: HashMap<String, &SolverRunRow> =
         runs.iter().map(|r| (r.run_id.clone(), r)).collect();
 
-    let per_req      = compute_per_request(&assignment_rows, &runs_by_id, base_cfg.slot_duration_seconds, &rolled_back_ids);
+    let mut per_req  = compute_per_request(&assignment_rows, &runs_by_id, base_cfg.slot_duration_seconds, &rolled_back_ids);
+    // Correct per-request carbon costs using final committed state to eliminate
+    // concurrent-baseline drift (see recompute_carbon_costs for details).
+    let final_assignments = shared_state.get_current_assignments();
+    recompute_carbon_costs(
+        &mut per_req,
+        &final_assignments,
+        &scenario.carbon_forecast,
+        &base_cfg.capacity_tiers,
+        base_cfg.carbon_cost_duration_scale,
+    );
     let batch_timings = compute_batch_timings(&runs, batch_size);
     let summary = compute_summary(
         "nshift_dp",
@@ -1139,4 +1201,86 @@ fn main() {
     }
 
     println!("\nWrote benchmark output for {} batch sizes to {}.", all_summaries.len(), bcfg.output_dir.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carbonshift_rs::types::CapacityTier;
+
+    fn make_assignment(id: u64, slot: i32, dur: i32) -> Assignment {
+        Assignment::new(id, slot, "Balanced".into(), 0.0, 0.0, dur, None, None)
+    }
+
+    fn make_per_req(id: u64, slot: i32) -> PerRequest {
+        PerRequest {
+            request_id: id, arrival_time: 0.0, arrival_slot: slot, deadline_slot: slot,
+            included_in_batch_slot: slot, batch_sequence: 0, scheduled_slot: slot,
+            queue_wait_slots: 0, queue_wait_seconds: 0.0, final_wait_slots: 0,
+            final_wait_seconds: 0.0, flavour_name: "Balanced".into(), error: 0.0,
+            carbon_cost: 999.0,  // deliberately wrong — will be recomputed
+            assignment_solver_mode: "dp".into(), assignment_solver_status: "ok".into(),
+            assigned_with_greedy_fallback: false, assigned_with_relaxed_retry: false,
+            assigned_with_rollback: false,
+        }
+    }
+
+    /// Two batches of 5 requests each solve from baseline=0 (no tier boundary).
+    /// Both batches compute incremental costs from baseline=0 so they both
+    /// "see" the same base — the summed incremental costs would double-count.
+    /// After recompute_carbon_costs, each request should get a fair share of
+    /// the true slot cost = carbon * mult(10) * 10*30 / 3600.
+    #[test]
+    fn recompute_corrects_concurrent_baseline_drift() {
+        let tiers = vec![CapacityTier { max_requests: Some(20), multiplier: 1.0 }];
+        let carbon_forecast = vec![120.0_f64]; // slot 0 only
+        let scale = 1.0 / 3600.0;
+
+        // 10 requests in slot 0, all duration 30s
+        let final_assignments: HashMap<u64, Assignment> = (1..=10u64)
+            .map(|id| (id, make_assignment(id, 0, 30)))
+            .collect();
+
+        let mut per_req: Vec<PerRequest> = (1..=10u64).map(|id| make_per_req(id, 0)).collect();
+
+        recompute_carbon_costs(&mut per_req, &final_assignments, &carbon_forecast, &tiers, scale);
+
+        // True slot cost = 120 * 1.0 * (10*30) / 3600 = 120 * 300 / 3600 = 10.0
+        let expected_total = 120.0 * 1.0 * (10 * 30) as f64 * scale;
+        let computed_total: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
+        assert!((computed_total - expected_total).abs() < 1e-9,
+            "total={computed_total}, expected={expected_total}");
+
+        // Each request has same duration → equal share
+        let per_request_expected = expected_total / 10.0;
+        for r in &per_req {
+            assert!((r.carbon_cost - per_request_expected).abs() < 1e-9,
+                "request {} cost={} expected={}", r.request_id, r.carbon_cost, per_request_expected);
+        }
+    }
+
+    /// Tier boundary crossing: slot has 70 requests crossing tier 2.0 (boundary at 60).
+    /// True cost = carbon * 2.0 * 70*30 / 3600; recompute should give each request
+    /// exactly that fair share regardless of what incremental costs were originally logged.
+    #[test]
+    fn recompute_handles_tier_crossing_correctly() {
+        let tiers = vec![
+            CapacityTier { max_requests: Some(60), multiplier: 1.0 },
+            CapacityTier { max_requests: None,     multiplier: 2.0 },
+        ];
+        let carbon = 100.0_f64;
+        let scale = 1.0 / 3600.0;
+
+        let final_assignments: HashMap<u64, Assignment> = (1..=70u64)
+            .map(|id| (id, make_assignment(id, 0, 30)))
+            .collect();
+        let mut per_req: Vec<PerRequest> = (1..=70u64).map(|id| make_per_req(id, 0)).collect();
+
+        recompute_carbon_costs(&mut per_req, &final_assignments, &[carbon], &tiers, scale);
+
+        let expected_total = carbon * 2.0 * (70 * 30) as f64 * scale;
+        let computed_total: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
+        assert!((computed_total - expected_total).abs() < 1e-9,
+            "total={computed_total}, expected={expected_total}");
+    }
 }

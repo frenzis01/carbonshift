@@ -214,7 +214,7 @@ def _write_rust_config(
                     "realtime_slots": True,
                     "realtime_speed_scale": 0.05,
                     "dp_allow_relaxed_error_retry": dp_allow_relaxed,
-                    "rollback_max_consecutive": 0,
+                    "rollback_max_consecutive": 4,
                     # TODO betterify param setting to avoid duplicating and hardcoding defaults
                 },
             },
