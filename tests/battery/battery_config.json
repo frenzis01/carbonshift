@@ -1,79 +1,14 @@
 {
   "_comment": "CarbonShift solver battery test configuration.",
   "battery_id": "default",
-  "batch_sizes": [1, 4, 6, 8, 10],
-  "infeasibility_modes": ["greedy_fallback","relaxed_retry"],
-  "_comment2":   ["greedy_fallback", "relaxed_retry"],
+  "batch_sizes": [1, 4, 6, 8, 10, 12],
+  "infeasibility_modes": ["relaxed_retry"],
+  "comment_2": ["greedy_fallback","relaxed_retry"],
+  "additional_strategies": ["greedy_cheapest", "bandit", "ant_colony"],
   "backend": "rust",
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
   "scenarios": [
-    {
-      "id": "low_load_2028",
-      "seed": 2028,
-      "requests_per_slot": 20.0,
-      "total_slots": 72,
-      "capacity_tiers": [
-        {"max_requests": 10,   "multiplier": 1.0},
-        {"max_requests": 25,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
-      ]
-    },
-    {
-      "id": "low_load_2030",
-      "seed": 2030,
-      "requests_per_slot": 20.0,
-      "total_slots": 72,
-      "capacity_tiers": [
-        {"max_requests": 10,   "multiplier": 1.0},
-        {"max_requests": 25,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
-      ]
-    },
-    {
-      "id": "medium_load_2028",
-      "seed": 2028,
-      "requests_per_slot": 60.0,
-      "total_slots": 72,
-      "capacity_tiers": [
-        {"max_requests": 30,   "multiplier": 1.0},
-        {"max_requests": 70,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
-      ]
-    },
-    {
-      "id": "medium_load_38",
-      "seed": 38,
-      "requests_per_slot": 60.0,
-      "total_slots": 72,
-      "capacity_tiers": [
-        {"max_requests": 30,   "multiplier": 1.0},
-        {"max_requests": 70,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
-      ]
-    },
-    {
-      "id": "high_load_92",
-      "seed": 92,
-      "requests_per_slot": 90.0,
-      "total_slots": 48,
-      "capacity_tiers": [
-        {"max_requests": 50,   "multiplier": 1.0},
-        {"max_requests": 105,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
-      ]
-    },
-    {
-      "id": "high_load_105",
-      "seed": 105,
-      "requests_per_slot": 90.0,
-      "total_slots": 72,
-      "capacity_tiers": [
-        {"max_requests": 50,   "multiplier": 1.0},
-        {"max_requests": 105,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
-      ]
-    },
     {
       "id": "xhigh_load_120",
       "seed": 120,

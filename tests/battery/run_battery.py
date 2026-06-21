@@ -198,9 +198,21 @@ def _write_rust_config(
     output_dir: Path,
     dp_allow_relaxed: bool,
     include_baseline: bool,
+    additional_strategies: Optional[List[str]] = None,
 ) -> Path:
     """Write a temporary nshift config.json; caller is responsible for deletion."""
     fd, tmp = tempfile.mkstemp(suffix=".json")
+    runner: Dict[str, Any] = {
+        "flush_partial_batch": True,
+        "include_greedy_baseline": include_baseline,
+        "realtime_slots": True,
+        "realtime_speed_scale": 0.05,
+        "dp_allow_relaxed_error_retry": dp_allow_relaxed,
+        "rollback_max_consecutive": 4,
+        # TODO betterify param setting to avoid duplicating and hardcoding defaults
+    }
+    if additional_strategies:
+        runner["additional_strategies"] = additional_strategies
     with os.fdopen(fd, "w") as f:
         json.dump(
             {
@@ -208,15 +220,7 @@ def _write_rust_config(
                 "scenario_path": str(scenario_path),
                 "output_dir": str(output_dir),
                 "rust_output_dir": str(output_dir),
-                "runner": {
-                    "flush_partial_batch": True,
-                    "include_greedy_baseline": include_baseline,
-                    "realtime_slots": True,
-                    "realtime_speed_scale": 0.05,
-                    "dp_allow_relaxed_error_retry": dp_allow_relaxed,
-                    "rollback_max_consecutive": 4,
-                    # TODO betterify param setting to avoid duplicating and hardcoding defaults
-                },
+                "runner": runner,
             },
             f,
         )
@@ -230,6 +234,7 @@ def _run_rust_scenario(
     modes: List[str],
     output_dir: Path,
     rust_binary: Path,
+    additional_strategies: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Run the Rust nshift binary for all modes of a single scenario."""
     baseline_cost: Optional[float] = None
@@ -302,6 +307,63 @@ def _run_rust_scenario(
                     f"saving={savings_pct:.1f}%, ",
                     f"total_rollbacks={row.get('total_rollbacks', 0)}, "
                 )
+
+    # ── additional strategies ──────────────────────────────────────────────
+    if additional_strategies:
+        bc = baseline_cost or 0.0
+        # Run strategies once in the first mode's dir (they don't depend on mode).
+        strat_dir = output_dir / "rust_greedy_fallback"
+        strat_dir.mkdir(parents=True, exist_ok=True)
+        tmp_config = _write_rust_config(
+            scenario_path,
+            [],                    # no DP batch runs
+            strat_dir,
+            False,
+            False,                 # greedy baseline already written
+            additional_strategies,
+        )
+        try:
+            subprocess.run([str(rust_binary), "--config", str(tmp_config)], check=True)
+        finally:
+            tmp_config.unlink(missing_ok=True)
+
+        for strategy in additional_strategies:
+            summary_csv = strat_dir / f"strategy_{strategy}" / "summary.csv"
+            per_ts_csv  = strat_dir / f"strategy_{strategy}" / "per_timeslot.csv"
+            if not summary_csv.exists():
+                print(f"    WARNING: {summary_csv} not found; skipping strategy={strategy}")
+                continue
+            with open(summary_csv, newline="") as f:
+                rows_csv = list(csv.DictReader(f))
+            for row in rows_csv:
+                carbon = float(row.get("total_carbon_cost", 0.0))
+                savings_pct = (bc - carbon) / bc * 100.0 if bc > 0.0 else 0.0
+                avg_slot_err = _avg_slot_error_from_csv(per_ts_csv)
+                all_rows.append({
+                    "scenario_id": scenario_id,
+                    "backend": "rust",
+                    "batch_size": 0,
+                    "infeasibility_mode": strategy,
+                    "solver_time_ms_avg": float(row.get("solver_time_ms_avg", 0.0)),
+                    "total_carbon_cost": carbon,
+                    "final_global_error": float(row.get("global_average_error", 0.0)),
+                    "avg_global_error_per_slot": avg_slot_err,
+                    "requests_assigned_with_greedy_fallback": 0,
+                    "requests_assigned_with_relaxed_retry": 0,
+                    "total_rollbacks": 0,
+                    "max_consecutive_rollbacks": 0,
+                    "baseline_total_carbon_cost": bc,
+                    "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                    "peak_concurrent_workers": 0,
+                    "avg_concurrent_workers": 0.0,
+                })
+                print(
+                    f"    [rust/{strategy}]: "
+                    f"carbon={carbon:.3f}, "
+                    f"error={float(row.get('global_average_error', 0.0)):.3f}, "
+                    f"saving={savings_pct:.1f}%"
+                )
+
     return all_rows
 
 
@@ -322,6 +384,7 @@ def run_battery(config_path: Path) -> None:
     modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback", "relaxed_retry"])
     # modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback"])
     backend: str = cfg.get("backend", "python")
+    additional_strategies: List[str] = cfg.get("additional_strategies", [])
 
     rust_binary: Optional[Path] = None
     if backend in ("rust", "both"):
@@ -370,7 +433,10 @@ def run_battery(config_path: Path) -> None:
                 all_rows.extend(rows)
 
         if backend in ("rust", "both") and rust_binary is not None:
-            rows = _run_rust_scenario(scenario_path, sid, batch_sizes, modes, scenario_dir, rust_binary)
+            rows = _run_rust_scenario(
+                scenario_path, sid, batch_sizes, modes, scenario_dir, rust_binary,
+                additional_strategies=additional_strategies if additional_strategies else None,
+            )
             all_rows.extend(rows)
 
         scenario_elapsed = time.monotonic() - scenario_t0

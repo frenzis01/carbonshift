@@ -68,6 +68,8 @@
 //!   N<n>/  { same files as above }
 //! ```
 
+mod swarm;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,7 +79,7 @@ use carbonshift_rs::metrics_logger::MetricsLogger;
 use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
-use carbonshift_rs::types::{Assignment, CapacityTier};
+use carbonshift_rs::types::{Assignment, CapacityTier, Flavour};
 
 use serde_json::Value;
 
@@ -94,6 +96,8 @@ struct BenchmarkConfig {
     dp_allow_relaxed_error_retry: bool,
     /// Max consecutive rollbacks before force-committing (0 = rollback disabled).
     rollback_max_consecutive: usize,
+    /// Additional offline strategies to run (e.g. "greedy_cheapest", "bandit", "ant_colony").
+    additional_strategies: Vec<String>,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -137,7 +141,13 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
     let rollback_max_consecutive =
         runner.get("rollback_max_consecutive").and_then(|x| x.as_u64()).unwrap_or(3) as usize;
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive }
+    let additional_strategies: Vec<String> = runner
+        .get("additional_strategies")
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -659,6 +669,276 @@ fn run_greedy_baseline(
     (per_req, batch_timings, summary)
 }
 
+// ─── greedy cheapest strategy ─────────────────────────────────────────────────
+
+/// Greedy cheapest: assign each request to the (slot, flavour) pair that
+/// minimises carbon cost while satisfying:
+/// - deadline and assignment_max_future_slots window,
+/// - global error constraint (average error over all assigned requests ≤ threshold),
+/// - window error constraint (average error in [slot−past, slot+future] ≤ threshold).
+///
+/// Falls back to the minimum-error flavour at the arrival slot when no
+/// feasible (slot, flavour) pair exists.
+fn run_greedy_cheapest(
+    scenario: &Scenario,
+    cfg: &Config,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    let slot_dur = cfg.slot_duration_seconds;
+    let carbon   = &scenario.carbon_forecast;
+    let tiers    = &cfg.capacity_tiers;
+    let scale    = cfg.carbon_cost_duration_scale;
+    let max_future   = cfg.assignment_max_future_slots;
+    let total_slots  = cfg.total_slots;
+    let win_past     = cfg.error_window_past;
+    let win_future   = cfg.error_window_future;
+    let max_err      = cfg.max_error_threshold;
+
+    // Sort flavours cheapest-first (shortest duration = lowest carbon cost per slot).
+    let mut sorted_flavours: Vec<&Flavour> = cfg.flavours.iter().collect();
+    sorted_flavours.sort_by_key(|f| f.duration);
+
+    // Fallback flavour = minimum error (for infeasible cases).
+    let fallback_flav = cfg.flavours
+        .iter()
+        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+        .expect("no flavours");
+
+    // Sort requests by (arrival_slot, request_id).
+    let mut requests: Vec<_> = scenario.requests.iter().collect();
+    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
+
+    let mut slot_count: HashMap<i32, i32>       = HashMap::new();
+    let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
+    let mut global_error_sum: f64 = 0.0;
+    let mut global_count: usize   = 0;
+    let mut per_req: Vec<PerRequest>    = Vec::new();
+    let mut batch_timings: Vec<BatchTiming> = Vec::new();
+    let mut seq: u64 = 0;
+
+    for req in &requests {
+        let arrival  = req.arrival_slot;
+        let deadline = req
+            .deadline_slot
+            .min(arrival + max_future)
+            .min(total_slots - 1);
+
+        // Find the cheapest feasible (slot, flavour) pair with a full scan.
+        let mut best: Option<(f64, i32, &Flavour)> = None;
+        for slot in arrival..=deadline {
+            let ci       = carbon.get(slot as usize).copied().unwrap_or(1.0);
+            let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
+            let mult     = get_capacity_multiplier(tiers, position as i64);
+
+            for flav in &sorted_flavours {
+                let cost = ci * mult * flav.duration as f64 * scale;
+
+                if cfg.global_error_constraint_enabled {
+                    let new_avg = (global_error_sum + flav.error) / (global_count as f64 + 1.0);
+                    if new_avg > max_err { continue; }
+                }
+                {
+                    let mut win_sum = flav.error;
+                    let mut win_cnt = 1usize;
+                    for ws in (slot - win_past)..=(slot + win_future) {
+                        if let Some(errs) = slot_errors.get(&ws) {
+                            win_sum += errs.iter().sum::<f64>();
+                            win_cnt += errs.len();
+                        }
+                    }
+                    if win_sum / win_cnt as f64 > max_err { continue; }
+                }
+                if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
+                    best = Some((cost, slot, flav));
+                }
+            }
+        }
+
+        // Commit the cheapest feasible pair; fall back if none found.
+        let (chosen_cost, chosen_slot, chosen_flav) = best.unwrap_or_else(|| {
+            let slot     = arrival;
+            let ci       = carbon.get(slot as usize).copied().unwrap_or(1.0);
+            let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
+            let mult     = get_capacity_multiplier(tiers, position as i64);
+            let cost     = ci * mult * fallback_flav.duration as f64 * scale;
+            (cost, slot, fallback_flav)
+        });
+
+        *slot_count.entry(chosen_slot).or_insert(0) += 1;
+        slot_errors.entry(chosen_slot).or_default().push(chosen_flav.error);
+        global_error_sum += chosen_flav.error;
+        global_count     += 1;
+        seq += 1;
+
+        let queue_wait_slots = (chosen_slot - arrival).max(0);
+        per_req.push(PerRequest {
+            request_id:             req.request_id,
+            arrival_time:           arrival as f64 * slot_dur,
+            arrival_slot:           arrival,
+            deadline_slot:          req.deadline_slot,
+            included_in_batch_slot: arrival,
+            batch_sequence:         seq,
+            scheduled_slot:         chosen_slot,
+            queue_wait_slots,
+            queue_wait_seconds:     queue_wait_slots as f64 * slot_dur,
+            final_wait_slots:       queue_wait_slots,
+            final_wait_seconds:     queue_wait_slots as f64 * slot_dur,
+            flavour_name:           chosen_flav.name.clone(),
+            error:                  chosen_flav.error,
+            carbon_cost:            chosen_cost,
+            assignment_solver_mode:   "greedy_cheapest".to_string(),
+            assignment_solver_status: "ok".to_string(),
+            assigned_with_greedy_fallback: false,
+            assigned_with_relaxed_retry:   false,
+            assigned_with_rollback:        false,
+        });
+        batch_timings.push(BatchTiming {
+            batch_sequence:       seq,
+            batch_size_n:         0,
+            effective_batch_size: 1,
+            slot:                 arrival,
+            pending_before:       1,
+            solver_elapsed_ms:    0.0,
+            scheduled:            true,
+            flush_partial_batch:  false,
+        });
+    }
+
+    let total_requests: usize = scenario.requests.len();
+    let summary = compute_summary(
+        "greedy_cheapest",
+        0,
+        realtime_slots,
+        realtime_speed_scale,
+        &per_req,
+        &batch_timings,
+        total_requests,
+        &fallback_flav.name,
+        fallback_flav.duration,
+        fallback_flav.error,
+        0, 0, 0,
+        0,    // peak_concurrent_workers
+        0.0,  // avg_concurrent_workers
+    );
+    (per_req, batch_timings, summary)
+}
+
+// ─── swarm strategy wrappers ──────────────────────────────────────────────────
+
+/// Convert `SwarmAssignment` results into the standard `PerRequest` / summary
+/// format used by the rest of the benchmark output.
+fn convert_swarm_to_outputs(
+    raw: Vec<swarm::SwarmAssignment>,
+    mode_name: &str,
+    scenario: &Scenario,
+    cfg: &Config,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    let slot_dur = cfg.slot_duration_seconds;
+    let best_flav = cfg.flavours
+        .iter()
+        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+        .expect("no flavours");
+
+    let mut per_req: Vec<PerRequest> = Vec::with_capacity(raw.len());
+    let mut batch_timings: Vec<BatchTiming> = Vec::with_capacity(raw.len());
+
+    for (i, a) in raw.iter().enumerate() {
+        let seq = (i + 1) as u64;
+        let queue_wait_slots = (a.scheduled_slot - a.arrival_slot).max(0);
+        per_req.push(PerRequest {
+            request_id:             a.request_id,
+            arrival_time:           a.arrival_slot as f64 * slot_dur,
+            arrival_slot:           a.arrival_slot,
+            deadline_slot:          a.deadline_slot,
+            included_in_batch_slot: a.arrival_slot,
+            batch_sequence:         seq,
+            scheduled_slot:         a.scheduled_slot,
+            queue_wait_slots,
+            queue_wait_seconds:     queue_wait_slots as f64 * slot_dur,
+            final_wait_slots:       queue_wait_slots,
+            final_wait_seconds:     queue_wait_slots as f64 * slot_dur,
+            flavour_name:           a.flavour_name.clone(),
+            error:                  a.error,
+            carbon_cost:            a.carbon_cost,
+            assignment_solver_mode:   mode_name.to_string(),
+            assignment_solver_status: "ok".to_string(),
+            assigned_with_greedy_fallback: false,
+            assigned_with_relaxed_retry:   false,
+            assigned_with_rollback:        false,
+        });
+        batch_timings.push(BatchTiming {
+            batch_sequence:       seq,
+            batch_size_n:         0,
+            effective_batch_size: 1,
+            slot:                 a.arrival_slot,
+            pending_before:       1,
+            solver_elapsed_ms:    0.0,
+            scheduled:            true,
+            flush_partial_batch:  false,
+        });
+    }
+
+    let summary = compute_summary(
+        mode_name,
+        0,
+        realtime_slots,
+        realtime_speed_scale,
+        &per_req,
+        &batch_timings,
+        scenario.requests.len(),
+        &best_flav.name,
+        best_flav.duration,
+        best_flav.error,
+        0, 0, 0, 0, 0.0,
+    );
+    (per_req, batch_timings, summary)
+}
+
+fn run_bandit_strategy(
+    scenario: &Scenario,
+    cfg: &Config,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    let params = swarm::BanditParams::default();
+    let mut requests: Vec<_> = scenario.requests.clone();
+    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
+    let raw = swarm::run_bandit(&requests, &scenario.carbon_forecast, cfg, &params);
+    convert_swarm_to_outputs(raw, "bandit", scenario, cfg, realtime_slots, realtime_speed_scale)
+}
+
+fn run_ant_colony_strategy(
+    scenario: &Scenario,
+    cfg: &Config,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    let params = swarm::AcoParams::default();
+    let mut requests: Vec<_> = scenario.requests.clone();
+    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
+    let raw = swarm::run_ant_colony(&requests, &scenario.carbon_forecast, cfg, &params);
+    convert_swarm_to_outputs(raw, "ant_colony", scenario, cfg, realtime_slots, realtime_speed_scale)
+}
+
+/// Dispatch an additional strategy by name.
+fn run_strategy(
+    name: &str,
+    scenario: &Scenario,
+    cfg: &Config,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    match name {
+        "greedy_cheapest" => run_greedy_cheapest(scenario, cfg, realtime_slots, realtime_speed_scale),
+        "bandit"          => run_bandit_strategy(scenario, cfg, realtime_slots, realtime_speed_scale),
+        "ant_colony"      => run_ant_colony_strategy(scenario, cfg, realtime_slots, realtime_speed_scale),
+        other             => panic!("Unknown strategy: '{other}'"),
+    }
+}
+
 // ─── output helpers ───────────────────────────────────────────────────────────
 
 const SUMMARY_CSV_HEADER: &[&str] = &[
@@ -1175,6 +1455,36 @@ fn main() {
         );
 
         all_summaries.push(summary);
+    }
+
+    // ── additional strategies ──────────────────────────────────────────────
+    for strategy in &bcfg.additional_strategies {
+        let strat_dir = bcfg.output_dir.join(format!("strategy_{strategy}"));
+        let (per_req, batch_timings, mut summary) =
+            run_strategy(strategy, &scenario, &base_cfg, realtime_slots, speed_scale);
+
+        if let Some(bc) = baseline_cost {
+            let saving = bc - summary.total_carbon_cost;
+            let pct    = if bc > 0.0 { saving / bc * 100.0 } else { 0.0 };
+            summary.baseline_total_carbon_cost         = bc;
+            summary.carbon_cost_saving_vs_baseline     = saving;
+            summary.carbon_cost_saving_vs_baseline_pct = pct;
+        }
+
+        let per_ts = compute_per_timeslot(
+            &per_req,
+            scenario.metadata.total_slots,
+            scenario.metadata.error_window_past,
+            scenario.metadata.error_window_future,
+        );
+        write_run_outputs(&strat_dir, &summary, &per_req, &batch_timings, &per_ts);
+        println!(
+            "Completed strategy={strategy}: total_carbon={:.3}, global_error={:.3}, \
+             saving_vs_baseline={:.3}",
+            summary.total_carbon_cost,
+            summary.global_average_error,
+            summary.carbon_cost_saving_vs_baseline,
+        );
     }
 
     // ── aggregate output ───────────────────────────────────────────────────
