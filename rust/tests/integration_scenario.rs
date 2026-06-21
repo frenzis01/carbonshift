@@ -112,10 +112,8 @@ fn drain_pending_with_dp(
         // Compute baseline from already-placed assignments.
         let current_assignments = ss.get_current_assignments();
         let mut base_counts: HashMap<i32, i32> = HashMap::new();
-        let mut base_durations: HashMap<i32, i32> = HashMap::new();
         for a in current_assignments.values() {
             *base_counts.entry(a.scheduled_slot).or_insert(0) += 1;
-            *base_durations.entry(a.scheduled_slot).or_insert(0) += a.flavour_duration;
         }
 
         // Get real window error baseline from shared state.
@@ -133,7 +131,6 @@ fn drain_pending_with_dp(
             capacity_multiplier: 1.0,
             capacity_tiers: &cfg.capacity_tiers,
             baseline_slot_counts: &base_counts,
-            baseline_slot_durations: &base_durations,
             error_window_baseline: ErrorWindowBaseline {
                 error_sum: ws.error_sum,
                 request_count: ws.count as f64,
@@ -152,8 +149,6 @@ fn drain_pending_with_dp(
             let deadlines: Vec<i32> = requests.iter().map(|(_, d)| *d).collect();
             let base_counts_arr: Vec<i32> =
                 (0..cfg.total_slots).map(|s| base_counts.get(&s).copied().unwrap_or(0)).collect();
-            let base_durations_arr: Vec<i32> =
-                (0..cfg.total_slots).map(|s| base_durations.get(&s).copied().unwrap_or(0)).collect();
 
             let greedy = solver.greedy_fallback(
                 &requests,
@@ -161,7 +156,6 @@ fn drain_pending_with_dp(
                 current_slot,
                 &cfg.capacity_tiers,
                 &base_counts_arr,
-                &base_durations_arr,
             );
 
             let assignments: Vec<Assignment> = greedy

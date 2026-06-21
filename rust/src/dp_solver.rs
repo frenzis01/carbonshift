@@ -32,17 +32,19 @@ use crate::types::{CapacityTier, Flavour, RequestAssignment};
 /// - `error_count`      number of requests counted in that sum (×1000 for int)
 /// - `mock_remaining`   synthetic baseline requests not yet consumed
 /// - `inc_counts`       per-slot request count delta introduced by this batch
-/// - `inc_durations`    per-slot total duration delta introduced by this batch
 ///
 /// `error_count` is stored as `(f64 * 1000) as i64` to avoid f64 in HashMap
 /// keys (f64 doesn't implement `Eq + Hash`).
+///
+/// `inc_durations` was removed: the new per-request tier model charges each
+/// request `carbon × mult(position) × duration` directly, so slot duration
+/// totals no longer affect the marginal cost formula.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DpStateKey {
     error_sum_bp: i64,
     error_count_milli: i64, // error_count × 1000, rounded
     mock_remaining: i32,
     inc_counts: Vec<i32>,
-    inc_durations: Vec<i32>,
 }
 
 impl DpStateKey {
@@ -51,14 +53,12 @@ impl DpStateKey {
         error_count: f64,
         mock_remaining: i32,
         inc_counts: Vec<i32>,
-        inc_durations: Vec<i32>,
     ) -> Self {
         Self {
             error_sum_bp,
             error_count_milli: (error_count * 1000.0).round() as i64,
             mock_remaining,
             inc_counts,
-            inc_durations,
         }
     }
 
@@ -81,8 +81,6 @@ pub struct SolveBatchInput<'a> {
     pub capacity_tiers: &'a [CapacityTier],
     /// Per-slot baseline request counts from already-fixed assignments.
     pub baseline_slot_counts: &'a HashMap<i32, i32>,
-    /// Per-slot baseline duration sums from already-fixed assignments.
-    pub baseline_slot_durations: &'a HashMap<i32, i32>,
     /// Pre-computed error baseline for the window.
     pub error_window_baseline: ErrorWindowBaseline,
     /// Maximum allowed average window error (None = no constraint).
@@ -181,15 +179,9 @@ impl DpSolver {
 
         // Build baseline arrays.
         let mut base_counts = vec![0i32; t];
-        let mut base_durations = vec![0i32; t];
         for (&slot, &cnt) in input.baseline_slot_counts {
             if slot >= 0 && (slot as usize) < t {
                 base_counts[slot as usize] = cnt;
-            }
-        }
-        for (&slot, &dur) in input.baseline_slot_durations {
-            if slot >= 0 && (slot as usize) < t {
-                base_durations[slot as usize] = dur;
             }
         }
 
@@ -207,7 +199,6 @@ impl DpSolver {
             initial_error_count,
             initial_mock_count,
             vec![0i32; t],
-            vec![0i32; t],
         );
         let mut dp_prev: HashMap<DpStateKey, (f64, Vec<RequestAssignment>)> = HashMap::new();
         dp_prev.insert(init_key, (0.0, vec![]));
@@ -221,7 +212,6 @@ impl DpSolver {
 
             for (state_key, (prev_cost, prev_assignments)) in &dp_prev {
                 let inc_counts = state_key.inc_counts.clone();
-                let inc_durations = state_key.inc_durations.clone();
 
                 for flavour in &self.flavours {
                     let f_error_bp = (flavour.error * 100.0).round() as i64;
@@ -230,14 +220,11 @@ impl DpSolver {
                     for slot in input.current_slot..=deadline {
                         let s = slot as usize;
 
-                        // Incremental cost with capacity-tier repricing.
                         let delta_cost = self.incremental_carbon_cost(
                             slot,
                             f_duration,
                             &base_counts,
-                            &base_durations,
                             &inc_counts,
-                            &inc_durations,
                             &tiers,
                         );
 
@@ -259,9 +246,7 @@ impl DpSolver {
                         }
 
                         let mut new_inc_counts = inc_counts.clone();
-                        let mut new_inc_durations = inc_durations.clone();
                         new_inc_counts[s] += 1;
-                        new_inc_durations[s] += f_duration;
 
                         let new_cost = prev_cost + delta_cost;
                         let new_key = DpStateKey::new(
@@ -269,7 +254,6 @@ impl DpSolver {
                             new_error_count,
                             new_mock_remaining,
                             new_inc_counts,
-                            new_inc_durations,
                         );
 
                         let assignment = RequestAssignment {
@@ -332,7 +316,6 @@ impl DpSolver {
                     input.current_slot,
                     &tiers,
                     &base_counts,
-                    &base_durations,
                 );
             }
 
@@ -368,10 +351,8 @@ impl DpSolver {
         current_slot: i32,
         capacity_tiers: &[CapacityTier],
         base_counts: &[i32],
-        base_durations: &[i32],
     ) -> Vec<RequestAssignment> {
         let mut inc_counts = base_counts.to_vec();
-        let mut inc_durations = base_durations.to_vec();
         // Most accurate = longest duration.
         let fallback_flavour = self
             .flavours
@@ -383,8 +364,6 @@ impl DpSolver {
 
         for (i, (req_id, _)) in requests.iter().enumerate() {
             let deadline = deadlines[i];
-            // The base_counts / base_durations passed in are already applied; we
-            // track incremental changes locally in inc_counts / inc_durations.
             let mut best: Option<(f64, i32)> = None;
             let empty_base = vec![0i32; self.window_size as usize];
 
@@ -393,9 +372,7 @@ impl DpSolver {
                     slot,
                     fallback_flavour.duration,
                     &empty_base,
-                    &empty_base,
                     &inc_counts,
-                    &inc_durations,
                     capacity_tiers,
                 );
                 if best.map_or(true, |(c, _)| cost < c) {
@@ -406,7 +383,6 @@ impl DpSolver {
             if let Some((cost, best_slot)) = best {
                 let s = best_slot as usize;
                 inc_counts[s] += 1;
-                inc_durations[s] += fallback_flavour.duration;
                 assignments.push(RequestAssignment {
                     request_id: *req_id,
                     flavour_name: fallback_flavour.name.clone(),
@@ -423,33 +399,26 @@ impl DpSolver {
 
     /// Marginal carbon cost of placing one request in `slot`.
     ///
-    /// Because capacity multipliers are step-functions of request count, adding
-    /// one request can shift the whole slot into a higher tier.  The cost is
-    /// therefore computed as the difference in full-slot cost before and after
-    /// the addition — the "rebound effect" repricing.
+    /// Under the per-request tier model, each request is charged based solely
+    /// on its position (1-indexed count) within the slot.  The request at
+    /// position K pays `carbon[slot] × mult(K) × duration × scale`, where
+    /// `mult(K)` is the multiplier of the capacity tier that K falls into.
+    ///
+    /// This is a pure additive model: placing a new request never retroactively
+    /// reprices earlier requests in the same slot.
     fn incremental_carbon_cost(
         &self,
         slot: i32,
         add_duration: i32,
         base_counts: &[i32],
-        base_durations: &[i32],
         inc_counts: &[i32],
-        inc_durations: &[i32],
         tiers: &[CapacityTier],
     ) -> f64 {
         let s = slot as usize;
-        let before_count = (base_counts[s] + inc_counts[s]) as i64;
-        let after_count = before_count + 1;
-        let before_dur = (base_durations[s] + inc_durations[s]) as i64;
-        let after_dur = before_dur + add_duration as i64;
-
-        let before_mult = Self::get_capacity_multiplier(tiers, before_count);
-        let after_mult = Self::get_capacity_multiplier(tiers, after_count);
-
+        let position = (base_counts[s] + inc_counts[s]) as i64 + 1; // 1-indexed position of this request
+        let mult = Self::get_capacity_multiplier(tiers, position);
         let carbon = self.carbon_forecast[s];
-        let before_cost = carbon * before_mult * before_dur as f64 * self.carbon_cost_scale;
-        let after_cost = carbon * after_mult * after_dur as f64 * self.carbon_cost_scale;
-        after_cost - before_cost
+        carbon * mult * add_duration as f64 * self.carbon_cost_scale
     }
 
     fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
@@ -489,7 +458,6 @@ mod tests {
         current_slot: i32,
         tiers: &'a [CapacityTier],
         counts: &'a HashMap<i32, i32>,
-        durations: &'a HashMap<i32, i32>,
     ) -> SolveBatchInput<'a> {
         SolveBatchInput {
             requests,
@@ -497,7 +465,6 @@ mod tests {
             capacity_multiplier: 1.0,
             capacity_tiers: tiers,
             baseline_slot_counts: counts,
-            baseline_slot_durations: durations,
             error_window_baseline: ErrorWindowBaseline::default(),
             max_error_threshold: Some(4.0),
             error_window_past: 2,
@@ -512,9 +479,8 @@ mod tests {
         current_slot: i32,
         tiers: &'a [CapacityTier],
         counts: &'a HashMap<i32, i32>,
-        durations: &'a HashMap<i32, i32>,
     ) -> SolveBatchInput<'a> {
-        make_input_with_maps(requests, current_slot, tiers, counts, durations)
+        make_input_with_maps(requests, current_slot, tiers, counts)
     }
 
     #[test]
@@ -533,15 +499,15 @@ mod tests {
         let requests = vec![(1u64, 4i32)];
         let tiers = no_tiers();
         let counts = HashMap::new();
-        let durations = HashMap::new();
-        let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts, &durations));
+        let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].slot, 2);
     }
 
     #[test]
-    fn capacity_tier_reprices_entire_slot() {
-        // Tier threshold at 1 request: >1 request triggers multiplier 2.0.
+    fn per_request_tier_model_no_repricing() {
+        // Tier threshold at 1 request: the 2nd request uses multiplier 2.0
+        // but the 1st request keeps multiplier 1.0 (no repricing).
         let tiers = vec![
             CapacityTier { max_requests: Some(1), multiplier: 1.0 },
             CapacityTier { max_requests: None,    multiplier: 2.0 },
@@ -556,21 +522,59 @@ mod tests {
             timeout: 5.0,
             carbon_cost_scale: 1.0 / 3600.0,
         };
-        // First request alone: cost = 40 * 1.0 * 60/3600 = 40/60
+        // First request is at position 1 → tier 1 (mult=1.0): cost = 40 * 1.0 * 60/3600
         let cost_first = solver.incremental_carbon_cost(
-            0, 60, &vec![0; 5], &vec![0; 5], &vec![0; 5], &vec![0; 5], &tiers
+            0, 60, &vec![0; 5], &vec![0; 5], &tiers,
         );
         assert!((cost_first - 40.0 * 1.0 * 60.0 / 3600.0).abs() < 1e-9,
             "cost_first={cost_first}");
 
-        // Second request triggers tier 2 (multiplier 2.0):
-        // after_cost = 40 * 2.0 * 120/3600; before_cost = 40 * 1.0 * 60/3600
-        // delta = 40 * (2.0*120 - 1.0*60) / 3600 = 40 * 180 / 3600 = 2.0
+        // Second request is at position 2 → tier 2 (mult=2.0): cost = 40 * 2.0 * 60/3600
+        // Previous request is NOT repriced — this is the per-request model.
         let cost_second = solver.incremental_carbon_cost(
-            0, 60, &vec![0; 5], &vec![0; 5], &vec![1; 5], &vec![60; 5], &tiers
+            0, 60, &vec![0; 5], &vec![1; 5], &tiers,
         );
-        assert!((cost_second - 2.0).abs() < 1e-9,
-            "cost_second={cost_second}");
+        let expected_second = 40.0 * 2.0 * 60.0 / 3600.0;
+        assert!((cost_second - expected_second).abs() < 1e-9,
+            "cost_second={cost_second}, expected={expected_second}");
+
+        // Total cost for 2 requests = cost_first + cost_second (additive, no repricing)
+        let total = cost_first + cost_second;
+        let expected_total = 40.0 * (1.0 * 60.0 + 2.0 * 60.0) / 3600.0;
+        assert!((total - expected_total).abs() < 1e-9,
+            "total={total}, expected={expected_total}");
+    }
+
+    #[test]
+    fn tier_crossing_does_not_reprice_earlier_requests() {
+        // 3 tiers: ≤2 mult=1.0, ≤4 mult=2.0, else mult=5.0; duration=30
+        let tiers = vec![
+            CapacityTier { max_requests: Some(2), multiplier: 1.0 },
+            CapacityTier { max_requests: Some(4), multiplier: 2.0 },
+            CapacityTier { max_requests: None,    multiplier: 5.0 },
+        ];
+        let forecast = vec![60.0; 5];
+        let solver = DpSolver {
+            flavours: vec![Flavour { name: "F".to_string(), error: 0.0, duration: 30 }],
+            window_size: 5, carbon_forecast: forecast.clone(), pruning: "none".to_string(),
+            pruning_k: 1000, timeout: 5.0, carbon_cost_scale: 1.0 / 3600.0,
+        };
+        let scale = 1.0 / 3600.0;
+        // positions 1,2 → mult 1.0; positions 3,4 → mult 2.0; position 5 → mult 5.0
+        let expected_costs = [
+            60.0 * 1.0 * 30.0 * scale, // position 1
+            60.0 * 1.0 * 30.0 * scale, // position 2
+            60.0 * 2.0 * 30.0 * scale, // position 3 (crosses tier)
+            60.0 * 2.0 * 30.0 * scale, // position 4
+            60.0 * 5.0 * 30.0 * scale, // position 5 (crosses tier)
+        ];
+        for (i, &expected) in expected_costs.iter().enumerate() {
+            let mut inc_counts = vec![0i32; 5];
+            inc_counts[0] = i as i32; // i requests already placed at slot 0
+            let cost = solver.incremental_carbon_cost(0, 30, &vec![0; 5], &inc_counts, &tiers);
+            assert!((cost - expected).abs() < 1e-9,
+                "position={}: cost={cost}, expected={expected}", i + 1);
+        }
     }
 
     #[test]
@@ -593,8 +597,7 @@ mod tests {
         let requests = vec![(1u64, 2i32)]; // deadline=2, window_future=2 → all slots in window
         let tiers = no_tiers();
         let counts = HashMap::new();
-        let durations = HashMap::new();
-        let mut input = make_input(&requests, 0, &tiers, &counts, &durations);
+        let mut input = make_input(&requests, 0, &tiers, &counts);
         input.max_error_threshold = Some(0.0);
         let result = solver.solve_batch(input);
         assert_eq!(result.len(), 1);
@@ -630,8 +633,7 @@ mod tests {
         let requests: Vec<(u64, i32)> = (1..=5).map(|i| (i, 23)).collect();
         let tiers = no_tiers();
         let counts = HashMap::new();
-        let durations = HashMap::new();
-        let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts, &durations));
+        let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts));
         assert_eq!(result.len(), 5, "all requests must be scheduled");
         // All assignments should be in cheap slots (outside window).
         for a in &result {
@@ -657,7 +659,7 @@ mod tests {
         let deadlines = vec![0, 1, 2];
         let tiers = no_tiers();
         let base = vec![0i32; 5];
-        let result = solver.greedy_fallback(&requests, &deadlines, 0, &tiers, &base, &base);
+        let result = solver.greedy_fallback(&requests, &deadlines, 0, &tiers, &base);
         assert_eq!(result.len(), 3);
     }
 
@@ -666,8 +668,7 @@ mod tests {
         let solver = make_solver(flat_forecast(24, 100.0));
         let tiers = no_tiers();
         let counts = HashMap::new();
-        let durations = HashMap::new();
-        let result = solver.solve_batch(make_input(&[], 0, &tiers, &counts, &durations));
+        let result = solver.solve_batch(make_input(&[], 0, &tiers, &counts));
         assert!(result.is_empty());
     }
 
@@ -685,10 +686,9 @@ mod tests {
         let tiers = no_tiers();
         let requests = vec![(1u64, 4i32)];
         let counts = HashMap::new();
-        let durations = HashMap::new();
         let result = solver.solve_batch(SolveBatchInput {
             current_slot: 5, // == window_size → early return
-            ..make_input_with_maps(&requests, 5, &tiers, &counts, &durations)
+            ..make_input_with_maps(&requests, 5, &tiers, &counts)
         });
         assert!(result.is_empty());
     }

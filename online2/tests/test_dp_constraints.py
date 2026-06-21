@@ -30,7 +30,7 @@ class TestDPSolverConstraints(unittest.TestCase):
         self.assertEqual(len(assignments), 1)
         self.assertGreaterEqual(assignments[0].slot, 3)
 
-    def test_capacity_tier_reprices_entire_slot(self):
+    def test_per_request_capacity_tier_cost(self):
         solver = RollingWindowDPScheduler(
             flavours=[{"name": "S", "error": 0.0, "duration": 1}],
             carbon_forecast=[10.0],
@@ -43,14 +43,16 @@ class TestDPSolverConstraints(unittest.TestCase):
             current_slot=0,
             capacity_tiers=[
                 {"max_requests": 1, "multiplier": 1.0},
-                {"max_requests": float("inf"), "multiplier": 2.0},
+                {"max_requests": None, "multiplier": 2.0},
             ],
         )
         self.assertEqual(len(assignments), 2)
-        # Expected: tier-repriced cost = 40 raw units × CARBON_COST_DURATION_SCALE.
-        # Tier 1 (1 req): cost = 10*1.0*1; Tier 2 (2 reqs): total = 10*2.0*2, delta = 30.
+        # Per-request tier model: each request is charged based on its 1-indexed position.
+        # Position 1 → x1.0 → cost = 10*1.0*1 = 10
+        # Position 2 → x2.0 → cost = 10*2.0*1 = 20
+        # Total = 30 × CARBON_COST_DURATION_SCALE
         import config as _cfg
-        expected = 40.0 * getattr(_cfg, "CARBON_COST_DURATION_SCALE", 1.0)
+        expected = 30.0 * getattr(_cfg, "CARBON_COST_DURATION_SCALE", 1.0)
         self.assertAlmostEqual(sum(a.carbon_cost for a in assignments), expected)
 
     def test_weighted_error_window_uses_total_error_over_total_requests(self):

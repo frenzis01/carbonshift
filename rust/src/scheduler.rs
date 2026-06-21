@@ -682,14 +682,10 @@ fn solve_dp(
         }
     }
 
-    // Baseline counts/durations from pinned future assignments.
+    // Baseline counts from pinned future assignments.
     let mut baseline_slot_counts: HashMap<i32, i32> = HashMap::new();
-    let mut baseline_slot_durations: HashMap<i32, i32> = HashMap::new();
     for a in &fixed_future {
-        let s = a.scheduled_slot;
-        *baseline_slot_counts.entry(s).or_insert(0) += 1;
-        let dur = a.flavour_duration.max(fdb.get(&a.flavour_name).copied().unwrap_or(0));
-        *baseline_slot_durations.entry(s).or_insert(0) += dur;
+        *baseline_slot_counts.entry(a.scheduled_slot).or_insert(0) += 1;
     }
 
     // ── Step 3: error baseline ──────────────────────────────────────────────
@@ -756,9 +752,6 @@ fn solve_dp(
     let base_counts_arr: Vec<i32> = (0..cfg.total_slots)
         .map(|s| baseline_slot_counts.get(&s).copied().unwrap_or(0))
         .collect();
-    let base_durations_arr: Vec<i32> = (0..cfg.total_slots)
-        .map(|s| baseline_slot_durations.get(&s).copied().unwrap_or(0))
-        .collect();
 
     let dp_result = solver.solve_batch(SolveBatchInput {
         requests: &dp_requests,
@@ -766,7 +759,6 @@ fn solve_dp(
         capacity_multiplier: 1.0,
         capacity_tiers: &cfg.capacity_tiers,
         baseline_slot_counts: &baseline_slot_counts,
-        baseline_slot_durations: &baseline_slot_durations,
         error_window_baseline: ErrorWindowBaseline {
             error_sum: error_baseline.error_sum,
             request_count: error_baseline.request_count,
@@ -804,7 +796,6 @@ fn solve_dp(
             cfg,
             carbon_forecast,
             &baseline_slot_counts,
-            &baseline_slot_durations,
             &error_baseline,
             assignment_cap,
             &mock_pool_input,
@@ -840,7 +831,6 @@ fn solve_dp(
                 current_slot,
                 &cfg.capacity_tiers,
                 &base_counts_arr,
-                &base_durations_arr,
             );
             dp_assignments = greedy;
             solve_status = "ok_greedy_after_infeasible".to_string();
@@ -1205,7 +1195,6 @@ fn solve_relaxed_retry(
     cfg: &Config,
     carbon_forecast: &[f64],
     baseline_slot_counts: &HashMap<i32, i32>,
-    baseline_slot_durations: &HashMap<i32, i32>,
     error_baseline: &ErrorBaseline,
     assignment_cap: i32,
     mock_pool: &MockPool,
@@ -1244,7 +1233,6 @@ fn solve_relaxed_retry(
         capacity_multiplier: 1.0,
         capacity_tiers: &cfg.capacity_tiers,
         baseline_slot_counts,
-        baseline_slot_durations,
         error_window_baseline: ErrorWindowBaseline {
             error_sum: error_baseline.error_sum,
             request_count: error_baseline.request_count,

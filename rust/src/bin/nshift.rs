@@ -527,19 +527,17 @@ fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
 
 /// Recompute per-request carbon costs from the final committed assignment state.
 ///
-/// The DP solver uses incremental `after_cost - before_cost` deltas computed
-/// from a snapshot baseline taken before concurrent batches commit.  When
-/// multiple batches solve simultaneously, their baselines diverge from the true
-/// final slot occupancy, so the sum of incremental deltas does NOT equal the
-/// true total carbon cost (it over-counts when rollbacks cause batches to
-/// re-solve with a higher baseline that crosses a tier boundary).
+/// Under the per-request tier model each request is charged:
+///   cost(r) = carbon[slot] × mult(position_K) × flavour_duration × scale
 ///
-/// This function replaces each per-request `carbon_cost` with a proportional
-/// fair share based on the actual final slot occupancy:
-///   fair_cost(r) = true_slot_cost(r.slot) * r.flavour_dur / total_slot_dur(r.slot)
+/// where `position_K` is the 1-indexed rank of request `r` within its slot.
+/// Requests are sorted by request_id within each slot (deterministic canonical
+/// order) to assign positions.
 ///
-/// This ensures `sum(per_req.carbon_cost) == true total carbon cost` regardless
-/// of concurrent scheduling order or rollback behaviour.
+/// This function corrects for small baseline-drift errors that arise when
+/// concurrent batches solve with slightly different snapshot baselines,
+/// ensuring a consistent per-request breakdown that matches the true final
+/// slot occupancies.
 fn recompute_carbon_costs(
     per_req: &mut [PerRequest],
     final_assignments: &HashMap<u64, Assignment>,
@@ -547,33 +545,32 @@ fn recompute_carbon_costs(
     tiers: &[CapacityTier],
     scale: f64,
 ) {
-    // Aggregate final slot occupancy.
-    let mut slot_counts: HashMap<i32, i64> = HashMap::new();
-    let mut slot_durations: HashMap<i32, i64> = HashMap::new();
+    // Group assignments by slot, sorted by request_id for a canonical position order.
+    let mut slot_requests: HashMap<i32, Vec<(u64, i32)>> = HashMap::new();
     for a in final_assignments.values() {
-        *slot_counts.entry(a.scheduled_slot).or_insert(0) += 1;
-        *slot_durations.entry(a.scheduled_slot).or_insert(0) += a.flavour_duration as i64;
+        slot_requests.entry(a.scheduled_slot)
+            .or_default()
+            .push((a.request_id, a.flavour_duration));
+    }
+    for reqs in slot_requests.values_mut() {
+        reqs.sort_by_key(|(id, _)| *id);
     }
 
-    // True total cost per slot under the rebound/repricing model.
-    let slot_true_cost: HashMap<i32, f64> = slot_counts.iter().map(|(&s, &count)| {
-        let dur = slot_durations.get(&s).copied().unwrap_or(0);
-        let mult = get_capacity_multiplier(tiers, count);
-        let carbon = carbon_forecast.get(s as usize).copied().unwrap_or(0.0);
-        (s, carbon * mult * dur as f64 * scale)
-    }).collect();
+    // Compute per-request cost: carbon * mult(1-indexed position) * duration * scale.
+    let mut req_cost: HashMap<u64, f64> = HashMap::new();
+    for (&slot, reqs) in &slot_requests {
+        let carbon = carbon_forecast.get(slot as usize).copied().unwrap_or(0.0);
+        for (pos_idx, &(req_id, dur)) in reqs.iter().enumerate() {
+            let position = (pos_idx + 1) as i64;
+            let mult = get_capacity_multiplier(tiers, position);
+            req_cost.insert(req_id, carbon * mult * dur as f64 * scale);
+        }
+    }
 
-    // Distribute proportionally to each request's flavour duration.
     for r in per_req.iter_mut() {
-        let s = final_assignments.get(&r.request_id)
-            .map(|a| a.scheduled_slot)
-            .unwrap_or(r.scheduled_slot);
-        let slot_total = slot_true_cost.get(&s).copied().unwrap_or(0.0);
-        let slot_dur = slot_durations.get(&s).copied().unwrap_or(1) as f64;
-        let flav_dur = final_assignments.get(&r.request_id)
-            .map(|a| a.flavour_duration as f64)
-            .unwrap_or(0.0);
-        r.carbon_cost = slot_total * flav_dur / slot_dur;
+        if let Some(&cost) = req_cost.get(&r.request_id) {
+            r.carbon_cost = cost;
+        }
     }
 }
 
@@ -601,16 +598,12 @@ fn run_greedy_baseline(
         if requests.is_empty() { continue; }
         let ci = carbon.get(slot).copied().unwrap_or(1.0);
         let mut before_count: i64 = 0;
-        let mut before_dur: i64 = 0;
         for req in requests {
             seq += 1;
-            let after_count = before_count + 1;
-            let after_dur = before_dur + flav.duration as i64;
-            let before_mult = get_capacity_multiplier(tiers, before_count);
-            let after_mult = get_capacity_multiplier(tiers, after_count);
-            let cost = (ci * after_mult * after_dur as f64 - ci * before_mult * before_dur as f64) * scale;
-            before_count = after_count;
-            before_dur = after_dur;
+            let position = before_count + 1;
+            let mult = get_capacity_multiplier(tiers, position);
+            let cost = ci * mult * flav.duration as f64 * scale;
+            before_count = position;
             per_req.push(PerRequest {
                 request_id:             req.id,
                 arrival_time:           req.arrival_slot as f64 * slot_dur,
@@ -1225,11 +1218,8 @@ mod tests {
         }
     }
 
-    /// Two batches of 5 requests each solve from baseline=0 (no tier boundary).
-    /// Both batches compute incremental costs from baseline=0 so they both
-    /// "see" the same base — the summed incremental costs would double-count.
-    /// After recompute_carbon_costs, each request should get a fair share of
-    /// the true slot cost = carbon * mult(10) * 10*30 / 3600.
+    /// Single tier (mult=1.0 up to 20): all 10 requests pay the same.
+    /// Under per-request model: each costs carbon * 1.0 * dur * scale.
     #[test]
     fn recompute_corrects_concurrent_baseline_drift() {
         let tiers = vec![CapacityTier { max_requests: Some(20), multiplier: 1.0 }];
@@ -1245,23 +1235,22 @@ mod tests {
 
         recompute_carbon_costs(&mut per_req, &final_assignments, &carbon_forecast, &tiers, scale);
 
-        // True slot cost = 120 * 1.0 * (10*30) / 3600 = 120 * 300 / 3600 = 10.0
-        let expected_total = 120.0 * 1.0 * (10 * 30) as f64 * scale;
+        // Per-request model: each request at position 1..10 all in tier 1 (mult=1.0)
+        // cost per request = 120 * 1.0 * 30 * scale
+        let per_req_expected = 120.0 * 1.0 * 30.0 * scale;
+        for r in &per_req {
+            assert!((r.carbon_cost - per_req_expected).abs() < 1e-9,
+                "request {} cost={} expected={}", r.request_id, r.carbon_cost, per_req_expected);
+        }
+        let expected_total = per_req_expected * 10.0;
         let computed_total: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
         assert!((computed_total - expected_total).abs() < 1e-9,
             "total={computed_total}, expected={expected_total}");
-
-        // Each request has same duration → equal share
-        let per_request_expected = expected_total / 10.0;
-        for r in &per_req {
-            assert!((r.carbon_cost - per_request_expected).abs() < 1e-9,
-                "request {} cost={} expected={}", r.request_id, r.carbon_cost, per_request_expected);
-        }
     }
 
-    /// Tier boundary crossing: slot has 70 requests crossing tier 2.0 (boundary at 60).
-    /// True cost = carbon * 2.0 * 70*30 / 3600; recompute should give each request
-    /// exactly that fair share regardless of what incremental costs were originally logged.
+    /// Tier boundary crossing: 70 requests split across two tiers.
+    /// Positions 1-60 use mult=1.0, positions 61-70 use mult=2.0.
+    /// Earlier requests are NOT repriced when the boundary is crossed.
     #[test]
     fn recompute_handles_tier_crossing_correctly() {
         let tiers = vec![
@@ -1278,7 +1267,20 @@ mod tests {
 
         recompute_carbon_costs(&mut per_req, &final_assignments, &[carbon], &tiers, scale);
 
-        let expected_total = carbon * 2.0 * (70 * 30) as f64 * scale;
+        // Positions 1..60 → mult=1.0; positions 61..70 → mult=2.0
+        // IDs are sorted 1..70 so IDs 1..60 are positions 1..60, IDs 61..70 are positions 61..70
+        let cost_tier1 = carbon * 1.0 * 30.0 * scale;
+        let cost_tier2 = carbon * 2.0 * 30.0 * scale;
+        per_req.sort_by_key(|r| r.request_id);
+        for r in &per_req[..60] {
+            assert!((r.carbon_cost - cost_tier1).abs() < 1e-9,
+                "id={}: cost={}, expected={cost_tier1}", r.request_id, r.carbon_cost);
+        }
+        for r in &per_req[60..] {
+            assert!((r.carbon_cost - cost_tier2).abs() < 1e-9,
+                "id={}: cost={}, expected={cost_tier2}", r.request_id, r.carbon_cost);
+        }
+        let expected_total = 60.0 * cost_tier1 + 10.0 * cost_tier2;
         let computed_total: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
         assert!((computed_total - expected_total).abs() < 1e-9,
             "total={computed_total}, expected={expected_total}");

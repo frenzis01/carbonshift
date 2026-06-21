@@ -365,7 +365,8 @@ class RollingWindowDPScheduler:
 
     def _get_capacity_multiplier(self, capacity_tiers: List[dict], request_count: int) -> float:
         for tier in capacity_tiers:
-            if request_count <= tier["max_requests"]:
+            max_req = tier["max_requests"]
+            if max_req is None or request_count <= max_req:
                 return float(tier["multiplier"])
         return float(capacity_tiers[-1]["multiplier"])
 
@@ -382,23 +383,16 @@ class RollingWindowDPScheduler:
         """
         Compute the marginal carbon cost of placing one request in a slot.
 
-        Because capacity multipliers are tier-based (step functions of request
-        count), adding one request can shift the whole slot into a higher tier.
-        The cost is therefore computed as the difference between the full slot
-        cost after and before the addition — not just the marginal request cost.
-        This is the "rebound effect" repricing.
+        Under the per-request tier model, each request is charged based on its
+        1-indexed position within the slot.  The request at position K pays:
+            carbon[slot] × mult(K) × duration × scale
+
+        where mult(K) is the multiplier of the capacity tier that K falls into.
+        Earlier requests are never repriced when a new request crosses a tier
+        boundary — this is a purely additive model.
         """
-        before_count = base_counts[slot] + inc_counts[slot]
-        after_count = before_count + 1
-
-        before_duration = base_durations[slot] + inc_durations[slot]
-        after_duration = before_duration + add_duration
-
-        before_mult = self._get_capacity_multiplier(capacity_tiers, before_count)
-        after_mult = self._get_capacity_multiplier(capacity_tiers, after_count)
-
+        position = base_counts[slot] + inc_counts[slot] + 1  # 1-indexed
+        mult = self._get_capacity_multiplier(capacity_tiers, position)
         slot_carbon = self.carbon_forecast[slot]
         scale = getattr(config, "CARBON_COST_DURATION_SCALE", 1.0)
-        before_cost = slot_carbon * before_mult * before_duration * scale
-        after_cost = slot_carbon * after_mult * after_duration * scale
-        return after_cost - before_cost
+        return slot_carbon * mult * add_duration * scale
