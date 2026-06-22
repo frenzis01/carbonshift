@@ -67,6 +67,8 @@ RESULT_COLUMNS = [
 
 TIMING_COLUMNS = ["scenario_id", "elapsed_seconds"]
 
+PER_N_TIMING_COLUMNS = ["scenario_id", "mode", "batch_size", "elapsed_seconds"]
+
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -205,10 +207,10 @@ def _write_rust_config(
     runner: Dict[str, Any] = {
         "flush_partial_batch": True,
         "include_greedy_baseline": include_baseline,
-        "realtime_slots": True,
+        "realtime_slots": False,
         "realtime_speed_scale": 0.05,
         "dp_allow_relaxed_error_retry": dp_allow_relaxed,
-        "rollback_max_consecutive": 4,
+        "rollback_max_consecutive": 0,
         # TODO betterify param setting to avoid duplicating and hardcoding defaults
     }
     if additional_strategies:
@@ -235,10 +237,14 @@ def _run_rust_scenario(
     output_dir: Path,
     rust_binary: Path,
     additional_strategies: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """Run the Rust nshift binary for all modes of a single scenario."""
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Run the Rust nshift binary for all modes of a single scenario.
+
+    Returns (all_rows, per_n_timing_rows).
+    """
     baseline_cost: Optional[float] = None
     all_rows: List[Dict[str, Any]] = []
+    per_n_timing_rows: List[Dict[str, Any]] = []
 
     for mode in modes:
         mode_dir = output_dir / f"rust_{mode}"
@@ -299,12 +305,20 @@ def _run_rust_scenario(
                     "peak_concurrent_workers": int(row.get("peak_concurrent_workers", 0)),
                     "avg_concurrent_workers": float(row.get("avg_concurrent_workers", 0.0)),
                 })
+                run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
+                per_n_timing_rows.append({
+                    "scenario_id": scenario_id,
+                    "mode": mode,
+                    "batch_size": n,
+                    "elapsed_seconds": round(run_elapsed, 3),
+                })
                 print(
                     f"    [rust/{mode}] N={n}: "
                     f"solver_ms={float(row['solver_time_ms_avg']):.1f}, "
                     f"carbon={carbon:.3f}, "
                     f"error={float(row['global_average_error']):.3f}, "
-                    f"saving={savings_pct:.1f}%, ",
+                    f"saving={savings_pct:.1f}%, "
+                    f"elapsed={run_elapsed:.1f}s, ",
                     f"total_rollbacks={row.get('total_rollbacks', 0)}, "
                 )
 
@@ -357,14 +371,22 @@ def _run_rust_scenario(
                     "peak_concurrent_workers": 0,
                     "avg_concurrent_workers": 0.0,
                 })
+                run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
+                per_n_timing_rows.append({
+                    "scenario_id": scenario_id,
+                    "mode": strategy,
+                    "batch_size": 0,
+                    "elapsed_seconds": round(run_elapsed, 3),
+                })
                 print(
                     f"    [rust/{strategy}]: "
                     f"carbon={carbon:.3f}, "
                     f"error={float(row.get('global_average_error', 0.0)):.3f}, "
-                    f"saving={savings_pct:.1f}%"
+                    f"saving={savings_pct:.1f}%, "
+                    f"elapsed={run_elapsed:.1f}s"
                 )
 
-    return all_rows
+    return all_rows, per_n_timing_rows
 
 
 # ─── Main orchestrator ─────────────────────────────────────────────────────────
@@ -399,6 +421,7 @@ def run_battery(config_path: Path) -> None:
 
     all_rows: List[Dict[str, Any]] = []
     timing_rows: List[Dict[str, Any]] = []
+    per_n_timing_rows: List[Dict[str, Any]] = []
     battery_t0 = time.monotonic()
 
     for scenario_def in cfg["scenarios"]:
@@ -433,11 +456,12 @@ def run_battery(config_path: Path) -> None:
                 all_rows.extend(rows)
 
         if backend in ("rust", "both") and rust_binary is not None:
-            rows = _run_rust_scenario(
+            rows, n_timings = _run_rust_scenario(
                 scenario_path, sid, batch_sizes, modes, scenario_dir, rust_binary,
                 additional_strategies=additional_strategies if additional_strategies else None,
             )
             all_rows.extend(rows)
+            per_n_timing_rows.extend(n_timings)
 
         scenario_elapsed = time.monotonic() - scenario_t0
         timing_rows.append({"scenario_id": sid, "elapsed_seconds": round(scenario_elapsed, 3)})
@@ -458,9 +482,16 @@ def run_battery(config_path: Path) -> None:
         writer.writeheader()
         writer.writerows(timing_rows)
 
+    per_n_timings_csv = output_dir / f"per_n_timings_{battery_id}.csv"
+    with open(per_n_timings_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PER_N_TIMING_COLUMNS)
+        writer.writeheader()
+        writer.writerows(per_n_timing_rows)
+
     print(f"\n{'='*60}")
     print(f"Battery complete in {battery_elapsed:.1f}s: {len(all_rows)} rows written to {results_csv}")
     print(f"Timings written to {timings_csv}")
+    print(f"Per-N timings written to {per_n_timings_csv}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:

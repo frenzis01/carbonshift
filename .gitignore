@@ -25,6 +25,7 @@ rust/target/
 tests/battery/results
 tests/battery/output
 
+**.mmd
 
 **.bk
 

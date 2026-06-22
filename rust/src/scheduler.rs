@@ -298,11 +298,12 @@ fn main_loop(
                 false,
             );
         } else if pending_count > 0
-            && active_workers == 0
+            && active_workers < cfg.max_batch_solver_parallelism
             && current_slot > last_flush_slot
         {
-            // Partial-batch flush: requests are stranded (< batch_size) and no
-            // workers are running.
+            // Slot-end flush: requests are stranded (< batch_size) and the slot
+            // has advanced.  Dispatch even a partial batch so requests don't
+            // miss their deadline waiting for the N-th arrival.
             if cfg.verbose {
                 println!(
                     "[Scheduler] Flush {pending_count} stale pending (slot={current_slot})"
@@ -320,6 +321,34 @@ fn main_loop(
                 true,
             );
             last_flush_slot = current_slot;
+        } else if cfg.batch_timeout_secs > 0.0
+            && pending_count > 0
+            && active_workers < cfg.max_batch_solver_parallelism
+        {
+            // Batch timeout: flush if the oldest pending request has been
+            // waiting longer than `batch_timeout_secs` virtual seconds.
+            let virtual_ms = shared_state.virtual_elapsed_ms.load(Ordering::Relaxed);
+            if let Some(age_ms) = shared_state.get_oldest_pending_age_ms(virtual_ms) {
+                if age_ms as f64 >= cfg.batch_timeout_secs * 1000.0 {
+                    if cfg.verbose {
+                        println!(
+                            "[Scheduler] Timeout flush {pending_count} pending \
+                             (age={age_ms}ms, slot={current_slot})"
+                        );
+                    }
+                    dispatch_batch_workers(
+                        current_slot,
+                        &shared_state,
+                        &cfg,
+                        &carbon_forecast,
+                        &fdb,
+                        &mutable,
+                        &ml,
+                        &running,
+                        true,
+                    );
+                }
+            }
         } else if cfg.skip_empty_slots
             && pending_count == 0
             && active_workers == 0

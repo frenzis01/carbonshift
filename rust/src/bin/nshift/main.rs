@@ -98,6 +98,8 @@ struct BenchmarkConfig {
     rollback_max_consecutive: usize,
     /// Additional offline strategies to run (e.g. "greedy_cheapest", "bandit", "ant_colony").
     additional_strategies: Vec<String>,
+    /// If > 0: flush a partial batch after this many seconds without a new request.
+    batch_timeout_secs: f64,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -147,7 +149,10 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies }
+    let batch_timeout_secs =
+        runner.get("batch_timeout_secs").and_then(|x| x.as_f64()).unwrap_or(0.0);
+
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, batch_timeout_secs }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -199,6 +204,8 @@ struct PerRequest {
     assigned_with_greedy_fallback: bool,
     assigned_with_relaxed_retry: bool,
     assigned_with_rollback: bool,
+    /// Slots past deadline at scheduling time (0 = on time or early).
+    lateness_slots: i32,
 }
 
 struct BatchTiming {
@@ -249,6 +256,10 @@ struct RunSummary {
     requests_assigned_with_rollback: usize,
     peak_concurrent_workers: usize,
     avg_concurrent_workers: f64,
+    /// Requests scheduled past their deadline (late flush or post-run drain).
+    requests_late: usize,
+    /// Maximum lateness observed (slots past deadline, 0 = all on time).
+    max_lateness_slots: i32,
     solver_time_ms_min: f64,
     solver_time_ms_max: f64,
     solver_time_ms_avg: f64,
@@ -261,6 +272,8 @@ struct RunSummary {
     baseline_total_carbon_cost: f64,
     carbon_cost_saving_vs_baseline: f64,
     carbon_cost_saving_vs_baseline_pct: f64,
+    /// Wall-clock seconds spent on this single N run (0.0 for the greedy baseline).
+    run_elapsed_seconds: f64,
 }
 
 // ─── CSV readers ──────────────────────────────────────────────────────────────
@@ -383,6 +396,7 @@ fn compute_per_request(
                 assigned_with_greedy_fallback: assigned_with_greedy,
                 assigned_with_relaxed_retry:   assigned_with_relaxed,
                 assigned_with_rollback,
+                lateness_slots:           (a.scheduled_slot - a.deadline_slot).max(0),
             }
         });
     }
@@ -481,6 +495,8 @@ fn compute_summary(
         &per_req.iter().map(|r| r.final_wait_seconds).collect::<Vec<_>>(),
     );
     let relaxed = per_req.iter().filter(|r| r.assigned_with_relaxed_retry).count();
+    let requests_late = per_req.iter().filter(|r| r.lateness_slots > 0).count();
+    let max_lateness_slots = per_req.iter().map(|r| r.lateness_slots).max().unwrap_or(0);
 
     RunSummary {
         execution_mode:          mode.to_string(),
@@ -492,7 +508,9 @@ fn compute_summary(
         baseline_flavour_error,
         requests_total:          total_received,
         requests_scheduled:      scheduled,
-        requests_unscheduled:    total_received - scheduled,
+        requests_unscheduled:    total_received.saturating_sub(scheduled),
+        requests_late,
+        max_lateness_slots,
         batches_executed:        batch_timings.len(),
         total_carbon_cost:       total_carbon,
         global_average_error:    avg_error,
@@ -519,6 +537,7 @@ fn compute_summary(
         baseline_total_carbon_cost:          0.0,
         carbon_cost_saving_vs_baseline:      0.0,
         carbon_cost_saving_vs_baseline_pct:  0.0,
+        run_elapsed_seconds:                 0.0,
     }
 }
 
@@ -634,6 +653,7 @@ fn run_greedy_baseline(
                 assigned_with_greedy_fallback: false,
                 assigned_with_relaxed_retry:   false,
                 assigned_with_rollback:        false,
+                lateness_slots:                0,
             });
             batch_timings.push(BatchTiming {
                 batch_sequence:      seq,
@@ -792,6 +812,7 @@ fn run_greedy_cheapest(
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry:   false,
             assigned_with_rollback:        false,
+            lateness_slots:                (chosen_slot - req.deadline_slot).max(0),
         });
         batch_timings.push(BatchTiming {
             batch_sequence:       seq,
@@ -868,6 +889,7 @@ fn convert_swarm_to_outputs(
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry:   false,
             assigned_with_rollback:        false,
+            lateness_slots:                0,
         });
         batch_timings.push(BatchTiming {
             batch_sequence:       seq,
@@ -944,7 +966,9 @@ fn run_strategy(
 const SUMMARY_CSV_HEADER: &[&str] = &[
     "execution_mode", "batch_size", "realtime_slots", "realtime_speed_scale",
     "baseline_flavour_name", "baseline_flavour_duration", "baseline_flavour_error",
-    "requests_total", "requests_scheduled", "requests_unscheduled", "batches_executed",
+    "requests_total", "requests_scheduled", "requests_unscheduled",
+    "requests_late", "max_lateness_slots",
+    "batches_executed",
     "total_carbon_cost", "global_average_error", "global_average_error_real",
     "global_average_error_modeled", "global_average_error_real_skip_first_k",
     "global_average_error_modeled_skip_first_k",
@@ -956,6 +980,7 @@ const SUMMARY_CSV_HEADER: &[&str] = &[
     "final_wait_seconds_min", "final_wait_seconds_max", "final_wait_seconds_avg",
     "baseline_total_carbon_cost", "carbon_cost_saving_vs_baseline",
     "carbon_cost_saving_vs_baseline_pct",
+    "run_elapsed_seconds",
 ];
 
 fn summary_to_json(s: &RunSummary) -> Value {
@@ -970,6 +995,8 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "requests_total":                          s.requests_total,
         "requests_scheduled":                      s.requests_scheduled,
         "requests_unscheduled":                    s.requests_unscheduled,
+        "requests_late":                           s.requests_late,
+        "max_lateness_slots":                      s.max_lateness_slots,
         "batches_executed":                        s.batches_executed,
         "total_carbon_cost":                       s.total_carbon_cost,
         "global_average_error":                    s.global_average_error,
@@ -996,6 +1023,7 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "baseline_total_carbon_cost":              s.baseline_total_carbon_cost,
         "carbon_cost_saving_vs_baseline":          s.carbon_cost_saving_vs_baseline,
         "carbon_cost_saving_vs_baseline_pct":      s.carbon_cost_saving_vs_baseline_pct,
+        "run_elapsed_seconds":                     s.run_elapsed_seconds,
     })
 }
 
@@ -1006,7 +1034,9 @@ fn summary_csv_row(s: &RunSummary) -> Vec<String> {
         s.baseline_flavour_name.clone(),s.baseline_flavour_duration.to_string(),
         s.baseline_flavour_error.to_string(),
         s.requests_total.to_string(),   s.requests_scheduled.to_string(),
-        s.requests_unscheduled.to_string(), s.batches_executed.to_string(),
+        s.requests_unscheduled.to_string(),
+        s.requests_late.to_string(),    s.max_lateness_slots.to_string(),
+        s.batches_executed.to_string(),
         s.total_carbon_cost.to_string(),s.global_average_error.to_string(),
         s.global_average_error_real.to_string(),
         s.global_average_error_modeled.to_string(),
@@ -1028,6 +1058,7 @@ fn summary_csv_row(s: &RunSummary) -> Vec<String> {
         s.baseline_total_carbon_cost.to_string(),
         s.carbon_cost_saving_vs_baseline.to_string(),
         s.carbon_cost_saving_vs_baseline_pct.to_string(),
+        s.run_elapsed_seconds.to_string(),
     ]
 }
 
@@ -1061,6 +1092,7 @@ fn write_run_outputs(
             "flavour_name","error","carbon_cost",
             "assignment_solver_mode","assignment_solver_status",
             "assigned_with_greedy_fallback","assigned_with_relaxed_retry","assigned_with_rollback",
+            "lateness_slots",
         ];
         let mut w = csv::Writer::from_path(run_dir.join("per_request.csv")).unwrap();
         w.write_record(header).unwrap();
@@ -1078,6 +1110,7 @@ fn write_run_outputs(
                 r.assigned_with_greedy_fallback.to_string(),
                 r.assigned_with_relaxed_retry.to_string(),
                 r.assigned_with_rollback.to_string(),
+                r.lateness_slots.to_string(),
             ]).unwrap();
             jrows.push(serde_json::json!({
                 "request_id":r.request_id,"arrival_time":r.arrival_time,
@@ -1094,6 +1127,7 @@ fn write_run_outputs(
                 "assigned_with_greedy_fallback":r.assigned_with_greedy_fallback,
                 "assigned_with_relaxed_retry":r.assigned_with_relaxed_retry,
                 "assigned_with_rollback":r.assigned_with_rollback,
+                "lateness_slots":r.lateness_slots,
             }));
         }
         w.flush().unwrap();
@@ -1187,6 +1221,79 @@ fn write_run_outputs(
 
 // ─── single-N run ─────────────────────────────────────────────────────────────
 
+/// Greedy late scheduling: assign pending requests that remained unprocessed
+/// after the run ended.
+///
+/// `scheduled_slot` is set to `deadline_slot` (clamped to [arrival_slot, total_slots-1])
+/// so that the carbon cost is computed at the slot the request *should* have occupied.
+///
+/// `lateness_slots` = (total_slots-1) - deadline_slot, i.e. how far past the deadline
+/// the request was still sitting unprocessed when the run ended.  This is always >= 0
+/// for drained requests because their deadline has already passed by end-of-run.
+fn schedule_late_requests(
+    remaining: Vec<carbonshift_rs::types::Request>,
+    carbon_forecast: &[f64],
+    cfg: &Config,
+) -> Vec<PerRequest> {
+    if remaining.is_empty() { return Vec::new(); }
+
+    let slot_dur   = cfg.slot_duration_seconds;
+    let tiers      = &cfg.capacity_tiers;
+    let scale      = cfg.carbon_cost_duration_scale;
+    let total_slots = cfg.total_slots;
+    let fallback_flav = cfg.flavours
+        .iter()
+        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+        .expect("no flavours");
+
+    let mut slot_count: HashMap<i32, i32> = HashMap::new();
+    let mut out = Vec::with_capacity(remaining.len());
+
+    let mut sorted = remaining;
+    sorted.sort_by_key(|r| (r.deadline_slot, r.arrival_slot, r.id));
+
+    for req in sorted {
+        let sched_slot = req.deadline_slot
+            .max(req.arrival_slot)
+            .min(total_slots - 1);
+        let position = *slot_count.get(&sched_slot).unwrap_or(&0) + 1;
+        let ci   = carbon_forecast.get(sched_slot as usize).copied().unwrap_or(1.0);
+        let mult = get_capacity_multiplier(tiers, position as i64);
+        let cost = ci * mult * fallback_flav.duration as f64 * scale;
+        // Lateness = how many slots past the deadline the request sat unprocessed.
+        // We measure from the end of the run (total_slots-1), not from sched_slot,
+        // because all drained requests were unprocessed until the run ended.
+        let lateness = ((total_slots - 1) - req.deadline_slot).max(0);
+        let queue_wait = (sched_slot - req.arrival_slot).max(0);
+
+        *slot_count.entry(sched_slot).or_insert(0) += 1;
+
+        out.push(PerRequest {
+            request_id:             req.id,
+            arrival_time:           req.arrival_slot as f64 * slot_dur,
+            arrival_slot:           req.arrival_slot,
+            deadline_slot:          req.deadline_slot,
+            included_in_batch_slot: sched_slot,
+            batch_sequence:         0,
+            scheduled_slot:         sched_slot,
+            queue_wait_slots:       queue_wait,
+            queue_wait_seconds:     queue_wait as f64 * slot_dur,
+            final_wait_slots:       queue_wait,
+            final_wait_seconds:     queue_wait as f64 * slot_dur,
+            flavour_name:           fallback_flav.name.clone(),
+            error:                  fallback_flav.error,
+            carbon_cost:            cost,
+            assignment_solver_mode:   "late_fallback".to_string(),
+            assignment_solver_status: "late".to_string(),
+            assigned_with_greedy_fallback: false,
+            assigned_with_relaxed_retry:   false,
+            assigned_with_rollback:        false,
+            lateness_slots:         lateness,
+        });
+    }
+    out
+}
+
 fn run_single_n(
     scenario: &Scenario,
     base_cfg: &Config,
@@ -1254,12 +1361,32 @@ fn run_single_n(
     sched.start();
     generator.start();
 
-    // Poll until all slots have been processed.
+    // Phase 1: wait until the scenario's virtual time is exhausted (generator stops emitting).
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
         if shared_state.virtual_elapsed_secs() >= total_dur {
             break;
         }
+    }
+
+    // Phase 2: let the scheduler drain the remaining pending queue.
+    // This is critical in realtime mode where the scheduler can fall behind the
+    // request-arrival rate: when the clock reaches total_dur, the generator has
+    // already stopped, but many requests may still be waiting in the pending queue.
+    // We keep the scheduler running until every request has been dispatched to a
+    // DP worker AND every worker has finished (pending==0 AND active==0).
+    //
+    // Safety timeout: 60 extra seconds to avoid hanging on pathological configs.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let stats   = sched.get_statistics();
+        let pending = shared_state.get_pending_count();
+        if (pending == 0 && stats.active_batch_workers == 0)
+            || std::time::Instant::now() > drain_deadline
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     generator.stop();
@@ -1277,6 +1404,13 @@ fn run_single_n(
         runs.iter().map(|r| (r.run_id.clone(), r)).collect();
 
     let mut per_req  = compute_per_request(&assignment_rows, &runs_by_id, base_cfg.slot_duration_seconds, &rolled_back_ids);
+    // Drain any requests that never made it into a batch (e.g., deadline
+    // expired while waiting in the pending queue) and schedule them late.
+    let remaining = shared_state.drain_pending_requests();
+    if !remaining.is_empty() {
+        let late = schedule_late_requests(remaining, &scenario.carbon_forecast, base_cfg);
+        per_req.extend(late);
+    }
     // Correct per-request carbon costs using final committed state to eliminate
     // concurrent-baseline drift (see recompute_carbon_costs for details).
     let final_assignments = shared_state.get_current_assignments();
@@ -1360,6 +1494,7 @@ fn main() {
     base_cfg.apply_scenario_metadata(&scenario.metadata);
     base_cfg.dp_allow_relaxed_error_retry = bcfg.dp_allow_relaxed_error_retry;
     base_cfg.rollback_max_consecutive     = bcfg.rollback_max_consecutive;
+    base_cfg.batch_timeout_secs           = bcfg.batch_timeout_secs;
 
     println!(
         "Loaded scenario: {} slots, {} requests ({})",
@@ -1416,6 +1551,7 @@ fn main() {
     // ── per-N runs ─────────────────────────────────────────────────────────
     for &batch_size in &bcfg.batch_sizes {
         let run_dir = bcfg.output_dir.join(format!("N{batch_size}"));
+        let n_t0 = std::time::Instant::now();
 
         let (per_req, batch_timings, mut summary) = run_single_n(
             &scenario,
@@ -1426,6 +1562,7 @@ fn main() {
             &run_dir,
             verbose,
         );
+        summary.run_elapsed_seconds = n_t0.elapsed().as_secs_f64();
 
         // Fill in baseline-relative fields.
         if let Some(bc) = baseline_cost {
@@ -1460,8 +1597,10 @@ fn main() {
     // ── additional strategies ──────────────────────────────────────────────
     for strategy in &bcfg.additional_strategies {
         let strat_dir = bcfg.output_dir.join(format!("strategy_{strategy}"));
+        let strat_t0 = std::time::Instant::now();
         let (per_req, batch_timings, mut summary) =
             run_strategy(strategy, &scenario, &base_cfg, realtime_slots, speed_scale);
+        summary.run_elapsed_seconds = strat_t0.elapsed().as_secs_f64();
 
         if let Some(bc) = baseline_cost {
             let saving = bc - summary.total_carbon_cost;
@@ -1524,7 +1663,7 @@ mod tests {
             carbon_cost: 999.0,  // deliberately wrong — will be recomputed
             assignment_solver_mode: "dp".into(), assignment_solver_status: "ok".into(),
             assigned_with_greedy_fallback: false, assigned_with_relaxed_retry: false,
-            assigned_with_rollback: false,
+            assigned_with_rollback: false, lateness_slots: 0,
         }
     }
 

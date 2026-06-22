@@ -95,6 +95,9 @@ pub struct Config {
     // ── threading & concurrency ───────────────────────────────────────────
     pub max_batch_solver_parallelism: usize,
     pub queue_timeout: f64,
+    /// Flush a partial batch (< batch_size requests) if its oldest request has
+    /// been waiting more than this many virtual seconds.  0.0 = disabled.
+    pub batch_timeout_secs: f64,
 
     // ── simulation speed ──────────────────────────────────────────────────
     /// When true: once a slot has no pending requests and no active workers,
@@ -168,6 +171,7 @@ impl Default for Config {
             deadline_max_slack: 8,
             max_batch_solver_parallelism: 20,
             queue_timeout: 1.0,
+            batch_timeout_secs: 0.0,
             rollback_max_consecutive: 3,
             skip_empty_slots: true,
             slot_speed_scale: 1.0,

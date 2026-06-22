@@ -222,7 +222,25 @@ impl SharedState {
         self.inner.lock().unwrap().pending.len()
     }
 
-    // ── assignments ───────────────────────────────────────────────────────
+    /// Virtual age in milliseconds of the oldest pending request, or `None` if
+    /// the queue is empty.  Uses the request's `arrival_time` field (seconds)
+    /// vs. the provided `virtual_ms` for the comparison.
+    pub fn get_oldest_pending_age_ms(&self, virtual_ms: u64) -> Option<u64> {
+        let g = self.inner.lock().unwrap();
+        g.pending.first().map(|r| {
+            let arrival_ms = (r.arrival_time * 1000.0) as u64;
+            virtual_ms.saturating_sub(arrival_ms)
+        })
+    }
+
+    /// Remove and return all pending requests (used after the run ends to
+    /// collect unprocessed requests for late scheduling).
+    pub fn drain_pending_requests(&self) -> Vec<Request> {
+        let mut g = self.inner.lock().unwrap();
+        g.pending.drain(..).collect()
+    }
+
+
 
     /// Record a batch of scheduling decisions.
     ///
