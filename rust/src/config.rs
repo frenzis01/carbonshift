@@ -109,9 +109,15 @@ pub struct Config {
     /// (only meaningful when `skip_empty_slots` is false).
     pub slot_speed_scale: f64,
 
+    // ── progress display ──────────────────────────────────────────────────
+    /// Total requests expected for this run (known from scenario upfront).
+    /// Used by the progress display to show `scheduled / total_requests` and
+    /// a stable percentage even before all requests have been received.
+    /// 0 means "unknown" — falls back to total_received.
+    pub total_requests: usize,
+
     // ── logging & output ──────────────────────────────────────────────────
     pub verbose: bool,
-    pub output_file: String,
     pub enable_solver_logging: bool,
     pub solver_runs_file: String,
     pub solver_assignments_file: String,
@@ -155,7 +161,7 @@ impl Default for Config {
             ],
             dp_pruning_method: "beam".to_string(),
             dp_pruning_min_batch_size: 5,
-            dp_pruning_k: 600,
+            dp_pruning_k: 1200,
             dp_timeout: 7.0,
             dp_lock_future_assignments: true,
             dp_allow_relaxed_error_retry: true,
@@ -175,8 +181,8 @@ impl Default for Config {
             rollback_max_consecutive: 3,
             skip_empty_slots: true,
             slot_speed_scale: 1.0,
+            total_requests: 0,
             verbose: true,
-            output_file: "/tmp/online2_assignments.csv".to_string(),
             enable_solver_logging: true,
             solver_runs_file: "/tmp/online2_solver_runs.csv".to_string(),
             solver_assignments_file: "/tmp/online2_solver_assignments.csv".to_string(),

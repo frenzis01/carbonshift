@@ -2,6 +2,14 @@
 name = "carbonshift_rs"
 version = "0.1.0"
 edition = "2024"
+# Disable auto-discovery so the empty legacy stubs (src/bin/nshift.rs,
+# src/bin/run_nshift_speed.rs) are never picked up as binary targets.
+autobins = false
+
+# Explicitly declare only the real binary.
+[[bin]]
+name = "nshift"
+path = "src/bin/nshift/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

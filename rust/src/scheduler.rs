@@ -10,6 +10,7 @@
 /// solver state across concurrent batches.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write as IoWrite;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -262,6 +263,8 @@ fn main_loop(
     let eff_slot_dur = cfg.effective_slot_duration_secs();
     let mut last_flush_slot: i32 = -1;
     let mut last_skip_slot: i32 = -1;
+    let mut last_progress_wall_ms: u64 = 0;
+    let mut printed_progress = false;
 
     while running.load(Ordering::Relaxed) {
         // Keep virtual clock in sync with wall clock (skip mode may advance it further).
@@ -277,6 +280,8 @@ fn main_loop(
 
         let pending_count = shared_state.get_pending_count();
         let active_workers = mutable.lock().unwrap().active_workers;
+
+        let mut did_something = false;
 
         if pending_count >= cfg.batch_size && active_workers < cfg.max_batch_solver_parallelism {
             if cfg.verbose {
@@ -297,6 +302,7 @@ fn main_loop(
                 &running,
                 false,
             );
+            did_something = true;
         } else if pending_count > 0
             && active_workers < cfg.max_batch_solver_parallelism
             && current_slot > last_flush_slot
@@ -321,6 +327,7 @@ fn main_loop(
                 true,
             );
             last_flush_slot = current_slot;
+            did_something = true;
         } else if cfg.batch_timeout_secs > 0.0
             && pending_count > 0
             && active_workers < cfg.max_batch_solver_parallelism
@@ -347,6 +354,7 @@ fn main_loop(
                         &running,
                         true,
                     );
+                    did_something = true;
                 }
             }
         } else if cfg.skip_empty_slots
@@ -367,9 +375,41 @@ fn main_loop(
             if cfg.verbose {
                 println!("[Scheduler] ⏩ Skip slot {current_slot} → {}", current_slot + 1);
             }
+            did_something = true;
         }
 
-        std::thread::sleep(Duration::from_millis(10));
+        // Sleep longer when truly idle; poll at 1ms when workers are running or
+        // requests are pending so we dispatch as fast as the solver allows.
+        let sleep_ms = if did_something || active_workers > 0 { 1 } else { 10 };
+        std::thread::sleep(Duration::from_millis(sleep_ms));
+
+        // Progress display (skipped in verbose mode to avoid mixing with debug lines).
+        if !cfg.verbose {
+            let wall_ms = wall_start.elapsed().as_millis() as u64;
+            if wall_ms.saturating_sub(last_progress_wall_ms) >= 500 {
+                let scheduled = mutable.lock().unwrap().stats.total_scheduled;
+                let total_received = shared_state.get_statistics().total_received;
+                // Use the known scenario total if available; fall back to total_received.
+                let total_display = if cfg.total_requests > 0 { cfg.total_requests } else { total_received as usize };
+                let pct = if total_display > 0 {
+                    scheduled as f64 / total_display as f64 * 100.0
+                } else { 0.0 };
+                print!(
+                    "\r  [N={:2}] Scheduled {:>6}/{:<6} ({:5.1}%)  Received: {:>6}",
+                    cfg.batch_size, scheduled, total_display, pct, total_received
+                );
+                std::io::stdout().flush().ok();
+                last_progress_wall_ms = wall_ms;
+                printed_progress = true;
+            }
+        }
+    }
+
+    if printed_progress {
+        // Do NOT emit a newline here: run_single_n will overwrite this line
+        // with the definitive 100% final count using \r.
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
     }
 }
 
@@ -534,8 +574,6 @@ fn batch_worker_entry(
                     shared_state.mark_requests_rolled_back(&req_ids);
                 }
 
-                shared_state.export_to_csv(&cfg.output_file).ok();
-
                 let new_count = pending.len();
                 let total_count = assignments.len();
                 let replanned = total_count.saturating_sub(new_count);
@@ -574,17 +612,13 @@ fn batch_worker_entry(
                 if ml.enabled {
                     let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
                     let pending_ids_str: HashSet<u64> = new_ids.clone();
-                    let all_assignments = shared_state.get_current_assignments();
 
-                    let real_window_after = shared_state.get_window_error_stats(
-                        slot,
-                        cfg.error_window_past,
-                        cfg.error_window_future,
-                        &HashSet::new(),
-                    );
-
+                    // Only log the NEW assignments from this batch — not all existing
+                    // assignments.  The old code fetched get_current_assignments() here
+                    // (all-time O(N) entries) and iterated every batch, producing
+                    // O(N²) total rows and memory pressure.
                     let assignment_rows = build_assignment_rows(
-                        &all_assignments.values().cloned().collect::<Vec<_>>(),
+                        &assignments,
                         &new_ids,
                         &pending_ids_str,
                         slot,
@@ -597,7 +631,12 @@ fn batch_worker_entry(
                     let avg_cost_per_new = if new_count > 0 { total_cost / new_count as f64 } else { 0.0 };
                     let avg_cost_per_total = if total_count > 0 { total_cost / total_count as f64 } else { 0.0 };
                     let modeled_avg = ctx.modeled_window_avg_after;
-                    let real_avg = real_window_after.average;
+                    let real_avg = shared_state.get_window_error_stats(
+                        slot,
+                        cfg.error_window_past,
+                        cfg.error_window_future,
+                        &HashSet::new(),
+                    ).average;
 
                     let mut run_row: HashMap<String, String> = HashMap::new();
                     run_row.insert("run_sequence".into(), run_sequence.to_string());

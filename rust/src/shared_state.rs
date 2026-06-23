@@ -365,34 +365,6 @@ impl SharedState {
             .cloned()
             .collect()
     }
-
-    // ── CSV export ────────────────────────────────────────────────────────
-
-    /// Export all current assignments to a CSV file.
-    pub fn export_to_csv(&self, path: &str) -> std::io::Result<()> {
-        let g = self.inner.lock().unwrap();
-        let mut wtr = csv::Writer::from_path(path)?;
-        wtr.write_record([
-            "request_id",
-            "scheduled_slot",
-            "flavour",
-            "carbon_cost",
-            "error",
-            "assignment_time",
-        ])?;
-        for a in g.assignments.values() {
-            wtr.write_record(&[
-                a.request_id.to_string(),
-                a.scheduled_slot.to_string(),
-                a.flavour_name.clone(),
-                a.carbon_cost.to_string(),
-                a.error.to_string(),
-                a.assignment_time.to_string(),
-            ])?;
-        }
-        wtr.flush()?;
-        Ok(())
-    }
     // ── rollback ──────────────────────────────────────────────────────────────
 
     /// Atomically attempt to commit assignments, checking for unintended

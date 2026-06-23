@@ -1328,6 +1328,7 @@ fn run_single_n(
     cfg.solver_assignments_file     = tmp_assignments.to_str().unwrap().to_string();
     cfg.solver_slot_metrics_file    = tmp_slot_mets.to_str().unwrap().to_string();
     cfg.enable_infeasibility_debug_logging = false;
+    cfg.total_requests              = scenario.requests.len();
 
     let eff_dur     = cfg.effective_slot_duration_secs();
     let total_dur   = cfg.total_slots as f64 * eff_dur;
@@ -1444,6 +1445,19 @@ fn run_single_n(
     let _ = std::fs::remove_file(&tmp_runs);
     let _ = std::fs::remove_file(&tmp_assignments);
     let _ = std::fs::remove_file(&tmp_slot_mets);
+
+    // Print a definitive final progress line overwriting whatever partial
+    // line the main_loop left behind.  This runs after late scheduling so
+    // the numbers are always 100%.
+    if !cfg.verbose {
+        let total = scenario.requests.len();
+        let scheduled = per_req.len();
+        let pct = if total > 0 { scheduled as f64 / total as f64 * 100.0 } else { 0.0 };
+        println!(
+            "\r  [N={:2}] Scheduled {:>6}/{:<6} ({:5.1}%)  Received: {:>6}",
+            batch_size, scheduled, total, pct, total_received
+        );
+    }
 
     (per_req, batch_timings, summary)
 }
