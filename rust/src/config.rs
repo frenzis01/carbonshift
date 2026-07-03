@@ -116,6 +116,40 @@ pub struct Config {
     /// 0 means "unknown" — falls back to total_received.
     pub total_requests: usize,
 
+    // ── solver strategy ───────────────────────────────────────────────────
+    /// Which solver to use for batch assignment.
+    /// `"dp"` (default): DP solver with error constraints and rollback.
+    /// `"bandit"`: online ε-greedy bandit (state shared across batches).
+    /// `"ant_colony"`: online ACO (pheromone shared across batches).
+    pub solver_strategy: String,
+
+    // ── swarm / bandit hyper-parameters ──────────────────────────────────
+    /// Exploration probability for the online bandit.
+    pub swarm_bandit_epsilon: f64,
+    /// Optimistic initial Q-value (encourages early exploration).
+    pub swarm_bandit_initial_q: f64,
+    /// RNG seed for the online bandit.
+    pub swarm_bandit_seed: u64,
+
+    // ── swarm / ACO hyper-parameters ─────────────────────────────────────
+    /// Number of ants per batch iteration.
+    pub swarm_aco_n_ants: usize,
+    /// Number of ACO iterations per batch (1 is fine for online use —
+    /// pheromone accumulates across many batches).
+    pub swarm_aco_n_iterations: usize,
+    /// Pheromone influence exponent α.
+    pub swarm_aco_alpha: f64,
+    /// Heuristic influence exponent β.
+    pub swarm_aco_beta: f64,
+    /// Pheromone evaporation rate ρ ∈ (0, 1).
+    pub swarm_aco_rho: f64,
+    /// Pheromone deposit quantity (divided by solution cost).
+    pub swarm_aco_q: f64,
+    /// Initial pheromone level τ₀.
+    pub swarm_aco_tau0: f64,
+    /// RNG seed for the online ACO.
+    pub swarm_aco_seed: u64,
+
     // ── logging & output ──────────────────────────────────────────────────
     pub verbose: bool,
     pub enable_solver_logging: bool,
@@ -182,6 +216,18 @@ impl Default for Config {
             skip_empty_slots: true,
             slot_speed_scale: 1.0,
             total_requests: 0,
+            solver_strategy: "dp".to_string(),
+            swarm_bandit_epsilon: 0.15,
+            swarm_bandit_initial_q: 10.0,
+            swarm_bandit_seed: 42,
+            swarm_aco_n_ants: 5,
+            swarm_aco_n_iterations: 1,
+            swarm_aco_alpha: 1.0,
+            swarm_aco_beta: 2.0,
+            swarm_aco_rho: 0.3,
+            swarm_aco_q: 1.0,
+            swarm_aco_tau0: 1.0,
+            swarm_aco_seed: 42,
             verbose: true,
             enable_solver_logging: true,
             solver_runs_file: "/tmp/online2_solver_runs.csv".to_string(),

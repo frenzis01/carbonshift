@@ -201,6 +201,7 @@ def _write_rust_config(
     dp_allow_relaxed: bool,
     include_baseline: bool,
     additional_strategies: Optional[List[str]] = None,
+    online_strategies: Optional[List[str]] = None,
 ) -> Path:
     """Write a temporary nshift config.json; caller is responsible for deletion."""
     fd, tmp = tempfile.mkstemp(suffix=".json")
@@ -215,6 +216,8 @@ def _write_rust_config(
     }
     if additional_strategies:
         runner["additional_strategies"] = additional_strategies
+    if online_strategies:
+        runner["online_strategies"] = online_strategies
     with os.fdopen(fd, "w") as f:
         json.dump(
             {
@@ -237,6 +240,7 @@ def _run_rust_scenario(
     output_dir: Path,
     rust_binary: Path,
     additional_strategies: Optional[List[str]] = None,
+    online_strategies: Optional[List[str]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run the Rust nshift binary for all modes of a single scenario.
 
@@ -246,14 +250,17 @@ def _run_rust_scenario(
     all_rows: List[Dict[str, Any]] = []
     per_n_timing_rows: List[Dict[str, Any]] = []
 
-    for mode in modes:
+    for mode_idx, mode in enumerate(modes):
         mode_dir = output_dir / f"rust_{mode}"
         mode_dir.mkdir(parents=True, exist_ok=True)
         dp_relaxed = mode == "relaxed_retry"
         include_baseline = baseline_cost is None  # compute baseline only on the first mode
+        # Run online strategies alongside the first mode to avoid duplicate work.
+        run_online = online_strategies if mode_idx == 0 else None
 
         tmp_config = _write_rust_config(
-            scenario_path, batch_sizes, mode_dir, dp_relaxed, include_baseline
+            scenario_path, batch_sizes, mode_dir, dp_relaxed, include_baseline,
+            online_strategies=run_online,
         )
         try:
             subprocess.run([str(rust_binary), "--config", str(tmp_config)], check=True)
@@ -357,7 +364,8 @@ def _run_rust_scenario(
                     "scenario_id": scenario_id,
                     "backend": "rust",
                     "batch_size": 0,
-                    "infeasibility_mode": strategy,
+                    # Prefix with "offline_" for unambiguous distinction from "online_*" modes.
+                    "infeasibility_mode": f"offline_{strategy}",
                     "solver_time_ms_avg": float(row.get("solver_time_ms_avg", 0.0)),
                     "total_carbon_cost": carbon,
                     "final_global_error": float(row.get("global_average_error", 0.0)),
@@ -374,17 +382,70 @@ def _run_rust_scenario(
                 run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
                 per_n_timing_rows.append({
                     "scenario_id": scenario_id,
-                    "mode": strategy,
+                    "mode": f"offline_{strategy}",
                     "batch_size": 0,
                     "elapsed_seconds": round(run_elapsed, 3),
                 })
                 print(
-                    f"    [rust/{strategy}]: "
+                    f"    [rust/offline_{strategy}]: "
                     f"carbon={carbon:.3f}, "
                     f"error={float(row.get('global_average_error', 0.0)):.3f}, "
                     f"saving={savings_pct:.1f}%, "
                     f"elapsed={run_elapsed:.1f}s"
                 )
+
+    # ── online strategies (results written by first mode's Rust run) ───────
+    if online_strategies:
+        bc = baseline_cost or 0.0
+        first_mode_dir = output_dir / f"rust_{modes[0]}"
+        for strategy in online_strategies:
+            summary_csv = first_mode_dir / f"online_{strategy}" / "summary_by_n.csv"
+            if not summary_csv.exists():
+                print(f"    WARNING: {summary_csv} not found; skipping online strategy={strategy}")
+                continue
+            with open(summary_csv, newline="") as f:
+                rows_csv = list(csv.DictReader(f))
+            for row in rows_csv:
+                n = int(row["batch_size"])
+                carbon = float(row["total_carbon_cost"])
+                savings_pct = (bc - carbon) / bc * 100.0 if bc > 0.0 else 0.0
+                per_ts_csv = first_mode_dir / f"online_{strategy}" / f"N{n}" / "per_timeslot.csv"
+                avg_slot_err = _avg_slot_error_from_csv(per_ts_csv)
+                all_rows.append({
+                    "scenario_id": scenario_id,
+                    "backend": "rust",
+                    "batch_size": n,
+                    "infeasibility_mode": f"online_{strategy}",
+                    "solver_time_ms_avg": float(row.get("solver_time_ms_avg", 0.0)),
+                    "total_carbon_cost": carbon,
+                    "final_global_error": float(row.get("global_average_error", 0.0)),
+                    "avg_global_error_per_slot": avg_slot_err,
+                    "requests_assigned_with_greedy_fallback": 0,
+                    "requests_assigned_with_relaxed_retry": 0,
+                    "total_rollbacks": 0,
+                    "max_consecutive_rollbacks": 0,
+                    "baseline_total_carbon_cost": bc,
+                    "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                    "peak_concurrent_workers": int(row.get("peak_concurrent_workers", 0)),
+                    "avg_concurrent_workers": float(row.get("avg_concurrent_workers", 0.0)),
+                })
+                run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
+                per_n_timing_rows.append({
+                    "scenario_id": scenario_id,
+                    "mode": f"online_{strategy}",
+                    "batch_size": n,
+                    "elapsed_seconds": round(run_elapsed, 3),
+                })
+                print(
+                    f"    [rust/online_{strategy}] N={n}: "
+                    f"solver_ms={float(row.get('solver_time_ms_avg', 0.0)):.1f}, "
+                    f"carbon={carbon:.3f}, "
+                    f"error={float(row.get('global_average_error', 0.0)):.3f}, "
+                    f"saving={savings_pct:.1f}%, "
+                    f"elapsed={run_elapsed:.1f}s"
+                )
+
+
 
     return all_rows, per_n_timing_rows
 
@@ -407,6 +468,7 @@ def run_battery(config_path: Path) -> None:
     # modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback"])
     backend: str = cfg.get("backend", "python")
     additional_strategies: List[str] = cfg.get("additional_strategies", [])
+    online_strategies: List[str] = cfg.get("online_strategies", [])
 
     rust_binary: Optional[Path] = None
     if backend in ("rust", "both"):
@@ -459,6 +521,7 @@ def run_battery(config_path: Path) -> None:
             rows, n_timings = _run_rust_scenario(
                 scenario_path, sid, batch_sizes, modes, scenario_dir, rust_binary,
                 additional_strategies=additional_strategies if additional_strategies else None,
+                online_strategies=online_strategies if online_strategies else None,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)

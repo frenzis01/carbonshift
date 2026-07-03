@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::online_swarm::SwarmContext;
 use crate::types::{Assignment, CapacityTier, Request};
 
 // ─── solver snapshot ─────────────────────────────────────────────────────────
@@ -276,6 +277,26 @@ impl SharedState {
             assignments: g.assignments.clone(),
             global_error_sum: g.global_error_sum,
             global_assignment_count: g.global_assignment_count,
+        }
+    }
+
+    /// Snapshot of committed state for the online swarm solvers.
+    ///
+    /// Builds per-slot assignment counts and error vectors from the current
+    /// committed assignments in a single lock acquisition.
+    pub fn swarm_context_snapshot(&self) -> SwarmContext {
+        let g = self.inner.lock().unwrap();
+        let mut slot_count: HashMap<i32, i32> = HashMap::new();
+        let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
+        for a in g.assignments.values() {
+            *slot_count.entry(a.scheduled_slot).or_insert(0) += 1;
+            slot_errors.entry(a.scheduled_slot).or_default().push(a.error);
+        }
+        SwarmContext {
+            slot_count,
+            slot_errors,
+            global_error_sum: g.global_error_sum,
+            global_count: g.global_assignment_count as usize,
         }
     }
 

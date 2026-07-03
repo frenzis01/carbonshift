@@ -2,6 +2,7 @@
   "_comment": "CarbonShift solver battery test configuration.",
   "battery_id": "default",
   "batch_sizes": [1, 4, 6, 8, 10, 12, 16],
+  "online_strategies": ["bandit", "ant_colony"],
   "infeasibility_modes": ["relaxed_retry"],
   "comment_2": ["greedy_fallback","relaxed_retry"],
   "additional_strategies": ["greedy_cheapest", "bandit", "ant_colony"],

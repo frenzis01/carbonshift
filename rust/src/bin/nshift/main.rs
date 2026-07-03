@@ -98,6 +98,8 @@ struct BenchmarkConfig {
     rollback_max_consecutive: usize,
     /// Additional offline strategies to run (e.g. "greedy_cheapest", "bandit", "ant_colony").
     additional_strategies: Vec<String>,
+    /// Online strategies to run through the scheduler pipeline (e.g. "bandit", "ant_colony").
+    online_strategies: Vec<String>,
     /// If > 0: flush a partial batch after this many seconds without a new request.
     batch_timeout_secs: f64,
 }
@@ -149,10 +151,16 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
+    let online_strategies: Vec<String> = runner
+        .get("online_strategies")
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
     let batch_timeout_secs =
         runner.get("batch_timeout_secs").and_then(|x| x.as_f64()).unwrap_or(0.0);
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, batch_timeout_secs }
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -1423,8 +1431,13 @@ fn run_single_n(
         base_cfg.carbon_cost_duration_scale,
     );
     let batch_timings = compute_batch_timings(&runs, batch_size);
+    let exec_mode = if cfg.solver_strategy == "dp" || cfg.solver_strategy.is_empty() {
+        "nshift_dp".to_string()
+    } else {
+        format!("nshift_{}", cfg.solver_strategy)
+    };
     let summary = compute_summary(
-        "nshift_dp",
+        &exec_mode,
         batch_size,
         realtime_slots,
         realtime_speed_scale,
@@ -1608,6 +1621,72 @@ fn main() {
         all_summaries.push(summary);
     }
 
+    // ── online strategies (generator + scheduler pipeline) ────────────────
+    for strategy in &bcfg.online_strategies {
+        for &batch_size in &bcfg.batch_sizes {
+            let run_dir = bcfg.output_dir.join(format!("online_{strategy}")).join(format!("N{batch_size}"));
+            let n_t0 = std::time::Instant::now();
+
+            let mut online_base_cfg = base_cfg.clone();
+            online_base_cfg.solver_strategy = strategy.clone();
+
+            let (per_req, batch_timings, mut summary) = run_single_n(
+                &scenario,
+                &online_base_cfg,
+                batch_size,
+                realtime_slots,
+                speed_scale,
+                &run_dir,
+                verbose,
+            );
+            summary.run_elapsed_seconds = n_t0.elapsed().as_secs_f64();
+
+            if let Some(bc) = baseline_cost {
+                let saving = bc - summary.total_carbon_cost;
+                let pct    = if bc > 0.0 { saving / bc * 100.0 } else { 0.0 };
+                summary.baseline_total_carbon_cost         = bc;
+                summary.carbon_cost_saving_vs_baseline     = saving;
+                summary.carbon_cost_saving_vs_baseline_pct = pct;
+            }
+
+            let per_ts = compute_per_timeslot(
+                &per_req,
+                scenario.metadata.total_slots,
+                scenario.metadata.error_window_past,
+                scenario.metadata.error_window_future,
+            );
+            write_run_outputs(&run_dir, &summary, &per_req, &batch_timings, &per_ts);
+
+            println!(
+                "Completed online_strategy={strategy} N={batch_size}: solver_ms_avg={:.3}, \
+                 total_carbon={:.3}, global_error={:.3}, saving_vs_baseline={:.3}",
+                summary.solver_time_ms_avg,
+                summary.total_carbon_cost,
+                summary.global_average_error,
+                summary.carbon_cost_saving_vs_baseline,
+            );
+
+            all_summaries.push(summary);
+        }
+
+        // Write per-strategy summary CSV.
+        let strat_dir = bcfg.output_dir.join(format!("online_{strategy}"));
+        let strat_summaries: Vec<&RunSummary> = all_summaries
+            .iter()
+            .rev()
+            .take(bcfg.batch_sizes.len())
+            .collect();
+        if !strat_summaries.is_empty() {
+            std::fs::create_dir_all(&strat_dir).ok();
+            let mut w = csv::Writer::from_path(strat_dir.join("summary_by_n.csv")).unwrap();
+            w.write_record(SUMMARY_CSV_HEADER).unwrap();
+            for s in strat_summaries.iter().rev() {
+                w.write_record(&summary_csv_row(s)).unwrap();
+            }
+            w.flush().unwrap();
+        }
+    }
+
     // ── additional strategies ──────────────────────────────────────────────
     for strategy in &bcfg.additional_strategies {
         let strat_dir = bcfg.output_dir.join(format!("strategy_{strategy}"));
@@ -1641,22 +1720,29 @@ fn main() {
     }
 
     // ── aggregate output ───────────────────────────────────────────────────
+    // Only DP runs belong in the top-level summary files; online strategy
+    // results have their own CSVs under online_{strategy}/.
+    let dp_summaries: Vec<&RunSummary> = all_summaries
+        .iter()
+        .filter(|s| s.execution_mode == "nshift_dp")
+        .collect();
+
     std::fs::write(
         bcfg.output_dir.join("summary_by_n.json"),
         serde_json::to_string_pretty(
-            &serde_json::json!({ "rows": all_summaries.iter().map(summary_to_json).collect::<Vec<_>>() }),
+            &serde_json::json!({ "rows": dp_summaries.iter().map(|s| summary_to_json(s)).collect::<Vec<_>>() }),
         ).unwrap(),
     ).unwrap();
-    if !all_summaries.is_empty() {
+    if !dp_summaries.is_empty() {
         let mut w = csv::Writer::from_path(bcfg.output_dir.join("summary_by_n.csv")).unwrap();
         w.write_record(SUMMARY_CSV_HEADER).unwrap();
-        for s in &all_summaries {
+        for s in &dp_summaries {
             w.write_record(&summary_csv_row(s)).unwrap();
         }
         w.flush().unwrap();
     }
 
-    println!("\nWrote benchmark output for {} batch sizes to {}.", all_summaries.len(), bcfg.output_dir.display());
+    println!("\nWrote benchmark output for {} batch sizes to {}.", dp_summaries.len(), bcfg.output_dir.display());
 }
 
 #[cfg(test)]

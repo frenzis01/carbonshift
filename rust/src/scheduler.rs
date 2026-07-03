@@ -24,6 +24,7 @@ use rand_distr::{Distribution, Normal};
 use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
+use crate::online_swarm::OnlineSwarmState;
 use crate::shared_state::{CommitOutcome, SharedState, SolverSnapshot};
 use crate::types::{Assignment, Flavour, Request, RequestAssignment};
 
@@ -66,6 +67,9 @@ struct SchedulerMutableState {
     stats: SchedulerStats,
     mock_pool: PersistentMockPool,
     mock_influence: MockInfluenceState,
+    /// Persistent state for online swarm strategies.  `None` variant when
+    /// the scheduler is using the DP solver.
+    swarm_state: OnlineSwarmState,
 }
 
 // ─── public result type ──────────────────────────────────────────────────────
@@ -142,6 +146,7 @@ impl BatchScheduler {
         let carbon_forecast = Arc::new(
             carbon_forecast.unwrap_or_else(|| generate_carbon_forecast(&cfg)),
         );
+        let swarm_state = OnlineSwarmState::from_config(&cfg, &carbon_forecast);
         let flavour_duration_by_name: HashMap<String, i32> =
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mock_influence_base = cfg.infeasibility_mock_influence.clamp(0.0, 1.0);
@@ -163,6 +168,7 @@ impl BatchScheduler {
                     above_threshold_streak: 0,
                     last_eval_slot: None,
                 },
+                swarm_state,
             })),
             metrics_logger,
             main_thread: None,
@@ -505,6 +511,11 @@ fn batch_worker_entry(
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
 ) -> bool {
+    // Fork: swarm strategies bypass the DP solver entirely.
+    if mutable.lock().unwrap().swarm_state.is_active() {
+        return batch_worker_entry_swarm(slot, pending, shared_state, cfg, carbon_forecast, mutable, ml);
+    }
+
     if cfg.verbose {
         println!("[Scheduler] Worker start: slot={slot}, batch_size={}", pending.len());
     }
@@ -686,6 +697,86 @@ fn batch_worker_entry(
             }
         }
     }
+}
+
+// ─── online swarm batch worker ────────────────────────────────────────────────
+
+/// Executes one batch of requests using an online swarm strategy (bandit or
+/// ACO).  Clones swarm state to allow lock-free solving, then writes back the
+/// updated state (eventual consistency — acceptable for swarm algorithms).
+fn batch_worker_entry_swarm(
+    slot: i32,
+    pending: Vec<Request>,
+    shared_state: &SharedState,
+    cfg: &Config,
+    carbon_forecast: &[f64],
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    ml: &MetricsLogger,
+) -> bool {
+    let t0 = Instant::now();
+
+    // 1. Snapshot committed state and clone swarm state — both under one lock,
+    //    then release the lock before the heavy solver runs.
+    let (mut swarm_clone, ctx) = {
+        let g = mutable.lock().unwrap();
+        (g.swarm_state.clone(), shared_state.swarm_context_snapshot())
+    };
+
+    // 2. Solve lock-free (mutates swarm_clone in place).
+    let assignments = swarm_clone.solve_batch(&pending, slot, carbon_forecast, &ctx, cfg);
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    if assignments.is_empty() {
+        shared_state.requeue_pending_requests_front(pending);
+        return false;
+    }
+
+    // 3. Write back updated swarm state (last-writer-wins — fine for approximate swarm).
+    {
+        let mut g = mutable.lock().unwrap();
+        g.swarm_state.merge_from(swarm_clone);
+    }
+
+    // 4. Commit assignments (no rollback / capacity-tier check for swarm paths).
+    let new_count = assignments.len();
+    shared_state.add_assignments(assignments.clone());
+
+    // 5. Update stats.
+    // NOTE: active_workers is decremented by the outer dispatch_batch_workers closure —
+    // do NOT touch it here to avoid a double-decrement that would underflow to usize::MAX.
+    let run_sequence = {
+        let mut g = mutable.lock().unwrap();
+        g.stats.solver_runs += 1;
+        g.stats.batches_processed += 1;
+        g.stats.total_scheduled += new_count as u64;
+        g.stats.solver_total_requests += new_count as u64;
+        g.stats.solver_total_time_ms += elapsed_ms;
+        g.stats.last_solver_elapsed_ms = elapsed_ms;
+        g.stats.solver_runs
+    };
+
+    // 6. Metrics logging — mark all batch requests as new assignments so
+    //    compute_per_request includes them (is_new_assignment_in_run=true).
+    {
+        let wall_ts = unix_now_f64();
+        let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
+        let total_cost: f64 = assignments.iter().map(|a| a.carbon_cost).sum();
+        let assignment_rows = build_assignment_rows(&assignments, &new_ids, &new_ids, slot, wall_ts, wall_ts);
+        let mut run_row: HashMap<String, String> = HashMap::new();
+        run_row.insert("run_sequence".into(), run_sequence.to_string());
+        run_row.insert("current_slot".into(), slot.to_string());
+        run_row.insert("pending_batch_size".into(), new_count.to_string());
+        run_row.insert("new_assignments".into(), new_count.to_string());
+        run_row.insert("total_assignments".into(), new_count.to_string());
+        run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
+        run_row.insert("total_carbon_cost".into(), total_cost.to_string());
+        run_row.insert("solver_mode".into(), cfg.solver_strategy.clone());
+        run_row.insert("solver_status".into(), "ok".into());
+        ml.log_solver_run(&run_row, &assignment_rows, &[]);
+    }
+
+    true
 }
 
 // ─── core DP pipeline ─────────────────────────────────────────────────────────
@@ -1443,6 +1534,7 @@ mod tests {
 
     fn make_mutable_state(cfg: &Config) -> Arc<Mutex<SchedulerMutableState>> {
         let base = cfg.infeasibility_mock_influence.clamp(0.0, 1.0);
+        let carbon_forecast = generate_carbon_forecast(cfg);
         Arc::new(Mutex::new(SchedulerMutableState {
             active_workers: 0,
             last_infeasible: None,
@@ -1454,6 +1546,7 @@ mod tests {
                 above_threshold_streak: 0,
                 last_eval_slot: None,
             },
+            swarm_state: OnlineSwarmState::from_config(cfg, &carbon_forecast),
         }))
     }
 
