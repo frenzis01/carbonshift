@@ -52,10 +52,6 @@ pub struct Config {
     pub prehistory_random_seed: u64,
     pub prehistory_mock_influence: f64,
 
-    // scenario generation
-    pub carbon_random_noise_amplitude: f64,
-    pub carbon_intensity_cycle_slots: i32,
-
     // ── capacity tiers (rebound effect) ──────────────────────────────────
     pub capacity_tiers: Vec<CapacityTier>,
 
@@ -185,8 +181,6 @@ impl Default for Config {
             prehistory_stochastic_counts: true,
             prehistory_random_seed: 4242,
             prehistory_mock_influence: 0.4,
-            carbon_random_noise_amplitude: 20.0,
-            carbon_intensity_cycle_slots: 24,
             capacity_tiers: vec![
                 CapacityTier { max_requests: Some(30),  multiplier: 1.0 },
                 CapacityTier { max_requests: Some(50),  multiplier: 1.5 },
@@ -279,8 +273,6 @@ impl Config {
         self.prehistory_error_ratio_of_threshold = meta.prehistory_error_ratio;
         self.forecast_error_ratio_of_threshold = meta.prehistory_error_ratio;
         self.prehistory_mock_influence = meta.prehistory_mock_influence;
-        self.carbon_intensity_cycle_slots = meta.carbon_intensity_cycle_slots;
-        self.carbon_random_noise_amplitude = meta.carbon_random_noise_amplitude;
         self.prehistory_random_seed = meta.seed;
         if let Some(tiers) = meta.capacity_tiers.as_ref() {
             self.capacity_tiers = tiers.clone();

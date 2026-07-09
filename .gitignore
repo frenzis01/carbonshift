@@ -24,6 +24,7 @@ online2/tests/Nshift_speed/*.png
 rust/target/
 tests/battery/results
 tests/battery/output
+tests/battery/scenarios
 
 **.mmd
 

@@ -39,10 +39,15 @@ from typing import Any, Dict, List, Optional
 # ─── path setup ───────────────────────────────────────────────────────────────
 CARBONSHIFT_ROOT = Path(__file__).resolve().parents[2]
 ONLINE2_ROOT = CARBONSHIFT_ROOT / "online2"
+SCENARIOS_DIR = CARBONSHIFT_ROOT / "tests" / "battery" / "scenarios"
+SCENARIOS_JSON_DIR = SCENARIOS_DIR / "json"
+
 sys.path.insert(0, str(ONLINE2_ROOT))
+sys.path.insert(0, str(SCENARIOS_DIR))
 
 import config as online2_config  # noqa: E402  (after sys.path update)
-from tests.Nshift_speed.scenario_io import generate_scenario_data, load_json, save_json  # noqa: E402
+import scenario_config  # noqa: E402  (scenario-generation defaults; decoupled from online2_config)
+from scenario_io import generate_scenario_data, load_json, save_json  # noqa: E402
 from tests.Nshift_speed.simulator import run_greedy_baseline, run_single_batch_size  # noqa: E402
 
 # ─── constants ────────────────────────────────────────────────────────────────
@@ -98,24 +103,24 @@ def _avg_slot_error_from_csv(csv_path: Path) -> float:
 
 def _generate_scenario(scenario_def: Dict[str, Any], output_path: Path) -> Dict[str, Any]:
     """Generate a deterministic scenario JSON and return the loaded dict."""
-    tiers = scenario_def.get("capacity_tiers", list(online2_config.CAPACITY_TIERS))
+    tiers = scenario_def.get("capacity_tiers", list(scenario_config.CAPACITY_TIERS))
     data = generate_scenario_data(
         seed=int(scenario_def.get("seed", 42)),
-        total_slots=int(scenario_def.get("total_slots", online2_config.TOTAL_SLOTS)),
+        total_slots=int(scenario_def.get("total_slots", scenario_config.TOTAL_SLOTS)),
         slot_duration_seconds=float(
-            scenario_def.get("slot_duration_seconds", online2_config.SLOT_DURATION_SECONDS)
+            scenario_def.get("slot_duration_seconds", scenario_config.SLOT_DURATION_SECONDS)
         ),
         requests_per_slot=float(
-            scenario_def.get("requests_per_slot", online2_config.PREDICTED_REQUESTS_PER_SLOT)
+            scenario_def.get("requests_per_slot", scenario_config.PREDICTED_REQUESTS_PER_SLOT)
         ),
-        carbon_intensity_cycle_slots=24,
-        request_rate_std_factor=float(online2_config.REQUEST_RATE_STD_FACTOR),
-        deadline_min_slack=int(online2_config.DEADLINE_MIN_SLACK),
-        deadline_max_slack=int(online2_config.DEADLINE_MAX_SLACK),
-        error_window_past=int(online2_config.ERROR_WINDOW_PAST),
-        error_window_future=int(online2_config.ERROR_WINDOW_FUTURE),
-        max_error_threshold=float(online2_config.MAX_ERROR_THRESHOLD),
-        prehistory_error_ratio=float(online2_config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
+        carbon_intensity_cycle_slots=int(scenario_config.CARBON_INTENSITY_CYCLE_SLOTS),
+        request_rate_std_factor=float(scenario_config.REQUEST_RATE_STD_FACTOR),
+        deadline_min_slack=int(scenario_config.DEADLINE_MIN_SLACK),
+        deadline_max_slack=int(scenario_config.DEADLINE_MAX_SLACK),
+        error_window_past=int(scenario_config.ERROR_WINDOW_PAST),
+        error_window_future=int(scenario_config.ERROR_WINDOW_FUTURE),
+        max_error_threshold=float(scenario_config.MAX_ERROR_THRESHOLD),
+        prehistory_error_ratio=float(scenario_config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
         capacity_tiers=tiers,
     )
     save_json(output_path, data)
@@ -490,7 +495,7 @@ def run_battery(config_path: Path) -> None:
         sid: str = scenario_def["id"]
         seed: int = int(scenario_def.get("seed", 42))
         total_slots: int = int(scenario_def.get("total_slots", 24))
-        req_per_slot: float = float(scenario_def.get("requests_per_slot", online2_config.PREDICTED_REQUESTS_PER_SLOT))
+        req_per_slot: float = float(scenario_def.get("requests_per_slot", scenario_config.PREDICTED_REQUESTS_PER_SLOT))
 
         print(f"\n{'='*60}")
         print(f"Scenario: {sid}  (seed={seed}, slots={total_slots}, req/slot={req_per_slot})")
@@ -500,7 +505,8 @@ def run_battery(config_path: Path) -> None:
         scenario_t0 = time.monotonic()
         scenario_dir = output_dir / sid
         scenario_dir.mkdir(parents=True, exist_ok=True)
-        scenario_path = scenario_dir / f"scenario_seed_{seed}.json"
+        SCENARIOS_JSON_DIR.mkdir(parents=True, exist_ok=True)
+        scenario_path = SCENARIOS_JSON_DIR / f"{sid}.json"
         scenario = _generate_scenario(scenario_def, scenario_path)
 
         # print first 24 values of carbon forecast for sanity check
