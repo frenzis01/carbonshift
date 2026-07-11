@@ -102,6 +102,8 @@ struct BenchmarkConfig {
     online_strategies: Vec<String>,
     /// If > 0: flush a partial batch after this many seconds without a new request.
     batch_timeout_secs: f64,
+    /// Overrides `Config::max_batch_solver_parallelism` when present; `None` keeps the default.
+    max_batch_solver_parallelism: Option<usize>,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -160,7 +162,12 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
     let batch_timeout_secs =
         runner.get("batch_timeout_secs").and_then(|x| x.as_f64()).unwrap_or(0.0);
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs }
+    let max_batch_solver_parallelism = runner
+        .get("max_batch_solver_parallelism")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize);
+
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -1522,6 +1529,9 @@ fn main() {
     base_cfg.dp_allow_relaxed_error_retry = bcfg.dp_allow_relaxed_error_retry;
     base_cfg.rollback_max_consecutive     = bcfg.rollback_max_consecutive;
     base_cfg.batch_timeout_secs           = bcfg.batch_timeout_secs;
+    if let Some(parallelism) = bcfg.max_batch_solver_parallelism {
+        base_cfg.max_batch_solver_parallelism = parallelism;
+    }
 
     println!(
         "Loaded scenario: {} slots, {} requests ({})",
@@ -1530,11 +1540,12 @@ fn main() {
         bcfg.scenario_path.display(),
     );
     println!(
-        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={}, output={}",
+        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={}, max_batch_solver_parallelism={}, output={}",
         bcfg.batch_sizes,
         realtime_slots,
         speed_scale,
         bcfg.rollback_max_consecutive,
+        base_cfg.max_batch_solver_parallelism,
         bcfg.output_dir.display(),
     );
 

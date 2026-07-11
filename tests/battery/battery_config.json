@@ -9,6 +9,11 @@
   "backend": "rust",
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
+  "comment_3": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values.",
+  "max_batch_solver_parallelism": 1,
+  "realtime_slots": false,
+  "realtime_speed_scale": 0.05,
+  "rollback_max_consecutive": 0,
   "scenarios": [
             {
       "id": "low_load_2028",

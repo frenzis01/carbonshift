@@ -29,10 +29,13 @@ import argparse
 import csv
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +44,7 @@ CARBONSHIFT_ROOT = Path(__file__).resolve().parents[2]
 ONLINE2_ROOT = CARBONSHIFT_ROOT / "online2"
 SCENARIOS_DIR = CARBONSHIFT_ROOT / "tests" / "battery" / "scenarios"
 SCENARIOS_JSON_DIR = SCENARIOS_DIR / "json"
+RUST_CONFIG_RS = CARBONSHIFT_ROOT / "rust" / "src" / "config.rs"
 
 sys.path.insert(0, str(ONLINE2_ROOT))
 sys.path.insert(0, str(SCENARIOS_DIR))
@@ -51,6 +55,15 @@ from scenario_io import generate_scenario_data, load_json, save_json  # noqa: E4
 from tests.Nshift_speed.simulator import run_greedy_baseline, run_single_batch_size  # noqa: E402
 
 # ─── constants ────────────────────────────────────────────────────────────────
+# Fallback defaults for the Rust runtime knobs below, mirroring
+# rust/src/config.rs's Config::default(). battery_config.json can override
+# each of these; they also feed the run-output folder name (see
+# _format_run_folder_name) and the generated README.md.
+DEFAULT_MAX_BATCH_SOLVER_PARALLELISM = 20
+DEFAULT_REALTIME_SLOTS = False
+DEFAULT_REALTIME_SPEED_SCALE = 0.05
+DEFAULT_ROLLBACK_MAX_CONSECUTIVE = 0
+
 RESULT_COLUMNS = [
     "scenario_id",
     "backend",
@@ -207,17 +220,21 @@ def _write_rust_config(
     include_baseline: bool,
     additional_strategies: Optional[List[str]] = None,
     online_strategies: Optional[List[str]] = None,
+    realtime_slots: bool = DEFAULT_REALTIME_SLOTS,
+    realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
+    max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
+    rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
 ) -> Path:
     """Write a temporary nshift config.json; caller is responsible for deletion."""
     fd, tmp = tempfile.mkstemp(suffix=".json")
     runner: Dict[str, Any] = {
         "flush_partial_batch": True,
         "include_greedy_baseline": include_baseline,
-        "realtime_slots": False,
-        "realtime_speed_scale": 0.05,
+        "realtime_slots": realtime_slots,
+        "realtime_speed_scale": realtime_speed_scale,
         "dp_allow_relaxed_error_retry": dp_allow_relaxed,
-        "rollback_max_consecutive": 0,
-        # TODO betterify param setting to avoid duplicating and hardcoding defaults
+        "rollback_max_consecutive": rollback_max_consecutive,
+        "max_batch_solver_parallelism": max_batch_solver_parallelism,
     }
     if additional_strategies:
         runner["additional_strategies"] = additional_strategies
@@ -246,6 +263,10 @@ def _run_rust_scenario(
     rust_binary: Path,
     additional_strategies: Optional[List[str]] = None,
     online_strategies: Optional[List[str]] = None,
+    realtime_slots: bool = DEFAULT_REALTIME_SLOTS,
+    realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
+    max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
+    rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run the Rust nshift binary for all modes of a single scenario.
 
@@ -266,6 +287,10 @@ def _run_rust_scenario(
         tmp_config = _write_rust_config(
             scenario_path, batch_sizes, mode_dir, dp_relaxed, include_baseline,
             online_strategies=run_online,
+            realtime_slots=realtime_slots,
+            realtime_speed_scale=realtime_speed_scale,
+            max_batch_solver_parallelism=max_batch_solver_parallelism,
+            rollback_max_consecutive=rollback_max_consecutive,
         )
         try:
             subprocess.run([str(rust_binary), "--config", str(tmp_config)], check=True)
@@ -347,6 +372,10 @@ def _run_rust_scenario(
             False,
             False,                 # greedy baseline already written
             additional_strategies,
+            realtime_slots=realtime_slots,
+            realtime_speed_scale=realtime_speed_scale,
+            max_batch_solver_parallelism=max_batch_solver_parallelism,
+            rollback_max_consecutive=rollback_max_consecutive,
         )
         try:
             subprocess.run([str(rust_binary), "--config", str(tmp_config)], check=True)
@@ -455,18 +484,225 @@ def _run_rust_scenario(
     return all_rows, per_n_timing_rows
 
 
+# ─── run-output packaging (folder name, config snapshot, README) ──────────────
+
+def _format_run_folder_name(
+    battery_id: str,
+    start_dt: datetime,
+    max_batch_solver_parallelism: int,
+    realtime_slots: bool,
+    realtime_speed_scale: float,
+    alt_strategies_enabled: bool,
+) -> str:
+    """Build the per-run results subfolder name.
+
+    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_<realtime_scale>_<altstratT|F>
+    - realtime_scale is "0" when realtime_slots is disabled, otherwise the
+      configured speed scale with its decimal point stripped (0.5 -> "05").
+    - altstrat is "T" if any online/additional alternative strategy is enabled.
+    """
+    mmdd = start_dt.strftime("%m%d")
+    hhmm = start_dt.strftime("%H%M")
+    scale_token = str(realtime_speed_scale).replace(".", "") if realtime_slots else "0"
+    altstrat_token = "T" if alt_strategies_enabled else "F"
+    return f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_{scale_token}_{altstrat_token}"
+
+
+# Rust scalar Config fields worth surfacing in the run README, mapped to a
+# human-readable label. Only single-line `field: value,` entries inside
+# `impl Default for Config` are matched (see _parse_rust_config_defaults),
+# so multi-line fields like `flavours`/`capacity_tiers` are intentionally
+# left out here.
+_RUST_CONFIG_README_FIELDS: List[tuple[str, str]] = [
+    ("batch_size", "DP batch size (N)"),
+    ("max_error_threshold", "Max error threshold (%)"),
+    ("error_window_past", "Error window – past slots"),
+    ("error_window_future", "Error window – future slots"),
+    ("error_window_past_decay_slots", "Error window – past decay slots"),
+    ("dp_pruning_method", "DP pruning method"),
+    ("dp_pruning_min_batch_size", "DP pruning min batch size"),
+    ("dp_pruning_k", "DP pruning k"),
+    ("dp_timeout", "DP solver timeout (s)"),
+    ("dp_lock_future_assignments", "DP locks future assignments"),
+    ("infeasibility_recovery_mode", "Infeasibility recovery mode"),
+    ("prehistory_use_virtual_past", "Virtual prehistory enabled (default)"),
+    ("queue_timeout", "Queue timeout (s)"),
+]
+
+
+def _parse_rust_config_defaults(config_rs_path: Path) -> Dict[str, str]:
+    """Extract scalar field values from `impl Default for Config` in config.rs.
+
+    This is intentionally a simple line-based scan (not a Rust parser): it only
+    captures single-line `name: value,` assignments and skips any line
+    containing brackets (`{`, `}`, `[`, `]`), which safely excludes multi-line
+    literals such as `flavours: vec![...]` or `capacity_tiers: vec![...]`.
+    Used only to populate the run README with human-readable defaults, so
+    approximate parsing is acceptable. Returns an empty dict if the file is
+    missing, so callers can render "?" placeholders instead of crashing.
+    """
+    if not config_rs_path.exists():
+        return {}
+    text = config_rs_path.read_text()
+    marker = "impl Default for Config"
+    start = text.find(marker)
+    if start == -1:
+        return {}
+    body = text[start:]
+    values: Dict[str, str] = {}
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or "{" in line or "}" in line or "[" in line or "]" in line:
+            continue
+        m = re.match(r"^(\w+):\s*(.+?),\s*(?://.*)?$", line)
+        if m:
+            value = m.group(2).strip().removesuffix(".to_string()")
+            values[m.group(1)] = value
+    return values
+
+
+def _row_label(row: Dict[str, Any]) -> str:
+    """Human-readable identifier for a results row: 'N=<n>' or an offline/online strategy name."""
+    mode = row["infeasibility_mode"]
+    if mode.startswith("offline_"):
+        return mode[len("offline_"):]
+    if mode.startswith("online_"):
+        return f"{mode[len('online_'):]} (N={row['batch_size']})"
+    return f"N={row['batch_size']}"
+
+
+def _top3_markdown_table(
+    rows: List[Dict[str, Any]],
+    elapsed_lookup: Dict[tuple, float],
+    scenario_id: str,
+) -> str:
+    """Markdown table of the 3 lowest-carbon-cost rows, or a placeholder if empty."""
+    if not rows:
+        return "_no executions in this category_\n"
+    top3 = sorted(rows, key=lambda r: r["total_carbon_cost"])[:3]
+    lines = [
+        "| Config | Carbon saving (%) | Carbon cost | Solver ms (avg) | Elapsed (s) |",
+        "|---|---|---|---|---|",
+    ]
+    for r in top3:
+        key = (scenario_id, r["infeasibility_mode"], r["batch_size"])
+        elapsed = elapsed_lookup.get(key)
+        elapsed_str = f"{elapsed:.1f}" if elapsed is not None else "n/a"
+        lines.append(
+            f"| {_row_label(r)} | {r['carbon_cost_saving_vs_baseline_pct']:.2f} | "
+            f"{r['total_carbon_cost']:.3f} | {r['solver_time_ms_avg']:.1f} | {elapsed_str} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_top3_section(
+    all_rows: List[Dict[str, Any]], per_n_timing_rows: List[Dict[str, Any]]
+) -> str:
+    """Per-scenario TOP-3 (lowest carbon cost) tables for relaxed-retry, online and
+    offline alternative-strategy executions."""
+    elapsed_lookup: Dict[tuple, float] = {
+        (r["scenario_id"], r["mode"], r["batch_size"]): r["elapsed_seconds"]
+        for r in per_n_timing_rows
+    }
+    scenario_ids = sorted({r["scenario_id"] for r in all_rows})
+    categories = [
+        ("Relaxed retry (DP) — top 3 by carbon cost", lambda m: m == "relaxed_retry"),
+        ("Online alternative strategies — top 3 by carbon cost", lambda m: m.startswith("online_")),
+        ("Offline alternative strategies — top 3 by carbon cost", lambda m: m.startswith("offline_")),
+    ]
+    sections = ["## Top executions per scenario\n"]
+    for sid in scenario_ids:
+        sections.append(f"### {sid}\n")
+        rows_for_scenario = [r for r in all_rows if r["scenario_id"] == sid]
+        for title, predicate in categories:
+            matched = [r for r in rows_for_scenario if predicate(r["infeasibility_mode"])]
+            sections.append(f"**{title}**\n")
+            sections.append(_top3_markdown_table(matched, elapsed_lookup, sid))
+    return "\n".join(sections)
+
+
+def _write_run_readme(
+    run_dir: Path,
+    battery_id: str,
+    start_dt: datetime,
+    max_batch_solver_parallelism: int,
+    realtime_slots: bool,
+    realtime_speed_scale: float,
+    rollback_max_consecutive: int,
+    alt_strategies_enabled: bool,
+    backend: str,
+    batch_sizes: List[int],
+    modes: List[str],
+    additional_strategies: List[str],
+    online_strategies: List[str],
+    all_rows: List[Dict[str, Any]],
+    per_n_timing_rows: List[Dict[str, Any]],
+    battery_elapsed: float,
+) -> None:
+    rust_defaults = _parse_rust_config_defaults(RUST_CONFIG_RS)
+    decay_slots = rust_defaults.get("error_window_past_decay_slots", "0")
+    decay_desc = "disabled" if decay_slots == "0" else f"enabled ({decay_slots} additional slots)"
+
+    lines: List[str] = [
+        f"# Battery run: {battery_id}",
+        "",
+        f"- Started: {start_dt.isoformat(timespec='seconds')}",
+        f"- Total elapsed: {battery_elapsed:.1f}s",
+        f"- Backend: {backend}",
+        "",
+        "## Run-identifying parameters (also encoded in the folder name)",
+        "",
+        f"- Battery id: `{battery_id}`",
+        f"- Start date: {start_dt.strftime('%Y-%m-%d')}",
+        f"- Start time: {start_dt.strftime('%H:%M')}",
+        f"- Max batch solver parallelism (max concurrent DP workers): {max_batch_solver_parallelism}",
+        (
+            f"- Realtime slot pacing: enabled, speed scale={realtime_speed_scale}"
+            if realtime_slots else
+            "- Realtime slot pacing: disabled (slots advance instantly)"
+        ),
+        f"- Alternative strategies enabled: {'yes' if alt_strategies_enabled else 'no'}",
+        "",
+        "## Other key runtime parameters",
+        "",
+        f"- Error window: {rust_defaults.get('error_window_past', '?')} past / "
+        f"{rust_defaults.get('error_window_future', '?')} future slots",
+        f"- Error window past decay: {decay_desc}",
+        f"- DP pruning method: {rust_defaults.get('dp_pruning_method', '?')}",
+        f"- DP pruning k: {rust_defaults.get('dp_pruning_k', '?')}",
+        f"- DP pruning min batch size: {rust_defaults.get('dp_pruning_min_batch_size', '?')}",
+        f"- Max error threshold: {rust_defaults.get('max_error_threshold', '?')}%",
+        f"- DP solver timeout: {rust_defaults.get('dp_timeout', '?')}s",
+        f"- Rollback max consecutive (this run): {rollback_max_consecutive} "
+        f"({'disabled' if rollback_max_consecutive == 0 else 'enabled'})",
+        f"- Infeasibility recovery mode: {rust_defaults.get('infeasibility_recovery_mode', '?')}",
+        f"- Batch sizes (N): {batch_sizes}",
+        f"- Infeasibility modes: {modes}",
+        f"- Additional (offline) strategies: {additional_strategies or 'none'}",
+        f"- Online strategies: {online_strategies or 'none'}",
+        "",
+        "_Full Rust defaults are in the `config.rs` snapshot copied into this folder; "
+        "values above reflect `Config::default()` possibly overridden by this run's "
+        "battery_config.json / scenario metadata._",
+        "",
+    ]
+    lines.append(_build_top3_section(all_rows, per_n_timing_rows))
+
+    (run_dir / "README.md").write_text("\n".join(lines) + "\n")
+
+
 # ─── Main orchestrator ─────────────────────────────────────────────────────────
 
 def run_battery(config_path: Path) -> None:
     with open(config_path) as f:
         cfg = json.load(f)
 
+    start_dt = datetime.now()
     battery_dir = config_path.parent
     battery_id: str = cfg.get("battery_id", "run")
-    output_dir = Path(cfg.get("output_dir", "results"))
-    if not output_dir.is_absolute():
-        output_dir = (CARBONSHIFT_ROOT / output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    base_output_dir = Path(cfg.get("output_dir", "results"))
+    if not base_output_dir.is_absolute():
+        base_output_dir = (CARBONSHIFT_ROOT / base_output_dir).resolve()
 
     batch_sizes: List[int] = [int(n) for n in cfg["batch_sizes"]]
     modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback", "relaxed_retry"])
@@ -474,6 +710,31 @@ def run_battery(config_path: Path) -> None:
     backend: str = cfg.get("backend", "python")
     additional_strategies: List[str] = cfg.get("additional_strategies", [])
     online_strategies: List[str] = cfg.get("online_strategies", [])
+
+    # Rust runtime knobs (also drive the run folder name below).
+    max_batch_solver_parallelism = int(
+        cfg.get("max_batch_solver_parallelism", DEFAULT_MAX_BATCH_SOLVER_PARALLELISM)
+    )
+    realtime_slots = bool(cfg.get("realtime_slots", DEFAULT_REALTIME_SLOTS))
+    realtime_speed_scale = float(cfg.get("realtime_speed_scale", DEFAULT_REALTIME_SPEED_SCALE))
+    rollback_max_consecutive = int(
+        cfg.get("rollback_max_consecutive", DEFAULT_ROLLBACK_MAX_CONSECUTIVE)
+    )
+    alt_strategies_enabled = bool(additional_strategies) or bool(online_strategies)
+
+    run_folder_name = _format_run_folder_name(
+        battery_id, start_dt, max_batch_solver_parallelism,
+        realtime_slots, realtime_speed_scale, alt_strategies_enabled,
+    )
+    output_dir = base_output_dir / run_folder_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Snapshot the exact battery config and Rust config used for this run.
+    shutil.copy2(config_path, output_dir / config_path.name)
+    if RUST_CONFIG_RS.exists():
+        shutil.copy2(RUST_CONFIG_RS, output_dir / "config.rs")
+    else:
+        print(f"WARNING: {RUST_CONFIG_RS} not found; skipping config.rs snapshot.")
 
     rust_binary: Optional[Path] = None
     if backend in ("rust", "both"):
@@ -528,6 +789,10 @@ def run_battery(config_path: Path) -> None:
                 scenario_path, sid, batch_sizes, modes, scenario_dir, rust_binary,
                 additional_strategies=additional_strategies if additional_strategies else None,
                 online_strategies=online_strategies if online_strategies else None,
+                realtime_slots=realtime_slots,
+                realtime_speed_scale=realtime_speed_scale,
+                max_batch_solver_parallelism=max_batch_solver_parallelism,
+                rollback_max_consecutive=rollback_max_consecutive,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)
@@ -557,10 +822,31 @@ def run_battery(config_path: Path) -> None:
         writer.writeheader()
         writer.writerows(per_n_timing_rows)
 
+    _write_run_readme(
+        output_dir,
+        battery_id,
+        start_dt,
+        max_batch_solver_parallelism,
+        realtime_slots,
+        realtime_speed_scale,
+        rollback_max_consecutive,
+        alt_strategies_enabled,
+        backend,
+        batch_sizes,
+        modes,
+        additional_strategies,
+        online_strategies,
+        all_rows,
+        per_n_timing_rows,
+        battery_elapsed,
+    )
+
     print(f"\n{'='*60}")
     print(f"Battery complete in {battery_elapsed:.1f}s: {len(all_rows)} rows written to {results_csv}")
     print(f"Timings written to {timings_csv}")
     print(f"Per-N timings written to {per_n_timings_csv}")
+    print(f"Run folder: {output_dir}")
+    print(f"README + battery_config.json + config.rs snapshot written to {output_dir}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
