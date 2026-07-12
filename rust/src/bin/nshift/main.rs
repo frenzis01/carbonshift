@@ -104,6 +104,8 @@ struct BenchmarkConfig {
     batch_timeout_secs: f64,
     /// Overrides `Config::max_batch_solver_parallelism` when present; `None` keeps the default.
     max_batch_solver_parallelism: Option<usize>,
+    /// Overrides `Config::online_swarm_mode` when present; `None` keeps the default ("serialized").
+    online_swarm_mode: Option<String>,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -167,7 +169,12 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .and_then(|x| x.as_u64())
         .map(|x| x as usize);
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism }
+    let online_swarm_mode = runner
+        .get("online_swarm_mode")
+        .and_then(|x| x.as_str())
+        .map(String::from);
+
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -1532,6 +1539,9 @@ fn main() {
     if let Some(parallelism) = bcfg.max_batch_solver_parallelism {
         base_cfg.max_batch_solver_parallelism = parallelism;
     }
+    if let Some(mode) = &bcfg.online_swarm_mode {
+        base_cfg.online_swarm_mode = mode.clone();
+    }
 
     println!(
         "Loaded scenario: {} slots, {} requests ({})",
@@ -1540,12 +1550,13 @@ fn main() {
         bcfg.scenario_path.display(),
     );
     println!(
-        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={}, max_batch_solver_parallelism={}, output={}",
+        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={}, max_batch_solver_parallelism={}, online_swarm_mode={}, output={}",
         bcfg.batch_sizes,
         realtime_slots,
         speed_scale,
         bcfg.rollback_max_consecutive,
         base_cfg.max_batch_solver_parallelism,
+        base_cfg.online_swarm_mode,
         bcfg.output_dir.display(),
     );
 

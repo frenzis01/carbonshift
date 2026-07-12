@@ -24,7 +24,6 @@ use rand_distr::{Distribution, Normal};
 use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
-use crate::online_swarm::OnlineSwarmState;
 use crate::shared_state::{CommitOutcome, SharedState, SolverSnapshot};
 use crate::types::{Assignment, Flavour, Request, RequestAssignment};
 
@@ -59,6 +58,44 @@ struct MockInfluenceState {
     last_eval_slot: Option<i32>,
 }
 
+/// Wraps the two selectable online-swarm concurrency backends (see
+/// `Config::online_swarm_mode`): `Serialized` (from `online_swarm.rs`, each
+/// worker mutates it while holding the scheduler mutex) or `Merge` (from
+/// `online_swarmerge.rs`, workers solve lock-free against a clone and
+/// additively merge their contribution back). Irrelevant when the scheduler
+/// uses the DP solver (`Config::solver_strategy == "dp"`).
+enum SwarmBackend {
+    Serialized(crate::online_swarm::OnlineSwarmState),
+    Merge(crate::online_swarmerge::OnlineSwarmState),
+}
+
+impl SwarmBackend {
+    fn from_config(cfg: &Config, carbon_forecast: &[f64]) -> Self {
+        if cfg.online_swarm_mode == "merge" {
+            Self::Merge(crate::online_swarmerge::OnlineSwarmState::from_config(cfg, carbon_forecast))
+        } else {
+            Self::Serialized(crate::online_swarm::OnlineSwarmState::from_config(cfg, carbon_forecast))
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        match self {
+            Self::Serialized(s) => s.is_active(),
+            Self::Merge(s) => s.is_active(),
+        }
+    }
+
+    /// Strategy name for logging/diagnostics (mirrors the wrapped state's
+    /// `name()`; not currently read anywhere but kept for parity/future use).
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Serialized(s) => s.name(),
+            Self::Merge(s) => s.name(),
+        }
+    }
+}
+
 /// All mutable scheduler state shared between the main loop and workers.
 struct SchedulerMutableState {
     active_workers: usize,
@@ -67,9 +104,9 @@ struct SchedulerMutableState {
     stats: SchedulerStats,
     mock_pool: PersistentMockPool,
     mock_influence: MockInfluenceState,
-    /// Persistent state for online swarm strategies.  `None` variant when
-    /// the scheduler is using the DP solver.
-    swarm_state: OnlineSwarmState,
+    /// Persistent state for online swarm strategies.  `None` variant (inside
+    /// either backend) when the scheduler is using the DP solver.
+    swarm_state: SwarmBackend,
 }
 
 // ─── public result type ──────────────────────────────────────────────────────
@@ -146,7 +183,7 @@ impl BatchScheduler {
         let carbon_forecast = Arc::new(
             carbon_forecast.unwrap_or_else(|| generate_carbon_forecast(&cfg)),
         );
-        let swarm_state = OnlineSwarmState::from_config(&cfg, &carbon_forecast);
+        let swarm_state = SwarmBackend::from_config(&cfg, &carbon_forecast);
         let flavour_duration_by_name: HashMap<String, i32> =
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mock_influence_base = cfg.infeasibility_mock_influence.clamp(0.0, 1.0);
@@ -702,9 +739,64 @@ fn batch_worker_entry(
 // ─── online swarm batch worker ────────────────────────────────────────────────
 
 /// Executes one batch of requests using an online swarm strategy (bandit or
-/// ACO).  Clones swarm state to allow lock-free solving, then writes back the
-/// updated state (eventual consistency — acceptable for swarm algorithms).
+/// ACO). Dispatches to one of two concurrency-safe implementations based on
+/// `Config::online_swarm_mode` (see `SwarmBackend`).
 fn batch_worker_entry_swarm(
+    slot: i32,
+    pending: Vec<Request>,
+    shared_state: &SharedState,
+    cfg: &Config,
+    carbon_forecast: &[f64],
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    ml: &MetricsLogger,
+) -> bool {
+    let is_merge = matches!(mutable.lock().unwrap().swarm_state, SwarmBackend::Merge(_));
+    if is_merge {
+        batch_worker_entry_swarm_merge(slot, pending, shared_state, cfg, carbon_forecast, mutable, ml)
+    } else {
+        batch_worker_entry_swarm_serialized(slot, pending, shared_state, cfg, carbon_forecast, mutable, ml)
+    }
+}
+
+/// Serialized backend: solves while holding the scheduler mutex for the
+/// whole call, so concurrent swarm workers never race on the same state —
+/// correct and reproducible, at the cost of limiting swarm batches to one in
+/// flight at a time (irrelevant to DP batches, since `solver_strategy` is
+/// global to the run: DP and swarm never execute concurrently).
+fn batch_worker_entry_swarm_serialized(
+    slot: i32,
+    pending: Vec<Request>,
+    shared_state: &SharedState,
+    cfg: &Config,
+    carbon_forecast: &[f64],
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    ml: &MetricsLogger,
+) -> bool {
+    let t0 = Instant::now();
+    let ctx = shared_state.swarm_context_snapshot();
+
+    let assignments = {
+        let mut g = mutable.lock().unwrap();
+        let SwarmBackend::Serialized(swarm) = &mut g.swarm_state else {
+            unreachable!("batch_worker_entry_swarm dispatched Serialized mode");
+        };
+        swarm.solve_batch(&pending, slot, carbon_forecast, &ctx, cfg)
+    };
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if assignments.is_empty() {
+        shared_state.requeue_pending_requests_front(pending);
+        return false;
+    }
+
+    finish_swarm_batch(slot, &pending, assignments, elapsed_ms, shared_state, cfg, mutable, ml)
+}
+
+/// Merge backend: clones the swarm state, solves lock-free against the
+/// clone (preserving full parallelism, like DP batches), then additively
+/// merges its own contribution back — see `online_swarmerge.rs` for why this
+/// never discards concurrent workers' updates, unlike a plain overwrite.
+fn batch_worker_entry_swarm_merge(
     slot: i32,
     pending: Vec<Request>,
     shared_state: &SharedState,
@@ -717,32 +809,51 @@ fn batch_worker_entry_swarm(
 
     // 1. Snapshot committed state and clone swarm state — both under one lock,
     //    then release the lock before the heavy solver runs.
-    let (mut swarm_clone, ctx) = {
+    let (swarm_snapshot, ctx) = {
         let g = mutable.lock().unwrap();
-        (g.swarm_state.clone(), shared_state.swarm_context_snapshot())
+        let SwarmBackend::Merge(swarm) = &g.swarm_state else {
+            unreachable!("batch_worker_entry_swarm dispatched Merge mode");
+        };
+        (swarm.clone(), shared_state.swarm_context_snapshot())
     };
 
-    // 2. Solve lock-free (mutates swarm_clone in place).
-    let assignments = swarm_clone.solve_batch(&pending, slot, carbon_forecast, &ctx, cfg);
+    // 2. Solve lock-free against the snapshot; returns assignments plus a
+    //    delta describing only this batch's net effect on the shared state.
+    let (assignments, delta) = swarm_snapshot.solve_batch(&pending, slot, carbon_forecast, &ctx, cfg);
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
     if assignments.is_empty() {
         shared_state.requeue_pending_requests_front(pending);
         return false;
     }
 
-    // 3. Write back updated swarm state (last-writer-wins — fine for approximate swarm).
+    // 3. Additively merge this worker's contribution into the live shared
+    //    state — never overwrites updates made by other concurrent workers.
     {
         let mut g = mutable.lock().unwrap();
-        g.swarm_state.merge_from(swarm_clone);
+        if let SwarmBackend::Merge(swarm) = &mut g.swarm_state {
+            swarm.merge_delta(delta);
+        }
     }
 
-    // 4. Commit assignments (no rollback / capacity-tier check for swarm paths).
+    finish_swarm_batch(slot, &pending, assignments, elapsed_ms, shared_state, cfg, mutable, ml)
+}
+
+/// Shared tail for both swarm backends: commit assignments, update stats,
+/// and log metrics (no rollback / capacity-tier check for swarm paths).
+fn finish_swarm_batch(
+    slot: i32,
+    pending: &[Request],
+    assignments: Vec<Assignment>,
+    elapsed_ms: f64,
+    shared_state: &SharedState,
+    cfg: &Config,
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    ml: &MetricsLogger,
+) -> bool {
     let new_count = assignments.len();
     shared_state.add_assignments(assignments.clone());
 
-    // 5. Update stats.
     // NOTE: active_workers is decremented by the outer dispatch_batch_workers closure —
     // do NOT touch it here to avoid a double-decrement that would underflow to usize::MAX.
     let run_sequence = {
@@ -756,8 +867,8 @@ fn batch_worker_entry_swarm(
         g.stats.solver_runs
     };
 
-    // 6. Metrics logging — mark all batch requests as new assignments so
-    //    compute_per_request includes them (is_new_assignment_in_run=true).
+    // Metrics logging — mark all batch requests as new assignments so
+    // compute_per_request includes them (is_new_assignment_in_run=true).
     {
         let wall_ts = unix_now_f64();
         let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
@@ -1546,7 +1657,7 @@ mod tests {
                 above_threshold_streak: 0,
                 last_eval_slot: None,
             },
-            swarm_state: OnlineSwarmState::from_config(cfg, &carbon_forecast),
+            swarm_state: SwarmBackend::from_config(cfg, &carbon_forecast),
         }))
     }
 

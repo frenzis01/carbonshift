@@ -1,4 +1,7 @@
-//! Online swarm scheduling strategies for the CarbonShift batch scheduler.
+//! Online swarm scheduling strategies for the CarbonShift batch scheduler
+//! (**serialized** concurrency variant — see `online_swarmerge.rs` for the
+//! parallel, additive-merge variant; select between them via
+//! `Config::online_swarm_mode`).
 //!
 //! Provides online variants of the bandit and ACO strategies that integrate
 //! with the generator + scheduler pipeline.  Unlike the offline versions in
@@ -9,11 +12,20 @@
 //! # Concurrency model
 //!
 //! `OnlineSwarmState` is stored in `SchedulerMutableState` (behind the
-//! scheduler mutex).  Each batch worker **clones** the state before solving
-//! and **writes back** the updated state after solving.  This gives *eventual
-//! consistency*: concurrent workers may see slightly stale Q-values or
-//! pheromone trails, which is acceptable — swarm algorithms are inherently
-//! approximate.  Last writer wins on the write-back.
+//! scheduler mutex).  Each batch worker solves **while holding the mutex**
+//! (see `scheduler.rs::batch_worker_entry_swarm_serialized`), so state updates
+//! are fully sequential regardless of how many worker threads are spawned
+//! concurrently — this trades away swarm/swarm concurrency (DP batches are
+//! unaffected) for correctness and reproducibility.
+//!
+//! An earlier version of this module used a "clone the state, solve
+//! lock-free, then overwrite (`*self = updated`)" pattern to avoid holding the
+//! lock during the solve. That is unsound: when two workers overlap, the
+//! second write-back **silently discards** the first worker's Q-value /
+//! pheromone updates rather than merging them — not just reordering, but
+//! genuine loss of learning signal, whose severity depends on `batch_size`
+//! (it changes how much workers overlap). Since a single swarm solve is much
+//! cheaper than a DP solve, serializing it has negligible performance cost.
 
 use std::collections::HashMap;
 
@@ -143,8 +155,9 @@ fn sorted_flavours_and_fallback(cfg: &Config) -> (Vec<&Flavour>, &Flavour) {
 
 // ─── Online Bandit ────────────────────────────────────────────────────────────
 
-/// Persistent ε-greedy bandit state, cloned for each batch worker and written
-/// back after solving (eventual consistency).
+/// Persistent ε-greedy bandit state. With the serialized concurrency model,
+/// each batch worker mutates this state directly while holding the scheduler
+/// mutex — no cloning or write-back merge is needed.
 #[derive(Clone)]
 pub struct OnlineBanditState {
     /// Per-slot running-mean Q-values (estimated carbon cost).
@@ -168,8 +181,8 @@ impl OnlineBanditState {
     /// Assign `pending` using the current Q-values.
     ///
     /// `ctx` is the committed-state baseline (slot counts, errors).
-    /// Q-values are updated incrementally in place; the caller clones before
-    /// calling and writes back for eventual consistency.
+    /// Q-values are updated incrementally in place; the caller must hold the
+    /// scheduler mutex for the duration of this call (serialized model).
     pub fn solve_batch(
         &mut self,
         pending: &[Request],
@@ -304,8 +317,8 @@ impl OnlineAcoState {
     /// Assign `pending` using the current pheromone state.
     ///
     /// Runs `n_iterations` × `n_ants` mini-iterations on the batch, updates
-    /// pheromone, and returns the best-ant solution.  Called clones before
-    /// calling and writes back for eventual consistency.
+    /// pheromone, and returns the best-ant solution. The caller must hold the
+    /// scheduler mutex for the duration of this call (serialized model).
     pub fn solve_batch(
         &mut self,
         pending: &[Request],
@@ -413,7 +426,7 @@ impl OnlineAcoState {
 // ─── OnlineSwarmState enum ────────────────────────────────────────────────────
 
 /// Unified online swarm state — stored in `SchedulerMutableState` and
-/// cloned per batch worker.
+/// mutated directly by whichever worker holds the scheduler mutex.
 #[derive(Clone)]
 pub enum OnlineSwarmState {
     /// The scheduler is using the DP solver; no swarm state.
@@ -466,8 +479,9 @@ impl OnlineSwarmState {
 
     /// Solve a batch of requests using the active swarm strategy.
     ///
-    /// Mutates `self` in place (Q-values or pheromone).  Callers should clone
-    /// first and call `merge_from` for eventual consistency.
+    /// Mutates `self` in place (Q-values or pheromone). The caller must hold
+    /// the scheduler mutex for the duration of this call so concurrent
+    /// workers never race on the same state (serialized model).
     pub fn solve_batch(
         &mut self,
         pending: &[Request],
@@ -481,10 +495,5 @@ impl OnlineSwarmState {
             Self::Bandit(b) => b.solve_batch(pending, carbon_forecast, ctx, cfg),
             Self::Aco(a) => a.solve_batch(pending, carbon_forecast, ctx, cfg),
         }
-    }
-
-    /// Write back the updated swarm state produced by a worker (last-writer-wins).
-    pub fn merge_from(&mut self, updated: OnlineSwarmState) {
-        *self = updated;
     }
 }

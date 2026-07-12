@@ -119,6 +119,22 @@ pub struct Config {
     /// `"ant_colony"`: online ACO (pheromone shared across batches).
     pub solver_strategy: String,
 
+    /// Concurrency strategy for online swarm strategies (bandit / ant_colony)
+    /// when `max_batch_solver_parallelism > 1`. Irrelevant for `"dp"`.
+    ///
+    /// `"serialized"` (default, see `online_swarm.rs`): each batch worker
+    /// solves while holding the scheduler mutex, so swarm state updates are
+    /// fully sequential — correct and reproducible, at the cost of limiting
+    /// swarm batches to one in flight at a time (DP batches are unaffected).
+    ///
+    /// `"merge"` (see `online_swarmerge.rs`): batch workers solve lock-free
+    /// against a snapshot, then additively merge their contribution (running-
+    /// mean deltas for bandit, discounted evaporation+deposit for ACO) back
+    /// into the shared state. Preserves full parallelism without discarding
+    /// concurrent updates (unlike the old last-writer-wins overwrite), at the
+    /// cost of workers reading slightly stale state while they solve.
+    pub online_swarm_mode: String,
+
     // ── swarm / bandit hyper-parameters ──────────────────────────────────
     /// Exploration probability for the online bandit.
     pub swarm_bandit_epsilon: f64,
@@ -211,6 +227,7 @@ impl Default for Config {
             slot_speed_scale: 1.0,
             total_requests: 0,
             solver_strategy: "dp".to_string(),
+            online_swarm_mode: "serialized".to_string(),
             swarm_bandit_epsilon: 0.15,
             swarm_bandit_initial_q: 10.0,
             swarm_bandit_seed: 42,

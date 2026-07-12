@@ -8,6 +8,7 @@ pub mod dp_solver;
 pub mod generator;
 pub mod metrics_logger;
 pub mod online_swarm;
+pub mod online_swarmerge;
 pub mod scenario;
 pub mod scheduler;
 pub mod shared_state;
