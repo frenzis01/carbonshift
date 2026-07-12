@@ -1,29 +1,59 @@
 {
   "_comment": "CarbonShift solver battery test configuration.",
   "battery_id": "low2xx_cf0716",
-  "batch_sizes": [1, 4, 6, 8, 10, 12, 16],
-  "online_strategies": ["bandit", "ant_colony"],
-  "infeasibility_modes": ["relaxed_retry"],
-  "comment_2": ["greedy_fallback","relaxed_retry"],
-  "additional_strategies": ["greedy_cheapest", "bandit", "ant_colony"],
+  "batch_sizes": [
+    1,
+    4,
+    6,
+    8,
+    10,
+    12,
+    16
+  ],
+  "online_strategies": [
+    "bandit",
+    "ant_colony"
+  ],
+  "infeasibility_modes": [
+    "relaxed_retry"
+  ],
+  "comment_2": [
+    "greedy_fallback",
+    "relaxed_retry"
+  ],
+  "additional_strategies": [
+    "greedy_cheapest",
+    "bandit",
+    "ant_colony"
+  ],
   "backend": "rust",
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
   "comment_3": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values.",
-  "max_batch_solver_parallelism": 1,
+  "max_batch_solver_parallelism": 20,
+  "online_swarm_mode": "merge",
   "realtime_slots": false,
   "realtime_speed_scale": 0.05,
-  "rollback_max_consecutive": 0,
+  "rollback_max_consecutive": 4,
   "scenarios": [
-            {
+    {
       "id": "low_load_2028",
       "seed": 2028,
       "requests_per_slot": 20.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 10,   "multiplier": 1.0},
-        {"max_requests": 25,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 10,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 25,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -32,9 +62,18 @@
       "requests_per_slot": 20.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 10,   "multiplier": 1.0},
-        {"max_requests": 25,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 10,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 25,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -43,9 +82,18 @@
       "requests_per_slot": 60.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 30,   "multiplier": 1.0},
-        {"max_requests": 70,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 30,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 70,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -54,9 +102,18 @@
       "requests_per_slot": 60.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 30,   "multiplier": 1.0},
-        {"max_requests": 70,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 30,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 70,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -65,9 +122,18 @@
       "requests_per_slot": 90.0,
       "total_slots": 48,
       "capacity_tiers": [
-        {"max_requests": 50,   "multiplier": 1.0},
-        {"max_requests": 105,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 50,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 105,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -76,9 +142,18 @@
       "requests_per_slot": 90.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 50,   "multiplier": 1.0},
-        {"max_requests": 105,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 50,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 105,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -87,9 +162,18 @@
       "requests_per_slot": 120.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 60,   "multiplier": 1.0},
-        {"max_requests": 140,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 60,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 140,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -98,9 +182,18 @@
       "requests_per_slot": 160.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 120,   "multiplier": 1.0},
-        {"max_requests": 220,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 120,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 220,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -109,9 +202,18 @@
       "requests_per_slot": 200.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 120,   "multiplier": 1.0},
-        {"max_requests": 220,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 120,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 220,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     },
     {
@@ -120,9 +222,18 @@
       "requests_per_slot": 200.0,
       "total_slots": 72,
       "capacity_tiers": [
-        {"max_requests": 120,   "multiplier": 1.0},
-        {"max_requests": 220,   "multiplier": 1.5},
-        {"max_requests": null, "multiplier": 5.0}
+        {
+          "max_requests": 120,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 220,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
       ]
     }
   ]

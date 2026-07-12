@@ -106,6 +106,12 @@ struct BenchmarkConfig {
     max_batch_solver_parallelism: Option<usize>,
     /// Overrides `Config::online_swarm_mode` when present; `None` keeps the default ("serialized").
     online_swarm_mode: Option<String>,
+    /// Precomputed baseline carbon cost to reuse when `include_greedy_baseline` is false
+    /// (e.g. a second nshift invocation for additional/offline strategies that shouldn't
+    /// recompute the greedy baseline already produced by an earlier invocation of the same
+    /// scenario). When `None` and `include_greedy_baseline` is false, saving-vs-baseline
+    /// fields simply stay at 0 for this run.
+    baseline_total_carbon_cost: Option<f64>,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -174,7 +180,11 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .and_then(|x| x.as_str())
         .map(String::from);
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode }
+    let baseline_total_carbon_cost = runner
+        .get("baseline_total_carbon_cost")
+        .and_then(|x| x.as_f64());
+
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode, baseline_total_carbon_cost }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -1550,20 +1560,20 @@ fn main() {
         bcfg.scenario_path.display(),
     );
     println!(
-        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={}, max_batch_solver_parallelism={}, online_swarm_mode={}, output={}",
+        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={} (online_swarm_mode={}), max_batch_solver_parallelism={}, output={}",
         bcfg.batch_sizes,
         realtime_slots,
         speed_scale,
         bcfg.rollback_max_consecutive,
-        base_cfg.max_batch_solver_parallelism,
         base_cfg.online_swarm_mode,
+        base_cfg.max_batch_solver_parallelism,
         bcfg.output_dir.display(),
     );
 
     std::fs::create_dir_all(&bcfg.output_dir).expect("Cannot create output dir");
 
     let mut all_summaries: Vec<RunSummary> = Vec::new();
-    let mut baseline_cost: Option<f64>     = None;
+    let mut baseline_cost: Option<f64>     = bcfg.baseline_total_carbon_cost;
 
     // ── greedy baseline ────────────────────────────────────────────────────
     if bcfg.include_greedy_baseline {
@@ -1764,7 +1774,18 @@ fn main() {
         w.flush().unwrap();
     }
 
-    println!("\nWrote benchmark output for {} batch sizes to {}.", dp_summaries.len(), bcfg.output_dir.display());
+    if !dp_summaries.is_empty() {
+        println!("\nWrote benchmark output for {} batch sizes to {}.", dp_summaries.len(), bcfg.output_dir.display());
+    } else if !bcfg.additional_strategies.is_empty() {
+        println!(
+            "\nWrote {} additional-strategy summaries to {}.",
+            bcfg.additional_strategies.len(), bcfg.output_dir.display(),
+        );
+    } else if !bcfg.online_strategies.is_empty() {
+        println!("\nWrote online-strategy output to {}.", bcfg.output_dir.display());
+    } else {
+        println!("\nNo DP/strategy output written (no batch sizes or strategies configured).");
+    }
 }
 
 #[cfg(test)]

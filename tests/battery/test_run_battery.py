@@ -22,26 +22,32 @@ import run_battery as rb  # noqa: E402
 
 def test_folder_name_realtime_disabled_uses_zero_token():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, False, 0.5, False)
-    assert name == "mybattery_0709_1123_20_0_F"
+    name = rb._format_run_folder_name("mybattery", dt, 20, False, 0.5, False, "serialized")
+    assert name == "mybattery_0709_1123_20_0_F_S"
 
 
 def test_folder_name_realtime_enabled_strips_dot_from_scale():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.5, True)
-    assert name == "mybattery_0709_1123_20_05_T"
+    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.5, True, "serialized")
+    assert name == "mybattery_0709_1123_20_05_T_S"
 
 
 def test_folder_name_scale_with_leading_zero():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.05, True)
-    assert name.endswith("_005_T")
+    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.05, True, "serialized")
+    assert name.endswith("_005_T_S")
 
 
 def test_folder_name_altstrat_false_when_no_strategies():
     dt = datetime(2026, 1, 1, 0, 0)
-    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False)
-    assert name.endswith("_F")
+    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False, "serialized")
+    assert name.endswith("_F_S")
+
+
+def test_folder_name_merge_swarm_mode_uses_m_token():
+    dt = datetime(2026, 1, 1, 0, 0)
+    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False, "merge")
+    assert name.endswith("_F_M")
 
 
 # ─── _parse_rust_config_defaults ───────────────────────────────────────────

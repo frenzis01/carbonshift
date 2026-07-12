@@ -63,6 +63,8 @@ DEFAULT_MAX_BATCH_SOLVER_PARALLELISM = 20
 DEFAULT_REALTIME_SLOTS = False
 DEFAULT_REALTIME_SPEED_SCALE = 0.05
 DEFAULT_ROLLBACK_MAX_CONSECUTIVE = 0
+# Mirrors rust/src/config.rs's Config::online_swarm_mode default ("serialized").
+DEFAULT_ONLINE_SWARM_MODE = "serialized"
 
 RESULT_COLUMNS = [
     "scenario_id",
@@ -224,6 +226,8 @@ def _write_rust_config(
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
+    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
+    baseline_total_carbon_cost: Optional[float] = None,
 ) -> Path:
     """Write a temporary nshift config.json; caller is responsible for deletion."""
     fd, tmp = tempfile.mkstemp(suffix=".json")
@@ -235,7 +239,13 @@ def _write_rust_config(
         "dp_allow_relaxed_error_retry": dp_allow_relaxed,
         "rollback_max_consecutive": rollback_max_consecutive,
         "max_batch_solver_parallelism": max_batch_solver_parallelism,
+        "online_swarm_mode": online_swarm_mode,
     }
+    if not include_baseline and baseline_total_carbon_cost is not None:
+        # Reuse a baseline computed by an earlier invocation (e.g. the DP/relaxed_retry
+        # run) so this run's own "saving_vs_baseline" stdout/CSV fields are populated
+        # instead of silently staying at 0 (this run never recomputes the baseline).
+        runner["baseline_total_carbon_cost"] = baseline_total_carbon_cost
     if additional_strategies:
         runner["additional_strategies"] = additional_strategies
     if online_strategies:
@@ -267,6 +277,7 @@ def _run_rust_scenario(
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
+    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run the Rust nshift binary for all modes of a single scenario.
 
@@ -291,6 +302,7 @@ def _run_rust_scenario(
             realtime_speed_scale=realtime_speed_scale,
             max_batch_solver_parallelism=max_batch_solver_parallelism,
             rollback_max_consecutive=rollback_max_consecutive,
+            online_swarm_mode=online_swarm_mode,
         )
         try:
             subprocess.run([str(rust_binary), "--config", str(tmp_config)], check=True)
@@ -376,6 +388,8 @@ def _run_rust_scenario(
             realtime_speed_scale=realtime_speed_scale,
             max_batch_solver_parallelism=max_batch_solver_parallelism,
             rollback_max_consecutive=rollback_max_consecutive,
+            online_swarm_mode=online_swarm_mode,
+            baseline_total_carbon_cost=baseline_cost,
         )
         try:
             subprocess.run([str(rust_binary), "--config", str(tmp_config)], check=True)
@@ -493,19 +507,26 @@ def _format_run_folder_name(
     realtime_slots: bool,
     realtime_speed_scale: float,
     alt_strategies_enabled: bool,
+    online_swarm_mode: str,
 ) -> str:
     """Build the per-run results subfolder name.
 
-    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_<realtime_scale>_<altstratT|F>
+    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_<realtime_scale>_<altstratT|F>_<S|M>
     - realtime_scale is "0" when realtime_slots is disabled, otherwise the
       configured speed scale with its decimal point stripped (0.5 -> "05").
     - altstrat is "T" if any online/additional alternative strategy is enabled.
+    - the trailing token is "S" for online_swarm_mode="serialized" (default)
+      or "M" for "merge" — see Config::online_swarm_mode in rust/src/config.rs.
     """
     mmdd = start_dt.strftime("%m%d")
     hhmm = start_dt.strftime("%H%M")
     scale_token = str(realtime_speed_scale).replace(".", "") if realtime_slots else "0"
     altstrat_token = "T" if alt_strategies_enabled else "F"
-    return f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_{scale_token}_{altstrat_token}"
+    swarm_mode_token = "M" if online_swarm_mode == "merge" else "S"
+    return (
+        f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_"
+        f"{scale_token}_{altstrat_token}_{swarm_mode_token}"
+    )
 
 
 # Rust scalar Config fields worth surfacing in the run README, mapped to a
@@ -638,6 +659,7 @@ def _write_run_readme(
     all_rows: List[Dict[str, Any]],
     per_n_timing_rows: List[Dict[str, Any]],
     battery_elapsed: float,
+    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
 ) -> None:
     rust_defaults = _parse_rust_config_defaults(RUST_CONFIG_RS)
     decay_slots = rust_defaults.get("error_window_past_decay_slots", "0")
@@ -662,6 +684,11 @@ def _write_run_readme(
             "- Realtime slot pacing: disabled (slots advance instantly)"
         ),
         f"- Alternative strategies enabled: {'yes' if alt_strategies_enabled else 'no'}",
+        (
+            f"- Online swarm concurrency mode: {online_swarm_mode} "
+            f"({'S' if online_swarm_mode != 'merge' else 'M'} token in folder name; "
+            "see Config::online_swarm_mode in rust/src/config.rs)"
+        ),
         "",
         "## Other key runtime parameters",
         "",
@@ -720,11 +747,13 @@ def run_battery(config_path: Path) -> None:
     rollback_max_consecutive = int(
         cfg.get("rollback_max_consecutive", DEFAULT_ROLLBACK_MAX_CONSECUTIVE)
     )
+    online_swarm_mode = str(cfg.get("online_swarm_mode", DEFAULT_ONLINE_SWARM_MODE))
     alt_strategies_enabled = bool(additional_strategies) or bool(online_strategies)
 
     run_folder_name = _format_run_folder_name(
         battery_id, start_dt, max_batch_solver_parallelism,
         realtime_slots, realtime_speed_scale, alt_strategies_enabled,
+        online_swarm_mode,
     )
     output_dir = base_output_dir / run_folder_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -793,6 +822,7 @@ def run_battery(config_path: Path) -> None:
                 realtime_speed_scale=realtime_speed_scale,
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
                 rollback_max_consecutive=rollback_max_consecutive,
+                online_swarm_mode=online_swarm_mode,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)
@@ -839,6 +869,7 @@ def run_battery(config_path: Path) -> None:
         all_rows,
         per_n_timing_rows,
         battery_elapsed,
+        online_swarm_mode,
     )
 
     print(f"\n{'='*60}")
