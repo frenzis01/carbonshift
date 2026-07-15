@@ -100,6 +100,7 @@ def main() -> int:
 
         cfg = load_config(CONFIG_PATH)
         update_runtime_knobs(cfg, rollback, parallelism, swarm_mode)
+        cfg["battery_id"] = f"cfg{idx - 1}"
         save_config(CONFIG_PATH, cfg)
 
         status = run_battery()

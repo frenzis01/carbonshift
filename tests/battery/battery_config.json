@@ -1,6 +1,6 @@
 {
   "_comment": "CarbonShift solver battery test configuration.",
-  "battery_id": "low2xx_cf0716",
+  "battery_id": "cfg11",
   "batch_sizes": [
     1,
     4,
@@ -15,6 +15,7 @@
     "ant_colony"
   ],
   "infeasibility_modes": [
+    "greedy_fallback",
     "relaxed_retry"
   ],
   "comment_2": [

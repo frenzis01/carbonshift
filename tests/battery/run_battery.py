@@ -508,12 +508,14 @@ def _format_run_folder_name(
     realtime_speed_scale: float,
     alt_strategies_enabled: bool,
     online_swarm_mode: str,
+    rollback_max_consecutive: int,
 ) -> str:
     """Build the per-run results subfolder name.
 
-    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_<realtime_scale>_<altstratT|F>_<S|M>
+    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_roll<X>_<realtime_scale>_<altstratT|F>_<S|M>
     - realtime_scale is "0" when realtime_slots is disabled, otherwise the
       configured speed scale with its decimal point stripped (0.5 -> "05").
+    - rollX is the configured rollback_max_consecutive (0 = rollback disabled).
     - altstrat is "T" if any online/additional alternative strategy is enabled.
     - the trailing token is "S" for online_swarm_mode="serialized" (default)
       or "M" for "merge" — see Config::online_swarm_mode in rust/src/config.rs.
@@ -524,7 +526,7 @@ def _format_run_folder_name(
     altstrat_token = "T" if alt_strategies_enabled else "F"
     swarm_mode_token = "M" if online_swarm_mode == "merge" else "S"
     return (
-        f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_"
+        f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_roll{rollback_max_consecutive}_"
         f"{scale_token}_{altstrat_token}_{swarm_mode_token}"
     )
 
@@ -753,7 +755,7 @@ def run_battery(config_path: Path) -> None:
     run_folder_name = _format_run_folder_name(
         battery_id, start_dt, max_batch_solver_parallelism,
         realtime_slots, realtime_speed_scale, alt_strategies_enabled,
-        online_swarm_mode,
+        online_swarm_mode, rollback_max_consecutive,
     )
     output_dir = base_output_dir / run_folder_name
     output_dir.mkdir(parents=True, exist_ok=True)
