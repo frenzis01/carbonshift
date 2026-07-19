@@ -26,6 +26,11 @@ tests/battery/results
 tests/battery/output
 tests/battery/scenarios
 tests/battery/EvaluationTest.md
+tests/battery/battery_config_*.json
+
+rust/src/bin/nshift.rs
+rust/src/bin/run_nshift_speed.rs
+**.bkup
 
 **.mmd
 

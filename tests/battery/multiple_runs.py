@@ -5,10 +5,12 @@ Run `run_battery.py` across the parameter grid defined by the battery table.
 
 For every row of the table the script:
   1. loads `battery_config.json`
-  2. updates (in place, without adding duplicates) the three runtime knobs:
+  2. updates (in place, without adding duplicates) the runtime knobs:
      - rollback_max_consecutive
      - max_batch_solver_parallelism
      - online_swarm_mode
+     - realtime_slots
+     - realtime_speed_scale
   3. saves the configuration back to `battery_config.json`
   4. invokes `python tests/battery/run_battery.py`
 
@@ -31,19 +33,20 @@ RUN_BATTERY_SCRIPT = BATTERY_DIR / "run_battery.py"
 
 # ─── parameter grid from the pinned table ─────────────────────────────────────
 PARAM_GRID = [
-    # rollback_max_consecutive, max_batch_solver_parallelism, online_swarm_mode
-    (0, 1, "serialized"),
-    (0, 1, "merge"),
-    (0, 8, "serialized"),
-    (0, 8, "merge"),
-    (0, 20, "serialized"),
-    (0, 20, "merge"),
-    (4, 1, "serialized"),
-    (4, 1, "merge"),
-    (4, 8, "serialized"),
-    (4, 8, "merge"),
-    (4, 20, "serialized"),
-    (4, 20, "merge"),
+    # rollback_max_consecutive, max_batch_solver_parallelism, online_swarm_mode,
+    # realtime_slots, realtime_speed_scale
+    # (0, 1, "serialized", False, 0.10),
+    # (0, 1, "merge", False, 0.10),
+    # (0, 8, "serialized", False, 0.10),
+    (0, 8, "merge", False, 0.10),
+    # (0, 20, "serialized", False, 0.10),
+    # (0, 20, "merge", False, 0.10),
+    # (4, 1, "serialized", False, 0.10),
+    # (4, 1, "merge", False, 0.10),
+    # (4, 8, "serialized", False, 0.10),
+    (4, 8, "merge", False, 0.10),
+    # (4, 20, "serialized", False, 0.10),
+    # (4, 20, "merge", False, 0.10),
 ]
 
 
@@ -65,14 +68,18 @@ def update_runtime_knobs(
     rollback: int,
     parallelism: int,
     swarm_mode: str,
+    realtime_slots: bool,
+    realtime_speed_scale: float,
 ) -> None:
-    """Update the three runtime knobs in the existing dictionary.
+    """Update the runtime knobs in the existing dictionary.
 
     Keys are overwritten in place; if they did not exist they are added once.
     """
     cfg["rollback_max_consecutive"] = rollback
     cfg["max_batch_solver_parallelism"] = parallelism
     cfg["online_swarm_mode"] = swarm_mode
+    cfg["realtime_slots"] = realtime_slots
+    cfg["realtime_speed_scale"] = realtime_speed_scale
 
 
 def run_battery() -> int:
@@ -90,17 +97,20 @@ def main() -> int:
     overall_status = 0
     total = len(PARAM_GRID)
 
-    for idx, (rollback, parallelism, swarm_mode) in enumerate(PARAM_GRID, start=1):
+    for idx, (rollback, parallelism, swarm_mode, realtime_slots, realtime_speed_scale) in enumerate(PARAM_GRID, start=1):
         print("\n" + "=" * 70)
         print(
             f"Run {idx}/{total}: "
-            f"rollback={rollback}, parallelism={parallelism}, mode={swarm_mode}"
+            f"rollback={rollback}, parallelism={parallelism}, mode={swarm_mode}, "
+            f"realtime_slots={realtime_slots}, realtime_speed_scale={realtime_speed_scale}"
         )
         print("=" * 70)
 
         cfg = load_config(CONFIG_PATH)
-        update_runtime_knobs(cfg, rollback, parallelism, swarm_mode)
-        cfg["battery_id"] = f"cfg{idx - 1}"
+        update_runtime_knobs(
+            cfg, rollback, parallelism, swarm_mode, realtime_slots, realtime_speed_scale
+        )
+        cfg["battery_id"] = f"cfg_onlyhigh_{idx - 1}"
         save_config(CONFIG_PATH, cfg)
 
         status = run_battery()

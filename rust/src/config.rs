@@ -67,9 +67,20 @@ pub struct Config {
     /// If true, future assignments are pinned as baseline load; if false, they
     /// are re-planned jointly with the current batch (time-shifting).
     pub dp_lock_future_assignments: bool,
-    pub dp_allow_relaxed_error_retry: bool,
-    pub dp_relaxed_retry_prefer_min_error: bool,
-    /// "min_error_recovery" | "carryover_last_slot" | "forecast_mock_current_slot"
+    /// Governs both how the error-window baseline is diluted *and* what
+    /// happens when the primary DP solve still can't cover all pending
+    /// requests. The error constraint (`max_error_threshold`) is NEVER
+    /// relaxed/removed — infeasibility always resolves via `greedy_fallback`
+    /// (accurate flavour, cheapest feasible slot), never via a second DP
+    /// pass with a loosened threshold.
+    ///
+    /// - "min_error_greedy": no synthetic/mock requests are injected; on
+    ///   infeasibility, go straight to `greedy_fallback`.
+    /// - "carryover": inject mock requests carried over from the slot that
+    ///   just left the error window (with influence decay); on infeasibility
+    ///   (even with mocks), go to `greedy_fallback`.
+    /// - "forecast": inject mock requests sampled from the expected arrival
+    ///   rate for the current slot (with influence decay); same fallback.
     pub infeasibility_recovery_mode: String,
     pub infeasibility_mock_influence: f64,
     /// None → policy-derived; Some(x) → fixed override.
@@ -186,9 +197,9 @@ impl Default for Config {
             carbon_cost_duration_scale: 1.0 / 3600.0,
             max_error_threshold: 4.0,
             error_window_past: 12,
-            error_window_future: 8,
-            error_window_past_decay_slots: 0,
-            assignment_max_future_slots: 8,
+            error_window_future: 14,
+            error_window_past_decay_slots: 12,
+            assignment_max_future_slots: 14,
             global_error_constraint_enabled: true,
             global_error_constraint_hard: true,
             prehistory_use_virtual_past: false,
@@ -208,17 +219,15 @@ impl Default for Config {
             dp_pruning_k: 1200,
             dp_timeout: 7.0,
             dp_lock_future_assignments: true,
-            dp_allow_relaxed_error_retry: true,
-            dp_relaxed_retry_prefer_min_error: true,
-            // infeasibility_recovery_mode: "forecast_mock_current_slot".to_string(),
-            infeasibility_recovery_mode: "carryover_last_slot".to_string(),
+            // infeasibility_recovery_mode: "forecast".to_string(),
+            infeasibility_recovery_mode: "carryover".to_string(),
             infeasibility_mock_influence: 0.6,
             infeasibility_mock_error_per_request: None,
             infeasibility_mock_influence_decay_step: 0.15,
             predicted_requests_per_slot: 60.0,
             request_rate_std_factor: 0.5,
             deadline_min_slack: 0,
-            deadline_max_slack: 8,
+            deadline_max_slack: 14,
             max_batch_solver_parallelism: 20,
             queue_timeout: 1.0,
             batch_timeout_secs: 0.0,
@@ -231,8 +240,8 @@ impl Default for Config {
             swarm_bandit_epsilon: 0.15,
             swarm_bandit_initial_q: 10.0,
             swarm_bandit_seed: 42,
-            swarm_aco_n_ants: 5,
-            swarm_aco_n_iterations: 1,
+            swarm_aco_n_ants: 10,
+            swarm_aco_n_iterations: 3,
             swarm_aco_alpha: 1.0,
             swarm_aco_beta: 2.0,
             swarm_aco_rho: 0.3,

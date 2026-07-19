@@ -86,7 +86,7 @@ def test_parse_rust_config_defaults_missing_file_returns_empty(tmp_path):
 # ─── _row_label ─────────────────────────────────────────────────────────────
 
 def test_row_label_plain_dp_mode():
-    row = {"infeasibility_mode": "relaxed_retry", "batch_size": 4}
+    row = {"infeasibility_mode": "min_error_greedy", "batch_size": 4}
     assert rb._row_label(row) == "N=4"
 
 
@@ -107,18 +107,18 @@ def _make_row(scenario_id, mode, batch_size, carbon_cost, saving=10.0, solver_ms
         "scenario_id": scenario_id,
         "infeasibility_mode": mode,
         "batch_size": batch_size,
-        "total_carbon_cost": carbon_cost,
-        "carbon_cost_saving_vs_baseline_pct": saving,
+        "carbon_cost": carbon_cost,
+        "carbon_saving": saving,
         "solver_time_ms_avg": solver_ms,
     }
 
 
 def test_top3_table_picks_three_lowest_carbon_cost():
     rows = [
-        _make_row("s1", "relaxed_retry", 1, 50.0),
-        _make_row("s1", "relaxed_retry", 4, 10.0),
-        _make_row("s1", "relaxed_retry", 8, 30.0),
-        _make_row("s1", "relaxed_retry", 12, 20.0),
+        _make_row("s1", "min_error_greedy", 1, 50.0),
+        _make_row("s1", "min_error_greedy", 4, 10.0),
+        _make_row("s1", "min_error_greedy", 8, 30.0),
+        _make_row("s1", "min_error_greedy", 12, 20.0),
     ]
     table = rb._top3_markdown_table(rows, elapsed_lookup={}, scenario_id="s1")
     # Only the 3 lowest-cost rows (10, 20, 30) should appear, in ascending order.
@@ -135,29 +135,29 @@ def test_top3_table_empty_rows_shows_placeholder():
 
 
 def test_top3_table_includes_elapsed_when_available():
-    rows = [_make_row("s1", "relaxed_retry", 4, 10.0)]
-    elapsed_lookup = {("s1", "relaxed_retry", 4): 12.345}
+    rows = [_make_row("s1", "min_error_greedy", 4, 10.0)]
+    elapsed_lookup = {("s1", "min_error_greedy", 4): 12.345}
     table = rb._top3_markdown_table(rows, elapsed_lookup, "s1")
     assert "12.3" in table
 
 
 def test_top3_table_elapsed_na_when_missing():
-    rows = [_make_row("s1", "relaxed_retry", 4, 10.0)]
+    rows = [_make_row("s1", "min_error_greedy", 4, 10.0)]
     table = rb._top3_markdown_table(rows, elapsed_lookup={}, scenario_id="s1")
     assert "n/a" in table
 
 
 def test_build_top3_section_groups_by_scenario_and_category():
     all_rows = [
-        _make_row("s1", "relaxed_retry", 1, 40.0),
+        _make_row("s1", "min_error_greedy", 1, 40.0),
         _make_row("s1", "online_bandit", 1, 35.0),
         _make_row("s1", "offline_greedy_cheapest", 0, 33.0),
-        _make_row("s2", "relaxed_retry", 1, 20.0),
+        _make_row("s2", "min_error_greedy", 1, 20.0),
     ]
     section = rb._build_top3_section(all_rows, per_n_timing_rows=[])
     assert "### s1" in section
     assert "### s2" in section
-    assert "Relaxed retry (DP)" in section
+    assert "DP recovery modes" in section
     assert "Online alternative strategies" in section
     assert "Offline alternative strategies" in section
     # s2 has no online/offline rows -> placeholder must appear at least once for it.

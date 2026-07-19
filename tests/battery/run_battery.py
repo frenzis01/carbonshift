@@ -12,7 +12,12 @@ Usage (from the repository root):
 Config fields
 -------------
 batch_sizes          : list[int]   – N values to benchmark
-infeasibility_modes  : list[str]   – "greedy_fallback" | "relaxed_retry"
+infeasibility_modes  : list[str]   – values of the DP solver's `infeasibility_recovery_mode`
+                                     knob to benchmark: "min_error_greedy" | "carryover" | "forecast".
+                                     The error-window constraint is never relaxed/removed for any
+                                     of these; they only differ in whether/how mock requests dilute
+                                     the error baseline before the primary DP solve. Infeasibility
+                                     always resolves via direct greedy fallback.
 backend              : str         – "python" | "rust" | "both"
 rust_binary_path     : str         – path to the nshift binary (relative to repo root)
 output_dir           : str         – where to write run artefacts + battery_results.csv
@@ -72,15 +77,16 @@ RESULT_COLUMNS = [
     "batch_size",
     "infeasibility_mode",
     "solver_time_ms_avg",
-    "total_carbon_cost",
+    "carbon_cost",
     "final_global_error",
     "avg_global_error_per_slot",
+    "requests_in",
     "requests_assigned_with_greedy_fallback",
     "requests_assigned_with_relaxed_retry",
     "total_rollbacks",
-    "max_consecutive_rollbacks",
-    "baseline_total_carbon_cost",
-    "carbon_cost_saving_vs_baseline_pct",
+    "peak_consecutive_rollbacks",
+    "baseline_carbon_cost",
+    "carbon_saving",
     "peak_concurrent_workers",
     "avg_concurrent_workers",
 ]
@@ -158,10 +164,9 @@ def _run_python_mode(
     output_dir: Path,
     baseline_cost: float,
 ) -> List[Dict[str, Any]]:
-    """Run the Python solver for all batch_sizes under one infeasibility mode."""
-    dp_relaxed = mode == "relaxed_retry"
-    original_relaxed = online2_config.DP_ALLOW_RELAXED_ERROR_RETRY
-    online2_config.DP_ALLOW_RELAXED_ERROR_RETRY = dp_relaxed
+    """Run the Python solver for all batch_sizes under one infeasibility_recovery_mode."""
+    original_recovery_mode = online2_config.INFEASIBILITY_RECOVERY_MODE
+    online2_config.INFEASIBILITY_RECOVERY_MODE = mode
     rows: List[Dict[str, Any]] = []
     try:
         for n in batch_sizes:
@@ -184,9 +189,10 @@ def _run_python_mode(
                 "batch_size": n,
                 "infeasibility_mode": mode,
                 "solver_time_ms_avg": float(s["solver_time_ms_avg"]),
-                "total_carbon_cost": carbon,
+                "carbon_cost": carbon,
                 "final_global_error": float(s["global_average_error"]),
                 "avg_global_error_per_slot": _avg_slot_error_from_list(result.per_timeslot),
+                "requests_in": int(s.get("requests_total", 0)),
                 "requests_assigned_with_greedy_fallback": int(
                     s.get("requests_assigned_with_greedy_fallback", 0)
                 ),
@@ -194,9 +200,9 @@ def _run_python_mode(
                     s.get("requests_assigned_with_relaxed_retry", 0)
                 ),
                 "total_rollbacks": 0,
-                "max_consecutive_rollbacks": 0,
-                "baseline_total_carbon_cost": baseline_cost,
-                "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                "peak_consecutive_rollbacks": 0,
+                "baseline_carbon_cost": baseline_cost,
+                "carbon_saving": savings_pct,
                 "peak_concurrent_workers": 0,
                 "avg_concurrent_workers": 0.0,
             })
@@ -208,7 +214,7 @@ def _run_python_mode(
                 f"saving={savings_pct:.1f}%"
             )
     finally:
-        online2_config.DP_ALLOW_RELAXED_ERROR_RETRY = original_relaxed
+        online2_config.INFEASIBILITY_RECOVERY_MODE = original_recovery_mode
     return rows
 
 
@@ -218,7 +224,7 @@ def _write_rust_config(
     scenario_path: Path,
     batch_sizes: List[int],
     output_dir: Path,
-    dp_allow_relaxed: bool,
+    infeasibility_recovery_mode: str,
     include_baseline: bool,
     additional_strategies: Optional[List[str]] = None,
     online_strategies: Optional[List[str]] = None,
@@ -236,15 +242,16 @@ def _write_rust_config(
         "include_greedy_baseline": include_baseline,
         "realtime_slots": realtime_slots,
         "realtime_speed_scale": realtime_speed_scale,
-        "dp_allow_relaxed_error_retry": dp_allow_relaxed,
+        "infeasibility_recovery_mode": infeasibility_recovery_mode,
         "rollback_max_consecutive": rollback_max_consecutive,
         "max_batch_solver_parallelism": max_batch_solver_parallelism,
         "online_swarm_mode": online_swarm_mode,
     }
     if not include_baseline and baseline_total_carbon_cost is not None:
-        # Reuse a baseline computed by an earlier invocation (e.g. the DP/relaxed_retry
-        # run) so this run's own "saving_vs_baseline" stdout/CSV fields are populated
-        # instead of silently staying at 0 (this run never recomputes the baseline).
+        # Reuse a baseline computed by an earlier invocation (e.g. the first
+        # infeasibility_recovery_mode run) so this run's own "saving_vs_baseline"
+        # stdout/CSV fields are populated instead of silently staying at 0
+        # (this run never recomputes the baseline).
         runner["baseline_total_carbon_cost"] = baseline_total_carbon_cost
     if additional_strategies:
         runner["additional_strategies"] = additional_strategies
@@ -290,13 +297,12 @@ def _run_rust_scenario(
     for mode_idx, mode in enumerate(modes):
         mode_dir = output_dir / f"rust_{mode}"
         mode_dir.mkdir(parents=True, exist_ok=True)
-        dp_relaxed = mode == "relaxed_retry"
         include_baseline = baseline_cost is None  # compute baseline only on the first mode
         # Run online strategies alongside the first mode to avoid duplicate work.
         run_online = online_strategies if mode_idx == 0 else None
 
         tmp_config = _write_rust_config(
-            scenario_path, batch_sizes, mode_dir, dp_relaxed, include_baseline,
+            scenario_path, batch_sizes, mode_dir, mode, include_baseline,
             online_strategies=run_online,
             realtime_slots=realtime_slots,
             realtime_speed_scale=realtime_speed_scale,
@@ -316,7 +322,7 @@ def _run_rust_scenario(
                 with open(baseline_csv, newline="") as f:
                     rows_csv = list(csv.DictReader(f))
                 if rows_csv:
-                    baseline_cost = float(rows_csv[0].get("total_carbon_cost", 0.0))
+                    baseline_cost = float(rows_csv[0].get("carbon_cost", 0.0))
                     print(f"    [rust/baseline]: carbon={baseline_cost:.3f}")
 
         bc = baseline_cost or 0.0
@@ -329,7 +335,7 @@ def _run_rust_scenario(
         with open(summary_csv, newline="") as f:
             for row in csv.DictReader(f):
                 n = int(row["batch_size"])
-                carbon = float(row["total_carbon_cost"])
+                carbon = float(row["carbon_cost"])
                 savings_pct = (bc - carbon) / bc * 100.0 if bc > 0.0 else 0.0
                 avg_slot_err = _avg_slot_error_from_csv(mode_dir / f"N{n}" / "per_timeslot.csv")
                 all_rows.append({
@@ -338,9 +344,10 @@ def _run_rust_scenario(
                     "batch_size": n,
                     "infeasibility_mode": mode,
                     "solver_time_ms_avg": float(row["solver_time_ms_avg"]),
-                    "total_carbon_cost": carbon,
+                    "carbon_cost": carbon,
                     "final_global_error": float(row["global_average_error"]),
                     "avg_global_error_per_slot": avg_slot_err,
+                    "requests_in": int(row.get("requests_total", 0)),
                     "requests_assigned_with_greedy_fallback": int(
                         row.get("requests_assigned_with_greedy_fallback", 0)
                     ),
@@ -348,9 +355,9 @@ def _run_rust_scenario(
                         row.get("requests_assigned_with_relaxed_retry", 0)
                     ),
                     "total_rollbacks": int(row.get("total_rollbacks", 0)),
-                    "max_consecutive_rollbacks": int(row.get("max_consecutive_rollbacks", 0)),
-                    "baseline_total_carbon_cost": bc,
-                    "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                    "peak_consecutive_rollbacks": int(row.get("peak_consecutive_rollbacks", 0)),
+                    "baseline_carbon_cost": bc,
+                    "carbon_saving": savings_pct,
                     "peak_concurrent_workers": int(row.get("peak_concurrent_workers", 0)),
                     "avg_concurrent_workers": float(row.get("avg_concurrent_workers", 0.0)),
                 })
@@ -405,7 +412,7 @@ def _run_rust_scenario(
             with open(summary_csv, newline="") as f:
                 rows_csv = list(csv.DictReader(f))
             for row in rows_csv:
-                carbon = float(row.get("total_carbon_cost", 0.0))
+                carbon = float(row.get("carbon_cost", 0.0))
                 savings_pct = (bc - carbon) / bc * 100.0 if bc > 0.0 else 0.0
                 avg_slot_err = _avg_slot_error_from_csv(per_ts_csv)
                 all_rows.append({
@@ -415,15 +422,16 @@ def _run_rust_scenario(
                     # Prefix with "offline_" for unambiguous distinction from "online_*" modes.
                     "infeasibility_mode": f"offline_{strategy}",
                     "solver_time_ms_avg": float(row.get("solver_time_ms_avg", 0.0)),
-                    "total_carbon_cost": carbon,
+                    "carbon_cost": carbon,
                     "final_global_error": float(row.get("global_average_error", 0.0)),
                     "avg_global_error_per_slot": avg_slot_err,
+                    "requests_in": int(row.get("requests_total", 0)),
                     "requests_assigned_with_greedy_fallback": 0,
                     "requests_assigned_with_relaxed_retry": 0,
                     "total_rollbacks": 0,
-                    "max_consecutive_rollbacks": 0,
-                    "baseline_total_carbon_cost": bc,
-                    "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                    "peak_consecutive_rollbacks": 0,
+                    "baseline_carbon_cost": bc,
+                    "carbon_saving": savings_pct,
                     "peak_concurrent_workers": 0,
                     "avg_concurrent_workers": 0.0,
                 })
@@ -455,7 +463,7 @@ def _run_rust_scenario(
                 rows_csv = list(csv.DictReader(f))
             for row in rows_csv:
                 n = int(row["batch_size"])
-                carbon = float(row["total_carbon_cost"])
+                carbon = float(row["carbon_cost"])
                 savings_pct = (bc - carbon) / bc * 100.0 if bc > 0.0 else 0.0
                 per_ts_csv = first_mode_dir / f"online_{strategy}" / f"N{n}" / "per_timeslot.csv"
                 avg_slot_err = _avg_slot_error_from_csv(per_ts_csv)
@@ -465,15 +473,16 @@ def _run_rust_scenario(
                     "batch_size": n,
                     "infeasibility_mode": f"online_{strategy}",
                     "solver_time_ms_avg": float(row.get("solver_time_ms_avg", 0.0)),
-                    "total_carbon_cost": carbon,
+                    "carbon_cost": carbon,
                     "final_global_error": float(row.get("global_average_error", 0.0)),
                     "avg_global_error_per_slot": avg_slot_err,
+                    "requests_in": int(row.get("requests_total", 0)),
                     "requests_assigned_with_greedy_fallback": 0,
                     "requests_assigned_with_relaxed_retry": 0,
                     "total_rollbacks": 0,
-                    "max_consecutive_rollbacks": 0,
-                    "baseline_total_carbon_cost": bc,
-                    "carbon_cost_saving_vs_baseline_pct": savings_pct,
+                    "peak_consecutive_rollbacks": 0,
+                    "baseline_carbon_cost": bc,
+                    "carbon_saving": savings_pct,
                     "peak_concurrent_workers": int(row.get("peak_concurrent_workers", 0)),
                     "avg_concurrent_workers": float(row.get("avg_concurrent_workers", 0.0)),
                 })
@@ -602,7 +611,7 @@ def _top3_markdown_table(
     """Markdown table of the 3 lowest-carbon-cost rows, or a placeholder if empty."""
     if not rows:
         return "_no executions in this category_\n"
-    top3 = sorted(rows, key=lambda r: r["total_carbon_cost"])[:3]
+    top3 = sorted(rows, key=lambda r: r["carbon_cost"])[:3]
     lines = [
         "| Config | Carbon saving (%) | Carbon cost | Solver ms (avg) | Elapsed (s) |",
         "|---|---|---|---|---|",
@@ -612,8 +621,8 @@ def _top3_markdown_table(
         elapsed = elapsed_lookup.get(key)
         elapsed_str = f"{elapsed:.1f}" if elapsed is not None else "n/a"
         lines.append(
-            f"| {_row_label(r)} | {r['carbon_cost_saving_vs_baseline_pct']:.2f} | "
-            f"{r['total_carbon_cost']:.3f} | {r['solver_time_ms_avg']:.1f} | {elapsed_str} |"
+            f"| {_row_label(r)} | {r['carbon_saving']:.2f} | "
+            f"{r['carbon_cost']:.3f} | {r['solver_time_ms_avg']:.1f} | {elapsed_str} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -629,7 +638,10 @@ def _build_top3_section(
     }
     scenario_ids = sorted({r["scenario_id"] for r in all_rows})
     categories = [
-        ("Relaxed retry (DP) — top 3 by carbon cost", lambda m: m == "relaxed_retry"),
+        (
+            "DP recovery modes — top 3 by carbon cost",
+            lambda m: not m.startswith("online_") and not m.startswith("offline_"),
+        ),
         ("Online alternative strategies — top 3 by carbon cost", lambda m: m.startswith("online_")),
         ("Offline alternative strategies — top 3 by carbon cost", lambda m: m.startswith("offline_")),
     ]
@@ -734,8 +746,7 @@ def run_battery(config_path: Path) -> None:
         base_output_dir = (CARBONSHIFT_ROOT / base_output_dir).resolve()
 
     batch_sizes: List[int] = [int(n) for n in cfg["batch_sizes"]]
-    modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback", "relaxed_retry"])
-    # modes: List[str] = cfg.get("infeasibility_modes", ["greedy_fallback"])
+    modes: List[str] = cfg.get("infeasibility_modes", ["min_error_greedy", "carryover", "forecast"])
     backend: str = cfg.get("backend", "python")
     additional_strategies: List[str] = cfg.get("additional_strategies", [])
     online_strategies: List[str] = cfg.get("online_strategies", [])

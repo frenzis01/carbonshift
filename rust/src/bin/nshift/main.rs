@@ -37,14 +37,17 @@
 //!     "include_greedy_baseline":      true,
 //!     "realtime_slots":               false,
 //!     "realtime_speed_scale":         1.0,
-//!     "dp_allow_relaxed_error_retry": true
+//!     "infeasibility_recovery_mode":  "carryover"
 //!   }
 //! }
 //! ```
 //!
 //! **Key runner fields:**
-//! - `dp_allow_relaxed_error_retry` (default: `true`): when `false`, the scheduler skips the
-//!   relaxed-window DP retry and falls back directly to greedy on infeasibility.
+//! - `infeasibility_recovery_mode` (default: `Config::infeasibility_recovery_mode`, "carryover"):
+//!   one of "min_error_greedy" | "carryover" | "forecast". The error-window constraint is never
+//!   relaxed/removed; on infeasibility the scheduler always falls back directly to
+//!   `greedy_fallback` (accurate flavour, cheapest feasible slot). This setting only controls
+//!   whether/how synthetic mock requests dilute the error baseline used by the primary DP solve.
 //!
 //! **Key fields:**
 //! - `batch_sizes`: list of N values to benchmark.
@@ -92,8 +95,9 @@ struct BenchmarkConfig {
     realtime_slots: bool,
     realtime_speed_scale: f64,
     include_greedy_baseline: bool,
-    /// When false, skip relaxed-window DP retry on infeasibility and go straight to greedy.
-    dp_allow_relaxed_error_retry: bool,
+    /// Overrides `Config::infeasibility_recovery_mode` when present; `None`
+    /// keeps the default. One of "min_error_greedy" | "carryover" | "forecast".
+    infeasibility_recovery_mode: Option<String>,
     /// Max consecutive rollbacks before force-committing (0 = rollback disabled).
     rollback_max_consecutive: usize,
     /// Additional offline strategies to run (e.g. "greedy_cheapest", "bandit", "ant_colony").
@@ -149,8 +153,10 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         runner.get("realtime_speed_scale").and_then(|x| x.as_f64()).unwrap_or(1.0);
     let include_greedy_baseline =
         runner.get("include_greedy_baseline").and_then(|x| x.as_bool()).unwrap_or(true);
-    let dp_allow_relaxed_error_retry =
-        runner.get("dp_allow_relaxed_error_retry").and_then(|x| x.as_bool()).unwrap_or(true);
+    let infeasibility_recovery_mode = runner
+        .get("infeasibility_recovery_mode")
+        .and_then(|x| x.as_str())
+        .map(String::from);
     // TODO in run_battery this is set in a tmp config. ideally unify with the same param in config.rs
     let rollback_max_consecutive =
         runner.get("rollback_max_consecutive").and_then(|x| x.as_u64()).unwrap_or(3) as usize;
@@ -184,7 +190,7 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .get("baseline_total_carbon_cost")
         .and_then(|x| x.as_f64());
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, dp_allow_relaxed_error_retry, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode, baseline_total_carbon_cost }
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, infeasibility_recovery_mode, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode, baseline_total_carbon_cost }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -526,6 +532,7 @@ fn compute_summary(
     let (fw_min, fw_max, fw_avg) = min_max_avg(
         &per_req.iter().map(|r| r.final_wait_seconds).collect::<Vec<_>>(),
     );
+    let greedy = per_req.iter().filter(|r| r.assigned_with_greedy_fallback).count();
     let relaxed = per_req.iter().filter(|r| r.assigned_with_relaxed_retry).count();
     let requests_late = per_req.iter().filter(|r| r.lateness_slots > 0).count();
     let max_lateness_slots = per_req.iter().map(|r| r.lateness_slots).max().unwrap_or(0);
@@ -550,7 +557,7 @@ fn compute_summary(
         global_average_error_modeled:           avg_error,
         global_average_error_real_skip_first_k: 0.0,
         global_average_error_modeled_skip_first_k: 0.0,
-        requests_assigned_with_greedy_fallback: 0,
+        requests_assigned_with_greedy_fallback: greedy,
         requests_assigned_with_relaxed_retry:   relaxed,
         total_rollbacks,
         max_consecutive_rollbacks,
@@ -776,6 +783,25 @@ fn run_greedy_cheapest(
             .min(arrival + max_future)
             .min(total_slots - 1);
 
+        // Global error constraint: retrospective (based on the average error
+        // *before* this request), not a per-candidate forward projection —
+        // mirrors solve_dp's step-function behaviour (Step 4 in solve_dp).
+        let global_avg = if global_count > 0 { global_error_sum / global_count as f64 } else { 0.0 };
+        let global_constraint_active =
+            cfg.global_error_constraint_enabled && global_count > 0 && global_avg > max_err;
+        // If the hard constraint would exclude every flavour, fall back to the
+        // full set (safety net identical to solve_dp's "never remove all flavours").
+        let allowed_flavours: Vec<&Flavour> = if global_constraint_active && cfg.global_error_constraint_hard {
+            let filtered: Vec<&Flavour> = sorted_flavours
+                .iter()
+                .filter(|f| f.error <= max_err)
+                .copied()
+                .collect();
+            if filtered.is_empty() { sorted_flavours.clone() } else { filtered }
+        } else {
+            sorted_flavours.clone()
+        };
+
         // Find the cheapest feasible (slot, flavour) pair with a full scan.
         let mut best: Option<(f64, i32, &Flavour)> = None;
         for slot in arrival..=deadline {
@@ -783,17 +809,17 @@ fn run_greedy_cheapest(
             let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
             let mult     = get_capacity_multiplier(tiers, position as i64);
 
-            for flav in &sorted_flavours {
+            for flav in &allowed_flavours {
                 let cost = ci * mult * flav.duration as f64 * scale;
 
-                if cfg.global_error_constraint_enabled {
-                    let new_avg = (global_error_sum + flav.error) / (global_count as f64 + 1.0);
-                    if new_avg > max_err { continue; }
-                }
                 {
+                    // Error window is anchored to `arrival` (when the request is
+                    // being decided), not to the candidate `slot` being tried —
+                    // mirrors solve_dp, which centers the window on current_slot
+                    // regardless of where the request ends up being placed.
                     let mut win_sum = flav.error;
                     let mut win_cnt = 1usize;
-                    for ws in (slot - win_past)..=(slot + win_future) {
+                    for ws in (arrival - win_past)..=(arrival + win_future) {
                         if let Some(errs) = slot_errors.get(&ws) {
                             win_sum += errs.iter().sum::<f64>();
                             win_cnt += errs.len();
@@ -1001,17 +1027,17 @@ const SUMMARY_CSV_HEADER: &[&str] = &[
     "requests_total", "requests_scheduled", "requests_unscheduled",
     "requests_late", "max_lateness_slots",
     "batches_executed",
-    "total_carbon_cost", "global_average_error", "global_average_error_real",
+    "carbon_cost", "global_average_error", "global_average_error_real",
     "global_average_error_modeled", "global_average_error_real_skip_first_k",
     "global_average_error_modeled_skip_first_k",
     "requests_assigned_with_greedy_fallback", "requests_assigned_with_relaxed_retry",
-    "total_rollbacks", "max_consecutive_rollbacks", "requests_assigned_with_rollback",
+    "total_rollbacks", "peak_consecutive_rollbacks", "requests_assigned_with_rollback",
     "peak_concurrent_workers", "avg_concurrent_workers",
     "solver_time_ms_min", "solver_time_ms_max", "solver_time_ms_avg",
     "queue_wait_seconds_min", "queue_wait_seconds_max", "queue_wait_seconds_avg",
     "final_wait_seconds_min", "final_wait_seconds_max", "final_wait_seconds_avg",
-    "baseline_total_carbon_cost", "carbon_cost_saving_vs_baseline",
-    "carbon_cost_saving_vs_baseline_pct",
+    "baseline_carbon_cost", "carbon_cost_saving_vs_baseline",
+    "carbon_saving",
     "run_elapsed_seconds",
 ];
 
@@ -1030,7 +1056,7 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "requests_late":                           s.requests_late,
         "max_lateness_slots":                      s.max_lateness_slots,
         "batches_executed":                        s.batches_executed,
-        "total_carbon_cost":                       s.total_carbon_cost,
+        "carbon_cost":                             s.total_carbon_cost,
         "global_average_error":                    s.global_average_error,
         "global_average_error_real":               s.global_average_error_real,
         "global_average_error_modeled":            s.global_average_error_modeled,
@@ -1039,7 +1065,7 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "requests_assigned_with_greedy_fallback":  s.requests_assigned_with_greedy_fallback,
         "requests_assigned_with_relaxed_retry":    s.requests_assigned_with_relaxed_retry,
         "total_rollbacks":                         s.total_rollbacks,
-        "max_consecutive_rollbacks":               s.max_consecutive_rollbacks,
+        "peak_consecutive_rollbacks":              s.max_consecutive_rollbacks,
         "requests_assigned_with_rollback":         s.requests_assigned_with_rollback,
         "peak_concurrent_workers":                 s.peak_concurrent_workers,
         "avg_concurrent_workers":                  s.avg_concurrent_workers,
@@ -1052,9 +1078,9 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "final_wait_seconds_min":                  s.final_wait_seconds_min,
         "final_wait_seconds_max":                  s.final_wait_seconds_max,
         "final_wait_seconds_avg":                  s.final_wait_seconds_avg,
-        "baseline_total_carbon_cost":              s.baseline_total_carbon_cost,
+        "baseline_carbon_cost":                    s.baseline_total_carbon_cost,
         "carbon_cost_saving_vs_baseline":          s.carbon_cost_saving_vs_baseline,
-        "carbon_cost_saving_vs_baseline_pct":      s.carbon_cost_saving_vs_baseline_pct,
+        "carbon_saving":                           s.carbon_cost_saving_vs_baseline_pct,
         "run_elapsed_seconds":                     s.run_elapsed_seconds,
     })
 }
@@ -1543,7 +1569,9 @@ fn main() {
     // Build a base config that has all scenario parameters applied.
     let mut base_cfg = Config::default();
     base_cfg.apply_scenario_metadata(&scenario.metadata);
-    base_cfg.dp_allow_relaxed_error_retry = bcfg.dp_allow_relaxed_error_retry;
+    if let Some(mode) = &bcfg.infeasibility_recovery_mode {
+        base_cfg.infeasibility_recovery_mode = mode.clone();
+    }
     base_cfg.rollback_max_consecutive     = bcfg.rollback_max_consecutive;
     base_cfg.batch_timeout_secs           = bcfg.batch_timeout_secs;
     if let Some(parallelism) = bcfg.max_batch_solver_parallelism {

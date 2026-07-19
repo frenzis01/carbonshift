@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
 use crate::shared_state::{CommitOutcome, SharedState, SolverSnapshot};
-use crate::types::{Assignment, Flavour, Request, RequestAssignment};
+use crate::types::{Assignment, Flavour, Request};
 
 // ─── internal state types ────────────────────────────────────────────────────
 
@@ -1051,61 +1051,35 @@ fn solve_dp(
     let mut solve_mode = format!("dp_{effective_pruning}");
 
     if scheduled_pending_ids.len() != pending_ids.len() {
+        // Greedy fallback: the error constraint is never relaxed/removed — on
+        // infeasibility (even after mock-pool dilution, if the recovery mode
+        // injects one) we go straight to the accurate-flavour/cheapest-slot
+        // fallback below. There is no intermediate "retry DP without the
+        // error threshold" step.
         if cfg.verbose {
             println!(
-                "[Scheduler] ⚠ Infeasible ({}/{} pending covered): trying relaxed retry.",
+                "[Scheduler] ⚠ Infeasible ({}/{} pending covered): forcing greedy scheduling.",
                 scheduled_pending_ids.len(),
                 pending_ids.len()
             );
         }
-
-        // 5a. Relaxed retry: re-run without the error-window threshold.
-        let (relaxed, relaxed_mode) = solve_relaxed_retry(
-            current_slot,
-            &dp_requests,
-            cfg,
-            carbon_forecast,
-            &baseline_slot_counts,
-            &error_baseline,
-            assignment_cap,
-            &mock_pool_input,
-            &solver_flavours,
-        );
-
-        let relaxed_pending: HashSet<u64> = relaxed
+        let pending_only: Vec<(u64, i32)> = pending
             .iter()
-            .filter(|a| pending_ids.contains(&a.request_id))
-            .map(|a| a.request_id)
+            .map(|r| (r.id, cap_deadline(r.deadline_slot)))
             .collect();
+        let deadlines: Vec<i32> = pending_only.iter().map(|(_, d)| *d).collect();
 
-        if relaxed_pending.len() == pending_ids.len() {
-            dp_assignments = relaxed;
-            solve_status = "ok_relaxed".to_string();
-            solve_mode = relaxed_mode;
-        } else {
-            // 5b. Greedy fallback: schedule pending-only requests ignoring the
-            //     error window completely.
-            if cfg.verbose {
-                println!("[Scheduler] ⚠ Still infeasible: forcing greedy scheduling.");
-            }
-            let pending_only: Vec<(u64, i32)> = pending
-                .iter()
-                .map(|r| (r.id, cap_deadline(r.deadline_slot)))
-                .collect();
-            let deadlines: Vec<i32> = pending_only.iter().map(|(_, d)| *d).collect();
-
-            let greedy_solver = build_solver(&cfg.flavours, carbon_forecast, cfg, "none");
-            let greedy = greedy_solver.greedy_fallback(
-                &pending_only,
-                &deadlines,
-                current_slot,
-                &cfg.capacity_tiers,
-                &base_counts_arr,
-            );
-            dp_assignments = greedy;
-            solve_status = "ok_greedy_after_infeasible".to_string();
-            solve_mode = "greedy_after_infeasible".to_string();
-        }
+        let greedy_solver = build_solver(&cfg.flavours, carbon_forecast, cfg, "none");
+        let greedy = greedy_solver.greedy_fallback(
+            &pending_only,
+            &deadlines,
+            current_slot,
+            &cfg.capacity_tiers,
+            &base_counts_arr,
+        );
+        dp_assignments = greedy;
+        solve_status = "ok_greedy_after_infeasible".to_string();
+        solve_mode = "greedy_after_infeasible".to_string();
     }
 
     // Safety check: if not all pending are covered, signal infeasibility.
@@ -1294,7 +1268,7 @@ fn apply_infeasibility_recovery(
     // Update mock influence once per slot (needs the current baseline avg).
     update_mock_influence(current_slot, baseline.average_error, cfg, mutable);
 
-    if mode == "min_error_recovery" {
+    if mode == "min_error_greedy" {
         // No mock injection; reset any persistent pool.
         reset_mock_pool(mutable);
         return (baseline, MockPool::default());
@@ -1388,7 +1362,7 @@ fn compute_mock_seed(
     snapshot: &SolverSnapshot,
 ) -> (i32, f64) {
     let (mut count, error) = match mode {
-        "carryover_last_slot" => {
+        "carryover" => {
             let window_start = (slot - cfg.error_window_past).max(0);
             let dropped_slot = window_start - 1;
             if dropped_slot < 0 {
@@ -1403,7 +1377,7 @@ fn compute_mock_seed(
             let mock_err = resolve_mock_error(avg_err, cfg);
             (n, mock_err)
         }
-        "forecast_mock_current_slot" => {
+        "forecast" => {
             let rate = cfg.predicted_requests_per_slot;
             let sigma = (rate * cfg.request_rate_std_factor).max(1.0);
             let seed = cfg.prehistory_random_seed.wrapping_add(slot as u64);
@@ -1436,7 +1410,7 @@ fn consume_mock_pool(
     cfg: &Config,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) {
-    if cfg.infeasibility_recovery_mode.trim().to_lowercase() == "min_error_recovery" {
+    if cfg.infeasibility_recovery_mode.trim().to_lowercase() == "min_error_greedy" {
         return;
     }
     let mut g = mutable.lock().unwrap();
@@ -1451,70 +1425,6 @@ fn reset_mock_pool(mutable: &Arc<Mutex<SchedulerMutableState>>) {
     g.mock_pool.mode = None;
     g.mock_pool.remaining = 0;
     g.mock_pool.error = 0.0;
-}
-
-// ─── relaxed retry ────────────────────────────────────────────────────────────
-
-/// Re-run DP without the strict error-window threshold.
-///
-/// Returns `(assignments, mode_label)`.  Empty vec when relaxed retry is
-/// disabled or fails.
-fn solve_relaxed_retry(
-    current_slot: i32,
-    dp_requests: &[(u64, i32)],
-    cfg: &Config,
-    carbon_forecast: &[f64],
-    baseline_slot_counts: &HashMap<i32, i32>,
-    error_baseline: &ErrorBaseline,
-    assignment_cap: i32,
-    mock_pool: &MockPool,
-    solver_flavours: &[Flavour],
-) -> (Vec<RequestAssignment>, String) {
-    if !cfg.dp_allow_relaxed_error_retry {
-        return (vec![], "dp_relaxed_disabled".to_string());
-    }
-
-    let prefer_min = cfg.dp_relaxed_retry_prefer_min_error;
-    let relaxed_flavours: Vec<Flavour> = if prefer_min && !solver_flavours.is_empty() {
-        let min_err = solver_flavours
-            .iter()
-            .map(|f| f.error)
-            .fold(f64::INFINITY, f64::min);
-        let filtered: Vec<Flavour> = solver_flavours
-            .iter()
-            .filter(|f| (f.error - min_err).abs() < 1e-9)
-            .cloned()
-            .collect();
-        if filtered.is_empty() { solver_flavours.to_vec() } else { filtered }
-    } else {
-        solver_flavours.to_vec()
-    };
-
-    let mode_label = if prefer_min {
-        "dp_relaxed_min_error".to_string()
-    } else {
-        "dp_relaxed_error".to_string()
-    };
-
-    let solver = build_solver(&relaxed_flavours, carbon_forecast, cfg, "none");
-    let result = solver.solve_batch(SolveBatchInput {
-        requests: dp_requests,
-        current_slot,
-        capacity_multiplier: 1.0,
-        capacity_tiers: &cfg.capacity_tiers,
-        baseline_slot_counts,
-        error_window_baseline: ErrorWindowBaseline {
-            error_sum: error_baseline.error_sum,
-            request_count: error_baseline.request_count,
-        },
-        max_error_threshold: None, // relaxed: no error constraint
-        error_window_past: cfg.error_window_past,
-        error_window_future: cfg.error_window_future,
-        assignment_max_slot: Some(assignment_cap),
-        dynamic_mock_pool: mock_pool.clone(),
-    });
-
-    (result, mode_label)
 }
 
 // ─── misc helpers ─────────────────────────────────────────────────────────────
@@ -1629,8 +1539,7 @@ mod tests {
             error_window_future: 4,
             max_error_threshold: 4.0,
             dp_lock_future_assignments: true,
-            dp_allow_relaxed_error_retry: false,
-            infeasibility_recovery_mode: "min_error_recovery".to_string(),
+            infeasibility_recovery_mode: "min_error_greedy".to_string(),
             infeasibility_mock_influence: 0.0,
             verbose: false,
             enable_solver_logging: false,
@@ -1788,7 +1697,6 @@ mod tests {
         let cfg = make_config(|c| {
             c.max_error_threshold = 0.0;
             c.flavours = vec![Flavour { name: "Only".to_string(), error: 1.0, duration: 10 }];
-            c.dp_allow_relaxed_error_retry = false;
         });
 
         let current_slot = 0;
