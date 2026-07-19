@@ -586,23 +586,14 @@ class BatchScheduler:
 
         scheduled_pending_ids = {a.request_id for a in dp_assignments if a.request_id in pending_ids}
         if len(scheduled_pending_ids) != len(pending_ids):
+            # Greedy fallback: the error constraint is never relaxed/removed —
+            # on infeasibility (even after mock-pool dilution, if the recovery
+            # mode injects one) we go straight to the accurate-flavour/
+            # cheapest-slot fallback below. There is no intermediate "retry DP
+            # without the error threshold" step.
             if config.VERBOSE:
-                print("[Scheduler] ⚠ Infeasible with strict error window: retry with relaxed window.")
+                print("[Scheduler] ⚠ Infeasible with strict error window: forcing greedy scheduling.")
 
-            # 5a. Relaxed retry: re-run DP without the error-window constraint
-            #     (or with min-error flavour only) to try to cover all pending ids.
-            relaxed_assignments, relaxed_mode = self._solve_relaxed_retry(
-                solver=solver,
-                dp_requests=dp_requests,
-                current_slot=current_slot,
-                baseline_slot_counts=baseline_slot_counts,
-                baseline_slot_durations=baseline_slot_durations,
-                error_baseline=error_baseline,
-                assignment_cap_slot=assignment_cap_slot,
-                dynamic_mock_pool=dynamic_mock_pool,
-                recovery_mode=solve_context.get("infeasibility_recovery_mode", "min_error_recovery"),
-            )
-            relaxed_pending_ids = {a.request_id for a in relaxed_assignments if a.request_id in pending_ids}
             debug_event_id = self._log_strict_infeasibility_debug(
                 current_slot=current_slot,
                 pending_requests=requests,
@@ -611,44 +602,34 @@ class BatchScheduler:
                 baseline_slot_counts=baseline_slot_counts,
                 error_baseline=error_baseline,
                 strict_scheduled_pending_count=len(scheduled_pending_ids),
-                relaxed_scheduled_pending_count=len(relaxed_pending_ids),
             )
             if debug_event_id and config.VERBOSE:
                 print(f"[Scheduler] ℹ Strict infeasibility debug logged: event_id={debug_event_id}")
-            if len(relaxed_pending_ids) == len(pending_ids):
-                dp_assignments = relaxed_assignments
-                solve_context["status"] = "ok_relaxed"
-                solve_context["mode"] = relaxed_mode
-            else:
-                # 5b. Greedy fallback: all pending requests are scheduled to their
-                #     earliest feasible slot ignoring the error constraint entirely.
-                if config.VERBOSE:
-                    print("[Scheduler] ⚠ Still infeasible: forcing greedy scheduling for pending requests.")
 
-                base_counts_arr = [0] * config.TOTAL_SLOTS
-                base_durations_arr = [0] * config.TOTAL_SLOTS
-                for slot, count in baseline_slot_counts.items():
-                    if 0 <= slot < config.TOTAL_SLOTS:
-                        base_counts_arr[slot] = int(count)
-                for slot, dur in baseline_slot_durations.items():
-                    if 0 <= slot < config.TOTAL_SLOTS:
-                        base_durations_arr[slot] = int(dur)
+            base_counts_arr = [0] * config.TOTAL_SLOTS
+            base_durations_arr = [0] * config.TOTAL_SLOTS
+            for slot, count in baseline_slot_counts.items():
+                if 0 <= slot < config.TOTAL_SLOTS:
+                    base_counts_arr[slot] = int(count)
+            for slot, dur in baseline_slot_durations.items():
+                if 0 <= slot < config.TOTAL_SLOTS:
+                    base_durations_arr[slot] = int(dur)
 
-                pending_only_requests = [{"id": req.id, "deadline_slot": req.deadline_slot} for req in requests]
-                pending_only_deadlines = [
-                    _cap_deadline(req.deadline_slot)
-                    for req in requests
-                ]
-                dp_assignments = solver._greedy_fallback(
-                    requests=pending_only_requests,
-                    deadlines=pending_only_deadlines,
-                    current_slot=current_slot,
-                    capacity_tiers=config.CAPACITY_TIERS,
-                    base_counts=base_counts_arr,
-                    base_durations=base_durations_arr,
-                )
-                solve_context["status"] = "ok_greedy_after_infeasible"
-                solve_context["mode"] = "greedy_after_infeasible"
+            pending_only_requests = [{"id": req.id, "deadline_slot": req.deadline_slot} for req in requests]
+            pending_only_deadlines = [
+                _cap_deadline(req.deadline_slot)
+                for req in requests
+            ]
+            dp_assignments = solver._greedy_fallback(
+                requests=pending_only_requests,
+                deadlines=pending_only_deadlines,
+                current_slot=current_slot,
+                capacity_tiers=config.CAPACITY_TIERS,
+                base_counts=base_counts_arr,
+                base_durations=base_durations_arr,
+            )
+            solve_context["status"] = "ok_greedy_after_infeasible"
+            solve_context["mode"] = "greedy_after_infeasible"
 
         # Safety check: if pending requests are still not all covered, keep retry behavior.
         scheduled_pending_ids = {a.request_id for a in dp_assignments if a.request_id in pending_ids}
@@ -696,7 +677,7 @@ class BatchScheduler:
         solve_context["mock_recovery_consumed_in_run"] = mock_consumed
         solve_context["mock_recovery_remaining_after"] = self._consume_persistent_mock_pool(
             current_slot=current_slot,
-            recovery_mode=solve_context.get("infeasibility_recovery_mode", "min_error_recovery"),
+            recovery_mode=solve_context.get("infeasibility_recovery_mode", "min_error_greedy"),
             consumed_count=mock_consumed,
         )
         solve_context["modeled_window_avg_after"] = (
@@ -887,7 +868,7 @@ class BatchScheduler:
         }
         dynamic_mock_pool = {"initial_count": 0, "error_per_request": 0.0}
 
-        if mode == "min_error_recovery":
+        if mode == "min_error_greedy":
             self._reset_persistent_mock_pool()
             return error_baseline, dynamic_mock_pool, context
 
@@ -917,7 +898,7 @@ class BatchScheduler:
         mock_count = 0
         mock_error = 0.0
 
-        if mode == "carryover_last_slot":
+        if mode == "carryover":
             window_start, _ = self._error_window_bounds(current_slot)
             dropped_slot = window_start - 1
             if dropped_slot >= 0:
@@ -927,7 +908,7 @@ class BatchScheduler:
                     carryover_avg_error = sum(a.error for a in dropped_assignments) / mock_count
                     mock_error = self._resolve_infeasibility_mock_error(carryover_avg_error)
 
-        elif mode == "forecast_mock_current_slot":
+        elif mode == "forecast":
             expected_rate = float(config.PREDICTED_REQUESTS_PER_SLOT)
             sigma = max(1.0, expected_rate * float(config.REQUEST_RATE_STD_FACTOR))
             rng = random.Random(int(config.PREHISTORY_RANDOM_SEED) + int(current_slot))
@@ -938,7 +919,7 @@ class BatchScheduler:
             )
             mock_error = self._resolve_infeasibility_mock_error(forecast_default_error)
 
-        if mode in {"carryover_last_slot", "forecast_mock_current_slot"} and mock_count > 0:
+        if mode in {"carryover", "forecast"} and mock_count > 0:
             influence = self._mock_influence_effective
             mock_count = int(round(mock_count * influence))
 
@@ -979,7 +960,7 @@ class BatchScheduler:
         recovery_mode: str,
         consumed_count: int,
     ) -> int:
-        if str(recovery_mode) == "min_error_recovery":
+        if str(recovery_mode) == "min_error_greedy":
             return 0
         with self._lock:
             if (
@@ -1155,75 +1136,6 @@ class BatchScheduler:
             )
         return rows
 
-    def _solve_relaxed_retry(
-        self,
-        solver: RollingWindowDPScheduler,
-        dp_requests: List[Dict],
-        current_slot: int,
-        baseline_slot_counts: Dict[int, int],
-        baseline_slot_durations: Dict[int, int],
-        error_baseline: Dict[str, float],
-        assignment_cap_slot: int,
-        dynamic_mock_pool: Dict[str, float],
-        recovery_mode: str,
-    ) -> Tuple[List, str]:
-        """
-        Re-run DP without the hard error-window constraint.
-
-        Two sub-modes depending on config and recovery_mode:
-        - dp_relaxed_min_error: restrict flavours to min-error only.
-        - dp_relaxed_error: allow all flavours, omit max_error_threshold.
-        Both restore the original flavour list on the solver before returning.
-        """
-        # If relaxed retry is disabled, or recovery mode explicitly requests
-        # min-error recovery semantics, skip relaxed DP and force greedy.
-        if (
-            not config.DP_ALLOW_RELAXED_ERROR_RETRY
-            or recovery_mode == "min_error_recovery"
-        ):
-            return [], "dp_relaxed_disabled"
-
-        preferred_mode = "dp_relaxed_error"
-        original_strategies = solver.flavours
-        relaxed_flavours = original_strategies
-
-        prefer_min_error = (
-            recovery_mode == "min_error_recovery"
-            or config.DP_RELAXED_RETRY_PREFER_MIN_ERROR
-        )
-        if prefer_min_error and original_strategies:
-            min_error = min(float(s["error"]) for s in original_strategies)
-            relaxed_flavours = [
-                s for s in original_strategies if abs(float(s["error"]) - min_error) < 1e-9
-            ]
-            if relaxed_flavours:
-                preferred_mode = "dp_relaxed_min_error"
-
-        try:
-            solver.flavours = relaxed_flavours
-            relaxed_assignments = solver.solve_batch(
-                requests=dp_requests,
-                current_slot=current_slot,
-                capacity_tiers=config.CAPACITY_TIERS,
-                baseline_slot_counts=baseline_slot_counts,
-                baseline_slot_durations=baseline_slot_durations,
-                error_window_baseline=error_baseline,
-                max_error_threshold=None,
-                error_window_past=config.ERROR_WINDOW_PAST,
-                error_window_future=config.ERROR_WINDOW_FUTURE,
-                assignment_max_slot=assignment_cap_slot,
-                dynamic_mock_pool=dynamic_mock_pool,
-            )
-        except Exception as e:
-            if config.VERBOSE:
-                print(f"[Scheduler] ✗ Relaxed DP retry failed: {e}")
-            relaxed_assignments = []
-            preferred_mode = "dp_relaxed_failed"
-        finally:
-            solver.flavours = original_strategies
-
-        return relaxed_assignments, preferred_mode
-
     def _build_assignment_rows(
         self,
         assignments: List[Assignment],
@@ -1263,7 +1175,6 @@ class BatchScheduler:
         baseline_slot_counts: Dict[int, int],
         error_baseline: Dict[str, float],
         strict_scheduled_pending_count: int,
-        relaxed_scheduled_pending_count: int,
     ) -> str:
         if not config.ENABLE_INFEASIBILITY_DEBUG_LOGGING:
             return ""
@@ -1329,8 +1240,6 @@ class BatchScheduler:
             "max_possible_avg_error_pending_only": max_possible_avg,
             "strict_infeasible_by_error_bound": min_possible_avg > strict_threshold,
             "strict_scheduled_pending_count": strict_scheduled_pending_count,
-            "relaxed_scheduled_pending_count": relaxed_scheduled_pending_count,
-            "relaxed_success": relaxed_scheduled_pending_count == len(pending_ids),
             "lock_future_assignments": config.DP_LOCK_FUTURE_ASSIGNMENTS,
             "future_assignment_count": len(future_assignments),
             "future_slot_counts": future_slot_counts_serialized,

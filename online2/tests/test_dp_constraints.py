@@ -185,7 +185,6 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
                 ENABLE_SOLVER_LOGGING=True,
                 ENABLE_INFEASIBILITY_DEBUG_LOGGING=True,
                 PREHISTORY_USE_VIRTUAL_PAST=False,
-                DP_ALLOW_RELAXED_ERROR_RETRY=True,
                 SOLVER_INFEASIBLE_DEBUG_FILE=str(Path(tmp) / "strict_debug.csv"),
             ):
                 scheduler = BatchScheduler(shared_state)
@@ -194,15 +193,12 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
                     debug_rows = list(csv.DictReader(f))
 
         self.assertEqual(len(assignments), 3)
-        self.assertIn(
-            context.get("mode"),
-            {"dp_relaxed_error", "dp_relaxed_min_error", "greedy_after_infeasible", "dp"},
-        )
-        self.assertIn(context.get("status"), {"ok_relaxed", "ok_greedy_after_infeasible", "ok"})
+        self.assertEqual(context.get("mode"), "greedy_after_infeasible")
+        self.assertEqual(context.get("status"), "ok_greedy_after_infeasible")
         self.assertEqual(len(debug_rows), 1)
         self.assertEqual(debug_rows[0]["current_slot"], "3")
 
-    def test_strict_infeasible_forces_greedy_when_relaxed_disabled_or_min_error_mode(self):
+    def test_strict_infeasible_always_forces_greedy_fallback(self):
         shared_state = SharedSchedulerState()
         shared_state.set_current_slot(3)
 
@@ -237,24 +233,18 @@ class TestSchedulerFutureAssignmentsFlag(unittest.TestCase):
             PREHISTORY_USE_VIRTUAL_PAST=False,
             ENABLE_INFEASIBILITY_DEBUG_LOGGING=False,
         ):
-            cases = [
-                (False, "forecast_mock_current_slot"),
-                (True, "min_error_recovery"),
-            ]
-            for allow_relaxed_retry, recovery_mode in cases:
-                with self.subTest(
-                    allow_relaxed_retry=allow_relaxed_retry,
-                    recovery_mode=recovery_mode,
-                ):
-                    with config_override(
-                        DP_ALLOW_RELAXED_ERROR_RETRY=allow_relaxed_retry,
-                        INFEASIBILITY_RECOVERY_MODE=recovery_mode,
-                    ):
+            # The error constraint is never relaxed: regardless of recovery
+            # mode, strict infeasibility always resolves via direct greedy
+            # fallback (no intermediate threshold-relaxed DP retry).
+            for recovery_mode in ("forecast", "min_error_greedy"):
+                with self.subTest(recovery_mode=recovery_mode):
+                    with config_override(INFEASIBILITY_RECOVERY_MODE=recovery_mode):
                         scheduler = BatchScheduler(shared_state)
                         assignments, context = scheduler._solve_dp(pending_batch, current_slot=3)
                         self.assertEqual(len(assignments), 3)
                         self.assertEqual(context.get("status"), "ok_greedy_after_infeasible")
                         self.assertEqual(context.get("mode"), "greedy_after_infeasible")
+
 
     def test_virtual_prehistory_baseline_is_configurable_and_applied(self):
         shared_state = SharedSchedulerState()
@@ -336,7 +326,7 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         scheduler = BatchScheduler(shared_state)
 
         with config_override(
-            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_RECOVERY_MODE="forecast",
             INFEASIBILITY_MOCK_INFLUENCE=0.8,
             INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP=0.10,
             MAX_ERROR_THRESHOLD=4.0,
@@ -373,7 +363,7 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         scheduler = BatchScheduler(shared_state)
 
         with config_override(
-            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_RECOVERY_MODE="forecast",
             INFEASIBILITY_MOCK_INFLUENCE=0.15,
             INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP=0.10,
             MAX_ERROR_THRESHOLD=4.0,
@@ -400,7 +390,7 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         scheduler = BatchScheduler(shared_state)
 
         with config_override(
-            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_RECOVERY_MODE="forecast",
             INFEASIBILITY_MOCK_INFLUENCE=1.0,
             PREDICTED_REQUESTS_PER_SLOT=40.0,
             REQUEST_RATE_STD_FACTOR=0.0,
@@ -422,7 +412,7 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         scheduler = BatchScheduler(shared_state)
 
         with config_override(
-            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_RECOVERY_MODE="forecast",
             INFEASIBILITY_MOCK_INFLUENCE=1.0,
             PREDICTED_REQUESTS_PER_SLOT=40.0,
             REQUEST_RATE_STD_FACTOR=0.0,
@@ -445,7 +435,7 @@ class TestSchedulerMockInfluenceDecay(unittest.TestCase):
         scheduler = BatchScheduler(shared_state)
 
         with config_override(
-            INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot",
+            INFEASIBILITY_RECOVERY_MODE="forecast",
             INFEASIBILITY_MOCK_INFLUENCE=1.0,
             PREDICTED_REQUESTS_PER_SLOT=40.0,
             REQUEST_RATE_STD_FACTOR=0.0,

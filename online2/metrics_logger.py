@@ -94,8 +94,6 @@ class SolverMetricsLogger:
         "max_possible_avg_error_pending_only",
         "strict_infeasible_by_error_bound",
         "strict_scheduled_pending_count",
-        "relaxed_scheduled_pending_count",
-        "relaxed_success",
         "lock_future_assignments",
         "future_assignment_count",
         "future_slot_counts",

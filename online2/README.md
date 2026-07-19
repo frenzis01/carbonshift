@@ -140,15 +140,13 @@ DP_PRUNING_MIN_BATCH_SIZE = 5
 # False -> include future assignments in DP and allow re-planning
 DP_LOCK_FUTURE_ASSIGNMENTS = True
 
-# Strict infeasibility handling:
-# - allow one relaxed retry
-# - relaxed retry can prefer minimum-error strategy for recovery
-DP_ALLOW_RELAXED_ERROR_RETRY = True
-DP_RELAXED_RETRY_PREFER_MIN_ERROR = True
+# Strict infeasibility handling: the error-window constraint is never
+# relaxed/removed. On infeasibility, always fall back to the greedy fallback
+# (accurate flavour, cheapest feasible slot) — see INFEASIBILITY_RECOVERY_MODE.
 
 # Sliding-window infeasibility recovery policy:
-# "min_error_recovery" | "carryover_last_slot" | "forecast_mock_current_slot"
-INFEASIBILITY_RECOVERY_MODE = "min_error_recovery"
+# "min_error_greedy" | "carryover" | "forecast"
+INFEASIBILITY_RECOVERY_MODE = "min_error_greedy"
 INFEASIBILITY_MOCK_INFLUENCE = 0.8
 INFEASIBILITY_MOCK_INFLUENCE_DECAY_STEP = 0.10
 

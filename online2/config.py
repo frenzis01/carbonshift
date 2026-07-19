@@ -75,7 +75,7 @@ GLOBAL_ERROR_CONSTRAINT_HARD = True
 PREHISTORY_USE_VIRTUAL_PAST = False
 PREHISTORY_ERROR_RATIO_OF_THRESHOLD = 1.0  # avg error = threshold * ratio
 # Forecast-policy synthetic error ratio for infeasibility recovery.
-# Used only by INFEASIBILITY_RECOVERY_MODE="forecast_mock_current_slot":
+# Used only by INFEASIBILITY_RECOVERY_MODE="forecast":
 # mock_error = MAX_ERROR_THRESHOLD * FORECAST_ERROR_RATIO_OF_THRESHOLD
 FORECAST_ERROR_RATIO_OF_THRESHOLD = 1.0
 PREHISTORY_STOCHASTIC_COUNTS = True
@@ -132,20 +132,22 @@ DP_TIMEOUT = 7.0
 # be moved.
 DP_LOCK_FUTURE_ASSIGNMENTS = True
 
-# If strict error-window DP is infeasible, allow one relaxed retry.
-# Disable to enforce hard-threshold behavior only.
-DP_ALLOW_RELAXED_ERROR_RETRY = False
+# If strict error-window DP is infeasible, we NEVER relax/remove the error
+# constraint. Infeasibility always resolves via greedy fallback (the
+# minimum-error flavour, placed at the cheapest feasible slot within the
+# deadline) — see INFEASIBILITY_RECOVERY_MODE below and
+# RollingWindowDPScheduler._greedy_fallback.
 
-# When relaxed retry is enabled, prefer the minimum-error flavour(s) so the
-# system can recover from a violated baseline instead of drifting to high error.
-DP_RELAXED_RETRY_PREFER_MIN_ERROR = True
-
-# Behavior when strict infeasibility is caused by an error baseline that is
-# difficult to recover right after the window slides:
-# - "min_error_recovery": assign with minimum-error flavour on recovery steps
-# - "carryover_last_slot": use mock carryover from the slot that just left window
-# - "forecast_mock_current_slot": use mock expected arrivals for current slot
-INFEASIBILITY_RECOVERY_MODE = "forecast_mock_current_slot"
+# Behavior on infeasibility (strict error-window DP fails to cover all
+# pending requests):
+# - "min_error_greedy": no synthetic/mock requests are injected into the
+#   error baseline; go straight to greedy fallback on infeasibility.
+# - "carryover": inject mock requests carried over from the slot that just
+#   left the error window (with influence decay); if still infeasible even
+#   with mocks, go to greedy fallback.
+# - "forecast": inject mock requests sampled from the expected arrival rate
+#   for the current slot (with influence decay); same fallback behavior.
+INFEASIBILITY_RECOVERY_MODE = "forecast"
 
 # Scales the number of mock requests used in carryover/forecast recovery modes.
 # Range [0, 1]: lower means less mock influence (more pessimistic).

@@ -812,8 +812,7 @@ def plot_infeasibility_event(event_id: str, debug_df: pd.DataFrame):
         f"threshold={float(row.get('strict_threshold', 0.0)):.2f}%  "
         f"min_possible_avg={float(row.get('min_possible_avg_error_pending_only', 0.0)):.2f}%  "
         f"strict_covered={int(float(row.get('strict_scheduled_pending_count', 0)))} / "
-        f"{int(float(row.get('pending_batch_size', 0)))}  "
-        f"relaxed_covered={int(float(row.get('relaxed_scheduled_pending_count', 0)))}"
+        f"{int(float(row.get('pending_batch_size', 0)))} (greedy fallback applied)"
     )
     fig.text(0.01, 0.01, summary, fontsize=9, ha="left", va="bottom")
 
