@@ -1,0 +1,16 @@
+# Escludi tutto per default e include solo ciò che serve al build.
+**
+
+# Root
+!requirements.txt
+
+# Rust
+!rust/Cargo.toml
+!rust/Cargo.lock
+!rust/src/**
+
+# Battery runner
+!tests/battery/multiple_runs.py
+!tests/battery/run_battery.py
+!tests/battery/battery_config.json
+!tests/battery/scenarios/**
