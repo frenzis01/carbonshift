@@ -31,8 +31,10 @@ tests/battery/battery_config_*.json
 rust/src/bin/nshift.rs
 rust/src/bin/run_nshift_speed.rs
 **.bkup
-
+**.pdf
 **.mmd
+
+rolling_window_dp.py
 
 **.bk
 
