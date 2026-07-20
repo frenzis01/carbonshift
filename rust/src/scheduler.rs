@@ -24,8 +24,8 @@ use rand_distr::{Distribution, Normal};
 use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
-use crate::shared_state::{CommitOutcome, SharedState, SolverSnapshot};
-use crate::types::{Assignment, Flavour, Request};
+use crate::shared_state::{CommitOutcome, GlobalErrorStats, SharedState, SolverSnapshot};
+use crate::types::{get_capacity_multiplier, Assignment, Flavour, Request, RequestAssignment};
 
 // ─── internal state types ────────────────────────────────────────────────────
 
@@ -558,13 +558,17 @@ fn batch_worker_entry(
     }
 
     let mut consecutive_rollbacks: usize = 0;
+    let is_greedy_singleton = cfg.solver_strategy.trim().eq_ignore_ascii_case("greedy_singleton");
 
     loop {
         let t0 = Instant::now();
         let wall_start = unix_now_f64();
 
-        let (assignments, ctx, baseline_slot_counts) =
-            solve_dp(slot, &pending, shared_state, cfg, carbon_forecast, fdb, mutable, ml);
+        let (assignments, ctx, baseline_slot_counts) = if is_greedy_singleton {
+            solve_greedy_singleton(slot, &pending, shared_state, cfg, carbon_forecast, fdb, mutable, ml)
+        } else {
+            solve_dp(slot, &pending, shared_state, cfg, carbon_forecast, fdb, mutable, ml)
+        };
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let wall_end = unix_now_f64();
@@ -890,18 +894,41 @@ fn finish_swarm_batch(
     true
 }
 
-// ─── core DP pipeline ─────────────────────────────────────────────────────────
+// ─── shared solve preamble (steps 1-4, used by both DP and greedy_singleton) ──
 
-fn solve_dp(
+/// Everything the "solve" step of a batch worker needs, computed once from a
+/// single consistent snapshot of shared state (Steps 1-4 of the pipeline).
+/// Shared between `solve_dp` and `solve_greedy_singleton` so the snapshotting,
+/// time-shifting, error-baseline, and global-error-constraint logic is not
+/// duplicated between solver strategies.
+struct PreparedSolve {
+    pending_ids: HashSet<u64>,
+    window_start: i32,
+    window_end: i32,
+    assignment_cap: i32,
+    /// (request_id, capped_deadline) pairs to schedule — the batch's pending
+    /// requests plus, when `dp_lock_future_assignments` is false, any movable
+    /// future assignments re-joining the pool for joint re-planning.
+    solve_requests: Vec<(u64, i32)>,
+    /// request_id → (arrival_slot, capped_deadline), for converting solver
+    /// results back into `Assignment`s.
+    assignment_metadata: HashMap<u64, (i32, i32)>,
+    baseline_slot_counts: HashMap<i32, i32>,
+    error_baseline: ErrorBaseline,
+    mock_pool_input: MockPool,
+    global_stats: GlobalErrorStats,
+    global_constraint_active: bool,
+    /// Flavours allowed by the (possibly active) global error constraint.
+    solver_flavours: Vec<Flavour>,
+}
+
+fn prepare_solve(
     current_slot: i32,
     pending: &[Request],
     shared_state: &SharedState,
     cfg: &Config,
-    carbon_forecast: &[f64],
-    fdb: &HashMap<String, i32>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
-    _ml: &MetricsLogger,
-) -> (Vec<Assignment>, SolveContext, HashMap<i32, i32>) {
+) -> PreparedSolve {
     let pending_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
 
     // Deadline cap = end of error window.
@@ -915,15 +942,15 @@ fn solve_dp(
 
     // ── Step 1 (pre-solve): capture a consistent snapshot of shared state ────
     // All reads from shared state happen here, under a single lock acquisition.
-    // The lock is released before the DP optimiser runs.
+    // The lock is released before the solver runs.
     let snapshot = shared_state.snapshot_for_solver();
 
     // ── Step 2: time-shifting ────────────────────────────────────────────────
     // If DP_LOCK_FUTURE_ASSIGNMENTS=True, future assignments are pinned as
-    // baseline load.  If False, they join the DP pool for joint re-planning.
+    // baseline load.  If False, they join the pool for joint re-planning.
     let future_assignments = snapshot.get_future_assignments(current_slot);
 
-    let mut dp_requests: Vec<(u64, i32)> = pending
+    let mut solve_requests: Vec<(u64, i32)> = pending
         .iter()
         .map(|r| (r.id, cap_deadline(r.deadline_slot)))
         .collect();
@@ -944,7 +971,7 @@ fn solve_dp(
         for a in &future_assignments {
             let deadline = a.deadline_slot.unwrap_or_else(|| a.scheduled_slot.max(current_slot));
             let capped = cap_deadline(deadline);
-            dp_requests.push((a.request_id, capped));
+            solve_requests.push((a.request_id, capped));
             assignment_metadata.insert(
                 a.request_id,
                 (a.arrival_slot.unwrap_or(0), capped),
@@ -1015,6 +1042,49 @@ fn solve_dp(
         global_constraint_active = false;
     }
 
+    PreparedSolve {
+        pending_ids,
+        window_start,
+        window_end,
+        assignment_cap,
+        solve_requests,
+        assignment_metadata,
+        baseline_slot_counts,
+        error_baseline,
+        mock_pool_input,
+        global_stats,
+        global_constraint_active,
+        solver_flavours,
+    }
+}
+
+// ─── core DP pipeline ─────────────────────────────────────────────────────────
+
+fn solve_dp(
+    current_slot: i32,
+    pending: &[Request],
+    shared_state: &SharedState,
+    cfg: &Config,
+    carbon_forecast: &[f64],
+    fdb: &HashMap<String, i32>,
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    _ml: &MetricsLogger,
+) -> (Vec<Assignment>, SolveContext, HashMap<i32, i32>) {
+    let PreparedSolve {
+        pending_ids,
+        window_start,
+        window_end,
+        assignment_cap,
+        solve_requests: dp_requests,
+        assignment_metadata,
+        baseline_slot_counts,
+        error_baseline,
+        mock_pool_input,
+        global_stats,
+        global_constraint_active,
+        solver_flavours,
+    } = prepare_solve(current_slot, pending, shared_state, cfg, mutable);
+
     // ── Step 5: DP solve ────────────────────────────────────────────────────
     let effective_pruning = get_effective_pruning_mode(pending.len(), cfg);
     let solver = build_solver(&solver_flavours, carbon_forecast, cfg, &effective_pruning);
@@ -1051,33 +1121,53 @@ fn solve_dp(
     let mut solve_mode = format!("dp_{effective_pruning}");
 
     if scheduled_pending_ids.len() != pending_ids.len() {
+        let cap_deadline = |d: i32| -> i32 {
+            d.max(current_slot).min(assignment_cap).min(cfg.total_slots - 1)
+        };
         // Greedy fallback: the error constraint is never relaxed/removed — on
         // infeasibility (even after mock-pool dilution, if the recovery mode
         // injects one) we go straight to the accurate-flavour/cheapest-slot
         // fallback below. There is no intermediate "retry DP without the
         // error threshold" step.
-        if cfg.verbose {
-            println!(
-                "[Scheduler] ⚠ Infeasible ({}/{} pending covered): forcing greedy scheduling.",
-                scheduled_pending_ids.len(),
-                pending_ids.len()
-            );
-        }
-        let pending_only: Vec<(u64, i32)> = pending
+        //
+        // Only the requests the DP left unscheduled are handed to the
+        // fallback; requests it *did* place keep their (better) DP
+        // assignment instead of being discarded and redone greedily too
+        // (a single infeasible request no longer drags the whole batch
+        // down to the greedy/most-accurate-flavour path).
+        let unscheduled: Vec<(u64, i32)> = pending
             .iter()
+            .filter(|r| !scheduled_pending_ids.contains(&r.id))
             .map(|r| (r.id, cap_deadline(r.deadline_slot)))
             .collect();
-        let deadlines: Vec<i32> = pending_only.iter().map(|(_, d)| *d).collect();
+        if cfg.verbose {
+            println!(
+                "[Scheduler] ⚠ Infeasible ({}/{} pending covered): greedy fallback for {} request(s).",
+                scheduled_pending_ids.len(),
+                pending_ids.len(),
+                unscheduled.len()
+            );
+        }
+        let deadlines: Vec<i32> = unscheduled.iter().map(|(_, d)| *d).collect();
+
+        // Fallback cost/capacity accounting must include slots the DP
+        // already filled in this same batch, not just the pre-batch baseline.
+        let mut fallback_base_counts = base_counts_arr.clone();
+        for a in &dp_assignments {
+            if pending_ids.contains(&a.request_id) {
+                fallback_base_counts[a.slot as usize] += 1;
+            }
+        }
 
         let greedy_solver = build_solver(&cfg.flavours, carbon_forecast, cfg, "none");
         let greedy = greedy_solver.greedy_fallback(
-            &pending_only,
+            &unscheduled,
             &deadlines,
             current_slot,
             &cfg.capacity_tiers,
-            &base_counts_arr,
+            &fallback_base_counts,
         );
-        dp_assignments = greedy;
+        dp_assignments.extend(greedy);
         solve_status = "ok_greedy_after_infeasible".to_string();
         solve_mode = "greedy_after_infeasible".to_string();
     }
@@ -1160,6 +1250,208 @@ fn solve_dp(
     };
 
     (assignments, ctx, baseline_slot_counts)
+}
+
+// ─── greedy singleton pipeline (online strategy, batch_size=1 only) ──────────
+
+/// Online greedy-cheapest strategy, restricted to `batch_size=1`.
+///
+/// For its one pending request, exhaustively scans every `(slot, flavour)`
+/// pair in `[current_slot, deadline]` and commits the cheapest one that
+/// satisfies the local error window and global error constraint — the same
+/// logic as the offline `greedy_cheapest` strategy (see
+/// `bin/nshift/main.rs::run_greedy_cheapest`), but driven through the live
+/// scheduler/`SharedState` instead of a single in-memory pass over a whole
+/// scenario.
+///
+/// With exactly one pending request there is no combinatorial ordering
+/// choice to make, so this exhaustive scan is already optimal for that one
+/// decision — no DP state-space search is needed. That is why this is a
+/// distinct, lighter "online alternative strategy" (grouped with Bandit/ACO)
+/// rather than just "DP with batch_size=1": it skips the DP machinery
+/// entirely, at the cost of never jointly re-planning already-scheduled
+/// future assignments (it always treats them as pinned baseline load,
+/// regardless of `dp_lock_future_assignments`).
+///
+/// Shares `prepare_solve`'s snapshot/error-baseline/global-constraint setup
+/// with `solve_dp` so both strategies see the exact same feasibility rules;
+/// it also shares `batch_worker_entry`'s rollback-checked commit path, since
+/// — like DP — its cost model depends on accurate per-slot request counts
+/// that a concurrent capacity-tier breach could invalidate.
+fn solve_greedy_singleton(
+    current_slot: i32,
+    pending: &[Request],
+    shared_state: &SharedState,
+    cfg: &Config,
+    carbon_forecast: &[f64],
+    fdb: &HashMap<String, i32>,
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    _ml: &MetricsLogger,
+) -> (Vec<Assignment>, SolveContext, HashMap<i32, i32>) {
+    if cfg.verbose && pending.len() > 1 {
+        println!(
+            "[Scheduler] ⚠ greedy_singleton received a batch of {} pending requests; \
+             it only supports batch_size=1 — scheduling them sequentially.",
+            pending.len()
+        );
+    }
+
+    let prep = prepare_solve(current_slot, pending, shared_state, cfg, mutable);
+
+    // ── Step 5: exhaustive greedy scan over (slot, flavour) ─────────────────
+    let mut sorted_flavours: Vec<&Flavour> = prep.solver_flavours.iter().collect();
+    sorted_flavours.sort_by_key(|f| f.duration);
+    let fallback_flav = prep
+        .solver_flavours
+        .iter()
+        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+        .expect("no flavours");
+
+    let global_avg = if prep.global_stats.count > 0 { prep.global_stats.avg } else { 0.0 };
+    let global_constraint_active = prep.global_constraint_active
+        && cfg.global_error_constraint_hard
+        && global_avg > cfg.max_error_threshold;
+
+    // Local mutable slot counts, seeded from the baseline (pinned future
+    // assignments) and updated as each request in `solve_requests` is
+    // placed — for the common batch_size=1 case this loop runs once.
+    let mut slot_count: HashMap<i32, i32> = prep.baseline_slot_counts.clone();
+    let mut solved: Vec<RequestAssignment> = Vec::new();
+
+    for &(request_id, deadline) in &prep.solve_requests {
+        let (arrival, _) = prep
+            .assignment_metadata
+            .get(&request_id)
+            .copied()
+            .unwrap_or((current_slot, deadline));
+        let start_slot = arrival.max(current_slot);
+
+        let mut best: Option<(f64, i32, &Flavour)> = None;
+        for slot in start_slot..=deadline {
+            let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
+            let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
+            let mult = get_capacity_multiplier(&cfg.capacity_tiers, position as i64);
+
+            for flav in &sorted_flavours {
+                // Global error constraint: retrospective (average error
+                // *before* this request), matching solve_dp's step-function
+                // behaviour rather than a per-candidate forward projection.
+                if global_constraint_active && flav.error > cfg.max_error_threshold {
+                    continue;
+                }
+
+                // Local error window is anchored to `arrival` (the request's
+                // decision moment), not to the candidate `slot` being tried —
+                // mirrors solve_dp, which centers the window on current_slot
+                // regardless of where the request ends up being placed.
+                let win_start = (arrival - cfg.error_window_past).max(0);
+                let win_end = (arrival + cfg.error_window_future).min(cfg.total_slots - 1);
+                let mut win_sum = prep.error_baseline.error_sum + flav.error;
+                let mut win_cnt = prep.error_baseline.request_count + 1.0;
+                for a in &solved {
+                    if a.slot >= win_start && a.slot <= win_end {
+                        win_sum += a.error;
+                        win_cnt += 1.0;
+                    }
+                }
+                if win_cnt > 0.0 && win_sum / win_cnt > cfg.max_error_threshold {
+                    continue;
+                }
+
+                let cost = ci * mult * flav.duration as f64 * cfg.carbon_cost_duration_scale;
+                if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
+                    best = Some((cost, slot, flav));
+                }
+            }
+        }
+
+        // Commit the cheapest feasible pair; if none is feasible (all
+        // flavours/slots violate the error window or global constraint),
+        // fall back to the accurate (min-error) flavour at the earliest slot
+        // — this guarantees every request is scheduled, so greedy_singleton
+        // never returns "infeasible" to the caller.
+        let (chosen_cost, chosen_slot, chosen_flav) = best.unwrap_or_else(|| {
+            let ci = carbon_forecast.get(start_slot as usize).copied().unwrap_or(1.0);
+            let position = *slot_count.get(&start_slot).unwrap_or(&0) + 1;
+            let mult = get_capacity_multiplier(&cfg.capacity_tiers, position as i64);
+            let cost = ci * mult * fallback_flav.duration as f64 * cfg.carbon_cost_duration_scale;
+            (cost, start_slot, fallback_flav)
+        });
+
+        *slot_count.entry(chosen_slot).or_insert(0) += 1;
+        solved.push(RequestAssignment {
+            request_id,
+            flavour_name: chosen_flav.name.clone(),
+            slot: chosen_slot,
+            carbon_cost: chosen_cost,
+            error: chosen_flav.error,
+        });
+    }
+
+    let solve_status = "ok".to_string();
+    let solve_mode = "greedy_singleton".to_string();
+
+    // ── Step 6: convert RequestAssignment → Assignment ──────────────────────
+    let assignments: Vec<Assignment> = solved
+        .iter()
+        .map(|ra| {
+            let (arrival, deadline) =
+                prep.assignment_metadata.get(&ra.request_id).copied().unwrap_or((0, 0));
+            let dur = fdb.get(&ra.flavour_name).copied().unwrap_or(0);
+            Assignment::new(
+                ra.request_id,
+                ra.slot,
+                ra.flavour_name.clone(),
+                ra.carbon_cost,
+                ra.error,
+                dur,
+                Some(arrival),
+                Some(deadline),
+            )
+        })
+        .collect();
+
+    // Compute the modelled window average after this run (mirrors solve_dp).
+    let mut modeled_error_sum = prep.error_baseline.error_sum;
+    let mut modeled_count = prep.error_baseline.request_count;
+    let mut mock_remaining = prep.mock_pool_input.initial_count;
+    let mock_err = prep.mock_pool_input.error_per_request;
+
+    for a in &assignments {
+        if a.scheduled_slot >= prep.window_start && a.scheduled_slot <= prep.window_end {
+            modeled_error_sum += a.error;
+            modeled_count += 1.0;
+            if mock_remaining > 0 && mock_err > 0.0 {
+                modeled_error_sum -= mock_err;
+                modeled_count = (modeled_count - 1.0).max(0.0);
+                mock_remaining -= 1;
+            }
+        }
+    }
+    let mock_consumed = (prep.mock_pool_input.initial_count - mock_remaining).max(0);
+    consume_mock_pool(current_slot, &solve_mode, mock_consumed, cfg, mutable);
+
+    let ctx = SolveContext {
+        status: solve_status,
+        mode: solve_mode,
+        new_assignments: prep.pending_ids.len(),
+        total_assignments: assignments.len(),
+        global_error_before: prep.global_stats.avg,
+        global_error_count_before: prep.global_stats.count,
+        global_error_constraint_active: prep.global_constraint_active,
+        modeled_window_avg_after: if modeled_count > 0.0 {
+            modeled_error_sum / modeled_count
+        } else {
+            0.0
+        },
+        window_start_slot: prep.window_start,
+        window_end_slot: prep.window_end,
+        mock_recovery_consumed: mock_consumed,
+        recovery_mode: cfg.infeasibility_recovery_mode.clone(),
+        solver_elapsed_ms: 0.0, // filled by the caller
+    };
+
+    (assignments, ctx, prep.baseline_slot_counts)
 }
 
 // ─── error baseline augmentation helpers ─────────────────────────────────────
@@ -1614,6 +1906,22 @@ mod tests {
         (a, c)
     }
 
+    fn call_solve_dp_with_forecast(
+        current_slot: i32,
+        pending: &[Request],
+        cfg: &Config,
+        ss: &SharedState,
+        forecast: &[f64],
+    ) -> (Vec<Assignment>, SolveContext) {
+        ss.set_current_slot(current_slot);
+        let fdb: HashMap<String, i32> =
+            cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
+        let mutable = make_mutable_state(cfg);
+        let ml = disabled_logger();
+        let (a, c, _) = solve_dp(current_slot, pending, ss, cfg, forecast, &fdb, &mutable, &ml);
+        (a, c)
+    }
+
     // ── tests ─────────────────────────────────────────────────────────────────
 
     /// All assigned slots must be ≥ current_slot.
@@ -1754,5 +2062,157 @@ mod tests {
         for id in [10u64, 11, 12] {
             assert!(result_ids.contains(&id), "request {} not scheduled", id);
         }
+    }
+
+    // ── greedy_singleton tests ──────────────────────────────────────────────
+
+    fn call_solve_greedy_singleton(
+        current_slot: i32,
+        pending: &[Request],
+        cfg: &Config,
+        ss: &SharedState,
+    ) -> (Vec<Assignment>, SolveContext) {
+        ss.set_current_slot(current_slot);
+        let forecast = flat_forecast(cfg.total_slots, 100.0);
+        let fdb: HashMap<String, i32> =
+            cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
+        let mutable = make_mutable_state(cfg);
+        let ml = disabled_logger();
+        let (a, c, _) =
+            solve_greedy_singleton(current_slot, pending, ss, cfg, &forecast, &fdb, &mutable, &ml);
+        (a, c)
+    }
+
+    fn call_solve_greedy_singleton_with_forecast(
+        current_slot: i32,
+        pending: &[Request],
+        cfg: &Config,
+        ss: &SharedState,
+        forecast: &[f64],
+    ) -> (Vec<Assignment>, SolveContext) {
+        ss.set_current_slot(current_slot);
+        let fdb: HashMap<String, i32> =
+            cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
+        let mutable = make_mutable_state(cfg);
+        let ml = disabled_logger();
+        let (a, c, _) =
+            solve_greedy_singleton(current_slot, pending, ss, cfg, forecast, &fdb, &mutable, &ml);
+        (a, c)
+    }
+
+    /// A single request must be scheduled at/after current_slot, tagged with
+    /// the "greedy_singleton" solver mode.
+    #[test]
+    fn test_greedy_singleton_schedules_single_request() {
+        let cfg = make_config(|_| {});
+        let ss = SharedState::new();
+        let current_slot = 3;
+        let pending = vec![req(0, current_slot, current_slot + 4)];
+
+        let (assignments, ctx) = call_solve_greedy_singleton(current_slot, &pending, &cfg, &ss);
+
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].scheduled_slot >= current_slot);
+        assert_eq!(ctx.mode, "greedy_singleton");
+        assert_eq!(ctx.status, "ok");
+    }
+
+    /// For a single request (batch_size=1), the exhaustive greedy scan must
+    /// pick the same (slot, flavour, cost) as the DP solver — with only one
+    /// request there is no combinatorial ordering effect, so both are
+    /// exhaustive searches over the same feasible set.
+    ///
+    /// Uses a non-flat carbon forecast so there is a unique cheapest slot —
+    /// with a flat forecast every candidate slot ties on cost and each
+    /// solver's internal (unspecified) tie-breaking order may legitimately
+    /// differ (DP iterates a HashMap; greedy scans slots ascending).
+    #[test]
+    fn test_greedy_singleton_matches_dp_for_single_request() {
+        let cfg = make_config(|_| {});
+        let current_slot = 2;
+        let pending = vec![req(7, current_slot, current_slot + 5)];
+        let mut forecast = flat_forecast(cfg.total_slots, 100.0);
+        forecast[4] = 10.0; // slot 4 is uniquely the cheapest candidate
+
+        let ss_dp = SharedState::new();
+        let (dp_assignments, _) =
+            call_solve_dp_with_forecast(current_slot, &pending, &cfg, &ss_dp, &forecast);
+
+        let ss_greedy = SharedState::new();
+        let (greedy_assignments, _) = call_solve_greedy_singleton_with_forecast(
+            current_slot, &pending, &cfg, &ss_greedy, &forecast,
+        );
+
+        assert_eq!(dp_assignments.len(), 1);
+        assert_eq!(greedy_assignments.len(), 1);
+        assert_eq!(dp_assignments[0].scheduled_slot, 4);
+        assert_eq!(dp_assignments[0].scheduled_slot, greedy_assignments[0].scheduled_slot);
+        assert_eq!(dp_assignments[0].flavour_name, greedy_assignments[0].flavour_name);
+        assert!((dp_assignments[0].carbon_cost - greedy_assignments[0].carbon_cost).abs() < 1e-9);
+    }
+
+    /// Requests already committed to a slot must raise the capacity-tier
+    /// multiplier for subsequent requests placed in the same slot — the
+    /// greedy scan must read this from live shared state, not start "fresh"
+    /// every call.
+    #[test]
+    fn test_greedy_singleton_respects_existing_slot_load() {
+        let mut cfg = make_config(|_| {});
+        cfg.capacity_tiers = vec![
+            crate::types::CapacityTier { max_requests: Some(1), multiplier: 1.0 },
+            crate::types::CapacityTier { max_requests: None, multiplier: 5.0 },
+        ];
+        let ss = SharedState::new();
+        let current_slot = 0;
+
+        // Pre-fill slot 0 with one committed assignment so the *next* request
+        // placed there would be position=2 → the expensive (5.0×) tier.
+        ss.add_assignments(vec![Assignment::new(
+            42, 0, cfg.flavours[0].name.clone(), 1.0, cfg.flavours[0].error, cfg.flavours[0].duration,
+            Some(0), Some(0),
+        )]);
+
+        // A request whose only feasible slot is 0 (arrival==deadline==0).
+        let pending = vec![req(1, current_slot, current_slot)];
+        let (assignments, _ctx) = call_solve_greedy_singleton(current_slot, &pending, &cfg, &ss);
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].scheduled_slot, 0);
+        // Cost must reflect the 5.0× multiplier (position 2), not the 1.0× baseline.
+        let cheapest_flavour_duration =
+            cfg.flavours.iter().map(|f| f.duration).min().unwrap();
+        let expected_min_cost =
+            100.0 * 5.0 * cheapest_flavour_duration as f64 * cfg.carbon_cost_duration_scale;
+        assert!(
+            assignments[0].carbon_cost >= expected_min_cost - 1e-9,
+            "cost {} should reflect the higher capacity tier (>= {})",
+            assignments[0].carbon_cost,
+            expected_min_cost
+        );
+    }
+
+    /// Global error constraint must be retrospective (based on the average
+    /// error *before* this request), matching solve_dp's step-function
+    /// behaviour, and must never exclude every flavour.
+    #[test]
+    fn test_greedy_singleton_global_error_constraint_is_retrospective() {
+        let cfg = make_config(|c| {
+            c.global_error_constraint_enabled = true;
+            c.global_error_constraint_hard = true;
+            c.max_error_threshold = 1.0;
+        });
+        let ss = SharedState::new();
+        let current_slot = 0;
+
+        // Push the global average error above threshold with a high-error assignment.
+        ss.add_assignments(vec![Assignment::new(
+            1, 0, "Slow".to_string(), 1.0, 10.0, 20, Some(0), Some(0),
+        )]);
+
+        let pending = vec![req(2, current_slot, current_slot + 3)];
+        let (assignments, ctx) = call_solve_greedy_singleton(current_slot, &pending, &cfg, &ss);
+
+        assert_eq!(assignments.len(), 1, "request must still be scheduled under a hard constraint");
+        assert!(ctx.global_error_constraint_active);
     }
 }

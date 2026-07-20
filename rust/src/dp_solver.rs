@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::types::{CapacityTier, Flavour, RequestAssignment};
+use crate::types::{get_capacity_multiplier, CapacityTier, Flavour, RequestAssignment};
 
 // ─── DP state key ─────────────────────────────────────────────────────────────
 
@@ -416,20 +416,9 @@ impl DpSolver {
     ) -> f64 {
         let s = slot as usize;
         let position = (base_counts[s] + inc_counts[s]) as i64 + 1; // 1-indexed position of this request
-        let mult = Self::get_capacity_multiplier(tiers, position);
+        let mult = get_capacity_multiplier(tiers, position);
         let carbon = self.carbon_forecast[s];
         carbon * mult * add_duration as f64 * self.carbon_cost_scale
-    }
-
-    fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
-        for tier in tiers {
-            match tier.max_requests {
-                None => return tier.multiplier,
-                Some(max) if count <= max => return tier.multiplier,
-                _ => {}
-            }
-        }
-        tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
     }
 }
 

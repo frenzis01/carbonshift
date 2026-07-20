@@ -48,6 +48,17 @@
 //!   relaxed/removed; on infeasibility the scheduler always falls back directly to
 //!   `greedy_fallback` (accurate flavour, cheapest feasible slot). This setting only controls
 //!   whether/how synthetic mock requests dilute the error baseline used by the primary DP solve.
+//! - `online_strategies`: online strategies to run through the scheduler pipeline, e.g.
+//!   `["bandit", "ant_colony", "greedy_singleton"]`. Independent of the DP phase: set the
+//!   top-level `batch_sizes` to `[]` to skip DP entirely and only run online strategies.
+//! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
+//!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent. Ignored
+//!   for "greedy_singleton", which always forces `[1]` (its only supported batch size) —
+//!   `rollback_max_consecutive` still affects it (it shares DP's rollback-checked commit
+//!   path), while `online_swarm_mode` only affects "bandit"/"ant_colony" (the swarm path).
+//! - `additional_strategies`: offline strategies to run once per scenario (no batching or
+//!   concurrency), e.g. `["greedy_cheapest", "ant_colony", "bandit"]`. Fully independent of
+//!   `batch_sizes`/`rollback_max_consecutive`/`max_batch_solver_parallelism`.
 //!
 //! **Key fields:**
 //! - `batch_sizes`: list of N values to benchmark.
@@ -82,7 +93,7 @@ use carbonshift_rs::metrics_logger::MetricsLogger;
 use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
-use carbonshift_rs::types::{Assignment, CapacityTier, Flavour};
+use carbonshift_rs::types::{get_capacity_multiplier, Assignment, CapacityTier, Flavour};
 
 use serde_json::Value;
 
@@ -104,6 +115,12 @@ struct BenchmarkConfig {
     additional_strategies: Vec<String>,
     /// Online strategies to run through the scheduler pipeline (e.g. "bandit", "ant_colony").
     online_strategies: Vec<String>,
+    /// Batch sizes to sweep for `online_strategies`, independent of `batch_sizes` (the DP
+    /// sweep). Falls back to `batch_sizes` when absent, so existing configs keep working
+    /// unchanged. This lets a battery run online strategies (e.g. bandit/ant_colony) without
+    /// also running the DP phase (`batch_sizes: []`), or with a different N sweep than DP's.
+    /// Ignored for "greedy_singleton", which always forces `[1]` (its only supported batch size).
+    online_batch_sizes: Option<Vec<usize>>,
     /// If > 0: flush a partial batch after this many seconds without a new request.
     batch_timeout_secs: f64,
     /// Overrides `Config::max_batch_solver_parallelism` when present; `None` keeps the default.
@@ -173,6 +190,15 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
+    let online_batch_sizes: Option<Vec<usize>> = runner
+        .get("online_batch_sizes")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|x| x.as_u64().expect("online_batch_sizes elements must be integers") as usize)
+                .collect()
+        });
+
     let batch_timeout_secs =
         runner.get("batch_timeout_secs").and_then(|x| x.as_f64()).unwrap_or(0.0);
 
@@ -190,7 +216,7 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .get("baseline_total_carbon_cost")
         .and_then(|x| x.as_f64());
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, infeasibility_recovery_mode, rollback_max_consecutive, additional_strategies, online_strategies, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode, baseline_total_carbon_cost }
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, infeasibility_recovery_mode, rollback_max_consecutive, additional_strategies, online_strategies, online_batch_sizes, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode, baseline_total_carbon_cost }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -581,17 +607,6 @@ fn compute_summary(
 }
 
 // ─── greedy baseline ──────────────────────────────────────────────────────────
-
-fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
-    for tier in tiers {
-        match tier.max_requests {
-            None => return tier.multiplier,          // overflow tier
-            Some(max) if count <= max => return tier.multiplier,
-            _ => {}
-        }
-    }
-    tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
-}
 
 /// Recompute per-request carbon costs from the final committed assignment state.
 ///
@@ -1682,8 +1697,31 @@ fn main() {
     }
 
     // ── online strategies (generator + scheduler pipeline) ────────────────
+    // Independent batch-size sweep from DP's `batch_sizes`, so a battery run
+    // can enable online strategies (bandit/ant_colony/greedy_singleton)
+    // without also running the DP phase (`batch_sizes: []`), or sweep a
+    // different N list for online vs. DP. Falls back to `batch_sizes` when
+    // `online_batch_sizes` is absent (keeps old configs behaving unchanged).
+    let online_batch_sizes_base: Vec<usize> =
+        bcfg.online_batch_sizes.clone().unwrap_or_else(|| bcfg.batch_sizes.clone());
     for strategy in &bcfg.online_strategies {
-        for &batch_size in &bcfg.batch_sizes {
+        // greedy_singleton only supports batch_size=1: force it regardless of
+        // the configured batch_sizes list, so a battery sweep across N doesn't
+        // redundantly repeat an identical run under a different label.
+        let is_greedy_singleton = strategy.eq_ignore_ascii_case("greedy_singleton");
+        let batch_sizes_for_strategy: Vec<usize> = if is_greedy_singleton {
+            if online_batch_sizes_base.as_slice() != [1] {
+                println!(
+                    "[Info] online strategy 'greedy_singleton' only supports batch_size=1; \
+                     ignoring other configured batch_sizes for this strategy."
+                );
+            }
+            vec![1]
+        } else {
+            online_batch_sizes_base.clone()
+        };
+
+        for &batch_size in &batch_sizes_for_strategy {
             let run_dir = bcfg.output_dir.join(format!("online_{strategy}")).join(format!("N{batch_size}"));
             let n_t0 = std::time::Instant::now();
 
@@ -1734,7 +1772,7 @@ fn main() {
         let strat_summaries: Vec<&RunSummary> = all_summaries
             .iter()
             .rev()
-            .take(bcfg.batch_sizes.len())
+            .take(batch_sizes_for_strategy.len())
             .collect();
         if !strat_summaries.is_empty() {
             std::fs::create_dir_all(&strat_dir).ok();
@@ -1904,5 +1942,43 @@ mod tests {
         let computed_total: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
         assert!((computed_total - expected_total).abs() < 1e-9,
             "total={computed_total}, expected={expected_total}");
+    }
+
+    // ─── load_benchmark_config: online_batch_sizes parsing ────────────────
+
+    /// Writes `json_body` to a uniquely-named file under the OS temp dir and
+    /// returns its path; avoids pulling in a `tempfile` dependency for tests.
+    fn write_tmp_config(name: &str, json_body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nshift_test_{name}_{}.json",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, json_body).unwrap();
+        path
+    }
+
+    #[test]
+    fn online_batch_sizes_absent_defaults_to_none() {
+        let path = write_tmp_config(
+            "absent",
+            r#"{"batch_sizes": [1, 4], "scenario_path": "s.json", "output_dir": "out", "runner": {}}"#,
+        );
+        let bcfg = load_benchmark_config(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(bcfg.online_batch_sizes, None);
+        assert_eq!(bcfg.batch_sizes, vec![1, 4]);
+    }
+
+    #[test]
+    fn online_batch_sizes_explicit_value_is_parsed() {
+        let path = write_tmp_config(
+            "explicit",
+            r#"{"batch_sizes": [], "scenario_path": "s.json", "output_dir": "out",
+                "runner": {"online_batch_sizes": [1, 6, 12]}}"#,
+        );
+        let bcfg = load_benchmark_config(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(bcfg.online_batch_sizes, Some(vec![1, 6, 12]));
+        assert!(bcfg.batch_sizes.is_empty());
     }
 }

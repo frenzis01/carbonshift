@@ -128,6 +128,8 @@ pub struct Config {
     /// `"dp"` (default): DP solver with error constraints and rollback.
     /// `"bandit"`: online ε-greedy bandit (state shared across batches).
     /// `"ant_colony"`: online ACO (pheromone shared across batches).
+    /// `"greedy_singleton"`: online exhaustive greedy scan (no learning, no
+    /// joint multi-request search) — only valid when `batch_size == 1`.
     pub solver_strategy: String,
 
     /// Concurrency strategy for online swarm strategies (bandit / ant_colony)
@@ -215,8 +217,8 @@ impl Default for Config {
                 CapacityTier { max_requests: None,      multiplier: 5.0 }, // 81+: overload
             ],
             dp_pruning_method: "beam".to_string(),
-            dp_pruning_min_batch_size: 5,
-            dp_pruning_k: 1200,
+            dp_pruning_min_batch_size: 23,
+            dp_pruning_k: 8000,
             dp_timeout: 7.0,
             dp_lock_future_assignments: true,
             // infeasibility_recovery_mode: "forecast".to_string(),

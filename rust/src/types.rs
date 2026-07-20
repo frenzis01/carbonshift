@@ -117,3 +117,22 @@ pub struct CapacityTier {
     pub max_requests: Option<i64>,
     pub multiplier: f64,
 }
+
+/// Look up the capacity/rebound multiplier for a slot holding `count`
+/// requests (1-indexed position of the request being priced).
+///
+/// Tiers are checked in order; the first tier whose `max_requests >= count`
+/// wins. A tier with `max_requests = None` is the overflow catch-all and
+/// always matches. Falls back to the last tier's multiplier (or `1.0` if
+/// `tiers` is empty) if no tier matches — this should not happen with a
+/// well-formed tier list that ends in an overflow tier.
+pub fn get_capacity_multiplier(tiers: &[CapacityTier], count: i64) -> f64 {
+    for tier in tiers {
+        match tier.max_requests {
+            None => return tier.multiplier,
+            Some(max) if count <= max => return tier.multiplier,
+            _ => {}
+        }
+    }
+    tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
+}

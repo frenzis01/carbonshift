@@ -1,5 +1,6 @@
 {
-  "_comment": "CarbonShift solver battery test configuration.",
+  "_comment": "CarbonShift solver battery test configuration (Rust nshift binary only).",
+  "_phases_comment": "Each phase is independently toggled by leaving its content list(s) empty: DP runs only if both batch_sizes AND infeasibility_modes are non-empty; online runs only if online_strategies is non-empty; offline runs only if additional_strategies is non-empty. See tests/battery/multiple_runs.py for phase-aware parameter grids that avoid redundantly re-running phases a given knob doesn't affect.",
   "battery_id": "cfg_onlyhigh_0",
   "batch_sizes": [
     1,
@@ -11,28 +12,28 @@
     16,
     22
   ],
-  "online_strategies": [
-    "bandit",
-    "ant_colony"
-  ],
   "infeasibility_modes": [
     "min_error_greedy",
     "carryover"
   ],
-  "comment_2": [
-    "min_error_greedy",
-    "carryover",
-    "forecast"
+  "online_strategies": [
+    "bandit",
+    "ant_colony"
+  ],
+  "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. greedy_singleton always forces N=1 regardless of this list.",
+  "online_batch_sizes__": [
+    1,
+    4,
+    8
   ],
   "additional_strategies": [
     "greedy_cheapest",
     "bandit",
     "ant_colony"
   ],
-  "backend": "rust",
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
-  "comment_3": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values.",
+  "_runtime_knobs_comment": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values. rollback_max_consecutive/max_batch_solver_parallelism affect DP and greedy_singleton only; online_swarm_mode affects bandit/ant_colony only (see multiple_runs.py sensitivity matrix).",
   "max_batch_solver_parallelism": 8,
   "online_swarm_mode": "merge",
   "realtime_slots": false,
