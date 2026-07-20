@@ -24,7 +24,7 @@ online2/tests/Nshift_speed/*.png
 rust/target/
 tests/battery/results
 tests/battery/output
-tests/battery/scenarios
+tests/battery/scenarios/json
 tests/battery/EvaluationTest.md
 tests/battery/battery_config_*.json
 
