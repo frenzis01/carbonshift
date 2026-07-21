@@ -36,8 +36,8 @@
   "_runtime_knobs_comment": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values. rollback_max_consecutive/max_batch_solver_parallelism affect DP and greedy_singleton only; online_swarm_mode affects bandit/ant_colony only (see multiple_runs.py sensitivity matrix).",
   "max_batch_solver_parallelism": 8,
   "online_swarm_mode": "merge",
-  "realtime_slots": false,
-  "realtime_speed_scale": 0.1,
+  "realtime_slots": true,
+  "realtime_speed_scale": 1.0,
   "rollback_max_consecutive": 0,
   "scenarios": [
     {

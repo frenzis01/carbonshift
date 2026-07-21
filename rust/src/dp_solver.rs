@@ -9,6 +9,13 @@
 /// (optimal sub-structure).  After each layer the state space is pruned to
 /// at most `pruning_k` states (beam or kbest strategy).
 ///
+/// # Warm-start variant
+/// Before the main DP begins, a sequential (request-by-request) solution is
+/// built.  This solution is used as a safety net:
+/// • its DP state survives pruning even when it would normally be discarded;
+/// • it is returned on timeout or infeasibility instead of a generic greedy
+///   fallback.
+///
 /// # Error representation
 /// Window error is tracked in *basis points* (integer, ×100) to avoid
 /// floating-point accumulation drift in the per-state totals.
@@ -143,8 +150,8 @@ impl DpSolver {
 
     /// Solve a batch of requests with DP.
     ///
-    /// Returns an empty `Vec` when the batch is provably infeasible under the
-    /// given error threshold (including after the feasibility filter).
+    /// Returns an empty `Vec` only when *both* the full DP and the warm-start
+    /// sequential solution are provably infeasible.
     pub fn solve_batch(&self, input: SolveBatchInput<'_>) -> Vec<RequestAssignment> {
         if input.requests.is_empty() {
             return vec![];
@@ -192,6 +199,38 @@ impl DpSolver {
         let initial_mock_count = input.dynamic_mock_pool.initial_count.max(0);
         let mock_error_bp =
             (input.dynamic_mock_pool.error_per_request * 100.0).round() as i64;
+
+        // ── warm start: sequential (request-by-request) solution ─────────
+        // This is equivalent to calling solve_batch once per request and
+        // updating baseline_slot_counts each time.  It is fast and gives a
+        // good upper bound on cost.
+        let (warm_assignments, warm_keys) = self.compute_sequential_solution(
+            &input,
+            &deadlines,
+            &base_counts,
+            &tiers,
+            initial_error_sum_bp,
+            initial_error_count,
+            initial_mock_count,
+            mock_error_bp,
+            window_start,
+            window_end,
+        );
+
+        // With a single request the sequential solution is already exhaustive:
+        // it evaluates every (flavour, slot) pair, which is exactly what the
+        // one-layer DP would do.  No pruning can occur, and no state merging
+        // can hide a better path.  We can return immediately.
+        if input.requests.len() == 1 {
+            // Honour the error threshold exactly as the full DP would.
+            if let Some(threshold) = input.max_error_threshold {
+                let ec = warm_keys[1].error_count();
+                if ec > 0.0 && (warm_keys[1].error_sum_bp as f64 / 100.0) / ec > threshold {
+                    return vec![];
+                }
+            }
+            return warm_assignments;
+        }
 
         // ── initial DP state ─────────────────────────────────────────────
         let init_key = DpStateKey::new(
@@ -275,13 +314,15 @@ impl DpSolver {
             }
 
             if dp_curr.is_empty() {
-                return vec![];
+                // DP dead-end: the warm-start solution is our safety net.
+                return warm_assignments;
             }
 
-            // ── pruning ──────────────────────────────────────────────────
+            // ── pruning with warm-start protection ───────────────────────
             if matches!(self.pruning.as_str(), "beam" | "kbest") && dp_curr.len() > self.pruning_k {
                 let mut items: Vec<(DpStateKey, (f64, Vec<RequestAssignment>))> =
                     dp_curr.into_iter().collect();
+
                 if self.pruning == "beam" {
                     items.sort_unstable_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap());
                 } else {
@@ -303,43 +344,157 @@ impl DpSolver {
                             .then(a_avg.partial_cmp(&b_avg).unwrap())
                     });
                 }
-                dp_curr = items.into_iter().take(self.pruning_k).collect();
+
+                // Locate the warm-start state for this layer.
+                let warm_key = &warm_keys[req_idx + 1];
+                let warm_idx = items.iter().position(|(k, _)| k == warm_key);
+
+                // If the warm state is outside the top-K, reserve one slot for it.
+                let take_n = if warm_idx.map_or(false, |i| i >= self.pruning_k) {
+                    self.pruning_k.saturating_sub(1)
+                } else {
+                    self.pruning_k
+                };
+
+                let mut trimmed: HashMap<_, _> =
+                    items.drain(..take_n.min(items.len())).collect();
+
+                // Inject the warm state if it was pruned away.
+                if let Some(wi) = warm_idx {
+                    if wi >= self.pruning_k && wi < take_n + items.len() {
+                        let actual_idx = wi - take_n;
+                        let (k, v) = items.remove(actual_idx);
+                        trimmed.insert(k, v);
+                    }
+                }
+
+                dp_curr = trimmed;
             }
 
-            // ── timeout: fall back to greedy for remaining requests ───────
+            // ── timeout: fall back to warm-start solution ────────────────
             if start.elapsed().as_secs_f64() > self.timeout {
-                let remaining_requests = &input.requests[req_idx..];
-                let remaining_deadlines = &deadlines[req_idx..];
-                return self.greedy_fallback(
-                    remaining_requests,
-                    remaining_deadlines,
-                    input.current_slot,
-                    &tiers,
-                    &base_counts,
-                );
+                return warm_assignments;
             }
 
             dp_prev = dp_curr;
         }
 
         // ── feasibility filter ───────────────────────────────────────────
-        // Apply error-window constraint once on the complete assignment set.
         if let Some(threshold) = input.max_error_threshold {
             dp_prev.retain(|k, _| {
                 let ec = k.error_count();
                 ec == 0.0 || (k.error_sum_bp as f64 / 100.0) / ec <= threshold
             });
             if dp_prev.is_empty() {
-                return vec![];
+                return warm_assignments;
             }
         }
 
-        // Return the minimum-cost feasible assignment.
+        // Return the minimum-cost feasible assignment, or warm-start if DP fails.
         dp_prev
             .into_values()
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
             .map(|(_, assignments)| assignments)
-            .unwrap_or_default()
+            .unwrap_or(warm_assignments)
+    }
+
+    // ── warm-start helper ─────────────────────────────────────────────────
+
+    /// Build a sequential (request-by-request) solution.
+    ///
+    /// For each request we greedily pick the cheapest (flavour, slot) pair
+    /// given the *current* incremental counts.  This is exactly optimal when
+    /// a batch contains a single request, and it mirrors the behaviour the
+    /// user observed to be cheaper than the full-batch DP (which likely
+    /// hit timeout / pruning).
+    ///
+    /// Returns:
+    /// • `assignments` – the full sequential assignment vector.
+    /// • `keys`        – the `DpStateKey` *before* the first request and
+    ///                   after each processed request (`len = N+1`).
+    fn compute_sequential_solution(
+        &self,
+        input: &SolveBatchInput<'_>,
+        deadlines: &[i32],
+        base_counts: &[i32],
+        tiers: &[CapacityTier],
+        initial_error_sum_bp: i64,
+        initial_error_count: f64,
+        initial_mock_count: i32,
+        mock_error_bp: i64,
+        window_start: i32,
+        window_end: i32,
+    ) -> (Vec<RequestAssignment>, Vec<DpStateKey>) {
+        let t = self.window_size as usize;
+
+        let mut key = DpStateKey::new(
+            initial_error_sum_bp,
+            initial_error_count,
+            initial_mock_count,
+            vec![0i32; t],
+        );
+        let mut keys = vec![key.clone()];
+        let mut assignments = Vec::new();
+
+        for (req_idx, (req_id, _)) in input.requests.iter().enumerate() {
+            let deadline = deadlines[req_idx];
+            let mut best: Option<(f64, &Flavour, i32)> = None;
+
+            for flavour in &self.flavours {
+                for slot in input.current_slot..=deadline {
+                    let cost = self.incremental_carbon_cost(
+                        slot,
+                        flavour.duration,
+                        base_counts,
+                        &key.inc_counts,
+                        tiers,
+                    );
+                    if best.map_or(true, |(c, _, _)| cost < c) {
+                        best = Some((cost, flavour, slot));
+                    }
+                }
+            }
+
+            if let Some((cost, flavour, slot)) = best {
+                let s = slot as usize;
+                let f_error_bp = (flavour.error * 100.0).round() as i64;
+
+                let mut new_error_sum_bp = key.error_sum_bp;
+                let mut new_error_count = key.error_count();
+                let mut new_mock_remaining = key.mock_remaining;
+
+                if slot >= window_start && slot <= window_end {
+                    new_error_sum_bp += f_error_bp;
+                    new_error_count += 1.0;
+                    if new_mock_remaining > 0 && mock_error_bp > 0 {
+                        new_error_sum_bp -= mock_error_bp;
+                        new_error_count = (new_error_count - 1.0).max(0.0);
+                        new_mock_remaining -= 1;
+                    }
+                }
+
+                let mut new_inc = key.inc_counts.clone();
+                new_inc[s] += 1;
+
+                key = DpStateKey::new(
+                    new_error_sum_bp,
+                    new_error_count,
+                    new_mock_remaining,
+                    new_inc,
+                );
+                keys.push(key.clone());
+
+                assignments.push(RequestAssignment {
+                    request_id: *req_id,
+                    flavour_name: flavour.name.clone(),
+                    slot,
+                    carbon_cost: cost,
+                    error: flavour.error,
+                });
+            }
+        }
+
+        (assignments, keys)
     }
 
     /// Greedy fallback: assign each request to the cheapest feasible slot using

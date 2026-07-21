@@ -216,10 +216,10 @@ impl Default for Config {
                 CapacityTier { max_requests: Some(80),  multiplier: 2.0 },
                 CapacityTier { max_requests: None,      multiplier: 5.0 }, // 81+: overload
             ],
-            dp_pruning_method: "beam".to_string(),
+            dp_pruning_method: "kbest".to_string(),
             dp_pruning_min_batch_size: 23,
-            dp_pruning_k: 8000,
-            dp_timeout: 7.0,
+            dp_pruning_k: 12000,
+            dp_timeout: 15.0,
             dp_lock_future_assignments: true,
             // infeasibility_recovery_mode: "forecast".to_string(),
             infeasibility_recovery_mode: "carryover".to_string(),

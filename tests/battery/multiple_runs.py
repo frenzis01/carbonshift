@@ -70,7 +70,7 @@ DP_CONTENT: Dict[str, Any] = {
     # "batch_sizes": [1, 4, 6, 8, 10, 12, 16, 22],
     # "infeasibility_modes": ["min_error_greedy", "carryover", "forecast"],
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
-    "batch_sizes": [22],
+    "batch_sizes": [1],
     "infeasibility_modes": ["min_error_greedy"],
     "online_strategies": [],
     "additional_strategies": [],

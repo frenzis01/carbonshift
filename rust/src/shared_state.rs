@@ -196,6 +196,13 @@ impl SharedState {
         g.total_received += 1;
     }
 
+    /// Append multiple requests to the pending queue.
+    pub fn add_requests(&self, requests: Vec<Request>) {
+        let mut g = self.inner.lock().unwrap();
+        g.total_received += requests.len() as u64;
+        g.pending.extend(requests);
+    }
+
     /// Atomically claim (remove) the first `count` pending requests.
     ///
     /// Returns fewer than `count` elements if the queue is shorter.

@@ -134,17 +134,14 @@ fn generator_loop(
         if current_slot >= cfg.total_slots {
             break;
         }
+        
+        const BATCH_SIZE: usize = 15;
 
         if current_slot > last_slot {
             last_slot = current_slot;
-
-            let requests: Vec<Request> = match &scenario_by_slot {
-                Some(by_slot) => {
-                    // Scenario replay: use pre-generated requests for this slot.
-                    by_slot.get(current_slot as usize).cloned().unwrap_or_default()
-                }
+            let mut requests: Vec<Request> = match &scenario_by_slot {
+                Some(by_slot) => by_slot.get(current_slot as usize).cloned().unwrap_or_default(),
                 None => {
-                    // Stochastic: draw from the configured Gaussian distribution.
                     let mut rng = rand::rngs::StdRng::seed_from_u64(
                         base_seed.wrapping_add(current_slot as u64),
                     );
@@ -152,20 +149,19 @@ fn generator_loop(
                     (0..num).map(|_| generate_request(current_slot, &cfg, &counter)).collect()
                 }
             };
-
+        
+            // Rispettiamo l'ordine di arrivo all'interno dello slot
+            requests.sort_by(|a, b| a.arrival_time.partial_cmp(&b.arrival_time).unwrap());
+        
             let num_requests = requests.len();
-            for req in requests {
-                shared_state.add_request(req);
+            for chunk in requests.chunks(BATCH_SIZE) {
+                shared_state.add_requests(chunk.to_vec()); // un solo lock per chunk
             }
-            // Confirm this slot has been processed so the scheduler's
-            // skip_empty_slots logic doesn't race ahead.
+        
             shared_state.set_generator_processed_slot(current_slot);
-
+        
             if cfg.verbose {
-                println!(
-                    "[RequestGenerator] Slot {current_slot}: {} requests",
-                    num_requests
-                );
+                println!("[RequestGenerator] Slot {current_slot}: {num_requests} requests");
             }
         }
 
