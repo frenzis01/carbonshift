@@ -135,7 +135,7 @@ fn generator_loop(
             break;
         }
         
-        const BATCH_SIZE: usize = 15;
+        const BATCH_SIZE: usize = 100;
 
         if current_slot > last_slot {
             last_slot = current_slot;

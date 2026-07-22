@@ -49,8 +49,8 @@ CARBON_INTENSITY_CYCLE_SLOTS: int = 24
 # process). Kept only so existing scenario JSON files / readers relying on the
 # field keep working.
 CARBON_RANDOM_NOISE_AMPLITUDE: float = 20.0
-CARBON_NIGHT_MIN: float = 75.0
-CARBON_DAY_MAX: float = 170.0
+CARBON_NIGHT_MAX: float = 75.0
+CARBON_DAY_MIN: float = 170.0
 CARBON_SUNRISE_FRACTION: float = 0.30
 CARBON_SUNSET_FRACTION: float = 0.78
 CARBON_TRANSITION_SLOPE: float = 20.0

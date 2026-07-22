@@ -96,8 +96,8 @@ def generate_carbon_intensity_forecast(
     total_slots: int,
     carbon_intensity_cycle_slots: int,
     seed: int,
-    night_min: float = 70.0,
-    day_max: float = 160.0,
+    night_max: float = 160.0,
+    day_min: float = 70.0,
     sunrise_fraction: float = 0.25,
     sunset_fraction: float = 0.75,
     transition_slope: float = 18.0,
@@ -118,11 +118,11 @@ def generate_carbon_intensity_forecast(
     seed:
         Random seed.
 
-    night_min:
-        Typical carbon intensity during the night valley.
+    night_max:
+        Typical carbon intensity during the night peak.
 
-    day_max:
-        Typical carbon intensity during the daytime peak.
+    day_min:
+        Typical carbon intensity during the daytime minimum.
 
     sunrise_fraction:
         Position of the morning transition within the cycle
@@ -176,8 +176,8 @@ def generate_carbon_intensity_forecast(
         daylight_factor = rise - fall
 
         trend = (
-            night_min
-            + (day_max - night_min) * daylight_factor
+            night_max
+            - (night_max - day_min) * daylight_factor
         )
 
         noise_state = (
@@ -213,8 +213,8 @@ def generate_scenario_data(
     include_prehistory: bool = True,
     carbon_intensity_cycle_slots: int = 24,
     capacity_tiers: Optional[List[Dict[str, Any]]] = None,
-    carbon_night_min: float = 75.0,
-    carbon_day_max: float = 170.0,
+    carbon_night_max: float = 160.0,
+    carbon_day_min: float = 70.0,
     carbon_sunrise_fraction: float = 0.30,
     carbon_sunset_fraction: float = 0.78,
     carbon_transition_slope: float = 20.0,
@@ -242,8 +242,8 @@ def generate_scenario_data(
         total_slots=total_slots,
         carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
         seed=seed,
-        night_min=carbon_night_min,
-        day_max=carbon_day_max,
+        night_max=carbon_night_max,
+        day_min=carbon_day_min,
         sunrise_fraction=carbon_sunrise_fraction,
         sunset_fraction=carbon_sunset_fraction,
         transition_slope=carbon_transition_slope,
