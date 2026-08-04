@@ -1,42 +1,27 @@
 {
   "_comment": "CarbonShift solver battery test configuration (Rust nshift binary only).",
   "_phases_comment": "Each phase is independently toggled by leaving its content list(s) empty: DP runs only if both batch_sizes AND infeasibility_modes are non-empty; online runs only if online_strategies is non-empty; offline runs only if additional_strategies is non-empty. See tests/battery/multiple_runs.py for phase-aware parameter grids that avoid redundantly re-running phases a given knob doesn't affect.",
-  "battery_id": "cfg_onlyhigh_0",
+  "battery_id": "cfg_onlyhigh_dp_0",
   "batch_sizes": [
-    1,
-    4,
-    6,
-    8,
-    10,
-    12,
-    16,
-    22
+    4
   ],
   "infeasibility_modes": [
-    "min_error_greedy",
-    "carryover"
+    "min_error_greedy"
   ],
-  "online_strategies": [
-    "bandit",
-    "ant_colony"
-  ],
+  "online_strategies": [],
   "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. greedy_singleton always forces N=1 regardless of this list.",
   "online_batch_sizes__": [
     1,
     4,
     8
   ],
-  "additional_strategies": [
-    "greedy_cheapest",
-    "bandit",
-    "ant_colony"
-  ],
+  "additional_strategies": [],
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
   "_runtime_knobs_comment": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values. rollback_max_consecutive/max_batch_solver_parallelism affect DP and greedy_singleton only; online_swarm_mode affects bandit/ant_colony only (see multiple_runs.py sensitivity matrix).",
   "max_batch_solver_parallelism": 8,
   "online_swarm_mode": "merge",
-  "realtime_slots": true,
+  "realtime_slots": false,
   "realtime_speed_scale": 1.0,
   "rollback_max_consecutive": 0,
   "scenarios": [
@@ -44,14 +29,35 @@
       "id": "high_load_1500_92",
       "seed": 92,
       "requests_per_slot": 1500.0,
-      "total_slots": 48,
+      "total_slots": 72,
+      "max_error_threshold": 3.0,
       "capacity_tiers": [
         {
           "max_requests": 1050,
           "multiplier": 1.0
         },
         {
-          "max_requests": 1800,
+          "max_requests": 2200,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
+      ]
+    },
+    {
+      "id": "xhigh_load_2000_120",
+      "seed": 120,
+      "requests_per_slot": 2000.0,
+      "total_slots": 72,
+      "capacity_tiers": [
+        {
+          "max_requests": 1400,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 2400,
           "multiplier": 1.5
         },
         {

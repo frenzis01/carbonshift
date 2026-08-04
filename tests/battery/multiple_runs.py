@@ -70,8 +70,9 @@ DP_CONTENT: Dict[str, Any] = {
     # "batch_sizes": [1, 4, 6, 8, 10, 12, 16, 22],
     # "infeasibility_modes": ["min_error_greedy", "carryover", "forecast"],
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
-    "batch_sizes": [1],
-    "infeasibility_modes": ["min_error_greedy"],
+    # "batch_sizes": [8,10,22],
+    "batch_sizes": [1,4,6,8,22],
+    "infeasibility_modes": ["min_error_greedy","carryover"],
     "online_strategies": [],
     "additional_strategies": [],
 }
@@ -80,7 +81,7 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "infeasibility_modes": [],
     "online_strategies": ["bandit", "ant_colony"],
-    "online_batch_sizes": [1, 4, 8],
+    "online_batch_sizes": [1,8,22],
     "additional_strategies": [],
 }
 
@@ -103,27 +104,31 @@ OFFLINE_CONTENT: Dict[str, Any] = {
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
 # DP + greedy_singleton: rollback x parallelism (swarm_mode is irrelevant to
 # both, so it is left fixed at whatever battery_config.json already has).
-_ROLLBACK_X_PARALLELISM = [
-    {"rollback_max_consecutive": rollback, "max_batch_solver_parallelism": parallelism}
+_ROLLBACK_X_PARALLELISM_X_THRESHOLD = [
+    {"rollback_max_consecutive": rollback, "max_batch_solver_parallelism": parallelism, "max_error_threshold": threshold}
     # for rollback in (0, 4)
     # for parallelism in (1, 8, 20)
+    # for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
     for rollback in (0,)
-    for parallelism in (8,)
+    for parallelism in (1,8,14,20)
+    for threshold in (4.0,)
 ]
 
 # bandit/ant_colony: parallelism x swarm_mode (rollback is irrelevant, left
 # fixed).
 _PARALLELISM_X_SWARM_MODE = [
     {"max_batch_solver_parallelism": parallelism, "online_swarm_mode": swarm_mode}
+    # for parallelism in (1, 8, 20)
     for parallelism in (1, 8, 20)
-    for swarm_mode in ("serialized", "merge")
+    # for swarm_mode in ("serialized", "merge")
+    for swarm_mode in ("merge",)
 ]
 
 PHASES: Dict[str, PhaseGrid] = {
-    "dp": PhaseGrid("dp", DP_CONTENT, _ROLLBACK_X_PARALLELISM),
+    "dp": PhaseGrid("dp", DP_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD),
     "online": PhaseGrid("online", SWARM_ONLINE_CONTENT, _PARALLELISM_X_SWARM_MODE),
     "greedy_singleton": PhaseGrid(
-        "greedy_singleton", GREEDY_SINGLETON_CONTENT, _ROLLBACK_X_PARALLELISM
+        "greedy_singleton", GREEDY_SINGLETON_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD
     ),
     # Offline strategies don't depend on any runtime knob: a single run
     # (empty knob override, i.e. keep battery_config.json's own defaults)
@@ -164,7 +169,19 @@ def run_phase(base_cfg: Dict[str, Any], phase: PhaseGrid, battery_id_prefix: str
     for idx, knobs in enumerate(phase.knob_grid, start=1):
         cfg = dict(base_cfg)
         cfg.update(phase.content)
+
+        # `max_error_threshold` is a per-scenario override in battery_config.json
+        # (nested under "scenarios"[i]), not a top-level runtime knob — apply it
+        # to every scenario entry instead of setting a (meaningless) root key.
+        knobs = dict(knobs)
+        max_error_threshold = knobs.pop("max_error_threshold", None)
         cfg.update(knobs)
+        if max_error_threshold is not None:
+            cfg["scenarios"] = [
+                {**scenario, "max_error_threshold": max_error_threshold}
+                for scenario in cfg.get("scenarios", [])
+            ]
+
         cfg["battery_id"] = f"{battery_id_prefix}_{phase.name}_{idx - 1}"
 
         print("\n" + "=" * 70)
@@ -195,7 +212,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="cfg_onlyhigh",
+        default="cfg_test0",
         help="Prefix used to build each run's battery_id "
         "(final id is '<prefix>_<phase>_<grid-index>').",
     )

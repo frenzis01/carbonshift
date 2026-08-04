@@ -11,6 +11,7 @@ use std::sync::{
     Arc,
 };
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -124,6 +125,11 @@ fn generator_loop(
     let base_seed = cfg.prehistory_random_seed;
 
     let mut last_slot: i32 = -1;
+    // True realtime pacing only makes sense when the virtual clock actually
+    // tracks wall-clock time (skip_empty_slots=false); in fast/skip mode the
+    // clock jumps ahead as soon as the queue drains, so bursting is correct.
+    let realtime_pacing = !cfg.skip_empty_slots;
+    const LOCK_BATCH_SIZE: usize = 50;
 
     while running.load(Ordering::Relaxed) {
         // Use the shared virtual clock so skip_empty_slots advances us too.
@@ -134,8 +140,6 @@ fn generator_loop(
         if current_slot >= cfg.total_slots {
             break;
         }
-        
-        const BATCH_SIZE: usize = 100;
 
         if current_slot > last_slot {
             last_slot = current_slot;
@@ -149,23 +153,50 @@ fn generator_loop(
                     (0..num).map(|_| generate_request(current_slot, &cfg, &counter)).collect()
                 }
             };
-        
+
             // Rispettiamo l'ordine di arrivo all'interno dello slot
             requests.sort_by(|a, b| a.arrival_time.partial_cmp(&b.arrival_time).unwrap());
-        
+
             let num_requests = requests.len();
-            for chunk in requests.chunks(BATCH_SIZE) {
-                shared_state.add_requests(chunk.to_vec()); // un solo lock per chunk
+
+            if realtime_pacing && num_requests > 0 {
+                // Spread the slot's requests evenly across its real-time
+                // duration, sending at most `generator_realtime_chunk_size`
+                // at a time and sleeping the proportional inter-chunk delay.
+                let chunk_size = cfg.generator_realtime_chunk_size.max(1);
+                let per_request_secs = slot_duration / num_requests as f64;
+                for chunk in requests.chunks(chunk_size) {
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    shared_state.add_requests(chunk.to_vec());
+                    sleep_interruptible(&running, per_request_secs * chunk.len() as f64);
+                }
+            } else {
+                for chunk in requests.chunks(LOCK_BATCH_SIZE) {
+                    shared_state.add_requests(chunk.to_vec()); // un solo lock per chunk
+                }
             }
-        
+
             shared_state.set_generator_processed_slot(current_slot);
-        
+
             if cfg.verbose {
                 println!("[RequestGenerator] Slot {current_slot}: {num_requests} requests");
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Sleep for `secs` real seconds, checking `running` every 10ms so `stop()`
+/// interrupts promptly instead of blocking for a whole slot.
+fn sleep_interruptible(running: &Arc<AtomicBool>, secs: f64) {
+    let mut remaining_ms = (secs * 1000.0).round() as i64;
+    while remaining_ms > 0 && running.load(Ordering::Relaxed) {
+        let step = remaining_ms.min(10);
+        std::thread::sleep(Duration::from_millis(step as u64));
+        remaining_ms -= step;
     }
 }
 

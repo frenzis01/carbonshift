@@ -147,7 +147,9 @@ def _generate_scenario(scenario_def: Dict[str, Any], output_path: Path) -> Dict[
         deadline_max_slack=int(scenario_config.DEADLINE_MAX_SLACK),
         error_window_past=int(scenario_config.ERROR_WINDOW_PAST),
         error_window_future=int(scenario_config.ERROR_WINDOW_FUTURE),
-        max_error_threshold=float(scenario_config.MAX_ERROR_THRESHOLD),
+        max_error_threshold=float(
+            scenario_def.get("max_error_threshold", scenario_config.MAX_ERROR_THRESHOLD),
+        ),
         prehistory_error_ratio=float(scenario_config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
         capacity_tiers=tiers,
     )

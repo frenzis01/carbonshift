@@ -115,6 +115,10 @@ pub struct Config {
     /// `1.0` = real-time; `0.1` = 10× faster; `0.0` = essentially instant
     /// (only meaningful when `skip_empty_slots` is false).
     pub slot_speed_scale: f64,
+    /// Max requests the generator emits per tick while pacing a slot's
+    /// arrivals in real time (only used when `skip_empty_slots` is false,
+    /// i.e. true realtime simulation). Larger K = coarser pacing.
+    pub generator_realtime_chunk_size: usize,
 
     // ── progress display ──────────────────────────────────────────────────
     /// Total requests expected for this run (known from scenario upfront).
@@ -216,14 +220,14 @@ impl Default for Config {
                 CapacityTier { max_requests: Some(80),  multiplier: 2.0 },
                 CapacityTier { max_requests: None,      multiplier: 5.0 }, // 81+: overload
             ],
-            dp_pruning_method: "kbest".to_string(),
-            dp_pruning_min_batch_size: 23,
-            dp_pruning_k: 12000,
-            dp_timeout: 15.0,
+            dp_pruning_method: "beam".to_string(),
+            dp_pruning_min_batch_size: 8,
+            dp_pruning_k: 1200,
+            dp_timeout: 25.0,
             dp_lock_future_assignments: true,
             // infeasibility_recovery_mode: "forecast".to_string(),
             infeasibility_recovery_mode: "carryover".to_string(),
-            infeasibility_mock_influence: 0.6,
+            infeasibility_mock_influence: 0.8,
             infeasibility_mock_error_per_request: None,
             infeasibility_mock_influence_decay_step: 0.15,
             predicted_requests_per_slot: 60.0,
@@ -236,6 +240,7 @@ impl Default for Config {
             rollback_max_consecutive: 3,
             skip_empty_slots: true,
             slot_speed_scale: 1.0,
+            generator_realtime_chunk_size: 10,
             total_requests: 0,
             solver_strategy: "dp".to_string(),
             online_swarm_mode: "serialized".to_string(),

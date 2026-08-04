@@ -308,21 +308,43 @@ fn main_loop(
     let mut last_skip_slot: i32 = -1;
     let mut last_progress_wall_ms: u64 = 0;
     let mut printed_progress = false;
+    // Delta-based wall-clock tracking so we can *freeze* virtual time (instead
+    // of losing it, only to burst-catch-up later) while the scheduler is busy.
+    let mut last_wall_ms: u64 = wall_start.elapsed().as_millis() as u64;
 
     while running.load(Ordering::Relaxed) {
-        // Keep virtual clock in sync with wall clock (skip mode may advance it further).
+        let pending_count = shared_state.get_pending_count();
+        let active_workers = mutable.lock().unwrap().active_workers;
+        // Freeze only while the solver pool is fully saturated (a genuine
+        // backlog storm — all workers busy with no spare capacity). Freezing
+        // on `active_workers > 0` alone is too aggressive: with any backlog
+        // at all, workers are ~always busy, so the generator would almost
+        // never get to inject fresh arrivals (near-livelock, verified in
+        // testing). Freezing only at full saturation still caps the worst
+        // case (virtual time racing dozens of slots ahead during a single
+        // slow batch) while letting normal load keep flowing.
+        let solver_saturated = active_workers >= cfg.max_batch_solver_parallelism;
+
+        // Keep virtual clock in sync with wall clock (skip mode may advance it
+        // further). When `skip_empty_slots` is enabled (offline / non-realtime
+        // simulation), freeze the virtual clock while the solver pool is
+        // saturated: otherwise a slow DP batch silently burns through virtual
+        // slots and deadlines while it's still being computed, which is
+        // exactly the "generator races ahead of the scheduler" failure mode.
+        // In true realtime mode (`!skip_empty_slots`) wall time always ticks
+        // 1:1, since falling behind there is meant to model genuine
+        // real-world lateness.
         let wall_ms = wall_start.elapsed().as_millis() as u64;
-        let current_vms = shared_state.virtual_elapsed_ms.load(Ordering::Relaxed);
-        if wall_ms > current_vms {
-            shared_state.set_virtual_elapsed_ms(wall_ms);
+        let delta_ms = wall_ms.saturating_sub(last_wall_ms);
+        last_wall_ms = wall_ms;
+        if !cfg.skip_empty_slots || !solver_saturated {
+            let current_vms = shared_state.virtual_elapsed_ms.load(Ordering::Relaxed);
+            shared_state.set_virtual_elapsed_ms(current_vms + delta_ms);
         }
 
         let elapsed = shared_state.virtual_elapsed_secs();
         let current_slot = (elapsed / eff_slot_dur) as i32;
         shared_state.set_current_slot(current_slot);
-
-        let pending_count = shared_state.get_pending_count();
-        let active_workers = mutable.lock().unwrap().active_workers;
 
         let mut did_something = false;
 

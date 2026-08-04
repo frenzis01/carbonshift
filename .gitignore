@@ -27,6 +27,7 @@ tests/battery/output
 tests/battery/scenarios/json
 tests/battery/EvaluationTest.md
 tests/battery/battery_config_*.json
+tests/battery/TEST_structure.md
 
 rust/src/bin/nshift.rs
 rust/src/bin/run_nshift_speed.rs
