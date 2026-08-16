@@ -1448,14 +1448,20 @@ fn run_single_n(
     // request-arrival rate: when the clock reaches total_dur, the generator has
     // already stopped, but many requests may still be waiting in the pending queue.
     // We keep the scheduler running until every request has been dispatched to a
-    // DP worker AND every worker has finished (pending==0 AND active==0).
-    //
-    // Safety timeout: 60 extra seconds to avoid hanging on pathological configs.
+    // DP worker AND every worker has finished (pending==0 AND active==0) AND the
+    // generator itself has finished emitting the last slot. That last check
+    // matters in realtime pacing mode: the generator sleeps *between* chunks of
+    // a slot, so the pending queue can transiently look empty (with no active
+    // worker) while the generator is still mid-slot, about to send more
+    // requests. Without it, Phase 2 can declare "done" and `generator.stop()`
+    // would cut the generator thread off before it emits the rest of that slot.
+    let last_slot = cfg.total_slots - 1;
     let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let stats   = sched.get_statistics();
         let pending = shared_state.get_pending_count();
-        if (pending == 0 && stats.active_batch_workers == 0)
+        let generator_done = shared_state.generator_processed_slot() >= last_slot;
+        if (pending == 0 && stats.active_batch_workers == 0 && generator_done)
             || std::time::Instant::now() > drain_deadline
         {
             break;

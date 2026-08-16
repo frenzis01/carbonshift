@@ -134,55 +134,70 @@ fn generator_loop(
     while running.load(Ordering::Relaxed) {
         // Use the shared virtual clock so skip_empty_slots advances us too.
         let elapsed = shared_state.virtual_elapsed_secs();
-        let current_slot = (elapsed / slot_duration) as i32;
-
-        // Stop once we've passed the last slot.
-        if current_slot >= cfg.total_slots {
-            break;
-        }
+        let raw_slot = (elapsed / slot_duration) as i32;
+        // Clamp so the final slot is always processed below even if the
+        // virtual clock has already moved past it by the time we check.
+        let current_slot = raw_slot.min(cfg.total_slots - 1);
 
         if current_slot > last_slot {
-            last_slot = current_slot;
-            let mut requests: Vec<Request> = match &scenario_by_slot {
-                Some(by_slot) => by_slot.get(current_slot as usize).cloned().unwrap_or_default(),
-                None => {
-                    let mut rng = rand::rngs::StdRng::seed_from_u64(
-                        base_seed.wrapping_add(current_slot as u64),
-                    );
-                    let num = (dist.sample(&mut rng) as i32).max(1) as usize;
-                    (0..num).map(|_| generate_request(current_slot, &cfg, &counter)).collect()
-                }
-            };
-
-            // Rispettiamo l'ordine di arrivo all'interno dello slot
-            requests.sort_by(|a, b| a.arrival_time.partial_cmp(&b.arrival_time).unwrap());
-
-            let num_requests = requests.len();
-
-            if realtime_pacing && num_requests > 0 {
-                // Spread the slot's requests evenly across its real-time
-                // duration, sending at most `generator_realtime_chunk_size`
-                // at a time and sleeping the proportional inter-chunk delay.
-                let chunk_size = cfg.generator_realtime_chunk_size.max(1);
-                let per_request_secs = slot_duration / num_requests as f64;
-                for chunk in requests.chunks(chunk_size) {
-                    if !running.load(Ordering::Relaxed) {
-                        break;
+            // Catch up on every slot boundary crossed since the last check.
+            // In real-time pacing mode, sending one slot's requests can take
+            // longer than that slot's real-time duration (chunking/locking
+            // overhead), so the virtual clock may jump ahead by more than
+            // one slot between iterations. Only fetching `current_slot`
+            // would silently drop the skipped slots' requests entirely, so
+            // process each crossed slot (bursting the ones we're already
+            // behind on; pacing only the one we just caught up to).
+            for slot in (last_slot + 1)..=current_slot {
+                let mut requests: Vec<Request> = match &scenario_by_slot {
+                    Some(by_slot) => by_slot.get(slot as usize).cloned().unwrap_or_default(),
+                    None => {
+                        let mut rng = rand::rngs::StdRng::seed_from_u64(
+                            base_seed.wrapping_add(slot as u64),
+                        );
+                        let num = (dist.sample(&mut rng) as i32).max(1) as usize;
+                        (0..num).map(|_| generate_request(slot, &cfg, &counter)).collect()
                     }
-                    shared_state.add_requests(chunk.to_vec());
-                    sleep_interruptible(&running, per_request_secs * chunk.len() as f64);
+                };
+
+                // Rispettiamo l'ordine di arrivo all'interno dello slot
+                requests.sort_by(|a, b| a.arrival_time.partial_cmp(&b.arrival_time).unwrap());
+
+                let num_requests = requests.len();
+
+                if realtime_pacing && num_requests > 0 && slot == current_slot {
+                    // Spread the slot's requests evenly across its real-time
+                    // duration, sending at most `generator_realtime_chunk_size`
+                    // at a time and sleeping the proportional inter-chunk delay.
+                    let chunk_size = cfg.generator_realtime_chunk_size.max(1);
+                    let per_request_secs = slot_duration / num_requests as f64;
+                    for chunk in requests.chunks(chunk_size) {
+                        if !running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        shared_state.add_requests(chunk.to_vec());
+                        sleep_interruptible(&running, per_request_secs * chunk.len() as f64);
+                    }
+                } else {
+                    // Older, already-elapsed slots (or non-paced mode): burst
+                    // immediately, pacing them further would only fall behind.
+                    for chunk in requests.chunks(LOCK_BATCH_SIZE) {
+                        shared_state.add_requests(chunk.to_vec()); // un solo lock per chunk
+                    }
                 }
-            } else {
-                for chunk in requests.chunks(LOCK_BATCH_SIZE) {
-                    shared_state.add_requests(chunk.to_vec()); // un solo lock per chunk
+
+                shared_state.set_generator_processed_slot(slot);
+
+                if cfg.verbose {
+                    println!("[RequestGenerator] Slot {slot}: {num_requests} requests");
                 }
             }
+            last_slot = current_slot;
+        }
 
-            shared_state.set_generator_processed_slot(current_slot);
-
-            if cfg.verbose {
-                println!("[RequestGenerator] Slot {current_slot}: {num_requests} requests");
-            }
+        // Stop once we've caught up through the last slot.
+        if raw_slot >= cfg.total_slots {
+            break;
         }
 
         std::thread::sleep(Duration::from_millis(10));

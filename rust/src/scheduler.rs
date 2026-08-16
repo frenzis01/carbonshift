@@ -343,7 +343,17 @@ fn main_loop(
         }
 
         let elapsed = shared_state.virtual_elapsed_secs();
-        let current_slot = (elapsed / eff_slot_dur) as i32;
+        // Clamp to the last valid slot: once the generator has finished
+        // emitting (end of scenario), wall-clock time keeps advancing while
+        // this loop drains any remaining pending requests (Phase 2 in
+        // `run_single_n`). Without this clamp, `current_slot` would keep
+        // growing past `total_slots`, eventually exceeding the deadline of
+        // any request still pending — making both the DP solver (which
+        // rejects `current_slot >= window_size` outright) and
+        // `greedy_fallback` (whose `current_slot..=deadline` range becomes
+        // empty) permanently unable to place it, no matter how long Phase 2
+        // waits.
+        let current_slot = ((elapsed / eff_slot_dur) as i32).min(cfg.total_slots - 1);
         shared_state.set_current_slot(current_slot);
 
         let mut did_something = false;

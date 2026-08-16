@@ -71,7 +71,7 @@ DP_CONTENT: Dict[str, Any] = {
     # "infeasibility_modes": ["min_error_greedy", "carryover", "forecast"],
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
     # "batch_sizes": [8,10,22],
-    "batch_sizes": [1,4,6,8,22],
+    "batch_sizes": [1,4,6],
     "infeasibility_modes": ["min_error_greedy","carryover"],
     "online_strategies": [],
     "additional_strategies": [],
@@ -110,7 +110,7 @@ _ROLLBACK_X_PARALLELISM_X_THRESHOLD = [
     # for parallelism in (1, 8, 20)
     # for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
     for rollback in (0,)
-    for parallelism in (1,8,14,20)
+    for parallelism in (8,20)
     for threshold in (4.0,)
 ]
 

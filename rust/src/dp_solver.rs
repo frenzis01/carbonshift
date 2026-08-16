@@ -217,20 +217,36 @@ impl DpSolver {
             window_end,
         );
 
-        // With a single request the sequential solution is already exhaustive:
-        // it evaluates every (flavour, slot) pair, which is exactly what the
-        // one-layer DP would do.  No pruning can occur, and no state merging
-        // can hide a better path.  We can return immediately.
-        if input.requests.len() == 1 {
-            // Honour the error threshold exactly as the full DP would.
-            if let Some(threshold) = input.max_error_threshold {
-                let ec = warm_keys[1].error_count();
-                if ec > 0.0 && (warm_keys[1].error_sum_bp as f64 / 100.0) / ec > threshold {
-                    return vec![];
-                }
-            }
-            return warm_assignments;
-        }
+        // NOTE: a single request is *not* special-cased here anymore. The
+        // sequential/warm-start solution above only ever tracks the single
+        // cheapest (flavour, slot) pair — it has no notion of the error
+        // constraint while picking it. A previous shortcut returned that one
+        // candidate directly (rejecting the whole request as infeasible if
+        // it happened to violate the error threshold), which meant it never
+        // considered a slightly costlier but constraint-satisfying
+        // alternative. The general per-request DP layer below evaluates
+        // *every* (flavour, slot) pair as its own candidate state and only
+        // filters by the error threshold at the end (same as for N>1), so
+        // falling through here fixes that without adding new logic.
+
+        // `compute_sequential_solution` picks purely by minimum cost — it has
+        // no notion of `max_error_threshold` at all (unlike `solve_greedy_singleton`
+        // and `greedy_fallback`, which both skip/avoid infeasible candidates
+        // and only fall back to the most-accurate flavour as a last resort).
+        // So `warm_assignments` is *not* guaranteed to respect the constraint,
+        // even though it is used below as a real returned answer (DP dead-end,
+        // DP timeout). Check its final accumulated error once, up front, and
+        // reuse this single verdict at every such site: if it violates the
+        // threshold, treat it exactly like the end-of-loop feasibility filter
+        // does — signal genuine infeasibility (`vec![]`) instead of silently
+        // returning a constraint-violating solution, so the caller routes to
+        // `greedy_fallback` (same rule, applied consistently everywhere).
+        let warm_is_feasible = input.max_error_threshold.map_or(true, |threshold| {
+            warm_keys.last().map_or(true, |k| {
+                let ec = k.error_count();
+                ec == 0.0 || (k.error_sum_bp as f64 / 100.0) / ec <= threshold
+            })
+        });
 
         // ── initial DP state ─────────────────────────────────────────────
         let init_key = DpStateKey::new(
@@ -314,8 +330,12 @@ impl DpSolver {
             }
 
             if dp_curr.is_empty() {
-                // DP dead-end: the warm-start solution is our safety net.
-                return warm_assignments;
+                // DP dead-end (unreachable in practice: flavours and the
+                // slot range are always non-empty, so `dp_curr` can never
+                // actually end up empty here — kept as a defensive guard).
+                // Same rule as everywhere else: only return the warm-start
+                // answer if it satisfies the error threshold.
+                return if warm_is_feasible { warm_assignments } else { vec![] };
             }
 
             // ── pruning with warm-start protection ───────────────────────
@@ -371,9 +391,9 @@ impl DpSolver {
                 dp_curr = trimmed;
             }
 
-            // ── timeout: fall back to warm-start solution ────────────────
+            // ── timeout: fall back to warm-start solution (if feasible) ──
             if start.elapsed().as_secs_f64() > self.timeout {
-                return warm_assignments;
+                return if warm_is_feasible { warm_assignments } else { vec![] };
             }
 
             dp_prev = dp_curr;
@@ -386,16 +406,26 @@ impl DpSolver {
                 ec == 0.0 || (k.error_sum_bp as f64 / 100.0) / ec <= threshold
             });
             if dp_prev.is_empty() {
-                return warm_assignments;
+                // Every explored combination violates the error threshold:
+                // this batch is genuinely infeasible. Falling back to
+                // `warm_assignments` here would silently relax the
+                // constraint (it ignores error entirely); the caller must
+                // see this as infeasible so it can route to greedy fallback
+                // instead.
+                return vec![];
             }
         }
 
-        // Return the minimum-cost feasible assignment, or warm-start if DP fails.
+        // Return the minimum-cost feasible assignment. `dp_prev` is
+        // guaranteed non-empty here (either no threshold was given, or the
+        // retain+empty-check above already returned): the `.unwrap_or(...)`
+        // is unreachable defensive code, kept consistent with the same rule
+        // as everywhere else in this function.
         dp_prev
             .into_values()
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
             .map(|(_, assignments)| assignments)
-            .unwrap_or(warm_assignments)
+            .unwrap_or_else(|| if warm_is_feasible { warm_assignments } else { vec![] })
     }
 
     // ── warm-start helper ─────────────────────────────────────────────────
@@ -412,6 +442,24 @@ impl DpSolver {
     /// • `assignments` – the full sequential assignment vector.
     /// • `keys`        – the `DpStateKey` *before* the first request and
     ///                   after each processed request (`len = N+1`).
+    /// Sequential (request-by-request) warm-start solution.
+    ///
+    /// Unlike a pure cost-greedy scan, this mirrors `solve_greedy_singleton`'s
+    /// feasibility rule: for each request, only cost-compare (flavour, slot)
+    /// candidates that keep the running window-average error within
+    /// `max_error_threshold` (checked a priori, before committing), and only
+    /// if *no* candidate is feasible does it fall back to the most-accurate
+    /// (min-error) flavour at its cheapest slot — the same "guaranteed to
+    /// schedule" last resort `greedy_fallback`/`solve_greedy_singleton` use.
+    /// This makes the resulting `warm_assignments` a real, constraint-respecting
+    /// solution whenever one is reachable via request-by-request placement, so
+    /// callers that return it directly (DP dead-end, DP timeout) are safe by
+    /// construction rather than relying on the caller's own after-the-fact check.
+    /// The only way the very last state can still violate the threshold is if a
+    /// request truly cannot be placed feasibly at all even with the most
+    /// accurate flavour — genuine infeasibility for this heuristic, which is
+    /// exactly what `solve_batch`'s `warm_is_feasible` check (and its
+    /// `greedy_fallback` fallback) exists to catch.
     fn compute_sequential_solution(
         &self,
         input: &SolveBatchInput<'_>,
@@ -440,6 +488,16 @@ impl DpSolver {
             let deadline = deadlines[req_idx];
             let mut best: Option<(f64, &Flavour, i32)> = None;
 
+            // Most-accurate (min-error) flavour, and its cheapest slot — the
+            // last-resort candidate if nothing keeps the window error within
+            // threshold (mirrors `solve_greedy_singleton`'s fallback).
+            let min_error_flavour = self
+                .flavours
+                .iter()
+                .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+                .expect("at least one flavour");
+            let mut fallback: Option<(f64, i32)> = None;
+
             for flavour in &self.flavours {
                 for slot in input.current_slot..=deadline {
                     let cost = self.incremental_carbon_cost(
@@ -449,13 +507,54 @@ impl DpSolver {
                         &key.inc_counts,
                         tiers,
                     );
+
+                    if std::ptr::eq(flavour, min_error_flavour)
+                        && fallback.map_or(true, |(c, _)| cost < c)
+                    {
+                        fallback = Some((cost, slot));
+                    }
+
+                    // Feasibility check (a priori): would committing this
+                    // candidate keep the window-average error within
+                    // threshold? Same accounting as the state update below
+                    // and as `solve_batch`'s end-of-loop filter, just applied
+                    // per-candidate instead of only at the very end.
+                    if let Some(threshold) = input.max_error_threshold {
+                        if slot >= window_start && slot <= window_end {
+                            let f_error_bp = (flavour.error * 100.0).round() as i64;
+                            let mut proj_sum = key.error_sum_bp + f_error_bp;
+                            let mut proj_cnt = key.error_count() + 1.0;
+                            if key.mock_remaining > 0 && mock_error_bp > 0 {
+                                proj_sum -= mock_error_bp;
+                                proj_cnt = (proj_cnt - 1.0).max(0.0);
+                            }
+                            if proj_cnt > 0.0 && (proj_sum as f64 / 100.0) / proj_cnt > threshold {
+                                continue; // infeasible candidate: skip it
+                            }
+                        }
+                    }
+
                     if best.map_or(true, |(c, _, _)| cost < c) {
                         best = Some((cost, flavour, slot));
                     }
                 }
             }
 
-            if let Some((cost, flavour, slot)) = best {
+            // No candidate kept the window error within threshold: fall back
+            // to the most-accurate flavour at its cheapest slot. This may
+            // still violate the threshold if even that can't recover it
+            // (genuine infeasibility for a request-by-request heuristic) —
+            // `solve_batch`'s final `warm_is_feasible` check catches that.
+            let (cost, flavour, slot) = match best {
+                Some(b) => b,
+                None => {
+                    let (cost, slot) =
+                        fallback.expect("at least one (flavour, slot) candidate must exist");
+                    (cost, min_error_flavour, slot)
+                }
+            };
+
+            {
                 let s = slot as usize;
                 let f_error_bp = (flavour.error * 100.0).round() as i64;
 

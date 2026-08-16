@@ -34,6 +34,8 @@ pub struct SwarmAssignment {
     pub deadline_slot: i32,
     pub scheduled_slot: i32,
     pub flavour_name: String,
+    // TODO verify if this is needed later on in the development or not
+    #[allow(dead_code)]
     pub flavour_duration: i32,
     pub error: f64,
     pub carbon_cost: f64,

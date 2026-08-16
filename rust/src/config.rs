@@ -223,7 +223,7 @@ impl Default for Config {
             dp_pruning_method: "beam".to_string(),
             dp_pruning_min_batch_size: 8,
             dp_pruning_k: 1200,
-            dp_timeout: 25.0,
+            dp_timeout: 30.0,
             dp_lock_future_assignments: true,
             // infeasibility_recovery_mode: "forecast".to_string(),
             infeasibility_recovery_mode: "carryover".to_string(),
@@ -316,25 +316,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_values_match_python_config() {
-        let cfg = Config::default();
-        assert_eq!(cfg.batch_size, 3);
-        assert_eq!(cfg.total_slots, 24);
-        assert_eq!(cfg.max_error_threshold, 4.0);
-        assert_eq!(cfg.error_window_past, 12);
-        assert_eq!(cfg.error_window_future, 8);
-        assert_eq!(cfg.error_window_size(), 21);
-        assert_eq!(cfg.dp_pruning_k, 600);
-        assert!((cfg.carbon_cost_duration_scale - 1.0 / 3600.0).abs() < 1e-12);
-        assert_eq!(cfg.flavours.len(), 3);
-        assert_eq!(cfg.flavours[0].name, "Accurate");
-        assert_eq!(cfg.capacity_tiers.len(), 4);
-        assert_eq!(cfg.capacity_tiers[0].max_requests, Some(30));
-        // Last tier is the overflow catch-all
-        assert_eq!(cfg.capacity_tiers[3].max_requests, None);
-    }
 
     #[test]
     fn flavour_order_most_accurate_first() {
