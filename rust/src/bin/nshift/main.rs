@@ -1403,8 +1403,6 @@ fn run_single_n(
     cfg.enable_infeasibility_debug_logging = false;
     cfg.total_requests              = scenario.requests.len();
 
-    let eff_dur     = cfg.effective_slot_duration_secs();
-    let total_dur   = cfg.total_slots as f64 * eff_dur;
     let cfg         = Arc::new(cfg);
 
     std::fs::create_dir_all(run_dir).unwrap();
@@ -1435,33 +1433,35 @@ fn run_single_n(
     sched.start();
     generator.start();
 
-    // Phase 1: wait until the scenario's virtual time is exhausted (generator stops emitting).
+    // Phase 1: wait until the generator has finished emitting every slot.
+    // `generator_processed_slot()` is the authoritative "generator done" signal
+    // (set once per slot, right after that slot's requests are added). The
+    // virtual clock (`virtual_elapsed_secs()`) is advanced independently by the
+    // scheduler and must NOT be used as this gate: the generator now applies
+    // backpressure (waiting for the scheduler to drain each slot before moving
+    // on, see `generator.rs::wait_for_drain`), so under heavy load it can fall
+    // far behind the virtual clock. Waiting on the clock alone would let this
+    // phase end while the generator is still mid-scenario, and the fixed-size
+    // drain timeout below would then cut it off, silently dropping every
+    // not-yet-emitted slot's requests.
+    let last_slot = cfg.total_slots - 1;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        if shared_state.virtual_elapsed_secs() >= total_dur {
+        if shared_state.generator_processed_slot() >= last_slot {
             break;
         }
     }
 
     // Phase 2: let the scheduler drain the remaining pending queue.
-    // This is critical in realtime mode where the scheduler can fall behind the
-    // request-arrival rate: when the clock reaches total_dur, the generator has
-    // already stopped, but many requests may still be waiting in the pending queue.
-    // We keep the scheduler running until every request has been dispatched to a
-    // DP worker AND every worker has finished (pending==0 AND active==0) AND the
-    // generator itself has finished emitting the last slot. That last check
-    // matters in realtime pacing mode: the generator sleeps *between* chunks of
-    // a slot, so the pending queue can transiently look empty (with no active
-    // worker) while the generator is still mid-slot, about to send more
-    // requests. Without it, Phase 2 can declare "done" and `generator.stop()`
-    // would cut the generator thread off before it emits the rest of that slot.
-    let last_slot = cfg.total_slots - 1;
+    // Requests may still be waiting (or mid-solve) when Phase 1 ends, since
+    // Phase 1 only guarantees the generator has *emitted* every slot, not that
+    // the scheduler has finished processing them. We keep the scheduler
+    // running until pending==0 AND every worker has finished.
     let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let stats   = sched.get_statistics();
         let pending = shared_state.get_pending_count();
-        let generator_done = shared_state.generator_processed_slot() >= last_slot;
-        if (pending == 0 && stats.active_batch_workers == 0 && generator_done)
+        if (pending == 0 && stats.active_batch_workers == 0)
             || std::time::Instant::now() > drain_deadline
         {
             break;

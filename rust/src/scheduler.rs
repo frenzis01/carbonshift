@@ -315,29 +315,40 @@ fn main_loop(
     while running.load(Ordering::Relaxed) {
         let pending_count = shared_state.get_pending_count();
         let active_workers = mutable.lock().unwrap().active_workers;
-        // Freeze only while the solver pool is fully saturated (a genuine
-        // backlog storm — all workers busy with no spare capacity). Freezing
-        // on `active_workers > 0` alone is too aggressive: with any backlog
-        // at all, workers are ~always busy, so the generator would almost
-        // never get to inject fresh arrivals (near-livelock, verified in
-        // testing). Freezing only at full saturation still caps the worst
-        // case (virtual time racing dozens of slots ahead during a single
-        // slow batch) while letting normal load keep flowing.
-        let solver_saturated = active_workers >= cfg.max_batch_solver_parallelism;
+        // Freeze the virtual clock whenever there is *any* outstanding work —
+        // pending requests waiting to be dispatched, or workers still solving.
+        // Freezing only at full saturation (the previous condition) has a gap:
+        // every time a worker finishes and is about to be immediately
+        // replaced, `active_workers` momentarily dips below the parallelism
+        // cap for the one loop iteration that reads it — and at batch_size=1
+        // this refill happens once per *request*, so thousands of brief,
+        // repeated "not quite saturated" windows per slot each leak a little
+        // real time into the virtual clock. That leak accumulates well past
+        // a request's deadline slack long before its own backlog is cleared,
+        // which is exactly the "huge late-request pileup" failure mode.
+        // Freezing on any backlog at all (matching the drain condition the
+        // skip-forward branch below already requires) closes that gap: the
+        // clock only ever advances once the system is genuinely caught up.
+        // This alone doesn't starve the generator (a concern with an even
+        // more aggressive freeze tried previously): the generator itself now
+        // waits for the scheduler to drain each slot before emitting the
+        // next one (see `generator.rs::wait_for_drain`), so both sides are
+        // paced by the same "fully drained" signal.
+        let system_busy = pending_count > 0 || active_workers > 0;
 
         // Keep virtual clock in sync with wall clock (skip mode may advance it
         // further). When `skip_empty_slots` is enabled (offline / non-realtime
-        // simulation), freeze the virtual clock while the solver pool is
-        // saturated: otherwise a slow DP batch silently burns through virtual
-        // slots and deadlines while it's still being computed, which is
-        // exactly the "generator races ahead of the scheduler" failure mode.
-        // In true realtime mode (`!skip_empty_slots`) wall time always ticks
-        // 1:1, since falling behind there is meant to model genuine
+        // simulation), freeze the virtual clock while there is outstanding
+        // work: otherwise a slow/backlogged batch silently burns through
+        // virtual slots and deadlines while it's still being computed, which
+        // is exactly the "generator races ahead of the scheduler" failure
+        // mode. In true realtime mode (`!skip_empty_slots`) wall time always
+        // ticks 1:1, since falling behind there is meant to model genuine
         // real-world lateness.
         let wall_ms = wall_start.elapsed().as_millis() as u64;
         let delta_ms = wall_ms.saturating_sub(last_wall_ms);
         last_wall_ms = wall_ms;
-        if !cfg.skip_empty_slots || !solver_saturated {
+        if !cfg.skip_empty_slots || !system_busy {
             let current_vms = shared_state.virtual_elapsed_ms.load(Ordering::Relaxed);
             shared_state.set_virtual_elapsed_ms(current_vms + delta_ms);
         }

@@ -191,6 +191,17 @@ fn generator_loop(
                 if cfg.verbose {
                     println!("[RequestGenerator] Slot {slot}: {num_requests} requests");
                 }
+
+                // Backpressure: don't move on to the next slot until the
+                // scheduler has actually drained what we just emitted. The
+                // virtual clock advances independently in
+                // `scheduler::main_loop` (it only freezes while solver
+                // workers are fully saturated), so without this wait it can
+                // race arbitrarily far ahead of real throughput — especially
+                // at batch_size=1, where per-dispatch overhead is highest —
+                // letting a huge backlog build up silently until it is
+                // dumped, mostly late, at the very end of the run.
+                wait_for_drain(&running, &shared_state);
             }
             last_slot = current_slot;
         }
@@ -200,6 +211,20 @@ fn generator_loop(
             break;
         }
 
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Block until the scheduler has drained the pending queue (or `running`
+/// goes false, or a generous safety timeout elapses — a genuine scheduler
+/// stall must not hang the generator forever). This is the backpressure that
+/// keeps the virtual clock from racing ahead of actual solver throughput.
+fn wait_for_drain(running: &Arc<AtomicBool>, shared_state: &SharedState) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while shared_state.get_pending_count() > 0
+        && running.load(Ordering::Relaxed)
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
