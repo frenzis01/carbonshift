@@ -71,8 +71,9 @@ DP_CONTENT: Dict[str, Any] = {
     # "infeasibility_modes": ["min_error_greedy", "carryover", "forecast"],
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
     # "batch_sizes": [8,10,22],
-    "batch_sizes": [1,4,6],
-    "infeasibility_modes": ["min_error_greedy","carryover"],
+    "batch_sizes": [4,],
+    # "infeasibility_modes": ["min_error_greedy", "carryover"],
+    "infeasibility_modes": ["carryover"],
     "online_strategies": [],
     "additional_strategies": [],
 }
@@ -110,18 +111,24 @@ _ROLLBACK_X_PARALLELISM_X_THRESHOLD = [
     # for parallelism in (1, 8, 20)
     # for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
     for rollback in (0,)
-    for parallelism in (8,20)
+    for parallelism in (12,)
     for threshold in (4.0,)
+
 ]
 
-# bandit/ant_colony: parallelism x swarm_mode (rollback is irrelevant, left
+# bandit/ant_colony: parallelism x swarm_mode x threshold (rollback is irrelevant, left
 # fixed).
 _PARALLELISM_X_SWARM_MODE = [
-    {"max_batch_solver_parallelism": parallelism, "online_swarm_mode": swarm_mode}
+    {
+        "max_batch_solver_parallelism": parallelism,
+        "online_swarm_mode": swarm_mode,
+        "max_error_threshold": threshold,
+    }
     # for parallelism in (1, 8, 20)
-    for parallelism in (1, 8, 20)
+    for parallelism in (12,)
     # for swarm_mode in ("serialized", "merge")
     for swarm_mode in ("merge",)
+    for threshold in (3.0, 3.5, 4.5)
 ]
 
 PHASES: Dict[str, PhaseGrid] = {
@@ -130,10 +137,13 @@ PHASES: Dict[str, PhaseGrid] = {
     "greedy_singleton": PhaseGrid(
         "greedy_singleton", GREEDY_SINGLETON_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD
     ),
-    # Offline strategies don't depend on any runtime knob: a single run
-    # (empty knob override, i.e. keep battery_config.json's own defaults)
-    # covers every scenario.
-    "offline": PhaseGrid("offline", OFFLINE_CONTENT, [{}]),
+    # Offline strategies can also be evaluated with different per-scenario error
+    # thresholds, even though they don't depend on rollback or swarm knobs.
+    "offline": PhaseGrid(
+        "offline",
+        OFFLINE_CONTENT,
+        [{"max_error_threshold": threshold} for threshold in (3.0, 3.5, 4.5)],
+    ),
 }
 
 # Which phases to run when `--phase` is not given.
@@ -212,7 +222,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="cfg_test0",
+        default="cfg_test6",
         help="Prefix used to build each run's battery_id "
         "(final id is '<prefix>_<phase>_<grid-index>').",
     )

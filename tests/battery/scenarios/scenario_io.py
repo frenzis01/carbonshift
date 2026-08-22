@@ -103,6 +103,8 @@ def generate_carbon_intensity_forecast(
     transition_slope: float = 18.0,
     noise_std: float = 2.0,
     noise_persistence: float = 0.95,
+    inverted: bool = False,
+    phase_shifted: bool = True,
 ) -> List[float]:
     """
     Generate synthetic carbon intensity data with realistic day/night plateaus.
@@ -161,6 +163,9 @@ def generate_carbon_intensity_forecast(
     for slot in range(total_slots):
         x = (slot % cycle) / cycle
 
+        if phase_shifted:
+            x = (x + 0.5) % 1.0
+
         rise = 1.0 / (
             1.0 + math.exp(
                 -transition_slope * (x - sunrise_fraction)
@@ -174,6 +179,11 @@ def generate_carbon_intensity_forecast(
         )
 
         daylight_factor = rise - fall
+        
+        # in case the user wants to invert the wave 
+        # (e.g. testing purposes or simulating a different region with opposite solar cycle)
+        if inverted:
+            daylight_factor = -daylight_factor
 
         trend = (
             night_max
@@ -220,6 +230,7 @@ def generate_scenario_data(
     carbon_transition_slope: float = 20.0,
     carbon_noise_std: float = 1.5,
     carbon_noise_persistence: float = 0.97,
+    carbon_inverted: bool = False,
     request_night_floor_ratio: float = 0.40,
 ) -> Dict[str, Any]:
     """
@@ -249,6 +260,7 @@ def generate_scenario_data(
         transition_slope=carbon_transition_slope,
         noise_std=carbon_noise_std,
         noise_persistence=carbon_noise_persistence,
+        inverted=carbon_inverted,
     )
 
     # Per-slot mean request rate following the same daylight wave as carbon intensity.

@@ -56,6 +56,7 @@ CARBON_SUNSET_FRACTION: float = 0.78
 CARBON_TRANSITION_SLOPE: float = 20.0
 CARBON_NOISE_STD: float = 1.5
 CARBON_NOISE_PERSISTENCE: float = 0.97
+CARBON_INVERTED: bool = True
 
 # ── request-rate daylight wave ───────────────────────────────────────────────
 # Requests follow the same sunrise/sunset/transition_slope shape as carbon

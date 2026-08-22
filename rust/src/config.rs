@@ -197,8 +197,8 @@ impl Default for Config {
             total_slots: 24,
             flavours: vec![
                 Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 },
-                Flavour { name: "Balanced".to_string(), error: 2.5, duration: 30 },
-                Flavour { name: "Fast".to_string(), error: 5.0, duration: 10 },
+                // Flavour { name: "Balanced".to_string(), error: 2.5, duration: 30 },
+                // Flavour { name: "Fast".to_string(), error: 5.0, duration: 10 },
             ],
             carbon_cost_duration_scale: 1.0 / 3600.0,
             max_error_threshold: 4.0,

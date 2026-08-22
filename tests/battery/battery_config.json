@@ -1,19 +1,12 @@
 {
   "_comment": "CarbonShift solver battery test configuration (Rust nshift binary only).",
   "_phases_comment": "Each phase is independently toggled by leaving its content list(s) empty: DP runs only if both batch_sizes AND infeasibility_modes are non-empty; online runs only if online_strategies is non-empty; offline runs only if additional_strategies is non-empty. See tests/battery/multiple_runs.py for phase-aware parameter grids that avoid redundantly re-running phases a given knob doesn't affect.",
-  "battery_id": "cfg_test0_dp_0",
-  "batch_sizes": [
-    1,
-    4,
-    6,
-    8,
-    22
+  "battery_id": "cfg_test1_greedy_singleton_5",
+  "batch_sizes": [],
+  "infeasibility_modes": [],
+  "online_strategies": [
+    "greedy_singleton"
   ],
-  "infeasibility_modes": [
-    "min_error_greedy",
-    "carryover"
-  ],
-  "online_strategies": [],
   "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. greedy_singleton always forces N=1 regardless of this list.",
   "online_batch_sizes__": [
     1,
@@ -24,11 +17,11 @@
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
   "_runtime_knobs_comment": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values. rollback_max_consecutive/max_batch_solver_parallelism affect DP and greedy_singleton only; online_swarm_mode affects bandit/ant_colony only (see multiple_runs.py sensitivity matrix).",
-  "max_batch_solver_parallelism": 8,
+  "max_batch_solver_parallelism": 20,
   "online_swarm_mode": "merge",
   "realtime_slots": false,
   "realtime_speed_scale": 1.0,
-  "rollback_max_consecutive": 0,
+  "rollback_max_consecutive": 8,
   "scenarios": [
     {
       "id": "high_load_1500_92",

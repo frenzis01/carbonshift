@@ -152,6 +152,7 @@ def _generate_scenario(scenario_def: Dict[str, Any], output_path: Path) -> Dict[
         ),
         prehistory_error_ratio=float(scenario_config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
         capacity_tiers=tiers,
+        carbon_inverted=bool(scenario_config.CARBON_INVERTED),
     )
     save_json(output_path, data)
     return data
