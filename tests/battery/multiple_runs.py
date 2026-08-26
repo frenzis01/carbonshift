@@ -222,7 +222,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="cfg_test6",
+        default="cfg_test5",
         help="Prefix used to build each run's battery_id "
         "(final id is '<prefix>_<phase>_<grid-index>').",
     )

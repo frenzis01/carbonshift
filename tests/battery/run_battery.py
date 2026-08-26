@@ -153,6 +153,7 @@ def _generate_scenario(scenario_def: Dict[str, Any], output_path: Path) -> Dict[
         prehistory_error_ratio=float(scenario_config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
         capacity_tiers=tiers,
         carbon_inverted=bool(scenario_config.CARBON_INVERTED),
+        carbon_shifted_phase=bool(scenario_config.CARBON_SHIFTED_PHASE),
     )
     save_json(output_path, data)
     return data
@@ -796,7 +797,8 @@ def run_battery(config_path: Path) -> None:
         scenario_dir.mkdir(parents=True, exist_ok=True)
         SCENARIOS_JSON_DIR.mkdir(parents=True, exist_ok=True)
         scenario_path = SCENARIOS_JSON_DIR / f"{sid}.json"
-        _generate_scenario(scenario_def, scenario_path)
+        scenario_data = _generate_scenario(scenario_def, scenario_path)
+        save_json(scenario_dir / f"{sid}.json", scenario_data)
 
         if not (run_dp or run_online or run_offline):
             print("  WARNING: no phase enabled (batch_sizes/infeasibility_modes, "

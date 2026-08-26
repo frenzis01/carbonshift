@@ -79,6 +79,7 @@ def generate_and_save_scenario(
         carbon_noise_std=float(cfg.CARBON_NOISE_STD),
         carbon_noise_persistence=float(cfg.CARBON_NOISE_PERSISTENCE),
         carbon_inverted=bool(cfg.CARBON_INVERTED),
+        carbon_shifted_phase=bool(cfg.CARBON_SHIFTED_PHASE),
         request_night_floor_ratio=float(cfg.REQUEST_NIGHT_FLOOR_RATIO),
     )
     save_json(output_path, scenario)
