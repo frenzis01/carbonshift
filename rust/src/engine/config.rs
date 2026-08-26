@@ -181,6 +181,9 @@ pub struct Config {
 
     // ── logging & output ──────────────────────────────────────────────────
     pub verbose: bool,
+    /// Print the `\r [N=..] Scheduled x/y (..%)` progress line to stdout.
+    /// Meant for CLI benchmark/simulate runs; the REST service disables it.
+    pub enable_progress_display: bool,
     pub enable_solver_logging: bool,
     pub solver_runs_file: String,
     pub solver_assignments_file: String,
@@ -197,8 +200,8 @@ impl Default for Config {
             total_slots: 24,
             flavours: vec![
                 Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 },
-                // Flavour { name: "Balanced".to_string(), error: 2.5, duration: 30 },
-                // Flavour { name: "Fast".to_string(), error: 5.0, duration: 10 },
+                Flavour { name: "Balanced".to_string(), error: 2.5, duration: 30 },
+                Flavour { name: "Fast".to_string(), error: 5.0, duration: 10 },
             ],
             carbon_cost_duration_scale: 1.0 / 3600.0,
             max_error_threshold: 4.0,
@@ -256,6 +259,7 @@ impl Default for Config {
             swarm_aco_tau0: 1.0,
             swarm_aco_seed: 42,
             verbose: true,
+            enable_progress_display: true,
             enable_solver_logging: true,
             solver_runs_file: "/tmp/online2_solver_runs.csv".to_string(),
             solver_assignments_file: "/tmp/online2_solver_assignments.csv".to_string(),

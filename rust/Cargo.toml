@@ -6,10 +6,18 @@ edition = "2024"
 # src/bin/run_nshift_speed.rs) are never picked up as binary targets.
 autobins = false
 
-# Explicitly declare only the real binary.
+# Explicitly declare only the real binaries.
 [[bin]]
 name = "nshift"
 path = "src/bin/nshift/main.rs"
+
+[[bin]]
+name = "simulate"
+path = "src/bin/simulate/main.rs"
+
+[[bin]]
+name = "carbonshift-service"
+path = "src/bin/service/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -18,6 +26,14 @@ csv = "1"
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
 ctrlc = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 
 [dev-dependencies]
 approx = "0.5"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

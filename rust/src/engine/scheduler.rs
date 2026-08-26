@@ -470,7 +470,7 @@ fn main_loop(
         std::thread::sleep(Duration::from_millis(sleep_ms));
 
         // Progress display (skipped in verbose mode to avoid mixing with debug lines).
-        if !cfg.verbose {
+        if !cfg.verbose && cfg.enable_progress_display {
             let wall_ms = wall_start.elapsed().as_millis() as u64;
             if wall_ms.saturating_sub(last_progress_wall_ms) >= 500 {
                 let scheduled = mutable.lock().unwrap().stats.total_scheduled;

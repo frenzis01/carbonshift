@@ -1,0 +1,27 @@
+services:
+  carbonshift-service:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      SELF_BASE_URL: http://carbonshift-service:8080
+      EXECUTOR_URL: http://mock-executor:9000/dispatch
+      TOTAL_SLOTS: "8640"
+      SUBMIT_WAIT_TIMEOUT_SECS: "5"
+      # The docker-compose network is private/trusted, so caller callback
+      # URLs pointing at other services on it (e.g. a test client container)
+      # are allowed; don't set this in a real deployment (see PLAN_SERVICE.md).
+      CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS: "1"
+    depends_on:
+      - mock-executor
+
+  # Stand-in for the real downstream executor, for end-to-end testing only.
+  mock-executor:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./docker/mock_executor.py:/app/mock_executor.py:ro
+    command: ["python", "mock_executor.py"]
+    ports:
+      - "9000:9000"

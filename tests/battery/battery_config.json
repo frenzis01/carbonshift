@@ -35,7 +35,7 @@
           "multiplier": 1.0
         },
         {
-          "max_requests": 2200,
+          "max_requests": 3500,
           "multiplier": 1.5
         },
         {
@@ -55,7 +55,7 @@
           "multiplier": 1.0
         },
         {
-          "max_requests": 2400,
+          "max_requests": 4500,
           "multiplier": 1.5
         },
         {
