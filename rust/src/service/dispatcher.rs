@@ -14,11 +14,9 @@ use crate::service::models::RequestStatus;
 use crate::service::models::ExecutorDispatchPayload;
 use crate::service::state::AppState;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
 /// Runs forever; spawn with `tokio::spawn(dispatcher::run(state))`.
 pub async fn run(state: AppState) {
-    let mut interval = tokio::time::interval(POLL_INTERVAL);
+    let mut interval = tokio::time::interval(Duration::from_millis(state.service_cfg.dispatcher_poll_interval_ms));
     let mut warned_horizon = false;
     loop {
         interval.tick().await;
@@ -36,7 +34,15 @@ pub async fn run(state: AppState) {
                         && guard
                             .get(*id)
                             .map(|t| {
-                                t.status == RequestStatus::Scheduled
+                                // Not `== Scheduled`: `submit_request`'s own poll only
+                                // marks it Scheduled if the assignment shows up within
+                                // its wait timeout — if the DP solver assigns it later
+                                // (e.g. via a flush triggered by an explicit slot
+                                // advance in manual-clock/emulation mode), the tracked
+                                // status is still `Pending` even though a real
+                                // assignment now exists. Anything not yet
+                                // dispatched/completed/failed is fair game here.
+                                matches!(t.status, RequestStatus::Pending | RequestStatus::Scheduled)
                                     && t.next_attempt_at.map(|at| at <= now).unwrap_or(true)
                             })
                             .unwrap_or(false)

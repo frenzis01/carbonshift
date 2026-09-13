@@ -105,26 +105,79 @@ e passano invariati dopo lo spostamento.
 ## Contratto REST (Fase 2 — ✅ implementata, MVP)
 
 - `POST /v1/requests`
-  - body: `{ "deadline_seconds": f64, "callback_url": "http://...", "payload": <json opzionale> }`
+  - body: `{ "deadline_seconds": f64, "callback_url": "http://...", "payload": <json opzionale>, "task_id": "..." (opzionale) }`
+  - `task_id`: seleziona quali flavour (vedi `POST /v1/tasks` sotto) il DP
+    solver considera per questa richiesta. Omesso o non registrato ⇒
+    `"default"` (`Config::flavours`, i 3 flavour built-in).
   - risposta `200 OK` se il solver ha già assegnato uno slot entro
     `SUBMIT_WAIT_TIMEOUT_SECS` (default 5s):
-    `{ "request_id", "status": "scheduled", "scheduled_slot", "eta_seconds", "flavour", "carbon_cost" }`
+    `{ "request_id", "status": "scheduled", "scheduled_slot", "eta_seconds", "flavour", "carbon_cost", "scheduled_at", "baseline_carbon_cost" }`
+  - `scheduled_at`: timestamp Unix (secondi, float) di quando il DP solver ha
+    committato questa assegnazione (`Assignment::assignment_time`) — `null`
+    finché lo stato resta `pending`. Distinto da quando arriva il risultato
+    dell'esecutore (`POST /v1/callback/{id}`, non tracciato qui ma dal
+    chiamante al ricevimento della callback).
+  - `baseline_carbon_cost` è sempre presente (anche nella risposta `202
+    pending`, dove `carbon_cost` è ancora assente): è il costo carbonico
+    stimato per eseguire *subito* la richiesta con il flavour più
+    accurato/costoso **tra quelli del suo `task_id`**, senza alcuna
+    ottimizzazione della carbon intensity — calcolato una sola volta al
+    momento della sottomissione (in base allo slot di arrivo e alla
+    posizione nella coda di quello slot, per la repricing da capacity tier)
+    e riusato dai chiamanti come riferimento per calcolare il risparmio
+    carbonico ottenuto dalla schedulazione.
   - risposta `202 Accepted` con `"status": "pending"` se il solver non ha
     ancora processato il batch: il chiamante può fare polling su
     `GET /v1/requests/{id}` o aspettare la callback.
 - `GET /v1/requests/{id}` — stato corrente (`pending|scheduled|dispatched|completed|failed`).
+- `POST /v1/tasks` — annuncia (o aggiorna) i flavour disponibili per un
+  `task_id`: `{ "task_id": "text_generation", "flavours": [{"name", "error", "duration"}, ...], "max_error_threshold": 17.5 }`.
+  Sovrascrive qualunque registrazione precedente per lo stesso `task_id`
+  (anche `"default"`, il task built-in seedato da `Config::flavours`).
+  I flavour sono tenuti in un registro dinamico (`AppState::task_flavours`,
+  `RwLock`-protected) — **non hardcoded**: nessun task/flavour è cablato nel
+  motore oltre al set di default, coerentemente con l'idea che sia il
+  client (non lo scheduler) a conoscere quali modelli/errori esistono per
+  ciascun task. Il DP solver riceve, per ogni richiesta, esattamente i
+  flavour del suo `task_id` (vedi `engine::dp_solver::SolveBatchInput::request_flavours`);
+  l'errore medio globale/di finestra resta però un'unica media aggregata
+  **indipendentemente dal task di appartenenza** (per design, non per
+  limitazione): riflette l'errore complessivo dello scheduler, non quello
+  di un singolo task. `max_error_threshold` (opzionale, %) sostituisce il
+  default globale `Config::max_error_threshold` (4%, pensato per un caso
+  generico) SOLO per il controllo di fattibilità locale/di finestra delle
+  richieste di quel task — mai per il vincolo globale sopra descritto, che
+  resta sempre `Config::max_error_threshold`. Serve perché task diversi
+  hanno flavour con range di errore molto diversi tra loro (es.
+  text_generation calibrato può avere anche il flavour più accurato oltre
+  il 4%): senza questa possibilità quel task sarebbe permanentemente
+  infattibile e finirebbe sempre nel greedy fallback. Se più richieste
+  in uno stesso batch appartengono a task con soglie diverse, viene usata
+  la più severa (minima) fra quelle presenti nel batch. Risposta
+  `204 No Content`, o `400` se `flavours` è vuoto.
 - `POST /v1/callback/{id}` — chiamata dall'esecutore con
   `{ "success": bool, "result": <json>, "error": "..." }`; il servizio
   inoltra il risultato al `callback_url` originale (fire-and-forget, non
-  blocca la risposta all'esecutore).
+  blocca la risposta all'esecutore). Se `result.actual_error_pct` è presente
+  (numero, %), corregge anche l'errore medio globale/di finestra: rimpiazza
+  l'errore *previsto* del flavour assegnato con questo valore (vedi
+  `SharedState::correct_assignment_error`). `actual_error_pct` è calcolato
+  dall'executor con una formula diversa per task (vedi
+  `executor/app/inference.py::run_task`): F1 su ground truth/shadow per
+  QA/NER, degrado relativo di `confidence` rispetto ad Accurate per
+  text_generation (l'F1 lessicale non è un proxy sensato per generazione
+  libera — anche Accurate otterrebbe punteggi bassi contro un qualunque
+  riferimento). Questo succede **solo** qui — le simulazioni offline
+  (`nshift`/`simulate`, che non passano mai da questo endpoint) continuano a
+  usare solo l'errore previsto, mai un dato reale, com'è corretto per definizione.
 - `GET /v1/stats` — conteggio delle richieste tracciate per stato
   (`pending/scheduled/dispatched/completed/failed`), per osservabilità.
 - `GET /health` — liveness.
 
-`POST/GET /v1/requests*` richiede `X-API-Key` se `CARBONSHIFT_API_KEY` è
-impostata; `POST /v1/callback/{id}` richiede `X-Executor-Token` se
-`CARBONSHIFT_EXECUTOR_TOKEN` è impostata (confronto a tempo costante,
-`service::auth`). Entrambe opzionali (default: endpoint aperti).
+`POST/GET /v1/requests*` e `POST /v1/tasks` richiedono `X-API-Key` se
+`CARBONSHIFT_API_KEY` è impostata; `POST /v1/callback/{id}` richiede
+`X-Executor-Token` se `CARBONSHIFT_EXECUTOR_TOKEN` è impostata (confronto a
+tempo costante, `service::auth`). Entrambe opzionali (default: endpoint aperti).
 
 Il **dispatcher** (`service::dispatcher::run`) gira come task `tokio` in
 polling ogni 200ms: quando `current_slot >= scheduled_slot` di una richiesta
@@ -183,6 +236,49 @@ simulazioni offline.
 Documentazione completa dell'architettura, elenco file per file e istruzioni
 dettagliate sui test (con e senza esecutore reale): vedi
 [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Emulazione a tempo fittizio (per client + executor)
+
+Per testare scenari multi-timeslot (es. ore/giorni di traffico) senza
+aspettare il tempo reale, il servizio supporta una modalità a **clock
+manuale**: `MANUAL_CLOCK=1` congela l'orologio virtuale (nessun avanzamento
+col wall-clock reale); l'unico modo per farlo avanzare è chiamare
+`POST /v1/admin/advance-slot`, che:
+1. sposta l'orologio virtuale all'inizio dello slot successivo;
+2. forza il flush di eventuali richieste ancora in coda per lo slot appena
+   lasciato (stesso meccanismo di "slot-end flush" già esistente);
+3. attende (bloccando la risposta HTTP) finché il proprio dispatcher non ha
+   consegnato tutto all'esecutore, così chi chiama sa che può procedere.
+
+Endpoint pensato per essere orchestrato dal **client** (vedi `client/README.md`
+§"Emulazione a tempo fittizio"): il client invia le richieste di un timeslot,
+chiama questo endpoint, poi chiama l'analogo endpoint dell'executor
+(`POST /admin/advance-slot`), e solo dopo passa al timeslot successivo.
+
+**Bug trovato e corretto testando dal vivo questo meccanismo**: il
+dispatcher filtrava le richieste da consegnare all'esecutore solo se il loro
+stato tracciato era esattamente `Scheduled` — uno stato impostato dal solo
+handler di `POST /v1/requests` se l'assegnazione arriva entro il suo timeout
+di poll (`SUBMIT_WAIT_TIMEOUT_SECS`). Quando quel timeout scade prima che il
+DP solver assegni la richiesta (il caso normale in emulazione, dove si conta
+sul flush esplicito dell'advance-slot), il flag rimaneva bloccato su `Pending`
+**per sempre**, anche se il DP solver aveva già assegnato uno slot alla
+richiesta (es. tramite il flush dell'advance-slot) — e quindi il dispatcher
+non la consegnava mai. Corretto ampliando la condizione a
+`Pending | Scheduled` (`service/dispatcher.rs`, `service::handlers::advance_slot`);
+coperto da un test di regressione
+(`dispatcher_picks_up_requests_stuck_pending_after_poll_timeout`).
+
+**Raccomandazione operativa**: in modalità emulazione impostare
+`SUBMIT_WAIT_TIMEOUT_SECS` basso (es. `0.2`–`0.5`), perché le richieste di un
+timeslot tipicamente non riempiono subito un batch e altrimenti ogni singola
+`POST /v1/requests` blocca per l'intero timeout di default (5s) prima di
+tornare `202 pending` — tempo reale sprecato che va contro lo scopo stesso
+del "tempo fittizio".
+
+Variabili d'ambiente aggiuntive per questa modalità: `MANUAL_CLOCK`,
+`SLOT_DURATION_SECONDS`, `DISPATCHER_POLL_INTERVAL_MS` (vedi doc-comment in
+`src/bin/service/main.rs`).
 
 ## Come riprendere
 

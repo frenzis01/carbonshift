@@ -360,6 +360,31 @@ impl SharedState {
         GlobalErrorStats { error_sum, count, avg }
     }
 
+    /// Replaces a committed assignment's *predicted* error with the
+    /// *actual* error measured once the request was really executed (e.g.
+    /// derived from the executor's `quality_score` in an emulation/real
+    /// deployment — never available in offline simulation, which is why
+    /// this is only ever called from the executor-callback handler).
+    ///
+    /// Updates both bookkeeping mechanisms consistently:
+    /// - the window-error average, computed live from `Assignment::error`
+    ///   at query time, sees the correction automatically once `a.error` is
+    ///   overwritten here;
+    /// - the global running sum (`global_error_sum`), which is *not*
+    ///   recomputed live, is adjusted by the delta (subtract the old
+    ///   predicted contribution, add the new actual one).
+    ///
+    /// No-op if `request_id` has no committed assignment (e.g. it was never
+    /// scheduled, or was already archived).
+    pub fn correct_assignment_error(&self, request_id: u64, actual_error: f64) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(a) = g.assignments.get_mut(&request_id) {
+            let delta = actual_error - a.error;
+            a.error = actual_error;
+            g.global_error_sum += delta;
+        }
+    }
+
     // ── slot management ───────────────────────────────────────────────────
 
     pub fn set_current_slot(&self, slot: i32) {
@@ -562,7 +587,15 @@ mod tests {
     use std::collections::HashSet;
 
     fn make_request(id: u64, arrival: i32, deadline: i32) -> Request {
-        Request { id, arrival_slot: arrival, deadline_slot: deadline, arrival_time: 0.0 }
+        Request {
+            id,
+            arrival_slot: arrival,
+            deadline_slot: deadline,
+            arrival_time: 0.0,
+            task_id: "default".to_string(),
+            flavours: vec![],
+            max_error_threshold: None,
+        }
     }
 
     fn make_assignment(id: u64, slot: i32, error: f64) -> Assignment {
@@ -611,6 +644,30 @@ mod tests {
         assert_eq!(g.count, 2);
         assert!((g.error_sum - 6.0).abs() < 1e-9);
         assert!((g.avg - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn correct_assignment_error_adjusts_global_sum_by_delta() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(1, 0, 3.2), make_assignment(2, 0, 2.0)]);
+        // Real measured error (2.1) replaces the predicted one (3.2) for request 1.
+        state.correct_assignment_error(1, 2.1);
+        let g = state.get_global_error_stats();
+        assert_eq!(g.count, 2, "correction must not change the assignment count");
+        assert!((g.error_sum - 4.1).abs() < 1e-9, "error_sum={}", g.error_sum); // 3.2 - 3.2 + 2.1 + 2.0
+        // The window average (recomputed live from Assignment::error) must
+        // also reflect the corrected value.
+        let window = state.get_window_error_stats(0, 2, 2, &HashSet::new());
+        assert!((window.error_sum - 4.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn correct_assignment_error_is_noop_for_unknown_request() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(1, 0, 3.2)]);
+        state.correct_assignment_error(999, 0.0); // unknown request_id
+        let g = state.get_global_error_stats();
+        assert!((g.error_sum - 3.2).abs() < 1e-9);
     }
 
     #[test]

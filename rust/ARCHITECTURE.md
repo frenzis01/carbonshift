@@ -233,3 +233,6 @@ Documentate anche come doc-comment in `src/bin/service/main.rs`. Riassunto:
 | `EXECUTOR_RETRY_BASE_MS` / `EXECUTOR_RETRY_MAX_MS` | `500` / `30000` | Backoff esponenziale fra i tentativi. |
 | `HORIZON_READY_THRESHOLD` | `0.9` | Frazione di `TOTAL_SLOTS` oltre la quale `GET /ready` risponde `503`. |
 | `CARBONSHIFT_ENABLE_SOLVER_LOGGING` | `0` | Abilita i CSV di log del solver (utili per debug, non per produzione). |
+| `SLOT_DURATION_SECONDS` | `10` | Durata di uno slot; usare es. `1800` per timeslot da 30 minuti. |
+| `MANUAL_CLOCK` | `0` | Congela l'orologio virtuale eccetto via `POST /v1/admin/advance-slot` (solo test/emulazione, vedi PLAN_SERVICE.md). |
+| `DISPATCHER_POLL_INTERVAL_MS` | `200` | Frequenza di polling del dispatcher; abbassarla (es. `20`) per test di emulazione più reattivi. |

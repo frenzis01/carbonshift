@@ -139,6 +139,7 @@ fn drain_pending_with_dp(
             error_window_future: cfg.error_window_future,
             assignment_max_slot: Some(window_end),
             dynamic_mock_pool: MockPool::default(),
+            request_flavours: &HashMap::new(),
         };
 
         let dp_result = solver.solve_batch(input);
@@ -155,6 +156,7 @@ fn drain_pending_with_dp(
                 current_slot,
                 &cfg.capacity_tiers,
                 &base_counts_arr,
+                &HashMap::new(),
             );
 
             let assignments: Vec<Assignment> = greedy
@@ -256,6 +258,8 @@ fn scenario_seed_2030_all_requests_scheduled_correctly() {
                     arrival_slot: r.arrival_slot,
                     arrival_time: 0.0,
                     deadline_slot: r.deadline_slot,
+                    task_id: "default".to_string(),
+                    flavours: vec![],
                 });
             }
         }

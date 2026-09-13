@@ -59,6 +59,10 @@
 //! - `additional_strategies`: offline strategies to run once per scenario (no batching or
 //!   concurrency), e.g. `["greedy_cheapest", "ant_colony", "bandit"]`. Fully independent of
 //!   `batch_sizes`/`rollback_max_consecutive`/`max_batch_solver_parallelism`.
+//! - `flavours`: overrides `Config::flavours` (the 3 built-in Accurate/Balanced/Fast
+//!   defaults) with `[{"name": "...", "error": <f64>, "duration": <seconds>}, ...]`.
+//!   Printed at startup alongside the other config knobs so it's clear which flavours
+//!   a given run actually used.
 //!
 //! **Key fields:**
 //! - `batch_sizes`: list of N values to benchmark.
@@ -133,6 +137,9 @@ struct BenchmarkConfig {
     /// scenario). When `None` and `include_greedy_baseline` is false, saving-vs-baseline
     /// fields simply stay at 0 for this run.
     baseline_total_carbon_cost: Option<f64>,
+    /// Overrides `Config::flavours` when present; `None` keeps the 3 built-in
+    /// Accurate/Balanced/Fast defaults from `Config::default()`.
+    flavours: Option<Vec<Flavour>>,
 }
 
 fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
@@ -216,7 +223,11 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .get("baseline_total_carbon_cost")
         .and_then(|x| x.as_f64());
 
-    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, infeasibility_recovery_mode, rollback_max_consecutive, additional_strategies, online_strategies, online_batch_sizes, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode, baseline_total_carbon_cost }
+    let flavours: Option<Vec<Flavour>> = runner
+        .get("flavours")
+        .map(|x| serde_json::from_value(x.clone()).expect("runner.flavours must be an array of {name, error, duration}"));
+
+    BenchmarkConfig { batch_sizes, scenario_path, output_dir, realtime_slots, realtime_speed_scale, include_greedy_baseline, infeasibility_recovery_mode, rollback_max_consecutive, additional_strategies, online_strategies, online_batch_sizes, batch_timeout_secs, max_batch_solver_parallelism, online_swarm_mode, baseline_total_carbon_cost, flavours }
 }
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
@@ -1601,6 +1612,9 @@ fn main() {
     if let Some(mode) = &bcfg.online_swarm_mode {
         base_cfg.online_swarm_mode = mode.clone();
     }
+    if let Some(flavours) = &bcfg.flavours {
+        base_cfg.flavours = flavours.clone();
+    }
 
     println!(
         "Loaded scenario: {} slots, {} requests ({})",
@@ -1608,6 +1622,11 @@ fn main() {
         scenario.requests.len(),
         bcfg.scenario_path.display(),
     );
+    let flavour_summary: String = base_cfg.flavours.iter()
+        .map(|f| format!("{}(error={:.1}%,duration={}s)", f.name, f.error, f.duration))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Flavours in use: [{flavour_summary}]");
     println!(
         "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={} (online_swarm_mode={}), max_batch_solver_parallelism={}, output={}",
         bcfg.batch_sizes,

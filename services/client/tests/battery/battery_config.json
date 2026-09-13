@@ -1,0 +1,41 @@
+{
+  "battery_id": "client_battery",
+  "client_url": "http://localhost:8100",
+  "carbonshift_url": "http://localhost:8080",
+  "executor_url": "http://localhost:9000",
+  "output_dir": "tests/battery/results",
+  "poll_interval_seconds": 1.0,
+  "poll_timeout_seconds": 300,
+  "scenarios": [
+    {
+      "id": "micro_textgen",
+      "task": "text_generation",
+      "count": 6,
+      "per_slot": 2,
+      "slot_minutes": 30,
+      "source": "synthetic",
+      "seed": 42,
+      "mode": "emulated"
+    },
+    {
+      "id": "micro_qa",
+      "task": "question_answering",
+      "count": 6,
+      "per_slot": 3,
+      "slot_minutes": 30,
+      "source": "synthetic",
+      "seed": 42,
+      "mode": "emulated"
+    },
+    {
+      "id": "large_textgen_dataset",
+      "task": "text_generation",
+      "count": 60,
+      "per_slot": 10,
+      "slot_minutes": 30,
+      "source": "dataset",
+      "seed": 7,
+      "mode": "emulated"
+    }
+  ]
+}

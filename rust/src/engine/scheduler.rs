@@ -348,7 +348,7 @@ fn main_loop(
         let wall_ms = wall_start.elapsed().as_millis() as u64;
         let delta_ms = wall_ms.saturating_sub(last_wall_ms);
         last_wall_ms = wall_ms;
-        if !cfg.skip_empty_slots || !system_busy {
+        if !cfg.manual_clock && (!cfg.skip_empty_slots || !system_busy) {
             let current_vms = shared_state.virtual_elapsed_ms.load(Ordering::Relaxed);
             shared_state.set_virtual_elapsed_ms(current_vms + delta_ms);
         }
@@ -963,6 +963,10 @@ struct PreparedSolve {
     global_constraint_active: bool,
     /// Flavours allowed by the (possibly active) global error constraint.
     solver_flavours: Vec<Flavour>,
+    /// Per-request (per-task) flavour overrides — see `prepare_solve`.
+    request_flavours: HashMap<u64, Vec<Flavour>>,
+    /// Local/window feasibility threshold (%) for this batch — see `prepare_solve`.
+    effective_error_threshold: f64,
 }
 
 fn prepare_solve(
@@ -1085,6 +1089,44 @@ fn prepare_solve(
         global_constraint_active = false;
     }
 
+    // Per-request (per-task) flavour overrides: requests whose task was
+    // dynamically registered (see `service::handlers::register_task`) carry
+    // their own `flavours` list, resolved once at intake. Requests with no
+    // override (empty `flavours`, e.g. CLI/simulation tools) fall back to
+    // `solver_flavours`/`cfg.flavours` inside the solver, unaffected by this
+    // map. The global error constraint above is task-agnostic by design
+    // (it reflects overall scheduler error, not any one task) but must still
+    // be honoured by these overrides too, so apply the same hard filter.
+    let mut request_flavours: HashMap<u64, Vec<Flavour>> = pending
+        .iter()
+        .filter(|r| !r.flavours.is_empty())
+        .map(|r| (r.id, r.flavours.clone()))
+        .collect();
+    if global_constraint_active && cfg.global_error_constraint_hard {
+        for flavours in request_flavours.values_mut() {
+            let filtered: Vec<Flavour> =
+                flavours.iter().cloned().filter(|f| f.error <= cfg.max_error_threshold).collect();
+            if !filtered.is_empty() {
+                *flavours = filtered;
+            } // else: never remove all flavours for a request (same safety rule as solver_flavours).
+        }
+    }
+
+    // Per-task local/window feasibility threshold: if any request in this
+    // batch registered its own `max_error_threshold` (see
+    // `service::handlers::register_task`), use the *strictest* (minimum) of
+    // them for the whole batch solve — different tasks' calibrated flavours
+    // can have very different error ranges (e.g. text_generation's may all
+    // be 20%+, so the global 4% default would make it permanently
+    // infeasible); this only affects the local/window check below, never
+    // the (task-agnostic by design) global error constraint above, which
+    // always uses `cfg.max_error_threshold`.
+    let effective_error_threshold = pending
+        .iter()
+        .filter_map(|r| r.max_error_threshold)
+        .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a: f64| a.min(t))))
+        .unwrap_or(cfg.max_error_threshold);
+
     PreparedSolve {
         pending_ids,
         window_start,
@@ -1098,6 +1140,8 @@ fn prepare_solve(
         global_stats,
         global_constraint_active,
         solver_flavours,
+        request_flavours,
+        effective_error_threshold,
     }
 }
 
@@ -1126,6 +1170,8 @@ fn solve_dp(
         global_stats,
         global_constraint_active,
         solver_flavours,
+        request_flavours,
+        effective_error_threshold,
     } = prepare_solve(current_slot, pending, shared_state, cfg, mutable);
 
     // ── Step 5: DP solve ────────────────────────────────────────────────────
@@ -1146,11 +1192,12 @@ fn solve_dp(
             error_sum: error_baseline.error_sum,
             request_count: error_baseline.request_count,
         },
-        max_error_threshold: Some(cfg.max_error_threshold),
+        max_error_threshold: Some(effective_error_threshold),
         error_window_past: cfg.error_window_past,
         error_window_future: cfg.error_window_future,
         assignment_max_slot: Some(assignment_cap),
         dynamic_mock_pool: mock_pool_input.clone(),
+        request_flavours: &request_flavours,
     });
 
     let scheduled_pending_ids: HashSet<u64> = dp_result
@@ -1209,6 +1256,7 @@ fn solve_dp(
             current_slot,
             &cfg.capacity_tiers,
             &fallback_base_counts,
+            &request_flavours,
         );
         dp_assignments.extend(greedy);
         solve_status = "ok_greedy_after_infeasible".to_string();
@@ -1807,6 +1855,41 @@ pub fn generate_carbon_forecast(cfg: &Config) -> Vec<f64> {
         .collect()
 }
 
+/// Manually advance the virtual clock to the start of the next slot boundary.
+///
+/// Only meaningful when `Config::manual_clock` is true (otherwise nothing
+/// else keeps the clock from also drifting with real wall-clock time).
+/// `main_loop` derives `current_slot` from `virtual_elapsed_ms` every tick,
+/// so bumping the latter is all that's needed — `main_loop`'s own slot-end
+/// flush (`current_slot > last_flush_slot`) then drains any request still
+/// stranded in the slot we just left, within its next 1-10ms tick. This
+/// function blocks briefly for that drain so the caller (the REST service's
+/// `/v1/admin/advance-slot`) can rely on "call returned" meaning "this
+/// slot's requests all got a DP assignment", not just "the clock moved".
+pub fn advance_to_next_slot(shared_state: &SharedState, cfg: &Config) -> i32 {
+    let current_slot = shared_state.get_current_slot();
+    let slot_ms = (cfg.effective_slot_duration_secs() * 1000.0) as u64;
+    let next_ms = (current_slot as u64 + 1) * slot_ms;
+    shared_state.set_virtual_elapsed_ms(next_ms);
+
+    let eff_slot_dur = cfg.effective_slot_duration_secs();
+    let new_slot = (((next_ms as f64 / 1000.0) / eff_slot_dur) as i32).min(cfg.total_slots - 1);
+    // Set directly rather than relying on `main_loop`'s next tick to derive
+    // it from `virtual_elapsed_ms`: makes this function self-consistent for
+    // rapid back-to-back calls (and unit-testable without a live scheduler).
+    shared_state.set_current_slot(new_slot);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while shared_state.get_pending_count() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Small settle grace period for a worker that already claimed the last
+    // pending batch but hasn't finished committing its assignment yet.
+    std::thread::sleep(Duration::from_millis(100));
+
+    new_slot
+}
+
 /// Build per-assignment CSV rows.
 fn build_assignment_rows(
     assignments: &[Assignment],
@@ -1914,7 +1997,15 @@ mod tests {
     }
 
     fn req(id: u64, arrival: i32, deadline: i32) -> Request {
-        Request { id, arrival_slot: arrival, arrival_time: 0.0, deadline_slot: deadline }
+        Request {
+            id,
+            arrival_slot: arrival,
+            arrival_time: 0.0,
+            deadline_slot: deadline,
+            task_id: "default".to_string(),
+            flavours: vec![],
+            max_error_threshold: None,
+        }
     }
 
     fn call_solve_dp(
@@ -2105,6 +2196,86 @@ mod tests {
         for id in [10u64, 11, 12] {
             assert!(result_ids.contains(&id), "request {} not scheduled", id);
         }
+    }
+
+    /// A request carrying its own (per-task) flavour list must be assigned
+    /// one of *those* flavours, not one from `cfg.flavours` — this is what
+    /// lets a dynamically-registered task's flavours actually reach the DP
+    /// solver (see `Request::new_for_task` / `service::handlers::register_task`).
+    #[test]
+    fn test_per_task_flavour_override_reaches_dp_solver() {
+        let cfg = make_config(|_| {});
+        let current_slot = 0;
+        let task_flavour = Flavour { name: "OnlyForThisTask".to_string(), error: 1.23, duration: 45 };
+        let pending = vec![Request::new_for_task(20, 0, 5, "custom_task".to_string(), vec![task_flavour.clone()], None)];
+        let (assignments, _ctx) = call_solve_dp(current_slot, &pending, &cfg);
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].flavour_name, "OnlyForThisTask");
+        assert_eq!(assignments[0].error, 1.23);
+        // cfg.flavours (the default task) must be untouched by this override.
+        assert!(cfg.flavours.iter().all(|f| f.name != "OnlyForThisTask"));
+    }
+
+    /// A per-task `max_error_threshold` override actually changes the DP's
+    /// choice: without it, the global default (4%) rejects a cheap-but-
+    /// high-error flavour in favour of the accurate one; with a lenient
+    /// override, the cheap flavour becomes feasible and wins on cost.
+    #[test]
+    fn test_per_task_error_threshold_override_allows_cheaper_flavour() {
+        let cfg = make_config(|_| {});
+        let current_slot = 0;
+        let cheap = Flavour { name: "Cheap".to_string(), error: 30.0, duration: 5 };
+        let accurate = Flavour { name: "Accurate2".to_string(), error: 0.0, duration: 60 };
+
+        let strict = vec![Request::new_for_task(
+            30, 0, 5, "t".to_string(), vec![cheap.clone(), accurate.clone()], None,
+        )];
+        let (assignments_strict, _ctx) = call_solve_dp(current_slot, &strict, &cfg);
+        assert_eq!(assignments_strict[0].flavour_name, "Accurate2");
+
+        let lenient = vec![Request::new_for_task(
+            31, 0, 5, "t".to_string(), vec![cheap, accurate], Some(50.0),
+        )];
+        let (assignments_lenient, _ctx) = call_solve_dp(current_slot, &lenient, &cfg);
+        assert_eq!(assignments_lenient[0].flavour_name, "Cheap");
+    }
+
+    /// `advance_to_next_slot` should bump the virtual clock by exactly one
+    /// slot, regardless of `manual_clock`/`skip_empty_slots` settings (it's
+    /// a direct clock manipulation, not gated by them).
+    #[test]
+    fn test_advance_to_next_slot_moves_exactly_one_slot() {
+        let cfg = make_config(|c| {
+            c.manual_clock = true;
+            c.slot_duration_seconds = 1800.0; // 30 minutes
+            c.slot_speed_scale = 1.0;
+        });
+        let ss = SharedState::new();
+        assert_eq!(ss.get_current_slot(), 0);
+
+        let new_slot = advance_to_next_slot(&ss, &cfg);
+        assert_eq!(new_slot, 1);
+        assert_eq!(ss.virtual_elapsed_secs(), 1800.0);
+
+        let new_slot = advance_to_next_slot(&ss, &cfg);
+        assert_eq!(new_slot, 2);
+        assert_eq!(ss.virtual_elapsed_secs(), 3600.0);
+    }
+
+    /// `advance_to_next_slot` never pushes the slot past `total_slots - 1`.
+    #[test]
+    fn test_advance_to_next_slot_clamped_to_horizon() {
+        let cfg = make_config(|c| {
+            c.manual_clock = true;
+            c.total_slots = 2;
+        });
+        let ss = SharedState::new();
+        ss.set_virtual_elapsed_ms(((cfg.total_slots - 1) as u64) * (cfg.slot_duration_seconds * 1000.0) as u64);
+        ss.set_current_slot(cfg.total_slots - 1);
+
+        let new_slot = advance_to_next_slot(&ss, &cfg);
+        assert_eq!(new_slot, cfg.total_slots - 1);
     }
 
     // ── greedy_singleton tests ──────────────────────────────────────────────

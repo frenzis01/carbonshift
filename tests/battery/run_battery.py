@@ -2,6 +2,13 @@
 """
 Battery performance test runner for CarbonShift solver (Rust `nshift` binary only).
 
+NOTE: `nshift` (this script's target) is the CLI scenario-batch benchmark tool,
+built from `rust/src/bin/nshift/`. It is unrelated to `carbonshift-service`
+(`rust/src/bin/service/`), the Dockerizable REST front-end used by the
+carbonshift/executor/client architecture (see `client/`, `PLAN_SERVICE.md`) —
+that binary is HTTP/env-var configured and does not accept `--config <path>`
+scenario batches, so it can never be used here.
+
 For each scenario in battery_config.json, generates a deterministic scenario and
 runs the Rust solver across three independent, individually-toggleable phases:
 
@@ -41,6 +48,13 @@ online_batch_sizes   : list[int]   – N sweep for online_strategies; falls back
 additional_strategies: list[str]   – offline strategies to run once per scenario
                                      (e.g. "greedy_cheapest", "ant_colony", "bandit");
                                      [] skips the offline phase.
+flavours             : list        – optional; overrides Config::default()'s 3 built-in
+                                     Accurate/Balanced/Fast flavours for every phase/scenario
+                                     in this run. Each entry: {"name": str, "error": float
+                                     (%), "duration": int (seconds)}. Omit to keep nshift's
+                                     built-in defaults (see config.rs). Printed at the start
+                                     of every scenario (Python side) and at every nshift
+                                     invocation (Rust stdout, "Flavours in use: [...]").
 rust_binary_path     : str         – path to the nshift binary (relative to repo root)
 output_dir           : str         – where to write run artefacts + battery_results.csv
 scenarios            : list        – each entry has:
@@ -70,7 +84,7 @@ from typing import Any, Dict, List, Optional
 CARBONSHIFT_ROOT = Path(__file__).resolve().parents[2]
 SCENARIOS_DIR = CARBONSHIFT_ROOT / "tests" / "battery" / "scenarios"
 SCENARIOS_JSON_DIR = SCENARIOS_DIR / "json"
-RUST_CONFIG_RS = CARBONSHIFT_ROOT / "rust" / "src" / "config.rs"
+RUST_CONFIG_RS = CARBONSHIFT_ROOT / "rust" / "src" / "engine" / "config.rs"
 
 sys.path.insert(0, str(SCENARIOS_DIR))
 
@@ -176,6 +190,7 @@ def _write_rust_config(
     rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
     online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     baseline_total_carbon_cost: Optional[float] = None,
+    flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
     """Write a temporary nshift config.json; caller is responsible for deletion."""
     fd, tmp = tempfile.mkstemp(suffix=".json")
@@ -189,6 +204,8 @@ def _write_rust_config(
         "max_batch_solver_parallelism": max_batch_solver_parallelism,
         "online_swarm_mode": online_swarm_mode,
     }
+    if flavours:
+        runner["flavours"] = flavours
     if not include_baseline and baseline_total_carbon_cost is not None:
         # Reuse a baseline computed by an earlier invocation (the dedicated
         # baseline-only run — see _run_baseline_only) so this run's own
@@ -272,6 +289,7 @@ def _run_baseline_only(
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
     online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
+    flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> float:
     """Compute the greedy baseline once via a dedicated, lightweight Rust
     invocation (no DP/online/offline work) so every phase can reuse the same
@@ -285,6 +303,7 @@ def _run_baseline_only(
         max_batch_solver_parallelism=max_batch_solver_parallelism,
         rollback_max_consecutive=rollback_max_consecutive,
         online_swarm_mode=online_swarm_mode,
+        flavours=flavours,
     )
     _run_rust_binary(rust_binary, tmp_config)
 
@@ -312,6 +331,7 @@ def _run_dp_phase(
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
     online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
+    flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Sweep `batch_sizes` × `infeasibility_modes` (the DP phase). Caller
     ensures both lists are non-empty; the baseline is precomputed and passed
@@ -330,6 +350,7 @@ def _run_dp_phase(
             rollback_max_consecutive=rollback_max_consecutive,
             online_swarm_mode=online_swarm_mode,
             baseline_total_carbon_cost=baseline_cost,
+            flavours=flavours,
         )
         _run_rust_binary(rust_binary, tmp_config)
 
@@ -373,6 +394,7 @@ def _run_online_phase(
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
     online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
+    flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run `online_strategies` once, independent of the DP phase (`batch_sizes`
     is always `[]` for this invocation — see `online_batch_sizes` instead).
@@ -392,6 +414,7 @@ def _run_online_phase(
         rollback_max_consecutive=rollback_max_consecutive,
         online_swarm_mode=online_swarm_mode,
         baseline_total_carbon_cost=baseline_cost,
+        flavours=flavours,
     )
     _run_rust_binary(rust_binary, tmp_config)
 
@@ -437,6 +460,7 @@ def _run_offline_phase(
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
     online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
+    flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run `additional_strategies` once per scenario — no batch-size,
     rollback, or DP-mode dependency. Caller ensures the list is non-empty."""
@@ -454,6 +478,7 @@ def _run_offline_phase(
         rollback_max_consecutive=rollback_max_consecutive,
         online_swarm_mode=online_swarm_mode,
         baseline_total_carbon_cost=baseline_cost,
+        flavours=flavours,
     )
     _run_rust_binary(rust_binary, tmp_config)
 
@@ -755,6 +780,11 @@ def run_battery(config_path: Path) -> None:
     online_swarm_mode = str(cfg.get("online_swarm_mode", DEFAULT_ONLINE_SWARM_MODE))
     alt_strategies_enabled = run_online or run_offline
 
+    # Optional override of Config::default()'s 3 built-in flavours (Accurate/
+    # Balanced/Fast) — a list of {"name", "error", "duration"} dicts. None
+    # (the field is simply absent) keeps nshift's own built-in defaults.
+    flavours: Optional[List[Dict[str, Any]]] = cfg.get("flavours")
+
     run_folder_name = _format_run_folder_name(
         battery_id, start_dt, max_batch_solver_parallelism,
         realtime_slots, realtime_speed_scale, alt_strategies_enabled,
@@ -791,6 +821,15 @@ def run_battery(config_path: Path) -> None:
         print(f"\n{'='*60}")
         print(f"Scenario: {sid}  (seed={seed}, slots={total_slots}, req/slot={req_per_slot})")
         print("=" * 60)
+        if flavours:
+            flavour_desc = ", ".join(
+                f"{f['name']}(error={f['error']}%, duration={f['duration']}s)" for f in flavours
+            )
+            print(f"  Flavours (override): {flavour_desc}")
+        else:
+            print("  Flavours: nshift built-in defaults (Accurate/Balanced/Fast — "
+                  "see config.rs snapshot in this run's output; set battery.json's "
+                  "top-level \"flavours\" to override)")
 
         scenario_t0 = time.monotonic()
         scenario_dir = output_dir / sid
@@ -816,6 +855,7 @@ def run_battery(config_path: Path) -> None:
             max_batch_solver_parallelism=max_batch_solver_parallelism,
             rollback_max_consecutive=rollback_max_consecutive,
             online_swarm_mode=online_swarm_mode,
+            flavours=flavours,
         )
 
         if run_dp:
@@ -827,6 +867,7 @@ def run_battery(config_path: Path) -> None:
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
                 rollback_max_consecutive=rollback_max_consecutive,
                 online_swarm_mode=online_swarm_mode,
+                flavours=flavours,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)
@@ -841,6 +882,7 @@ def run_battery(config_path: Path) -> None:
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
                 rollback_max_consecutive=rollback_max_consecutive,
                 online_swarm_mode=online_swarm_mode,
+                flavours=flavours,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)
@@ -854,6 +896,7 @@ def run_battery(config_path: Path) -> None:
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
                 rollback_max_consecutive=rollback_max_consecutive,
                 online_swarm_mode=online_swarm_mode,
+                flavours=flavours,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)

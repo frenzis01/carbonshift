@@ -71,7 +71,8 @@ DP_CONTENT: Dict[str, Any] = {
     # "infeasibility_modes": ["min_error_greedy", "carryover", "forecast"],
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
     # "batch_sizes": [8,10,22],
-    "batch_sizes": [4,],
+    # "batch_sizes": [1,4,6,8,22],
+    "batch_sizes": [4],
     # "infeasibility_modes": ["min_error_greedy", "carryover"],
     "infeasibility_modes": ["carryover"],
     "online_strategies": [],
@@ -82,7 +83,7 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "infeasibility_modes": [],
     "online_strategies": ["bandit", "ant_colony"],
-    "online_batch_sizes": [1,8,22],
+    "online_batch_sizes": [1,8,22,48,96],
     "additional_strategies": [],
 }
 
@@ -105,16 +106,56 @@ OFFLINE_CONTENT: Dict[str, Any] = {
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
 # DP + greedy_singleton: rollback x parallelism (swarm_mode is irrelevant to
 # both, so it is left fixed at whatever battery_config.json already has).
-_ROLLBACK_X_PARALLELISM_X_THRESHOLD = [
-    {"rollback_max_consecutive": rollback, "max_batch_solver_parallelism": parallelism, "max_error_threshold": threshold}
-    # for rollback in (0, 4)
-    # for parallelism in (1, 8, 20)
-    # for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
-    for rollback in (0,)
-    for parallelism in (12,)
-    for threshold in (4.0,)
+def build_rollback_parallelism_grid(
+    rollbacks: tuple,
+    parallelisms: tuple,
+    thresholds: tuple,
+) -> List[Dict[str, Any]]:
+    """Build the rollback x parallelism x threshold grid for the phases that
+    are sensitive to rollback (dp / greedy_singleton).
 
-]
+    `rollback_max_consecutive > 0` only means something when there's more
+    than one parallel batch solver to roll back *among* — with
+    `max_batch_solver_parallelism == 1` there's nothing to roll back
+    against. So:
+
+      - If 0 is one of the requested rollback values, any run with
+        parallelism == 1 and rollback > 0 is skipped (it would be redundant
+        with the rollback == 0 / parallelism == 1 run that's already in the
+        grid).
+      - If every requested rollback value is > 0 (no 0 present in
+        `rollbacks`), there's no rollback == 0 baseline to fall back on, so
+        the parallelism == 1 run is still executed for each rollback value —
+        but with an extra `FORCE_ROLLB_PAR1: True` flag set on that grid
+        point, flagging that parallelism == 1 is being forced together with
+        rollback > 0 on purpose.
+    """
+    has_zero_rollback = 0 in rollbacks
+    grid: List[Dict[str, Any]] = []
+    for rollback in rollbacks:
+        for parallelism in parallelisms:
+            for threshold in thresholds:
+                if has_zero_rollback and parallelism == 1 and rollback > 0:
+                    continue
+                point: Dict[str, Any] = {
+                    "rollback_max_consecutive": rollback,
+                    "max_batch_solver_parallelism": parallelism,
+                    "max_error_threshold": threshold,
+                }
+                if not has_zero_rollback and parallelism == 1:
+                    point["FORCE_ROLLB_PAR1"] = True
+                grid.append(point)
+    return grid
+
+
+# for rollback in (0, 4)
+# for parallelism in (1, 8, 20)
+# for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
+_ROLLBACK_X_PARALLELISM_X_THRESHOLD = build_rollback_parallelism_grid(
+    rollbacks=(0, 5),
+    parallelisms=(12,),
+    thresholds=(4.0,),
+)
 
 # bandit/ant_colony: parallelism x swarm_mode x threshold (rollback is irrelevant, left
 # fixed).
@@ -128,7 +169,7 @@ _PARALLELISM_X_SWARM_MODE = [
     for parallelism in (12,)
     # for swarm_mode in ("serialized", "merge")
     for swarm_mode in ("merge",)
-    for threshold in (3.0, 3.5, 4.5)
+    for threshold in (4.0,)
 ]
 
 PHASES: Dict[str, PhaseGrid] = {
@@ -142,7 +183,7 @@ PHASES: Dict[str, PhaseGrid] = {
     "offline": PhaseGrid(
         "offline",
         OFFLINE_CONTENT,
-        [{"max_error_threshold": threshold} for threshold in (3.0, 3.5, 4.5)],
+        [{"max_error_threshold": threshold} for threshold in (4.0,)],
     ),
 }
 
@@ -222,7 +263,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="cfg_test5",
+        default="cfg_test12_high1low2CAP",
         help="Prefix used to build each run's battery_id "
         "(final id is '<prefix>_<phase>_<grid-index>').",
     )

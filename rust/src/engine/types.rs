@@ -3,7 +3,7 @@
 /// These mirror the Python dataclasses in `shared_state.py` and the flavour /
 /// capacity-tier dicts in `config.py`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -25,11 +25,54 @@ pub struct Request {
     pub deadline_slot: i32,
     /// Wall-clock arrival time (seconds since UNIX epoch).
     pub arrival_time: f64,
+    /// Identifies which task this request belongs to (e.g. "text_generation"),
+    /// i.e. which entry of the dynamic task registry `flavours` was resolved
+    /// from. `"default"` for requests with no task-specific flavours (CLI/
+    /// simulation tools, or callers that never registered a task).
+    pub task_id: String,
+    /// Flavours available for this request's task, resolved once at intake
+    /// time. Empty means "no task-specific override" — the solver falls
+    /// back to `Config::flavours` (the predefined default task).
+    pub flavours: Vec<Flavour>,
+    /// Overrides `Config::max_error_threshold` (%) for this request's local/
+    /// window feasibility check, if its task registered one (see
+    /// `service::handlers::register_task`). `None` = use the global default.
+    pub max_error_threshold: Option<f64>,
 }
 
 impl Request {
     pub fn new(id: u64, arrival_slot: i32, deadline_slot: i32) -> Self {
-        Self { id, arrival_slot, deadline_slot, arrival_time: unix_now() }
+        Self {
+            id,
+            arrival_slot,
+            deadline_slot,
+            arrival_time: unix_now(),
+            task_id: "default".to_string(),
+            flavours: Vec::new(),
+            max_error_threshold: None,
+        }
+    }
+
+    /// Builds a request tied to a specific (dynamically-registered) task,
+    /// carrying the flavours (and optional error-threshold override) the
+    /// solver must use for it.
+    pub fn new_for_task(
+        id: u64,
+        arrival_slot: i32,
+        deadline_slot: i32,
+        task_id: String,
+        flavours: Vec<Flavour>,
+        max_error_threshold: Option<f64>,
+    ) -> Self {
+        Self {
+            id,
+            arrival_slot,
+            deadline_slot,
+            arrival_time: unix_now(),
+            task_id,
+            flavours,
+            max_error_threshold,
+        }
     }
 }
 
@@ -95,7 +138,7 @@ pub struct RequestAssignment {
 ///
 /// `duration` is in seconds (integer) and is used as a relative cost weight
 /// in the DP.  Carbon cost is reported in gCO₂ by the scale factor in Config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Flavour {
     pub name: String,
     /// Approximation error introduced by this flavour (%).

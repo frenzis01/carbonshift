@@ -30,6 +30,16 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::types::{get_capacity_multiplier, CapacityTier, Flavour, RequestAssignment};
 
+/// Shared, `'static` empty map used as the default `request_flavours` when a
+/// caller has no per-request (task-specific) flavour overrides — avoids
+/// forcing every call site to construct/own one.
+#[cfg(test)]
+fn empty_request_flavours() -> &'static HashMap<u64, Vec<Flavour>> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<HashMap<u64, Vec<Flavour>>> = OnceLock::new();
+    MAP.get_or_init(HashMap::new)
+}
+
 // ─── DP state key ─────────────────────────────────────────────────────────────
 
 /// Per-state key for the DP hash map.
@@ -98,6 +108,10 @@ pub struct SolveBatchInput<'a> {
     pub assignment_max_slot: Option<i32>,
     /// Optional synthetic mock pool for infeasibility recovery.
     pub dynamic_mock_pool: MockPool,
+    /// Per-request flavour overrides (request_id → flavours available for
+    /// its task). A request absent from this map uses `DpSolver::flavours`
+    /// (the predefined default task) instead.
+    pub request_flavours: &'a HashMap<u64, Vec<Flavour>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +148,14 @@ impl DpSolver {
             timeout: cfg.dp_timeout,
             carbon_cost_scale: cfg.carbon_cost_duration_scale,
         }
+    }
+
+    /// Flavours to consider for `req_id`: its task-specific override if
+    /// present in `overrides`, otherwise `self.flavours` (the predefined
+    /// default task — used as-is by CLI/simulation tools and by any request
+    /// whose task wasn't dynamically registered).
+    fn flavours_for<'b>(&'b self, req_id: u64, overrides: &'b HashMap<u64, Vec<Flavour>>) -> &'b [Flavour] {
+        overrides.get(&req_id).map(|v| v.as_slice()).unwrap_or(&self.flavours)
     }
 
     pub fn with_carbon_forecast(mut self, forecast: Vec<f64>) -> Self {
@@ -268,7 +290,7 @@ impl DpSolver {
             for (state_key, (prev_cost, prev_assignments)) in &dp_prev {
                 let inc_counts = state_key.inc_counts.clone();
 
-                for flavour in &self.flavours {
+                for flavour in self.flavours_for(*req_id, input.request_flavours) {
                     let f_error_bp = (flavour.error * 100.0).round() as i64;
                     let f_duration = flavour.duration;
 
@@ -491,14 +513,14 @@ impl DpSolver {
             // Most-accurate (min-error) flavour, and its cheapest slot — the
             // last-resort candidate if nothing keeps the window error within
             // threshold (mirrors `solve_greedy_singleton`'s fallback).
-            let min_error_flavour = self
-                .flavours
+            let candidate_flavours = self.flavours_for(*req_id, input.request_flavours);
+            let min_error_flavour = candidate_flavours
                 .iter()
                 .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
                 .expect("at least one flavour");
             let mut fallback: Option<(f64, i32)> = None;
 
-            for flavour in &self.flavours {
+            for flavour in candidate_flavours {
                 for slot in input.current_slot..=deadline {
                     let cost = self.incremental_carbon_cost(
                         slot,
@@ -597,7 +619,7 @@ impl DpSolver {
     }
 
     /// Greedy fallback: assign each request to the cheapest feasible slot using
-    /// the most accurate (longest duration) flavour.
+    /// the most accurate (longest duration) flavour available to it.
     pub fn greedy_fallback(
         &self,
         requests: &[(u64, i32)],
@@ -605,19 +627,20 @@ impl DpSolver {
         current_slot: i32,
         capacity_tiers: &[CapacityTier],
         base_counts: &[i32],
+        request_flavours: &HashMap<u64, Vec<Flavour>>,
     ) -> Vec<RequestAssignment> {
         let mut inc_counts = base_counts.to_vec();
-        // Most accurate = longest duration.
-        let fallback_flavour = self
-            .flavours
-            .iter()
-            .max_by_key(|f| f.duration)
-            .expect("at least one flavour");
-
         let mut assignments = Vec::new();
 
         for (i, (req_id, _)) in requests.iter().enumerate() {
             let deadline = deadlines[i];
+            // Most accurate = longest duration, among this request's own
+            // (task-specific, or default) candidate flavours.
+            let fallback_flavour = self
+                .flavours_for(*req_id, request_flavours)
+                .iter()
+                .max_by_key(|f| f.duration)
+                .expect("at least one flavour");
             let mut best: Option<(f64, i32)> = None;
             let empty_base = vec![0i32; self.window_size as usize];
 
@@ -714,6 +737,7 @@ mod tests {
             error_window_future: 2,
             assignment_max_slot: None,
             dynamic_mock_pool: MockPool::default(),
+            request_flavours: empty_request_flavours(),
         }
     }
 
@@ -849,6 +873,54 @@ mod tests {
     }
 
     #[test]
+    fn per_request_flavour_override_is_used_over_default() {
+        // Solver's own (default-task) flavour list only has "Accurate".
+        let solver = DpSolver {
+            flavours: vec![Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 }],
+            window_size: 5,
+            carbon_forecast: flat_forecast(5, 40.0),
+            pruning: "none".to_string(),
+            pruning_k: 1000,
+            timeout: 5.0,
+            carbon_cost_scale: 1.0 / 3600.0,
+        };
+        let requests = vec![(1u64, 2i32)];
+        let tiers = no_tiers();
+        let counts = HashMap::new();
+        let mut overrides: HashMap<u64, Vec<Flavour>> = HashMap::new();
+        overrides.insert(1, vec![Flavour { name: "TaskOnly".to_string(), error: 1.0, duration: 5 }]);
+        let result = solver.solve_batch(SolveBatchInput {
+            request_flavours: &overrides,
+            ..make_input(&requests, 0, &tiers, &counts)
+        });
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].flavour_name, "TaskOnly");
+        assert_eq!(result[0].error, 1.0);
+    }
+
+    #[test]
+    fn greedy_fallback_uses_per_request_flavour_override() {
+        let solver = DpSolver {
+            flavours: vec![Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 }],
+            window_size: 5,
+            carbon_forecast: flat_forecast(5, 40.0),
+            pruning: "none".to_string(),
+            pruning_k: 1000,
+            timeout: 5.0,
+            carbon_cost_scale: 1.0 / 3600.0,
+        };
+        let requests = vec![(1u64, 0i32)];
+        let deadlines = vec![0];
+        let tiers = no_tiers();
+        let base = vec![0i32; 5];
+        let mut overrides: HashMap<u64, Vec<Flavour>> = HashMap::new();
+        overrides.insert(1, vec![Flavour { name: "TaskOnly".to_string(), error: 1.0, duration: 45 }]);
+        let result = solver.greedy_fallback(&requests, &deadlines, 0, &tiers, &base, &overrides);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].flavour_name, "TaskOnly");
+    }
+
+    #[test]
     fn beam_pruning_still_finds_feasible_solution() {
         // Forecast: slots 0-2 (in window) are expensive, slots 3+ are cheap.
         // Beam pruning will keep cheapest states → assigns to slots 3+, outside
@@ -902,7 +974,7 @@ mod tests {
         let deadlines = vec![0, 1, 2];
         let tiers = no_tiers();
         let base = vec![0i32; 5];
-        let result = solver.greedy_fallback(&requests, &deadlines, 0, &tiers, &base);
+        let result = solver.greedy_fallback(&requests, &deadlines, 0, &tiers, &base, empty_request_flavours());
         assert_eq!(result.len(), 3);
     }
 

@@ -115,6 +115,13 @@ pub struct Config {
     /// `1.0` = real-time; `0.1` = 10× faster; `0.0` = essentially instant
     /// (only meaningful when `skip_empty_slots` is false).
     pub slot_speed_scale: f64,
+    /// When true, the virtual clock never advances with real wall-clock
+    /// time — it only moves via an explicit `scheduler::advance_to_next_slot`
+    /// call (exposed as `POST /v1/admin/advance-slot` by the REST service).
+    /// Used for deterministic "fake time" end-to-end testing (see
+    /// PLAN_SERVICE.md §"Emulazione a tempo fittizio"); never enable in
+    /// production, since nothing else advances the clock.
+    pub manual_clock: bool,
     /// Max requests the generator emits per tick while pacing a slot's
     /// arrivals in real time (only used when `skip_empty_slots` is false,
     /// i.e. true realtime simulation). Larger K = coarser pacing.
@@ -243,6 +250,7 @@ impl Default for Config {
             rollback_max_consecutive: 3,
             skip_empty_slots: true,
             slot_speed_scale: 1.0,
+            manual_clock: false,
             generator_realtime_chunk_size: 10,
             total_requests: 0,
             solver_strategy: "dp".to_string(),
