@@ -391,6 +391,72 @@ async fn advance_slot_rejects_when_manual_clock_disabled() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn advance_slot_accepts_actual_carbon_intensity_query_param() {
+    let mut cfg = test_engine_config();
+    cfg.manual_clock = true;
+    let cfg = Arc::new(cfg);
+    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
+    let state = AppState::new(SharedState::new(), cfg, test_service_cfg(), forecast);
+    let app = build_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/advance-slot?actual_carbon_intensity=123.4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// The client's reported actual carbon intensity for an assignment's slot
+/// rescales `carbon_cost` (forwarded to the caller) once its result arrives.
+#[tokio::test]
+async fn executor_callback_corrects_carbon_cost_with_actual_carbon_intensity() {
+    let mut cfg = test_engine_config();
+    cfg.batch_size = 1;
+    let cfg = Arc::new(cfg);
+    let shared_state = SharedState::new();
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
+    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    scheduler.start();
+
+    let mut svc_cfg = test_service_cfg();
+    svc_cfg.submit_wait_timeout_secs = 5.0;
+    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
+    let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast.clone());
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(json_request("POST", "/v1/requests", r#"{"deadline_seconds": 5}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let request_id = json["request_id"].as_u64().unwrap();
+    let scheduled_slot = json["scheduled_slot"].as_i64().unwrap() as i32;
+    let predicted_cost = json["carbon_cost"].as_f64().unwrap();
+
+    // Actual carbon intensity turns out to be double the forecast for that slot.
+    let actual_ci = forecast[scheduled_slot as usize] * 2.0;
+    state.actual_carbon_intensity.lock().unwrap().insert(scheduled_slot, actual_ci);
+
+    let resp = app
+        .oneshot(json_request("POST", &format!("/v1/callback/{request_id}"), r#"{"success": true, "result": {}}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let corrected = shared_state.get_current_assignments()[&request_id].carbon_cost;
+    assert!((corrected - predicted_cost * 2.0).abs() < 1e-9, "corrected={corrected}, expected={}", predicted_cost * 2.0);
+
+    scheduler.stop();
+}
+
 /// Full "fake time" protocol: submit under `manual_clock`, then advance —
 /// the handler must block until the dispatcher has handed the assignment
 /// off to the (dry-run) executor before returning.

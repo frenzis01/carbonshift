@@ -6,6 +6,7 @@ immediately, then synchronizes via carbonshift's and the executor's
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 import uuid
@@ -14,12 +15,20 @@ from typing import Any, Optional
 
 import requests
 
-from .carbonshift_client import CarbonshiftError, submit
+from .carbonshift_client import CarbonshiftError, get_carbon_forecast, submit
 from .config import settings
 from .timeslots import ceil_to_slot_end, slot_index
 from .tracker import RequestTracker, TrackedRequest
 
 logger = logging.getLogger("client.plan_runner")
+
+
+def _perturbed_actual_ci(forecast: list[float], seed: int = 42, jitter: float = 0.05) -> list[float]:
+    """A plausible "real" carbon intensity reading per slot: the forecast
+    with small (default 5%) gaussian noise, standing in for the real-world
+    deviation the scheduler's forecast never perfectly predicts."""
+    rng = random.Random(seed)
+    return [max(0.0, v * (1.0 + rng.gauss(0.0, jitter))) for v in forecast]
 
 
 def run_plan(tracker: RequestTracker, requests_spec: list[dict[str, Any]], slot_minutes: float,
@@ -47,6 +56,14 @@ def _group_by_slot(requests_spec: list[dict[str, Any]], slot_minutes: float) -> 
 def _run(tracker: RequestTracker, slots: dict[int, list[dict[str, Any]]], slot_minutes: float,
           mode: str, executor_url: Optional[str], batch_id: str) -> None:
     callback_url = f"{settings.self_base_url}/callback"
+    actual_ci: list[float] = []
+    if mode == "emulated":
+        try:
+            actual_ci = _perturbed_actual_ci(get_carbon_forecast())
+        except CarbonshiftError:
+            logger.warning("plan %s: could not fetch carbon forecast, skipping actual-CI reporting", batch_id,
+                            exc_info=True)
+
     for idx in sorted(slots):
         if mode == "realtime":
             _wait_until(slots[idx][0]["start_at"])
@@ -66,7 +83,10 @@ def _run(tracker: RequestTracker, slots: dict[int, list[dict[str, Any]]], slot_m
             logger.info("plan %s slot %d: submitted request_id=%s", batch_id, idx, request_id)
 
         if mode == "emulated":
-            _advance_slot(executor_url, batch_id, idx)
+            # `idx + 1` is the slot carbonshift's clock is about to enter
+            # (advance_to_next_slot always moves exactly one slot forward).
+            actual = actual_ci[idx + 1] if idx + 1 < len(actual_ci) else None
+            _advance_slot(executor_url, batch_id, idx, actual)
 
 
 def _wait_until(target: datetime) -> None:
@@ -75,12 +95,15 @@ def _wait_until(target: datetime) -> None:
         time.sleep(delay)
 
 
-def _advance_slot(executor_url: Optional[str], batch_id: str, idx: int) -> None:
+def _advance_slot(executor_url: Optional[str], batch_id: str, idx: int, actual_carbon_intensity: float | None) -> None:
     # 1) carbonshift: flush this slot's requests and block until its own
     #    dispatcher has handed them off to the executor.
     try:
+        params = {}
+        if actual_carbon_intensity is not None:
+            params["actual_carbon_intensity"] = actual_carbon_intensity
         resp = requests.post(f"{settings.carbonshift_url}/v1/admin/advance-slot",
-                              timeout=settings.admin_timeout_seconds)
+                              params=params, timeout=settings.admin_timeout_seconds)
         resp.raise_for_status()
         logger.info("plan %s: carbonshift advanced past slot %d -> %s", batch_id, idx, resp.json())
     except requests.RequestException:

@@ -3,9 +3,10 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use serde::Deserialize;
 
 use crate::engine::types::{get_capacity_multiplier, Flavour, Request as EngineRequest};
 use crate::service::models::{
@@ -15,6 +16,12 @@ use crate::service::models::{
 use crate::service::state::{AppState, TrackedRequest};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
+
+#[derive(Debug, Deserialize)]
+pub struct AdvanceSlotQuery {
+    #[serde(default)]
+    pub actual_carbon_intensity: Option<f64>,
+}
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(serde_json::json!({ "error": msg.into() })))
@@ -144,11 +151,24 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HorizonRe
 /// handed off to the executor (status `Dispatched`, not just `Scheduled`).
 /// See PLAN_SERVICE.md "Emulazione a tempo fittizio" for the full protocol
 /// this enables together with the executor's own `/admin/advance-slot`.
-pub async fn advance_slot(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+///
+/// `?actual_carbon_intensity=<f64>` (optional): the client's real (not
+/// forecast) carbon intensity reading for the slot being advanced into —
+/// piggybacked here since the client already calls this once per slot, to
+/// avoid a separate synchronization channel (see PLAN_SERVICE.md). Used to
+/// correct already-committed `carbon_cost` once a request in that slot
+/// completes (see `executor_callback`); never fed back into live scheduling.
+pub async fn advance_slot(
+    State(state): State<AppState>,
+    Query(query): Query<AdvanceSlotQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     if !state.cfg.manual_clock {
         return Err(api_error(StatusCode::CONFLICT, "MANUAL_CLOCK is not enabled on this instance"));
     }
     let new_slot = crate::engine::scheduler::advance_to_next_slot(&state.shared_state, &state.cfg);
+    if let Some(ci) = query.actual_carbon_intensity {
+        state.actual_carbon_intensity.lock().unwrap().insert(new_slot, ci);
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -165,6 +185,14 @@ pub async fn advance_slot(State(state): State<AppState>) -> Result<Json<serde_js
     }
 
     Ok(Json(serde_json::json!({ "current_slot": new_slot })))
+}
+
+/// `GET /v1/carbon-forecast` — the forecast the DP solver is scheduling
+/// against (index = slot). Read-only: lets the client derive a plausible
+/// "actual" carbon intensity series (e.g. the forecast with small jitter)
+/// to report back via `POST /v1/admin/advance-slot?actual_carbon_intensity=`.
+pub async fn carbon_forecast(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "forecast": *state.carbon_forecast }))
 }
 
 /// `GET /v1/stats` — counts of tracked requests by lifecycle status.
@@ -233,7 +261,7 @@ pub async fn submit_request(
 
     state.tracked.lock().unwrap().insert(
         request_id,
-        TrackedRequest::new(body.callback_url.clone(), body.payload.clone(), baseline_carbon_cost),
+        TrackedRequest::new(body.callback_url.clone(), body.payload.clone(), baseline_carbon_cost, current_slot),
     );
 
     state.shared_state.add_request(EngineRequest::new_for_task(
@@ -341,6 +369,13 @@ pub async fn get_request_status(
 /// real outcomes feed back into it. This only ever runs for real/emulated
 /// executions (this endpoint is never hit by offline simulation, which has
 /// no executor to call back).
+///
+/// Also corrects `carbon_cost`/`baseline_carbon_cost` with the *actual*
+/// carbon intensity for their slots, if the client ever reported one (see
+/// `advance_slot`) — rescaled by `actual_ci / forecast_ci`, since execution
+/// time/capacity multiplier are unaffected by carbon intensity. Both
+/// corrected values are forwarded to the caller so it can see the real cost,
+/// not just the DP's forecast-time estimate.
 pub async fn executor_callback(
     State(state): State<AppState>,
     Path(request_id): Path<u64>,
@@ -350,14 +385,27 @@ pub async fn executor_callback(
         state.shared_state.correct_assignment_error(request_id, actual_error);
     }
 
-    let callback_url = {
+    let mut actual_carbon_cost = None;
+    if let Some(assignment) = state.shared_state.get_current_assignments().get(&request_id) {
+        if let Some(ratio) = state.carbon_intensity_ratio(assignment.scheduled_slot) {
+            actual_carbon_cost = state
+                .shared_state
+                .correct_assignment_carbon_cost(request_id, assignment.carbon_cost * ratio);
+        }
+    }
+
+    let (callback_url, actual_baseline_carbon_cost) = {
         let mut guard = state.tracked.lock().unwrap();
         let t = guard
             .get_mut(&request_id)
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
         t.status = if body.success { RequestStatus::Completed } else { RequestStatus::Failed };
         t.error = body.error.clone();
-        t.callback_url.clone()
+        let actual_baseline = state.carbon_intensity_ratio(t.arrival_slot).map(|ratio| {
+            t.baseline_carbon_cost *= ratio;
+            t.baseline_carbon_cost
+        });
+        (t.callback_url.clone(), actual_baseline)
     };
 
     if let Some(url) = callback_url {
@@ -367,6 +415,8 @@ pub async fn executor_callback(
             success: body.success,
             result: body.result,
             error: body.error,
+            actual_carbon_cost,
+            actual_baseline_carbon_cost,
         };
         tokio::spawn(async move {
             if let Err(e) = http.post(&url).json(&payload).send().await {

@@ -16,6 +16,8 @@ class CallerCallbackPayload(BaseModel):
     success: bool
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    actual_carbon_cost: Optional[float] = None
+    actual_baseline_carbon_cost: Optional[float] = None
 
 
 class SendBatchRequest(BaseModel):

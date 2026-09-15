@@ -255,6 +255,17 @@ Endpoint pensato per essere orchestrato dal **client** (vedi `client/README.md`
 chiama questo endpoint, poi chiama l'analogo endpoint dell'executor
 (`POST /admin/advance-slot`), e solo dopo passa al timeslot successivo.
 
+`?actual_carbon_intensity=<f64>` (opzionale): il client vi riporta, piggyback
+su questa stessa chiamata, la CI *reale* (non prevista) per lo slot appena
+iniziato — letta una tantum da `GET /v1/carbon-forecast` e perturbata
+leggermente (`plan_runner.py::_perturbed_actual_ci`). Mai usata dal DP solver
+(che pianifica solo sulla previsione); serve solo a correggere
+`carbon_cost`/`baseline_carbon_cost` di un'assegnazione già fatta, una volta
+che arriva il suo risultato (`POST /v1/callback/{id}`, rescaling per
+`ci_reale/ci_prevista` — vedi `handlers::executor_callback`), e a inoltrare
+`actual_carbon_cost`/`actual_baseline_carbon_cost` al client nel callback
+finale.
+
 **Bug trovato e corretto testando dal vivo questo meccanismo**: il
 dispatcher filtrava le richieste da consegnare all'esecutore solo se il loro
 stato tracciato era esattamente `Scheduled` — uno stato impostato dal solo

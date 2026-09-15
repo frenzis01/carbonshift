@@ -130,3 +130,25 @@ def get_task_config(task_id: str) -> dict[str, Any]:
     if resp.status_code != 200:
         raise CarbonshiftError(f"carbonshift returned {resp.status_code}: {resp.text}")
     return resp.json()
+
+
+def get_carbon_forecast() -> list[float]:
+    """`GET /v1/carbon-forecast` — the forecast (index = slot) the DP solver
+    is scheduling against, used to derive a plausible "actual" carbon
+    intensity series to report back via `POST /v1/admin/advance-slot`."""
+    headers = {}
+    if settings.carbonshift_api_key:
+        headers["X-API-Key"] = settings.carbonshift_api_key
+
+    try:
+        resp = requests.get(
+            f"{settings.carbonshift_url}/v1/carbon-forecast",
+            headers=headers,
+            timeout=settings.http_timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        raise CarbonshiftError(f"cannot reach carbonshift at {settings.carbonshift_url}: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise CarbonshiftError(f"carbonshift returned {resp.status_code}: {resp.text}")
+    return resp.json()["forecast"]

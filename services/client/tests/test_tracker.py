@@ -150,6 +150,19 @@ def test_to_dict_computes_carbon_saving_pct(tmp_path):
     assert record["carbon_saving_pct"] == 50.0
 
 
+def test_on_callback_with_actual_carbon_cost_computes_actual_saving_pct(tmp_path):
+    tracker = make_tracker(tmp_path)
+    tracker.add(TrackedRequest("1", "text_generation", 30.0, datetime.now(timezone.utc),
+                                make_ack(carbon_cost=1.5, baseline_carbon_cost=3.0)))
+
+    tracker.on_callback("1", True, {}, None, actual_carbon_cost=2.0, actual_baseline_carbon_cost=4.0)
+    record = tracker.get("1").to_dict()
+    assert record["actual_carbon_cost"] == 2.0
+    assert record["actual_baseline_carbon_cost"] == 4.0
+    assert record["actual_carbon_saving_pct"] == 50.0
+    assert record["carbon_saving_pct"] == 50.0  # predicted figures unaffected
+
+
 def test_to_dict_converts_scheduled_at_to_iso8601(tmp_path):
     tracker = make_tracker(tmp_path)
     tracker.add(TrackedRequest("1", "text_generation", 30.0, datetime.now(timezone.utc),

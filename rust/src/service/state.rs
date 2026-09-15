@@ -29,10 +29,16 @@ pub struct TrackedRequest {
     /// `handlers::compute_baseline_carbon_cost`). Computed once at submit
     /// time so it stays comparable even after the real assignment changes.
     pub baseline_carbon_cost: f64,
+    /// Slot the request arrived at — needed to look up the *actual* (not
+    /// forecast) carbon intensity for that slot once known, to correct
+    /// `baseline_carbon_cost` the same way `Assignment::carbon_cost` gets
+    /// corrected (see `executor_callback`).
+    pub arrival_slot: i32,
 }
 
 impl TrackedRequest {
-    pub fn new(callback_url: Option<String>, payload: serde_json::Value, baseline_carbon_cost: f64) -> Self {
+    pub fn new(callback_url: Option<String>, payload: serde_json::Value, baseline_carbon_cost: f64,
+               arrival_slot: i32) -> Self {
         Self {
             callback_url,
             payload,
@@ -41,6 +47,7 @@ impl TrackedRequest {
             dispatch_attempts: 0,
             next_attempt_at: None,
             baseline_carbon_cost,
+            arrival_slot,
         }
     }
 }
@@ -117,6 +124,13 @@ pub struct AppState {
     /// requests that don't reference a registered task (or CLI/simulation
     /// tools) keep using the predefined default flavours, unchanged.
     pub task_flavours: Arc<Mutex<HashMap<String, TaskConfig>>>,
+    /// Real (not forecast) carbon intensity per slot, reported by the client
+    /// piggybacked on `POST /v1/admin/advance-slot` (see
+    /// `handlers::advance_slot`). Used only to correct already-committed
+    /// `carbon_cost`/`baseline_carbon_cost` after the fact (see
+    /// `handlers::executor_callback`) — never fed back into the live DP
+    /// solver, which keeps planning against the original forecast.
+    pub actual_carbon_intensity: Arc<Mutex<HashMap<i32, f64>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -138,12 +152,22 @@ impl AppState {
             carbon_forecast,
             baseline_slot_counts: Arc::new(Mutex::new(HashMap::new())),
             task_flavours: Arc::new(Mutex::new(task_flavours)),
+            actual_carbon_intensity: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
     pub fn next_request_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Ratio of actual-to-forecast carbon intensity at `slot`, if the client
+    /// ever reported an actual reading for it — `None` otherwise (nothing
+    /// to correct with).
+    pub fn carbon_intensity_ratio(&self, slot: i32) -> Option<f64> {
+        let actual = *self.actual_carbon_intensity.lock().unwrap().get(&slot)?;
+        let forecast = self.carbon_forecast.get(slot as usize).copied().unwrap_or(0.0);
+        if forecast <= 0.0 { None } else { Some(actual / forecast) }
     }
 
     /// Flavours registered for `task_id`, or the `"default"` task's

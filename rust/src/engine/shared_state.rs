@@ -385,6 +385,19 @@ impl SharedState {
         }
     }
 
+    /// Replaces a committed assignment's *predicted* `carbon_cost` (forecast
+    /// carbon intensity × nominal duration) with the *actual* one, once the
+    /// real carbon intensity for its slot is known (see
+    /// `AppState::carbon_intensity_ratio` / `handlers::executor_callback`).
+    /// Returns the new value (so the caller can forward it to the client)
+    /// or `None` if there's no committed assignment for `request_id`.
+    pub fn correct_assignment_carbon_cost(&self, request_id: u64, actual_carbon_cost: f64) -> Option<f64> {
+        let mut g = self.inner.lock().unwrap();
+        let a = g.assignments.get_mut(&request_id)?;
+        a.carbon_cost = actual_carbon_cost;
+        Some(actual_carbon_cost)
+    }
+
     // ── slot management ───────────────────────────────────────────────────
 
     pub fn set_current_slot(&self, slot: i32) {
@@ -668,6 +681,21 @@ mod tests {
         state.correct_assignment_error(999, 0.0); // unknown request_id
         let g = state.get_global_error_stats();
         assert!((g.error_sum - 3.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn correct_assignment_carbon_cost_updates_in_place() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(1, 0, 0.0)]); // carbon_cost starts at 1.0
+        let result = state.correct_assignment_carbon_cost(1, 2.5);
+        assert_eq!(result, Some(2.5));
+        assert_eq!(state.get_current_assignments()[&1].carbon_cost, 2.5);
+    }
+
+    #[test]
+    fn correct_assignment_carbon_cost_is_none_for_unknown_request() {
+        let state = SharedState::new();
+        assert_eq!(state.correct_assignment_carbon_cost(999, 2.5), None);
     }
 
     #[test]

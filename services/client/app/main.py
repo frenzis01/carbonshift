@@ -75,7 +75,8 @@ async def run_send_plan(body: SendPlanRequest) -> SendPlanResponse:
 
 @app.post("/callback")
 async def callback(body: CallerCallbackPayload) -> dict[str, str]:
-    found = tracker.on_callback(str(body.request_id), body.success, body.result, body.error)
+    found = tracker.on_callback(str(body.request_id), body.success, body.result, body.error,
+                                 body.actual_carbon_cost, body.actual_baseline_carbon_cost)
     if not found:
         logger.warning("callback for unknown/untracked request_id=%s", body.request_id)
     return {"status": "ok"}

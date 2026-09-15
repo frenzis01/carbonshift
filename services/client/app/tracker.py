@@ -47,6 +47,11 @@ class TrackedRequest:
         self.success: Optional[bool] = None
         self.result: Optional[dict[str, Any]] = None
         self.error: Optional[str] = None
+        # Real (not forecast-time) carbon cost, corrected by carbonshift once
+        # the actual carbon intensity for the assignment's slot is known
+        # (see carbonshift_client/README — reported via advance-slot).
+        self.actual_carbon_cost: Optional[float] = None
+        self.actual_baseline_carbon_cost: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         end_to_end_seconds = None
@@ -59,6 +64,18 @@ class TrackedRequest:
         carbon_saving_pct = None
         if carbon_cost is not None and baseline_carbon_cost:
             carbon_saving_pct = (baseline_carbon_cost - carbon_cost) / baseline_carbon_cost * 100
+        # Same shape as carbon_saving_pct, but with the *actual* (real carbon
+        # intensity corrected) costs when available, falling back to the
+        # predicted ones for whichever side isn't corrected yet.
+        actual_carbon_cost = self.actual_carbon_cost if self.actual_carbon_cost is not None else carbon_cost
+        actual_baseline_carbon_cost = (
+            self.actual_baseline_carbon_cost if self.actual_baseline_carbon_cost is not None else baseline_carbon_cost
+        )
+        actual_carbon_saving_pct = None
+        if actual_carbon_cost is not None and actual_baseline_carbon_cost:
+            actual_carbon_saving_pct = (
+                (actual_baseline_carbon_cost - actual_carbon_cost) / actual_baseline_carbon_cost * 100
+            )
         execution_time_seconds = None
         baseline_execution_time_seconds = None
         energy_saving_pct = None
@@ -85,6 +102,9 @@ class TrackedRequest:
             "carbon_cost": carbon_cost,
             "baseline_carbon_cost": baseline_carbon_cost,
             "carbon_saving_pct": carbon_saving_pct,
+            "actual_carbon_cost": self.actual_carbon_cost,
+            "actual_baseline_carbon_cost": self.actual_baseline_carbon_cost,
+            "actual_carbon_saving_pct": actual_carbon_saving_pct,
             "execution_time_seconds": execution_time_seconds,
             "baseline_execution_time_seconds": baseline_execution_time_seconds,
             "energy_saving_pct": energy_saving_pct,
@@ -116,7 +136,8 @@ class RequestTracker:
             return self._by_id.get(request_id)
 
     def on_callback(self, request_id: str, success: bool, result: Optional[dict[str, Any]],
-                     error: Optional[str]) -> bool:
+                     error: Optional[str], actual_carbon_cost: Optional[float] = None,
+                     actual_baseline_carbon_cost: Optional[float] = None) -> bool:
         with self._lock:
             t = self._by_id.get(request_id)
             stale = t is not None and t.ack.get("status") == "pending"
@@ -138,6 +159,8 @@ class RequestTracker:
             t.success = success
             t.result = result
             t.error = error
+            t.actual_carbon_cost = actual_carbon_cost
+            t.actual_baseline_carbon_cost = actual_baseline_carbon_cost
             t.status = "completed" if success else "failed"
             record = t.to_dict()
         self._persist(record)

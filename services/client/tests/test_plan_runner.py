@@ -78,10 +78,11 @@ def test_run_plan_realtime_submits_all_requests(monkeypatch, tmp_path):
 def test_run_plan_emulated_calls_advance_slot_between_groups(monkeypatch, tmp_path):
     fake_submit, calls = make_fake_submit()
     monkeypatch.setattr(plan_runner, "submit", fake_submit)
+    monkeypatch.setattr(plan_runner, "get_carbon_forecast", lambda: [100.0] * 10)
 
     advance_calls = []
 
-    def fake_post(url, timeout=None):
+    def fake_post(url, params=None, timeout=None):
         advance_calls.append(url)
         return FakeResponse({"current_slot": 1})
 

@@ -106,6 +106,13 @@ pub struct CallerCallbackPayload {
     pub success: bool,
     pub result: serde_json::Value,
     pub error: Option<String>,
+    /// `carbon_cost` rescaled by actual/forecast carbon intensity for the
+    /// scheduled slot, if the client ever reported an actual reading for it
+    /// (see `handlers::advance_slot`). `None` if no actual reading is known.
+    pub actual_carbon_cost: Option<f64>,
+    /// Same rescaling applied to `baseline_carbon_cost`, using the actual
+    /// carbon intensity at the request's *arrival* slot instead.
+    pub actual_baseline_carbon_cost: Option<f64>,
 }
 
 /// Response of `GET /v1/stats` — counts of tracked requests by status, plus
