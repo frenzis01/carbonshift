@@ -126,6 +126,20 @@ def test_summary_overall_aggregates_across_task_flavour_groups(tmp_path):
     assert overall["carbon_cost"]["avg"] == 2.0  # (1.0 + 3.0) / 2, across both flavours
 
 
+def test_summary_aggregates_carbon_saving_by_total_baseline_cost(tmp_path):
+    tracker = make_tracker(tmp_path)
+    tracker.add(TrackedRequest("1", "text_generation", 30.0, datetime.now(timezone.utc),
+                                make_ack(flavour="Fast", carbon_cost=1.0, baseline_carbon_cost=2.0)))
+    tracker.add(TrackedRequest("2", "text_generation", 30.0, datetime.now(timezone.utc),
+                                make_ack(flavour="Accurate", carbon_cost=3.0, baseline_carbon_cost=3.0)))
+    tracker.on_callback("1", True, {}, None)
+    tracker.on_callback("2", True, {}, None)
+
+    overall = tracker.summary()["overall"]
+    # total baseline = 5.0, total cost = 4.0, so overall saving = (5 - 4)/5 * 100 = 20.0%
+    assert overall["carbon_saving_pct"]["avg"] == 20.0
+
+
 def test_to_dict_computes_carbon_saving_pct(tmp_path):
     tracker = make_tracker(tmp_path)
     tracker.add(TrackedRequest("1", "text_generation", 30.0, datetime.now(timezone.utc),

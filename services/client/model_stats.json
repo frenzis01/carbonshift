@@ -1,92 +1,83 @@
 {
-  "deepset/bert-base-cased-squad2": {
-    "avg_execution_time_seconds": 0.16772945293341762,
-    "error_pct": 38.88176638176638,
-    "flavour": "balanced",
-    "measured_at": "2026-09-07T14:30:06.101633+00:00",
-    "model": "deepset/bert-base-cased-squad2",
-    "sample_count": 30,
-    "task": "question_answering"
-  },
-  "deepset/bert-base-uncased-squad2": {
-    "avg_execution_time_seconds": 0.18231359277990122,
-    "error_pct": 19.137184654426033,
-    "flavour": "balanced",
-    "measured_at": "2026-09-07T15:37:46.031607+00:00",
-    "model": "deepset/bert-base-uncased-squad2",
-    "sample_count": 50,
-    "task": "question_answering"
-  },
   "deepset/bert-large-uncased-whole-word-masking-squad2": {
-    "avg_execution_time_seconds": 0.5572279923399037,
-    "error_pct": 14.403393541324576,
+    "avg_execution_time_seconds": 0.32418552899049247,
+    "error_pct": 9.81866685696609,
     "flavour": "accurate",
-    "measured_at": "2026-09-07T15:37:11.498932+00:00",
+    "measured_at": "2026-09-15T19:11:02.458376+00:00",
     "model": "deepset/bert-large-uncased-whole-word-masking-squad2",
-    "sample_count": 50,
+    "sample_count": 300,
+    "task": "question_answering"
+  },
+  "deepset/roberta-base-squad2": {
+    "avg_execution_time_seconds": 0.10412121084004564,
+    "error_pct": 20.92761516085382,
+    "flavour": "balanced",
+    "measured_at": "2026-09-15T19:17:41.170833+00:00",
+    "model": "deepset/roberta-base-squad2",
+    "sample_count": 300,
     "task": "question_answering"
   },
   "distilbert-base-cased-distilled-squad": {
-    "avg_execution_time_seconds": 0.09873432325999602,
-    "error_pct": 28.138627655869037,
+    "avg_execution_time_seconds": 0.05708057012680608,
+    "error_pct": 28.558886766966406,
     "flavour": "fast",
-    "measured_at": "2026-09-07T15:38:18.373798+00:00",
+    "measured_at": "2026-09-15T19:24:13.062329+00:00",
     "model": "distilbert-base-cased-distilled-squad",
-    "sample_count": 50,
+    "sample_count": 300,
     "task": "question_answering"
   },
   "distilgpt2": {
-    "avg_execution_time_seconds": 0.26584462958002403,
-    "error_pct": 35.175906126946785,
+    "avg_execution_time_seconds": 0.2188127937099974,
+    "error_pct": 31.63560908566436,
     "flavour": "fast",
-    "measured_at": "2026-09-07T15:36:22.554162+00:00",
+    "measured_at": "2026-09-15T18:53:07.225786+00:00",
     "model": "distilgpt2",
-    "sample_count": 50,
+    "sample_count": 300,
     "task": "text_generation"
   },
   "dslim/bert-base-NER": {
-    "avg_execution_time_seconds": 0.010213319580216193,
-    "error_pct": 51.202597402597405,
+    "avg_execution_time_seconds": 0.007291620703278265,
+    "error_pct": 42.13112651546856,
     "flavour": "balanced",
-    "measured_at": "2026-09-07T15:36:36.096078+00:00",
+    "measured_at": "2026-09-15T19:01:00.604685+00:00",
     "model": "dslim/bert-base-NER",
-    "sample_count": 50,
+    "sample_count": 300,
     "task": "ner"
   },
   "dslim/bert-large-NER": {
-    "avg_execution_time_seconds": 0.029996218159940326,
-    "error_pct": 12.857142857142858,
+    "avg_execution_time_seconds": 0.015272319259383948,
+    "error_pct": 13.86966181966182,
     "flavour": "accurate",
-    "measured_at": "2026-09-07T15:36:30.977099+00:00",
+    "measured_at": "2026-09-15T18:57:04.429339+00:00",
     "model": "dslim/bert-large-NER",
-    "sample_count": 50,
+    "sample_count": 300,
     "task": "ner"
   },
   "dslim/distilbert-NER": {
-    "avg_execution_time_seconds": 0.005833139919923269,
-    "error_pct": 67.18379398379399,
+    "avg_execution_time_seconds": 0.004391139369593778,
+    "error_pct": 68.19231465702055,
     "flavour": "fast",
-    "measured_at": "2026-09-07T15:36:40.230691+00:00",
+    "measured_at": "2026-09-15T19:04:55.409358+00:00",
     "model": "dslim/distilbert-NER",
-    "sample_count": 50,
+    "sample_count": 300,
     "task": "ner"
   },
   "gpt2": {
-    "avg_execution_time_seconds": 0.3764493941600085,
-    "error_pct": 22.71435869061091,
+    "avg_execution_time_seconds": 0.362332712453402,
+    "error_pct": 20.572348102013777,
     "flavour": "balanced",
-    "measured_at": "2026-09-07T15:34:46.282773+00:00",
+    "measured_at": "2026-09-15T18:38:05.965629+00:00",
     "model": "gpt2",
-    "sample_count": 50,
+    "sample_count": 300,
     "task": "text_generation"
   },
   "gpt2-medium": {
-    "avg_execution_time_seconds": 0.7061446306004655,
+    "avg_execution_time_seconds": 0.6091440947902447,
     "error_pct": 0.0,
     "flavour": "accurate",
-    "measured_at": "2026-09-07T15:33:15.045991+00:00",
+    "measured_at": "2026-09-15T18:22:18.291949+00:00",
     "model": "gpt2-medium",
-    "sample_count": 50,
+    "sample_count": 300,
     "task": "text_generation"
   }
 }

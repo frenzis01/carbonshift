@@ -25,8 +25,17 @@ class ExtractiveQAPipeline:
             self.device = torch.device("cpu")
 
     def __call__(self, question: str, context: str) -> dict:
+        max_len = getattr(self.tokenizer, "model_max_length", None)
+        if max_len is None or max_len <= 0 or max_len > 1000000:
+            max_len = 512
+
         encoding = self.tokenizer(
-            question, context, return_tensors="pt", truncation=True, return_offsets_mapping=True
+            question,
+            context,
+            return_tensors="pt",
+            truncation="only_second",
+            max_length=max_len,
+            return_offsets_mapping=True,
         )
         offsets = encoding.pop("offset_mapping")[0]
         # la risposta deve provenire dal contesto (sequence 1), mai dalla domanda (sequence 0)

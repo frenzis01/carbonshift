@@ -69,3 +69,28 @@ def test_never_picks_answer_from_question_tokens():
     assert result["answer"] == "Paris"
     assert result["start"] == 0
     assert result["end"] == 5
+
+
+def test_pipeline_passes_model_max_length_to_tokenizer_for_qa():
+    seen = {}
+
+    class FakeTokenizer:
+        model_max_length = 512
+
+        def __call__(self, question, context, **kwargs):
+            seen.update(kwargs)
+            assert kwargs["truncation"] == "only_second"
+            assert kwargs["max_length"] == 512
+            return _FakeEncoding(
+                offsets=[(0, 0), (0, 0), (0, 5), (6, 8)],
+                sequence_ids=[None, 0, 1, 1],
+            )
+
+    pipe = ExtractiveQAPipeline.__new__(ExtractiveQAPipeline)
+    pipe.device = torch.device("cpu")
+    pipe.tokenizer = FakeTokenizer()
+    pipe.model = lambda **kwargs: _FakeOutputs([0, 0, 0, 0], [0, 0, 0, 0])
+
+    pipe("What is the capital?", "Paris is the capital")
+
+    assert seen["max_length"] == 512

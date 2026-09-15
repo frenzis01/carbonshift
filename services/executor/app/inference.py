@@ -314,6 +314,8 @@ def run_task(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, A
             quality_score = _compare_outputs(task, task_input, primary["output"], accurate["output"])
 
     if flavour == Flavour.ACCURATE:
+        # For the Accurate flavour, we could consider the error percentage to be zero
+        # since it is considered the reference output.
         actual_error_pct = 0.0
         if quality_score is None:
             quality_score = 1.0

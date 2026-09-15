@@ -45,7 +45,10 @@ MODEL_REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
         # even Fast on squad_v2 (~35% vs ~23% error over the same sample) —
         # the uncased checkpoint (matching Accurate's own uncased family)
         # measures ~13%, correctly between Accurate and Fast.
-        Flavour.BALANCED: ("question-answering", "deepset/bert-base-uncased-squad2"),
+        # Flavour.BALANCED: ("question-answering", "deepset/bert-base-cased-squad2"),
+        # Flavour.BALANCED: ("question-answering", "deepset/bert-base-uncased-squad2"),
+        Flavour.BALANCED: ("question-answering", "deepset/roberta-base-squad2"),
+        
         Flavour.ACCURATE: ("question-answering", "deepset/bert-large-uncased-whole-word-masking-squad2"),
     },
 }

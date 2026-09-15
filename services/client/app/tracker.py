@@ -169,16 +169,28 @@ class RequestTracker:
         ack = [i["ack_latency_seconds"] for i in its]
         carbon = [i["carbon_cost"] for i in its if i["carbon_cost"] is not None]
         baseline_carbon = [i["baseline_carbon_cost"] for i in its if i["baseline_carbon_cost"] is not None]
-        carbon_saving = [i["carbon_saving_pct"] for i in its if i["carbon_saving_pct"] is not None]
         exec_time = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
         baseline_exec_time = [i["baseline_execution_time_seconds"] for i in completed
                                if i["baseline_execution_time_seconds"] is not None]
-        energy_saving = [i["energy_saving_pct"] for i in completed if i["energy_saving_pct"] is not None]
         confidences = [i["result"]["confidence"] for i in completed
                         if i.get("result") and i["result"].get("confidence") is not None]
         qualities = [i["result"]["quality_score"] for i in completed
                      if i.get("result") and i["result"].get("quality_score") is not None]
         late_count = sum(1 for i in its if i["late"])
+
+        total_carbon_cost = sum(carbon)
+        total_baseline_carbon_cost = sum(baseline_carbon)
+        total_execution_time = sum(exec_time)
+        total_baseline_execution_time = sum(baseline_exec_time)
+        carbon_saving_value = None
+        if total_baseline_carbon_cost:
+            carbon_saving_value = ((total_baseline_carbon_cost - total_carbon_cost)
+                                  / total_baseline_carbon_cost) * 100
+        energy_saving_value = None
+        if total_baseline_execution_time:
+            energy_saving_value = ((total_baseline_execution_time - total_execution_time)
+                                  / total_baseline_execution_time) * 100
+
         return {
             "count": len(its),
             "completed": len(completed),
@@ -190,10 +202,18 @@ class RequestTracker:
             "end_to_end_seconds": _stats(e2e),
             "execution_time_seconds": _stats(exec_time),
             "baseline_execution_time_seconds": _stats(baseline_exec_time),
-            "energy_saving_pct": _stats(energy_saving),
+            "energy_saving_pct": {
+                "avg": round(energy_saving_value, 2) if energy_saving_value is not None else None,
+                "min": None,
+                "max": None,
+            },
             "carbon_cost": _stats(carbon),
             "baseline_carbon_cost": _stats(baseline_carbon),
-            "carbon_saving_pct": _stats(carbon_saving),
+            "carbon_saving_pct": {
+                "avg": round(carbon_saving_value, 2) if carbon_saving_value is not None else None,
+                "min": None,
+                "max": None,
+            },
             "confidence": _stats(confidences),
             "quality_score": _stats(qualities),
         }
@@ -236,12 +256,28 @@ class RequestTracker:
         scheduled = [i for i in items if i["scheduled_slot"] is not None or i["status"] == "completed"]
         ack = [i["ack_latency_seconds"] for i in items]
         exec_time = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
-        carbon_saving = [i["carbon_saving_pct"] for i in items if i["carbon_saving_pct"] is not None]
-        energy_saving = [i["energy_saving_pct"] for i in completed if i["energy_saving_pct"] is not None]
+        carbon_cost = [i["carbon_cost"] for i in items if i["carbon_cost"] is not None]
+        baseline_carbon_cost = [i["baseline_carbon_cost"] for i in items if i["baseline_carbon_cost"] is not None]
+        energy_cost = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
+        baseline_execution_cost = [i["baseline_execution_time_seconds"] for i in completed
+                                   if i["baseline_execution_time_seconds"] is not None]
         confidences = [i["result"]["confidence"] for i in completed
                         if i.get("result") and i["result"].get("confidence") is not None]
         qualities = [i["result"]["quality_score"] for i in completed
                      if i.get("result") and i["result"].get("quality_score") is not None]
+        total_carbon_cost = sum(carbon_cost)
+        total_baseline_carbon_cost = sum(baseline_carbon_cost)
+        total_execution_time = sum(energy_cost)
+        total_baseline_execution_time = sum(baseline_execution_cost)
+
+        avg_carbon_saving_pct = None
+        if total_baseline_carbon_cost:
+            avg_carbon_saving_pct = ((total_baseline_carbon_cost - total_carbon_cost)
+                                    / total_baseline_carbon_cost) * 100
+        avg_energy_saving_pct = None
+        if total_baseline_execution_time:
+            avg_energy_saving_pct = ((total_baseline_execution_time - total_execution_time)
+                                    / total_baseline_execution_time) * 100
 
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -255,8 +291,8 @@ class RequestTracker:
             "avg_confidence": _stats(confidences)["avg"],
             "avg_execution_time_seconds": _stats(exec_time)["avg"],
             "avg_ack_latency_seconds": _stats(ack)["avg"],
-            "avg_carbon_saving_pct": _stats(carbon_saving)["avg"],
-            "avg_energy_saving_pct": _stats(energy_saving)["avg"],
+            "avg_carbon_saving_pct": round(avg_carbon_saving_pct, 2) if avg_carbon_saving_pct is not None else None,
+            "avg_energy_saving_pct": round(avg_energy_saving_pct, 2) if avg_energy_saving_pct is not None else None,
         }
 
     def _persist(self, record: dict[str, Any]) -> None:

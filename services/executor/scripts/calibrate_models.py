@@ -56,6 +56,20 @@ def _load_examples(task: str, count: int, seed: int, source: str) -> list[dict]:
     spec = importlib.util.spec_from_file_location("_client_datasets", CLIENT_DIR / "app" / "datasets.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # if no specific seed is provided, we generate a random seed every K examples
+    if seed is None:
+        K = 3  # number of examples to generate per random seed
+        examples = []
+        import random
+        upper_bound = count + count % K
+        # ensure we generate enough examples to cover the requested count with random seeds
+        for i in range(0, upper_bound):
+            seed = random.randint(0, 2**32 - 1)
+            examples.append(module.load_examples(task, 3, seed=seed, source=source)[0])
+            i += K
+        # trim the list to the requested count
+        return examples[:count]
+    # otherwise, use the provided seed
     return module.load_examples(task, count, seed=seed, source=source)
 
 
@@ -98,7 +112,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--samples", type=int, default=30, help="Examples per (task, flavour) combination.")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--source", default="synthetic", choices=["synthetic", "dataset"])
     parser.add_argument("--tasks", nargs="+", default=ALL_TASKS, choices=ALL_TASKS)
     parser.add_argument("--flavours", nargs="+", default=ALL_FLAVOURS, choices=ALL_FLAVOURS)
