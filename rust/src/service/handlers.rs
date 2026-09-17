@@ -413,6 +413,15 @@ pub async fn executor_callback(
                 })
         });
 
+    
+    // The logic behind the formula of actual carbon cost is as follows:
+    // actual_carbon_cost = forecast_carbon_cost * (actual_ci / forecast_ci) * (actual_exec_time / forecast_exec_time)
+    // being the forecast_carbon_cost = forecast_ci * forecast_exec_time * cap_level_multiplier * hourly_scale
+    // we get that the actual carbon cost ultimately is:
+    // actual_carbon_cost = actual_ci * actual_exec_time * cap_level_multiplier * hourly_scale
+    // 
+    // The formula is less readable than the direct one, but avoids having here explicit cap_level_multiplier and hourly_scale values.
+     
     let mut actual_carbon_cost = None;
     if let Some(assignment) = state.shared_state.get_current_assignments().get(&request_id) {
         let ci_ratio = state.carbon_intensity_ratio(assignment.scheduled_slot);
