@@ -575,3 +575,111 @@ async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
 
     scheduler.stop();
 }
+
+#[tokio::test]
+async fn executor_callback_corrects_carbon_cost_with_actual_execution_time() {
+    let mut cfg = test_engine_config();
+    cfg.batch_size = 1;
+    let cfg = Arc::new(cfg);
+    let shared_state = SharedState::new();
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
+    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    scheduler.start();
+
+    let mut svc_cfg = test_service_cfg();
+    svc_cfg.submit_wait_timeout_secs = 5.0;
+    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
+    let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast.clone());
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(json_request("POST", "/v1/requests", r#"{"deadline_seconds": 5}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let request_id = json["request_id"].as_u64().unwrap();
+    let predicted_cost = json["carbon_cost"].as_f64().unwrap();
+    let assignment = shared_state.get_current_assignments()[&request_id].clone();
+    let duration = assignment.flavour_duration as f64;
+
+    // Actual execution time is 40% of nominal duration.
+    let actual_exec_time = duration * 0.4;
+    let callback_body = format!(
+        r#"{{"success": true, "result": {{"execution_time_seconds": {actual_exec_time}}}}}"#
+    );
+
+    let resp = app
+        .oneshot(json_request("POST", &format!("/v1/callback/{request_id}"), &callback_body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let corrected = shared_state.get_current_assignments()[&request_id].carbon_cost;
+    assert!(
+        (corrected - predicted_cost * 0.4).abs() < 1e-9,
+        "corrected={corrected}, expected={}",
+        predicted_cost * 0.4
+    );
+
+    scheduler.stop();
+}
+
+#[tokio::test]
+async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and_arrival_ci() {
+    let mut cfg = test_engine_config();
+    cfg.batch_size = 1;
+    let cfg = Arc::new(cfg);
+    let shared_state = SharedState::new();
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
+    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    scheduler.start();
+
+    let mut svc_cfg = test_service_cfg();
+    svc_cfg.submit_wait_timeout_secs = 5.0;
+    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
+    let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast.clone());
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(json_request("POST", "/v1/requests", r#"{"deadline_seconds": 5}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let request_id = json["request_id"].as_u64().unwrap();
+    let initial_baseline = json["baseline_carbon_cost"].as_f64().unwrap();
+
+    let (arrival_slot, baseline_dur) = {
+        let guard = state.tracked.lock().unwrap();
+        let t = &guard[&request_id];
+        (t.arrival_slot, t.baseline_duration as f64)
+    };
+
+    // Actual CI for arrival_slot turns out to be 1.5x forecast
+    let actual_ci = forecast[arrival_slot as usize] * 1.5;
+    state.actual_carbon_intensity.lock().unwrap().insert(arrival_slot, actual_ci);
+
+    // Baseline execution time turns out to be 0.75x nominal baseline duration
+    let actual_baseline_time = baseline_dur * 0.75;
+    let callback_body = format!(
+        r#"{{"success": true, "result": {{"baseline_execution_time_seconds": {actual_baseline_time}}}}}"#
+    );
+
+    let resp = app
+        .oneshot(json_request("POST", &format!("/v1/callback/{request_id}"), &callback_body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let corrected_baseline = state.tracked.lock().unwrap()[&request_id].baseline_carbon_cost;
+    let expected = initial_baseline * 1.5 * 0.75;
+    assert!(
+        (corrected_baseline - expected).abs() < 1e-9,
+        "corrected_baseline={corrected_baseline}, expected={expected}"
+    );
+
+    scheduler.stop();
+}

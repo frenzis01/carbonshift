@@ -260,6 +260,7 @@ fn scenario_seed_2030_all_requests_scheduled_correctly() {
                     deadline_slot: r.deadline_slot,
                     task_id: "default".to_string(),
                     flavours: vec![],
+                    max_error_threshold: None,
                 });
             }
         }

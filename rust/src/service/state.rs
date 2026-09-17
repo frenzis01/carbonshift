@@ -29,6 +29,8 @@ pub struct TrackedRequest {
     /// `handlers::compute_baseline_carbon_cost`). Computed once at submit
     /// time so it stays comparable even after the real assignment changes.
     pub baseline_carbon_cost: f64,
+    /// Duration in seconds of the accurate flavour used to compute baseline_carbon_cost.
+    pub baseline_duration: i32,
     /// Slot the request arrived at — needed to look up the *actual* (not
     /// forecast) carbon intensity for that slot once known, to correct
     /// `baseline_carbon_cost` the same way `Assignment::carbon_cost` gets
@@ -37,8 +39,13 @@ pub struct TrackedRequest {
 }
 
 impl TrackedRequest {
-    pub fn new(callback_url: Option<String>, payload: serde_json::Value, baseline_carbon_cost: f64,
-               arrival_slot: i32) -> Self {
+    pub fn new(
+        callback_url: Option<String>,
+        payload: serde_json::Value,
+        baseline_carbon_cost: f64,
+        baseline_duration: i32,
+        arrival_slot: i32,
+    ) -> Self {
         Self {
             callback_url,
             payload,
@@ -47,6 +54,7 @@ impl TrackedRequest {
             dispatch_attempts: 0,
             next_attempt_at: None,
             baseline_carbon_cost,
+            baseline_duration,
             arrival_slot,
         }
     }

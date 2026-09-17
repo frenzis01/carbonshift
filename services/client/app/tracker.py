@@ -214,6 +214,21 @@ class RequestTracker:
             energy_saving_value = ((total_baseline_execution_time - total_execution_time)
                                   / total_baseline_execution_time) * 100
 
+        actual_carbon = [
+            i["actual_carbon_cost"] if i.get("actual_carbon_cost") is not None else i["carbon_cost"]
+            for i in its if (i.get("actual_carbon_cost") is not None or i.get("carbon_cost") is not None)
+        ]
+        actual_baseline_carbon = [
+            i["actual_baseline_carbon_cost"] if i.get("actual_baseline_carbon_cost") is not None else i["baseline_carbon_cost"]
+            for i in its if (i.get("actual_baseline_carbon_cost") is not None or i.get("baseline_carbon_cost") is not None)
+        ]
+        total_actual_carbon_cost = sum(actual_carbon)
+        total_actual_baseline_carbon_cost = sum(actual_baseline_carbon)
+        actual_carbon_saving_value = None
+        if total_actual_baseline_carbon_cost:
+            actual_carbon_saving_value = ((total_actual_baseline_carbon_cost - total_actual_carbon_cost)
+                                          / total_actual_baseline_carbon_cost) * 100
+
         return {
             "count": len(its),
             "completed": len(completed),
@@ -234,6 +249,13 @@ class RequestTracker:
             "baseline_carbon_cost": _stats(baseline_carbon),
             "carbon_saving_pct": {
                 "avg": round(carbon_saving_value, 2) if carbon_saving_value is not None else None,
+                "min": None,
+                "max": None,
+            },
+            "actual_carbon_cost": _stats(actual_carbon),
+            "actual_baseline_carbon_cost": _stats(actual_baseline_carbon),
+            "actual_carbon_saving_pct": {
+                "avg": round(actual_carbon_saving_value, 2) if actual_carbon_saving_value is not None else None,
                 "min": None,
                 "max": None,
             },
@@ -293,10 +315,25 @@ class RequestTracker:
         total_execution_time = sum(energy_cost)
         total_baseline_execution_time = sum(baseline_execution_cost)
 
+        actual_carbon = [
+            i["actual_carbon_cost"] if i.get("actual_carbon_cost") is not None else i["carbon_cost"]
+            for i in items if (i.get("actual_carbon_cost") is not None or i.get("carbon_cost") is not None)
+        ]
+        actual_baseline_carbon = [
+            i["actual_baseline_carbon_cost"] if i.get("actual_baseline_carbon_cost") is not None else i["baseline_carbon_cost"]
+            for i in items if (i.get("actual_baseline_carbon_cost") is not None or i.get("baseline_carbon_cost") is not None)
+        ]
+        total_actual_carbon_cost = sum(actual_carbon)
+        total_actual_baseline_carbon_cost = sum(actual_baseline_carbon)
+
         avg_carbon_saving_pct = None
         if total_baseline_carbon_cost:
             avg_carbon_saving_pct = ((total_baseline_carbon_cost - total_carbon_cost)
                                     / total_baseline_carbon_cost) * 100
+        avg_actual_carbon_saving_pct = None
+        if total_actual_baseline_carbon_cost:
+            avg_actual_carbon_saving_pct = ((total_actual_baseline_carbon_cost - total_actual_carbon_cost)
+                                            / total_actual_baseline_carbon_cost) * 100
         avg_energy_saving_pct = None
         if total_baseline_execution_time:
             avg_energy_saving_pct = ((total_baseline_execution_time - total_execution_time)
@@ -315,6 +352,7 @@ class RequestTracker:
             "avg_execution_time_seconds": _stats(exec_time)["avg"],
             "avg_ack_latency_seconds": _stats(ack)["avg"],
             "avg_carbon_saving_pct": round(avg_carbon_saving_pct, 2) if avg_carbon_saving_pct is not None else None,
+            "avg_actual_carbon_saving_pct": round(avg_actual_carbon_saving_pct, 2) if avg_actual_carbon_saving_pct is not None else None,
             "avg_energy_saving_pct": round(avg_energy_saving_pct, 2) if avg_energy_saving_pct is not None else None,
         }
 

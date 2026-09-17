@@ -7,16 +7,6 @@ venv/
 .venv/
 env/
 
-online2/tests/Nshift_speed/output**
-online2/notebooks/html
-online2/AGENT_CONTEXT.md
-online2/notebooks/2028
-online2/notebooks/20*
-online2/DEVELOPMENT.md
-
-online2/tests/Nshift_speed/test_cbint.py
-online2/tests/Nshift_speed/*.png
-
 **/placeholder
 
 **/scenario_seed_*.json
@@ -39,6 +29,7 @@ rolling_window_dp.py
 
 **.bk
 **.bak
+implementation_plan.md
 
 ignore
 

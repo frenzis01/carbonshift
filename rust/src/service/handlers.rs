@@ -84,7 +84,7 @@ pub async fn health() -> &'static str {
 /// `flavours` is the request's own resolved flavour set (its task's, or the
 /// default task's) — the same set the DP solver chooses among for it, so
 /// the baseline and the real assignment are always comparable apples-to-apples.
-fn compute_baseline_carbon_cost(state: &AppState, arrival_slot: i32, flavours: &[Flavour]) -> f64 {
+fn compute_baseline_carbon_cost(state: &AppState, arrival_slot: i32, flavours: &[Flavour]) -> (f64, i32) {
     let position = {
         let mut counts = state.baseline_slot_counts.lock().unwrap();
         let c = counts.entry(arrival_slot).or_insert(0);
@@ -97,7 +97,8 @@ fn compute_baseline_carbon_cost(state: &AppState, arrival_slot: i32, flavours: &
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("task must have at least one flavour");
-    carbon * mult * accurate.duration as f64 * state.cfg.carbon_cost_duration_scale
+    let cost = carbon * mult * accurate.duration as f64 * state.cfg.carbon_cost_duration_scale;
+    (cost, accurate.duration)
 }
 
 /// `POST /v1/tasks` — announce (or update) a task's available flavours.
@@ -257,11 +258,17 @@ pub async fn submit_request(
     let task_id = body.task_id.clone().unwrap_or_else(|| "default".to_string());
     let task_flavours = state.flavours_for_task(&task_id);
     let task_threshold = state.threshold_for_task(&task_id);
-    let baseline_carbon_cost = compute_baseline_carbon_cost(&state, current_slot, &task_flavours);
+    let (baseline_carbon_cost, baseline_duration) = compute_baseline_carbon_cost(&state, current_slot, &task_flavours);
 
     state.tracked.lock().unwrap().insert(
         request_id,
-        TrackedRequest::new(body.callback_url.clone(), body.payload.clone(), baseline_carbon_cost, current_slot),
+        TrackedRequest::new(
+            body.callback_url.clone(),
+            body.payload.clone(),
+            baseline_carbon_cost,
+            baseline_duration,
+            current_slot,
+        ),
     );
 
     state.shared_state.add_request(EngineRequest::new_for_task(
@@ -371,11 +378,14 @@ pub async fn get_request_status(
 /// no executor to call back).
 ///
 /// Also corrects `carbon_cost`/`baseline_carbon_cost` with the *actual*
-/// carbon intensity for their slots, if the client ever reported one (see
-/// `advance_slot`) — rescaled by `actual_ci / forecast_ci`, since execution
-/// time/capacity multiplier are unaffected by carbon intensity. Both
-/// corrected values are forwarded to the caller so it can see the real cost,
-/// not just the DP's forecast-time estimate.
+/// carbon intensity for their slots (if reported via `advance_slot` or
+/// `set_carbon_intensity`) AND the *actual* execution time measured by the
+/// executor (`execution_time_seconds` and `baseline_execution_time_seconds`).
+/// For `carbon_cost`, slot is `assignment.scheduled_slot` and duration is
+/// `assignment.flavour_duration`. For `baseline_carbon_cost`, slot is
+/// `t.arrival_slot` (the slot where baseline would execute immediately) and
+/// duration is `t.baseline_duration`. Both corrected values are forwarded
+/// to the caller so it can see the real cost, not just the forecast estimates.
 pub async fn executor_callback(
     State(state): State<AppState>,
     Path(request_id): Path<u64>,
@@ -385,12 +395,39 @@ pub async fn executor_callback(
         state.shared_state.correct_assignment_error(request_id, actual_error);
     }
 
+    let actual_execution_time = body.result.get("execution_time_seconds").and_then(|v| v.as_f64());
+    let baseline_execution_time = body
+        .result
+        .get("baseline_execution_time_seconds")
+        .and_then(|v| v.as_f64())
+        .or_else(|| {
+            body.result
+                .get("flavour")
+                .and_then(|f| f.as_str())
+                .and_then(|f| {
+                    if f.eq_ignore_ascii_case("accurate") {
+                        actual_execution_time
+                    } else {
+                        None
+                    }
+                })
+        });
+
     let mut actual_carbon_cost = None;
     if let Some(assignment) = state.shared_state.get_current_assignments().get(&request_id) {
-        if let Some(ratio) = state.carbon_intensity_ratio(assignment.scheduled_slot) {
+        let ci_ratio = state.carbon_intensity_ratio(assignment.scheduled_slot);
+        let time_ratio = match (actual_execution_time, assignment.flavour_duration) {
+            (Some(t_exec), dur) if dur > 0 => Some(t_exec / dur as f64),
+            _ => None,
+        };
+
+        if ci_ratio.is_some() || time_ratio.is_some() {
+            let cost = assignment.carbon_cost
+                * ci_ratio.unwrap_or(1.0)
+                * time_ratio.unwrap_or(1.0);
             actual_carbon_cost = state
                 .shared_state
-                .correct_assignment_carbon_cost(request_id, assignment.carbon_cost * ratio);
+                .correct_assignment_carbon_cost(request_id, cost);
         }
     }
 
@@ -401,10 +438,23 @@ pub async fn executor_callback(
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
         t.status = if body.success { RequestStatus::Completed } else { RequestStatus::Failed };
         t.error = body.error.clone();
-        let actual_baseline = state.carbon_intensity_ratio(t.arrival_slot).map(|ratio| {
-            t.baseline_carbon_cost *= ratio;
-            t.baseline_carbon_cost
-        });
+
+        let ci_ratio = state.carbon_intensity_ratio(t.arrival_slot);
+        let time_ratio = match (baseline_execution_time, t.baseline_duration) {
+            (Some(t_exec), dur) if dur > 0 => Some(t_exec / dur as f64),
+            _ => None,
+        };
+
+        let actual_baseline = if ci_ratio.is_some() || time_ratio.is_some() {
+            let cost = t.baseline_carbon_cost
+                * ci_ratio.unwrap_or(1.0)
+                * time_ratio.unwrap_or(1.0);
+            t.baseline_carbon_cost = cost;
+            Some(cost)
+        } else {
+            None
+        };
+
         (t.callback_url.clone(), actual_baseline)
     };
 
@@ -494,8 +544,10 @@ mod tests {
         let state = AppState::new(SharedState::new(), cfg.clone(), service_cfg, forecast);
 
         let baseline = compute_baseline_carbon_cost(&state, 0, &cfg.flavours);
+        let (baseline, duration) = compute_baseline_carbon_cost(&state, 0, &cfg.flavours);
         let carbon = state.carbon_forecast[0];
         let expected = carbon * 10.0 * cfg.carbon_cost_duration_scale; // "Precise"'s duration (lowest error), position 1 => multiplier 1.0
         assert!((baseline - expected).abs() < 1e-9, "baseline={baseline}, expected={expected}");
+        assert_eq!(duration, 10);
     }
 }
