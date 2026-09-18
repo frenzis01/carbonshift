@@ -217,16 +217,6 @@ def test_on_callback_exposes_execution_time_from_result(tmp_path):
     assert record["execution_time_seconds"] == 2.5
 
 
-def test_to_dict_computes_energy_saving_pct_from_baseline_execution_time(tmp_path):
-    tracker = make_tracker(tmp_path)
-    tracker.add(TrackedRequest("1", "text_generation", 30.0, datetime.now(timezone.utc), make_ack()))
-
-    tracker.on_callback("1", True, {"execution_time_seconds": 1.0, "baseline_execution_time_seconds": 4.0}, None)
-    record = tracker.get("1").to_dict()
-    assert record["baseline_execution_time_seconds"] == 4.0
-    assert record["energy_saving_pct"] == 75.0
-
-
 def test_summary_includes_execution_time_and_carbon_saving_stats(tmp_path):
     tracker = make_tracker(tmp_path)
     tracker.add(TrackedRequest("1", "text_generation", 30.0, datetime.now(timezone.utc),
@@ -237,7 +227,6 @@ def test_summary_includes_execution_time_and_carbon_saving_stats(tmp_path):
     group = summary["by_task_flavour"]["text_generation/Fast"]
     assert group["execution_time_seconds"]["avg"] == 2.0
     assert group["baseline_execution_time_seconds"]["avg"] == 4.0
-    assert group["energy_saving_pct"]["avg"] == 50.0
     assert group["baseline_carbon_cost"]["avg"] == 3.0
     assert group["carbon_saving_pct"]["avg"] == 50.0
 
@@ -260,4 +249,3 @@ def test_progress_reports_counts_and_averages(tmp_path):
     assert progress["avg_confidence"] == 0.9
     assert progress["avg_execution_time_seconds"] == 1.0
     assert progress["avg_carbon_saving_pct"] == 50.0
-    assert progress["avg_energy_saving_pct"] == 50.0

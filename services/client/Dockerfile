@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY scripts ./scripts
+COPY model_stats.json .
 
 ENV CLIENT_HOST=0.0.0.0
 EXPOSE 8100

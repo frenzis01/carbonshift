@@ -385,6 +385,12 @@ impl SharedState {
         }
     }
 
+    /// Returns the predicted error for a given assignment
+    pub fn get_error_for_assignment(&self, request_id: u64) -> Option<f64> {
+        let g = self.inner.lock().unwrap();
+        g.assignments.get(&request_id).map(|a| a.error)
+    }
+
     /// Replaces a committed assignment's *predicted* `carbon_cost` (forecast
     /// carbon intensity × nominal duration) with the *actual* one, once the
     /// real carbon intensity for its slot is known (see

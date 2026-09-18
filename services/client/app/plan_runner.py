@@ -104,7 +104,13 @@ def _advance_slot(executor_url: Optional[str], batch_id: str, idx: int, actual_c
             params["actual_carbon_intensity"] = actual_carbon_intensity
         resp = requests.post(f"{settings.carbonshift_url}/v1/admin/advance-slot",
                               params=params, timeout=settings.admin_timeout_seconds)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError:
+            logger.exception("plan %s: carbonshift advance-slot failed at slot %d", batch_id, idx)
+            logger.debug("Response content: %s", resp.content)
+            return
+
         logger.info("plan %s: carbonshift advanced past slot %d -> %s", batch_id, idx, resp.json())
     except requests.RequestException:
         logger.exception("plan %s: carbonshift advance-slot failed at slot %d", batch_id, idx)

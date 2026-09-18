@@ -18,6 +18,8 @@ class CallerCallbackPayload(BaseModel):
     error: Optional[str] = None
     actual_carbon_cost: Optional[float] = None
     actual_baseline_carbon_cost: Optional[float] = None
+    execution_time_seconds: Optional[float] = None
+    baseline_execution_time_seconds: Optional[float] = None
 
 
 class SendBatchRequest(BaseModel):

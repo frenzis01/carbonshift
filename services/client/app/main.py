@@ -3,6 +3,7 @@ batch-send trigger, and metrics report.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -75,8 +76,10 @@ async def run_send_plan(body: SendPlanRequest) -> SendPlanResponse:
 
 @app.post("/callback")
 async def callback(body: CallerCallbackPayload) -> dict[str, str]:
+    logger.info("received callback for request_id=%s, success=%s", body.request_id, body.success)
     found = tracker.on_callback(str(body.request_id), body.success, body.result, body.error,
-                                 body.actual_carbon_cost, body.actual_baseline_carbon_cost)
+                                 body.actual_carbon_cost, body.actual_baseline_carbon_cost,
+                                 body.execution_time_seconds, body.baseline_execution_time_seconds)
     if not found:
         logger.warning("callback for unknown/untracked request_id=%s", body.request_id)
     return {"status": "ok"}

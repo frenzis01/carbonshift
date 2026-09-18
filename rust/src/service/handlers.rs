@@ -392,6 +392,17 @@ pub async fn executor_callback(
     Json(body): Json<ExecutorCallbackPayload>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(actual_error) = body.result.get("actual_error_pct").and_then(|v| v.as_f64()) {
+        // TODO remove
+        // For auditing purposes, we log the diff between the predicted and actual error.
+        let predicted_err = state.shared_state.get_error_for_assignment(request_id);
+        tracing::info!(
+            "Request {}: predicted vs actual error: {:?} vs {:?}",
+            request_id,
+            predicted_err,
+            actual_error
+        );
+
+        // Correct the assignment error with the actual error reported by the executor.
         state.shared_state.correct_assignment_error(request_id, actual_error);
     }
 
@@ -476,6 +487,8 @@ pub async fn executor_callback(
             error: body.error,
             actual_carbon_cost,
             actual_baseline_carbon_cost,
+            execution_time_seconds: actual_execution_time,
+            baseline_execution_time_seconds: baseline_execution_time,
         };
         tokio::spawn(async move {
             if let Err(e) = http.post(&url).json(&payload).send().await {

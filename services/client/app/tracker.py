@@ -10,19 +10,25 @@ import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
+from pathlib import Path
+from statistics import fmean
 
 from .carbonshift_client import CarbonshiftError, get_status
 
+
 logger = logging.getLogger("client.tracker")
+
+ROUND_DIGITS = 4
+DEFAULT_MODEL_STATS = Path(__file__).resolve().parent.parent / "model_stats.json"
 
 
 def _stats(values: list[float]) -> dict[str, Optional[float]]:
     if not values:
         return {"avg": None, "min": None, "max": None}
     return {
-        "avg": round(sum(values) / len(values), 2),
-        "min": round(min(values), 2),
-        "max": round(max(values), 2),
+        "avg": round(sum(values) / len(values), ROUND_DIGITS),
+        "min": round(min(values), ROUND_DIGITS),
+        "max": round(max(values), ROUND_DIGITS),
     }
 
 
@@ -76,17 +82,11 @@ class TrackedRequest:
             actual_carbon_saving_pct = (
                 (actual_baseline_carbon_cost - actual_carbon_cost) / actual_baseline_carbon_cost * 100
             )
-        execution_time_seconds = None
-        baseline_execution_time_seconds = None
-        energy_saving_pct = None
-        if self.result:
-            execution_time_seconds = self.result.get("execution_time_seconds")
-            baseline_execution_time_seconds = self.result.get("baseline_execution_time_seconds")
-            if execution_time_seconds is not None and baseline_execution_time_seconds:
-                energy_saving_pct = (
-                    (baseline_execution_time_seconds - execution_time_seconds)
-                    / baseline_execution_time_seconds * 100
-                )
+        
+        # get execution times from result
+        execution_time_seconds = self.result.get("execution_time_seconds") if self.result else None
+        baseline_execution_time_seconds = self.result.get("baseline_execution_time_seconds") if self.result else None
+        
         return {
             "request_id": self.request_id,
             "task": self.task,
@@ -107,7 +107,6 @@ class TrackedRequest:
             "actual_carbon_saving_pct": actual_carbon_saving_pct,
             "execution_time_seconds": execution_time_seconds,
             "baseline_execution_time_seconds": baseline_execution_time_seconds,
-            "energy_saving_pct": energy_saving_pct,
             "callback_received_at": self.callback_received_at.isoformat() if self.callback_received_at else None,
             "end_to_end_seconds": end_to_end_seconds,
             "late": late,
@@ -137,7 +136,11 @@ class RequestTracker:
 
     def on_callback(self, request_id: str, success: bool, result: Optional[dict[str, Any]],
                      error: Optional[str], actual_carbon_cost: Optional[float] = None,
-                     actual_baseline_carbon_cost: Optional[float] = None) -> bool:
+                     actual_baseline_carbon_cost: Optional[float] = None, 
+                    #  TODO FIX
+                     execution_time_seconds: Optional[float] = None,
+                     baseline_execution_time_seconds: Optional[float] = None,
+                     ) -> bool:
         with self._lock:
             t = self._by_id.get(request_id)
             stale = t is not None and t.ack.get("status") == "pending"
@@ -154,6 +157,8 @@ class RequestTracker:
                     t.ack = fresh_ack
             except CarbonshiftError:
                 logger.warning("failed to refresh stale ack for request_id=%s", request_id, exc_info=True)
+        logger.info("actual_carbon_cost=%s, actual_baseline_carbon_cost=%s", actual_carbon_cost, actual_baseline_carbon_cost)
+        logger.info("execution_time_seconds=%s, baseline_execution_time_seconds=%s", execution_time_seconds, baseline_execution_time_seconds)
         with self._lock:
             t.callback_received_at = datetime.now(timezone.utc)
             t.success = success
@@ -181,12 +186,17 @@ class RequestTracker:
                 record = t.to_dict()
             self._persist(record)
 
+    def round_dict(self, record: dict[str, Any]) -> dict[str, Any]:
+        return {k: (round(v, ROUND_DIGITS) if isinstance(v, float) and v is not None else v) for k, v in record.items()}
+
     def all(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [t.to_dict() for t in self._by_id.values()]
+            return [self.round_dict(t.to_dict()) for t in self._by_id.values()]
 
+
+    ''' Group statistics for a list of requests. '''
     @staticmethod
-    def _group_stats(its: list[dict[str, Any]]) -> dict[str, Any]:
+    def _group_stats(its: list[dict[str, Any]],tasks:tuple=None,flavour=None) -> dict[str, Any]:
         completed = [i for i in its if i["status"] == "completed"]
         e2e = [i["end_to_end_seconds"] for i in completed if i["end_to_end_seconds"] is not None]
         ack = [i["ack_latency_seconds"] for i in its]
@@ -209,10 +219,6 @@ class RequestTracker:
         if total_baseline_carbon_cost:
             carbon_saving_value = ((total_baseline_carbon_cost - total_carbon_cost)
                                   / total_baseline_carbon_cost) * 100
-        energy_saving_value = None
-        if total_baseline_execution_time:
-            energy_saving_value = ((total_baseline_execution_time - total_execution_time)
-                                  / total_baseline_execution_time) * 100
 
         actual_carbon = [
             i["actual_carbon_cost"] if i.get("actual_carbon_cost") is not None else i["carbon_cost"]
@@ -228,37 +234,45 @@ class RequestTracker:
         if total_actual_baseline_carbon_cost:
             actual_carbon_saving_value = ((total_actual_baseline_carbon_cost - total_actual_carbon_cost)
                                           / total_actual_baseline_carbon_cost) * 100
+        
+        forecasted_exec_time = None
 
+        if DEFAULT_MODEL_STATS.exists():
+            with DEFAULT_MODEL_STATS.open(encoding="utf-8") as f:
+                model_stats = json.load(f)
+
+            # Filter the model stats to find models matching the given tasks and flavour
+            matching_models = [
+                stats
+                for stats in model_stats.values()
+                if (not tasks or stats["task"] in tasks)
+                and (not flavour or stats["flavour"].lower() == flavour.lower())
+            ]
+
+            # Calculate the forecasted execution time based on the matching models
+            if matching_models:
+                forecasted_exec_time = fmean(
+                    stats["avg_execution_time_seconds"]
+                    for stats in matching_models
+                )
         return {
             "count": len(its),
             "completed": len(completed),
             "failed": sum(1 for i in its if i["status"] == "failed"),
             "timed_out": sum(1 for i in its if i["status"] == "timed_out"),
             "late_count": late_count,
-            "late_rate": round(late_count / len(its), 2) if its else 0.0,
+            "late_rate": round(late_count / len(its), ROUND_DIGITS) if its else 0.0,
             "ack_latency_seconds": _stats(ack),
             "end_to_end_seconds": _stats(e2e),
+            "forecasted_execution_time_seconds": round(forecasted_exec_time, ROUND_DIGITS) if forecasted_exec_time is not None else None,
             "execution_time_seconds": _stats(exec_time),
             "baseline_execution_time_seconds": _stats(baseline_exec_time),
-            "energy_saving_pct": {
-                "avg": round(energy_saving_value, 2) if energy_saving_value is not None else None,
-                "min": None,
-                "max": None,
-            },
             "carbon_cost": _stats(carbon),
             "baseline_carbon_cost": _stats(baseline_carbon),
-            "carbon_saving_pct": {
-                "avg": round(carbon_saving_value, 2) if carbon_saving_value is not None else None,
-                "min": None,
-                "max": None,
-            },
+            "carbon_saving_pct": round(carbon_saving_value, ROUND_DIGITS) if carbon_saving_value is not None else None,
             "actual_carbon_cost": _stats(actual_carbon),
             "actual_baseline_carbon_cost": _stats(actual_baseline_carbon),
-            "actual_carbon_saving_pct": {
-                "avg": round(actual_carbon_saving_value, 2) if actual_carbon_saving_value is not None else None,
-                "min": None,
-                "max": None,
-            },
+            "actual_carbon_saving_pct": round(actual_carbon_saving_value, ROUND_DIGITS) if actual_carbon_saving_value is not None else None,
             "confidence": _stats(confidences),
             "quality_score": _stats(qualities),
         }
@@ -269,9 +283,12 @@ class RequestTracker:
         for i in items:
             groups[(i["task"], i["flavour"] or "unknown")].append(i)
 
-        by_task_flavour = {f"{task}/{flavour}": self._group_stats(its) for (task, flavour), its in groups.items()}
 
-        return {
+        tasks = tuple(set(i["task"] for i in items))
+        logger.info("Tasks identified: %s", tasks)
+        by_task_flavour = {f"{task}/{flavour}": self._group_stats(its,task,flavour) for (task, flavour), its in groups.items()}
+
+        output = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "total_requests": len(items),
             # Same shape as each `by_task_flavour` entry, but aggregated
@@ -280,7 +297,9 @@ class RequestTracker:
             # which no per-flavour breakdown answers directly.
             "overall": self._group_stats(items),
             "by_task_flavour": by_task_flavour,
-        }
+                  }
+
+        return output
 
     def progress(self) -> dict[str, Any]:
         """Quick top-level snapshot of an in-progress (or finished) test run:
@@ -303,7 +322,6 @@ class RequestTracker:
         exec_time = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
         carbon_cost = [i["carbon_cost"] for i in items if i["carbon_cost"] is not None]
         baseline_carbon_cost = [i["baseline_carbon_cost"] for i in items if i["baseline_carbon_cost"] is not None]
-        energy_cost = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
         baseline_execution_cost = [i["baseline_execution_time_seconds"] for i in completed
                                    if i["baseline_execution_time_seconds"] is not None]
         confidences = [i["result"]["confidence"] for i in completed
@@ -312,7 +330,7 @@ class RequestTracker:
                      if i.get("result") and i["result"].get("quality_score") is not None]
         total_carbon_cost = sum(carbon_cost)
         total_baseline_carbon_cost = sum(baseline_carbon_cost)
-        total_execution_time = sum(energy_cost)
+        total_execution_time = sum(exec_time)
         total_baseline_execution_time = sum(baseline_execution_cost)
 
         actual_carbon = [
@@ -334,10 +352,6 @@ class RequestTracker:
         if total_actual_baseline_carbon_cost:
             avg_actual_carbon_saving_pct = ((total_actual_baseline_carbon_cost - total_actual_carbon_cost)
                                             / total_actual_baseline_carbon_cost) * 100
-        avg_energy_saving_pct = None
-        if total_baseline_execution_time:
-            avg_energy_saving_pct = ((total_baseline_execution_time - total_execution_time)
-                                    / total_baseline_execution_time) * 100
 
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -351,9 +365,8 @@ class RequestTracker:
             "avg_confidence": _stats(confidences)["avg"],
             "avg_execution_time_seconds": _stats(exec_time)["avg"],
             "avg_ack_latency_seconds": _stats(ack)["avg"],
-            "avg_carbon_saving_pct": round(avg_carbon_saving_pct, 2) if avg_carbon_saving_pct is not None else None,
-            "avg_actual_carbon_saving_pct": round(avg_actual_carbon_saving_pct, 2) if avg_actual_carbon_saving_pct is not None else None,
-            "avg_energy_saving_pct": round(avg_energy_saving_pct, 2) if avg_energy_saving_pct is not None else None,
+            "avg_carbon_saving_pct": round(avg_carbon_saving_pct, ROUND_DIGITS) if avg_carbon_saving_pct is not None else None,
+            "avg_actual_carbon_saving_pct": round(avg_actual_carbon_saving_pct, ROUND_DIGITS) if avg_actual_carbon_saving_pct is not None else None,
         }
 
     def _persist(self, record: dict[str, Any]) -> None:

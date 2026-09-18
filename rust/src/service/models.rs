@@ -69,6 +69,12 @@ pub struct ExecutorCallbackPayload {
     pub result: serde_json::Value,
     #[serde(default)]
     pub error: Option<String>,
+    /// Actual execution time reported by the executor, if available.
+    #[serde(default)]
+    pub execution_time_seconds: Option<f64>,
+    /// Actual baseline execution time, if available.
+    #[serde(default)]
+    pub baseline_execution_time_seconds: Option<f64>,
 }
 
 /// Body of `POST /v1/tasks`: announces (or updates) a task's available
@@ -113,6 +119,10 @@ pub struct CallerCallbackPayload {
     /// Same rescaling applied to `baseline_carbon_cost`, using the actual
     /// carbon intensity at the request's *arrival* slot instead.
     pub actual_baseline_carbon_cost: Option<f64>,
+    /// Actual execution time reported by the executor, if available.
+    pub execution_time_seconds: Option<f64>,
+    /// Actual baseline execution time, if available.
+    pub baseline_execution_time_seconds: Option<f64>,
 }
 
 /// Response of `GET /v1/stats` — counts of tracked requests by status, plus
