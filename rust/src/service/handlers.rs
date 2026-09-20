@@ -113,6 +113,7 @@ pub async fn register_task(
     if body.flavours.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "flavours must not be empty"));
     }
+    println!("Registered max_error_threshold: {:?}", Some(body.max_error_threshold));
     state.task_flavours.lock().unwrap().insert(
         body.task_id,
         crate::service::state::TaskConfig { flavours: body.flavours, max_error_threshold: body.max_error_threshold },
@@ -185,6 +186,8 @@ pub async fn advance_slot(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
+    // TODO: remove this debug print
+    println!("[Service] Advanced to new slot: {current_slot} -> {new_slot}", current_slot = state.shared_state.get_current_slot(), new_slot = new_slot);
     Ok(Json(serde_json::json!({ "current_slot": new_slot })))
 }
 
@@ -210,6 +213,7 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         }
     }
     drop(guard);
+    // TODO: Get error stats from state.rs, where there is TaskConfig with the proper error threhsold set 
     let g = state.shared_state.get_global_error_stats();
     s.global_error_count = g.count;
     s.global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
@@ -280,6 +284,9 @@ pub async fn submit_request(
         task_threshold,
     ));
 
+    // TODO: remove this debug print
+    println!("[Service] Submitted request ID: {}", request_id);
+
     // Poll for the solver's assignment; short sleeps so we don't block the
     // async runtime while waiting for the (std-threaded) engine to catch up.
     let deadline = tokio::time::Instant::now()
@@ -291,6 +298,8 @@ pub async fn submit_request(
             if let Some(t) = state.tracked.lock().unwrap().get_mut(&request_id) {
                 t.status = RequestStatus::Scheduled;
             }
+            // TODO: remove this debug print
+            println!("[Service] Request ID {} scheduled at slot {} / {current_slot}", request_id, assignment.scheduled_slot, current_slot = state.shared_state.get_current_slot());
             return Ok((
                 StatusCode::OK,
                 Json(RequestStatusResponse {
@@ -392,7 +401,7 @@ pub async fn executor_callback(
     Json(body): Json<ExecutorCallbackPayload>,
 ) -> Result<StatusCode, ApiError> {
     if let Some(actual_error) = body.result.get("actual_error_pct").and_then(|v| v.as_f64()) {
-        // TODO remove
+        // TODO: remove
         // For auditing purposes, we log the diff between the predicted and actual error.
         let predicted_err = state.shared_state.get_error_for_assignment(request_id);
         tracing::info!(

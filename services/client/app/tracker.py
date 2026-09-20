@@ -58,6 +58,7 @@ class TrackedRequest:
         # (see carbonshift_client/README — reported via advance-slot).
         self.actual_carbon_cost: Optional[float] = None
         self.actual_baseline_carbon_cost: Optional[float] = None
+        self.actual_error_pct: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         end_to_end_seconds = None
@@ -102,6 +103,7 @@ class TrackedRequest:
             "carbon_cost": carbon_cost,
             "baseline_carbon_cost": baseline_carbon_cost,
             "carbon_saving_pct": carbon_saving_pct,
+            "actual_error_pct": self.actual_error_pct,
             "actual_carbon_cost": self.actual_carbon_cost,
             "actual_baseline_carbon_cost": self.actual_baseline_carbon_cost,
             "actual_carbon_saving_pct": actual_carbon_saving_pct,
@@ -157,6 +159,11 @@ class RequestTracker:
                     t.ack = fresh_ack
             except CarbonshiftError:
                 logger.warning("failed to refresh stale ack for request_id=%s", request_id, exc_info=True)
+
+        # result is a JSON containing the actual error percentage
+        actual_error_pct = result.get("actual_error_pct") if result else None
+        logger.info("actual_error_pct=%s", actual_error_pct)
+        # logger.info("result=%s", result)
         logger.info("actual_carbon_cost=%s, actual_baseline_carbon_cost=%s", actual_carbon_cost, actual_baseline_carbon_cost)
         logger.info("execution_time_seconds=%s, baseline_execution_time_seconds=%s", execution_time_seconds, baseline_execution_time_seconds)
         with self._lock:
@@ -166,6 +173,7 @@ class RequestTracker:
             t.error = error
             t.actual_carbon_cost = actual_carbon_cost
             t.actual_baseline_carbon_cost = actual_baseline_carbon_cost
+            t.actual_error_pct = actual_error_pct
             t.status = "completed" if success else "failed"
             record = t.to_dict()
         self._persist(record)
@@ -181,6 +189,13 @@ class RequestTracker:
             with self._lock:
                 if t.status != "submitted":
                     continue
+                # Before marking as timed out, double-check by requesting the latest status from the server
+                try:
+                    fresh_status = get_status(t.request_id)
+                    if fresh_status.get("status") != "submitted":
+                        continue
+                except CarbonshiftError:
+                    logger.warning("failed to refresh status for request_id=%s", t.request_id, exc_info=True)
                 t.status = "timed_out"
                 t.error = f"no callback within {self.timeout_seconds}s"
                 record = t.to_dict()
@@ -228,6 +243,15 @@ class RequestTracker:
             i["actual_baseline_carbon_cost"] if i.get("actual_baseline_carbon_cost") is not None else i["baseline_carbon_cost"]
             for i in its if (i.get("actual_baseline_carbon_cost") is not None or i.get("baseline_carbon_cost") is not None)
         ]
+        
+        # compute average of actual error percentage
+        # assume it to be present
+        actual_error_pct = [
+            i["actual_error_pct"] if i.get("actual_error_pct") is not None else None
+            for i in its if i.get("actual_error_pct") is not None
+        ]
+        actual_error_pct_avg = fmean(actual_error_pct) if actual_error_pct else None
+        
         total_actual_carbon_cost = sum(actual_carbon)
         total_actual_baseline_carbon_cost = sum(actual_baseline_carbon)
         actual_carbon_saving_value = None
@@ -236,6 +260,7 @@ class RequestTracker:
                                           / total_actual_baseline_carbon_cost) * 100
         
         forecasted_exec_time = None
+        forecasted_error = None
 
         if DEFAULT_MODEL_STATS.exists():
             with DEFAULT_MODEL_STATS.open(encoding="utf-8") as f:
@@ -255,6 +280,10 @@ class RequestTracker:
                     stats["avg_execution_time_seconds"]
                     for stats in matching_models
                 )
+                forecasted_error = fmean(
+                    stats["error_pct"]
+                    for stats in matching_models
+                )
         return {
             "count": len(its),
             "completed": len(completed),
@@ -265,6 +294,8 @@ class RequestTracker:
             "ack_latency_seconds": _stats(ack),
             "end_to_end_seconds": _stats(e2e),
             "forecasted_execution_time_seconds": round(forecasted_exec_time, ROUND_DIGITS) if forecasted_exec_time is not None else None,
+            "forecasted_error_pct": round(forecasted_error, ROUND_DIGITS) if forecasted_error is not None else None,
+            "actual_error_pct_avg": round(actual_error_pct_avg, ROUND_DIGITS) if actual_error_pct_avg is not None else None,
             "execution_time_seconds": _stats(exec_time),
             "baseline_execution_time_seconds": _stats(baseline_exec_time),
             "carbon_cost": _stats(carbon),

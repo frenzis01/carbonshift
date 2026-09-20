@@ -704,9 +704,9 @@ fn batch_worker_entry(
                 }
 
                 // Build and emit metrics log row.
+                let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
+                let pending_ids_str: HashSet<u64> = new_ids.clone();
                 if ml.enabled {
-                    let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
-                    let pending_ids_str: HashSet<u64> = new_ids.clone();
 
                     // Only log the NEW assignments from this batch — not all existing
                     // assignments.  The old code fetched get_current_assignments() here
@@ -732,6 +732,10 @@ fn batch_worker_entry(
                         cfg.error_window_future,
                         &HashSet::new(),
                     ).average;
+
+                    // TODO: remove this debug print
+                    println!("[Scheduler] Newly assigned IDs in this run: {:?}", new_ids);
+
 
                     let mut run_row: HashMap<String, String> = HashMap::new();
                     run_row.insert("run_sequence".into(), run_sequence.to_string());

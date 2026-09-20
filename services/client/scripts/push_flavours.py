@@ -34,6 +34,10 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
+import logging
+
+logger = logging.getLogger("client.push_flavours")
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -99,8 +103,9 @@ def main() -> None:
         except CarbonshiftError as exc:
             print(f"task={task_id}: FAILED ({exc})")
             continue
-        print(f"task={task_id}: registered {len(flavours)} flavours (max_error_threshold={threshold:.2f}%) "
-              f"on {settings.carbonshift_url}")
+        # print(f"task={task_id}: registered {len(flavours)} flavours (max_error_threshold={threshold:.2f}%) "
+        #f"on {settings.carbonshift_url}")
+        logger.info(f"task={task_id}: registered {len(flavours)} flavours (max_error_threshold={threshold:.2f}%)")
         for f in flavours:
             print(f"  {f['name']}: error={f['error']:.2f}% duration={f['duration']}ms")
 

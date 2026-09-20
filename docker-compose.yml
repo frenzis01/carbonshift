@@ -10,12 +10,15 @@ services:
       CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS: "1"
       TOTAL_SLOTS: "${TOTAL_SLOTS:-8640}"
       SLOT_DURATION_SECONDS: "${SLOT_DURATION_SECONDS:-10}"
-      MANUAL_CLOCK: "${MANUAL_CLOCK:-0}"
+      MANUAL_CLOCK: "${MANUAL_CLOCK:-1}"
       DISPATCHER_POLL_INTERVAL_MS: "${DISPATCHER_POLL_INTERVAL_MS:-200}"
       # Lower this (e.g. 0.3) when MANUAL_CLOCK=1: submissions routinely
       # aren't scheduled within the default 5s poll in emulation mode, so
       # every /v1/requests call would otherwise block for the full timeout.
       SUBMIT_WAIT_TIMEOUT_SECS: "${SUBMIT_WAIT_TIMEOUT_SECS:-5}"
+    # map container /tmp folder to host ./carbonshift_tmp for storage
+    volumes:
+      - carbonshift_tmp:/tmp
     depends_on:
       - executor
 
@@ -24,7 +27,7 @@ services:
     ports:
       - "9000:9000"
     environment:
-      EXECUTOR_MANUAL_CLOCK: "${MANUAL_CLOCK:-0}"
+      EXECUTOR_MANUAL_CLOCK: "${MANUAL_CLOCK:-1}"
       EXECUTOR_SLOT_MINUTES: "${EXECUTOR_SLOT_MINUTES:-30}"
       # Shadow Accurate-flavour pass per request, for empirical baseline
       # execution time + model-vs-model quality_score (see executor/README.md).
@@ -41,6 +44,7 @@ services:
       CARBONSHIFT_URL: http://carbonshift:8080
       CLIENT_SELF_BASE_URL: http://client:8100
       EXECUTOR_ADMIN_URL: http://executor:9000
+      CLIENT_CALLBACK_TIMEOUT_SECONDS: 6000
     depends_on:
       - carbonshift
 
@@ -54,6 +58,10 @@ services:
     profiles: ["emulation"]
     depends_on:
       - client
+    environment:
+      CARBONSHIFT_URL: http://carbonshift:8080
+      CLIENT_SELF_BASE_URL: http://client:8100
+      EXECUTOR_ADMIN_URL: http://executor:9000
     entrypoint:
       - python3
       - scripts/run_emulation.py
@@ -64,3 +72,4 @@ services:
 
 volumes:
   hf-cache:
+  carbonshift_tmp:

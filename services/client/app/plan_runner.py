@@ -105,6 +105,7 @@ def _advance_slot(executor_url: Optional[str], batch_id: str, idx: int, actual_c
         resp = requests.post(f"{settings.carbonshift_url}/v1/admin/advance-slot",
                               params=params, timeout=settings.admin_timeout_seconds)
         try:
+            logger.info("response message: %s", resp.text)
             resp.raise_for_status()
         except requests.exceptions.HTTPError:
             logger.exception("plan %s: carbonshift advance-slot failed at slot %d", batch_id, idx)

@@ -22,7 +22,7 @@ class Settings:
     # executor then runs a real model inference before replying.
     admin_timeout_seconds: float = float(os.environ.get("CLIENT_ADMIN_TIMEOUT_SECONDS", "60"))
     # A request with no callback after this long is marked "timed_out".
-    callback_timeout_seconds: float = float(os.environ.get("CLIENT_CALLBACK_TIMEOUT_SECONDS", "120"))
+    callback_timeout_seconds: float = float(os.environ.get("CLIENT_CALLBACK_TIMEOUT_SECONDS", "300"))
     metrics_path: str = os.environ.get("CLIENT_METRICS_PATH", "data/metrics.jsonl")
     # Default executor admin base URL for the "emulated" plan mode (only
     # used to call POST /admin/advance-slot directly — normal task traffic

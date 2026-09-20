@@ -16,6 +16,10 @@ import sys
 from pathlib import Path
 
 import requests
+import logging
+
+# Use the root logger for simplicity
+logger = logging.getLogger()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -41,6 +45,8 @@ def _ensure_task_registered(task: str, threshold_position: float) -> None:
     try:
         register_task(task, flavours, max_error_threshold=threshold)
         print(f"registered task={task}: {len(flavours)} flavours, max_error_threshold={threshold:.2f}%")
+        logger.info(f"registered task={task}: {len(flavours)} flavours, max_error_threshold={threshold:.2f}%")
+        
     except CarbonshiftError as exc:
         print(f"warning: could not register task={task} on carbonshift ({exc}) — using its defaults")
 
@@ -77,7 +83,7 @@ def main() -> None:
     })
     resp.raise_for_status()
     print(json.dumps(resp.json(), indent=2))
-    print("\nWatch progress with:")
+    print("\nWatch progress with URL:")
     print(f"  curl {args.client_url}/requests")
     print(f"  curl {args.client_url}/metrics/summary")
     print(f"  curl {args.client_url}/v1/stats")
