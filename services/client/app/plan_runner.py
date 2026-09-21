@@ -64,6 +64,18 @@ def _run(tracker: RequestTracker, slots: dict[int, list[dict[str, Any]]], slot_m
             logger.warning("plan %s: could not fetch carbon forecast, skipping actual-CI reporting", batch_id,
                             exc_info=True)
 
+    # The schulder will most likely have scheduled requests for slots beyond the last one,
+    # so we need to keep advancing the slot until all requests are dispatched.
+    
+    # TODO: remove hardcoded MAX_ADVANCE_ATTEMPTS and make it adapt to max_future_window
+    MAX_ADVANCE_ATTEMPTS = 14
+    # add to slots empty entries for future slots up to MAX_ADVANCE_ATTEMPTS
+    for i in range(1, MAX_ADVANCE_ATTEMPTS + 1):
+        slots.setdefault(max(slots) + i, [])
+    # TODO: assess whether this is creates problem with
+    #   - CI for future slots
+    #   - no waiting when advancing for empty future slots
+    
     for idx in sorted(slots):
         if mode == "realtime":
             _wait_until(slots[idx][0]["start_at"])
@@ -87,6 +99,7 @@ def _run(tracker: RequestTracker, slots: dict[int, list[dict[str, Any]]], slot_m
             # (advance_to_next_slot always moves exactly one slot forward).
             actual = actual_ci[idx + 1] if idx + 1 < len(actual_ci) else None
             _advance_slot(executor_url, batch_id, idx, actual)
+            
 
 
 def _wait_until(target: datetime) -> None:
