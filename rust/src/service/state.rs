@@ -9,6 +9,7 @@ use crate::engine::config::Config;
 use crate::engine::shared_state::SharedState;
 use crate::engine::types::Flavour;
 use crate::service::models::RequestStatus;
+use crate::types::CapacityTier;
 
 /// Per-request bookkeeping that lives outside the scheduling engine: the
 /// caller's callback URL, the opaque payload to forward to the executor, and
@@ -109,6 +110,8 @@ pub struct TaskConfig {
     /// default. Never affects the (task-agnostic by design) global error
     /// constraint, which always uses `Config::max_error_threshold`.
     pub max_error_threshold: Option<f64>,
+    /// Override for cap levels (`Config::cap_levels`) for this task. `None` = use the global default.
+    pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
 
 #[derive(Clone)]
@@ -150,7 +153,7 @@ impl AppState {
         carbon_forecast: Arc<Vec<f64>>,
     ) -> Self {
         let mut task_flavours = HashMap::new();
-        task_flavours.insert("default".to_string(), TaskConfig { flavours: cfg.flavours.clone(), max_error_threshold: None });
+        task_flavours.insert("default".to_string(), TaskConfig { flavours: cfg.flavours.clone(), max_error_threshold: None, capacity_tiers: None });
         Self {
             shared_state,
             cfg,
@@ -192,5 +195,10 @@ impl AppState {
     /// `task_id`'s registered `max_error_threshold` override (%), if any.
     pub fn threshold_for_task(&self, task_id: &str) -> Option<f64> {
         self.task_flavours.lock().unwrap().get(task_id).and_then(|t| t.max_error_threshold)
+    }
+
+    /// `task_id`'s registered `capacity_tiers` override, if any.
+    pub fn capacity_tiers_for_task(&self, task_id: &str) -> Option<Vec<CapacityTier>> {
+        self.task_flavours.lock().unwrap().get(task_id).and_then(|t| t.capacity_tiers.clone())
     }
 }

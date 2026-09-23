@@ -28,7 +28,7 @@ from app.plan_builder import build_requests  # noqa: E402
 from scripts.push_flavours import DEFAULT_MODEL_STATS, build_task_flavours, default_error_threshold  # noqa: E402
 
 
-def _ensure_task_registered(task: str, threshold_position: float) -> None:
+def _ensure_task_registered(task: str, threshold_position: float, requests_per_slot: int) -> None:
     """Carbonshift's task registry (flavours + error threshold, see
     `push_flavours.py`) is in-memory only: a carbonshift restart between a
     `push_flavours.py` run and this emulation silently loses it, falling
@@ -42,14 +42,22 @@ def _ensure_task_registered(task: str, threshold_position: float) -> None:
     if not flavours:
         return
     threshold = default_error_threshold(flavours, threshold_position)
+    capacity_tiers = build_capacity_tiers(requests_per_slot)  # Example value; adjust as needed
     try:
-        register_task(task, flavours, max_error_threshold=threshold)
+        register_task(task, flavours, max_error_threshold=threshold, capacity_tiers=capacity_tiers)
         print(f"registered task={task}: {len(flavours)} flavours, max_error_threshold={threshold:.2f}%")
         logger.info(f"registered task={task}: {len(flavours)} flavours, max_error_threshold={threshold:.2f}%")
         
     except CarbonshiftError as exc:
         print(f"warning: could not register task={task} on carbonshift ({exc}) — using its defaults")
 
+def build_capacity_tiers(requests_per_slot: int) -> list[dict]:
+    base = max(1, requests_per_slot)
+    return [
+        {"max_requests": base, "multiplier": 1.0},
+        {"max_requests": base * 2, "multiplier": 1.5},
+        {"max_requests": None, "multiplier": 5.0},
+    ]
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -58,7 +66,7 @@ def main() -> None:
     parser.add_argument("--task", default="text_generation",
                          choices=["text_generation", "ner", "question_answering"])
     parser.add_argument("--slots", type=int, default=3)
-    parser.add_argument("--per-slot", type=int, default=2)
+    parser.add_argument("--per-slot", type=int, default=20)
     parser.add_argument("--slot-minutes", type=float, default=30.0)
     parser.add_argument("--source", default="synthetic", choices=["synthetic", "dataset"])
     parser.add_argument("--seed", type=int, default=None,
@@ -70,7 +78,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.no_register:
-        _ensure_task_registered(args.task, args.threshold_position)
+        _ensure_task_registered(args.task, args.threshold_position, args.per_slot)
 
     seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
     print(f"seed={seed}" + (" (random)" if args.seed is None else " (fixed)"))

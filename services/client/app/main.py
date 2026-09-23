@@ -125,10 +125,13 @@ def _scheduler_snapshot() -> dict[str, Any]:
         try:
             cfg = get_task_config(task)
             threshold = cfg.get("max_error_threshold")
-            snapshot["tasks"][task] = {"max_error_threshold": round(threshold, 2) if threshold is not None else None}
+            capacity_tiers = cfg.get("capacity_tiers")
+            snapshot["tasks"][task] = {"max_error_threshold": round(threshold, 2) if threshold is not None else None,
+                                        "capacity_tiers": capacity_tiers}
         except CarbonshiftError:
             logger.warning("failed to fetch carbonshift task config for task=%s", task, exc_info=True)
-            snapshot["tasks"][task] = {"max_error_threshold": None}
+            snapshot["tasks"][task] = {"max_error_threshold": None,
+                                        "capacity_tiers": None}
     return snapshot
 
 

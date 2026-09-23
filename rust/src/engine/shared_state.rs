@@ -614,6 +614,7 @@ mod tests {
             task_id: "default".to_string(),
             flavours: vec![],
             max_error_threshold: None,
+            capacity_tiers: None,
         }
     }
 

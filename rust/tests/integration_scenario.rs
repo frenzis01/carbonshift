@@ -261,6 +261,7 @@ fn scenario_seed_2030_all_requests_scheduled_correctly() {
                     task_id: "default".to_string(),
                     flavours: vec![],
                     max_error_threshold: None,
+                    capacity_tiers: None,
                 });
             }
         }

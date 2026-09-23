@@ -38,6 +38,10 @@ pub struct Request {
     /// window feasibility check, if its task registered one (see
     /// `service::handlers::register_task`). `None` = use the global default.
     pub max_error_threshold: Option<f64>,
+    /// Capacity tiers available for this request's task, resolved once at intake
+    /// time. `None` means "no task-specific override" — the solver falls
+    /// back to `Config::capacity_tiers` (the predefined default task).
+    pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
 
 impl Request {
@@ -50,6 +54,7 @@ impl Request {
             task_id: "default".to_string(),
             flavours: Vec::new(),
             max_error_threshold: None,
+            capacity_tiers: None,
         }
     }
 
@@ -63,6 +68,7 @@ impl Request {
         task_id: String,
         flavours: Vec<Flavour>,
         max_error_threshold: Option<f64>,
+        capacity_tiers: Option<Vec<CapacityTier>>,
     ) -> Self {
         Self {
             id,
@@ -72,6 +78,7 @@ impl Request {
             task_id,
             flavours,
             max_error_threshold,
+            capacity_tiers,
         }
     }
 }
@@ -155,7 +162,7 @@ pub struct Flavour {
 /// `max_requests >= count`.  A tier with `max_requests = null` (JSON) / `None`
 /// (Rust) is the overflow tier and matches all counts above the previous tier.
 /// The implicit baseline multiplier 1.0 applies for counts up to the first tier.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CapacityTier {
     pub max_requests: Option<i64>,
     pub multiplier: f64,

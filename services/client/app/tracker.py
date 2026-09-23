@@ -162,10 +162,14 @@ class RequestTracker:
 
         # result is a JSON containing the actual error percentage
         actual_error_pct = result.get("actual_error_pct") if result else None
-        logger.info("actual_error_pct=%s", actual_error_pct)
+        # TODO: remove these prints
+        # logger.info("actual_error_pct=%s", actual_error_pct)
         # logger.info("result=%s", result)
-        logger.info("actual_carbon_cost=%s, actual_baseline_carbon_cost=%s", actual_carbon_cost, actual_baseline_carbon_cost)
-        logger.info("execution_time_seconds=%s, baseline_execution_time_seconds=%s", execution_time_seconds, baseline_execution_time_seconds)
+        # logger.info("actual_carbon_cost=%s, actual_baseline_carbon_cost=%s", actual_carbon_cost, actual_baseline_carbon_cost)
+        # logger.info("execution_time_seconds=%s, baseline_execution_time_seconds=%s", execution_time_seconds, baseline_execution_time_seconds)
+        # TODO: Log at which slot the request was sent and what is the current slot
+        # logger.info("sent_at_slot=%s, current_slot=%s", t.sent_at_slot, get_current_slot())
+        # logger.info("Received callback for request_id=%s / scheduled slot %s ", request_id, t.scheduled_slot if t else None)
         with self._lock:
             t.callback_received_at = datetime.now(timezone.utc)
             t.success = success
@@ -244,6 +248,8 @@ class RequestTracker:
             for i in its if (i.get("actual_baseline_carbon_cost") is not None or i.get("baseline_carbon_cost") is not None)
         ]
         
+        # TODO: make carbon a sum and not an average
+        
         # compute average of actual error percentage
         # assume it to be present
         actual_error_pct = [
@@ -298,11 +304,11 @@ class RequestTracker:
             "actual_error_pct_avg": round(actual_error_pct_avg, ROUND_DIGITS) if actual_error_pct_avg is not None else None,
             "execution_time_seconds": _stats(exec_time),
             "baseline_execution_time_seconds": _stats(baseline_exec_time),
-            "carbon_cost": _stats(carbon),
-            "baseline_carbon_cost": _stats(baseline_carbon),
+            "carbon_cost": round(sum(carbon), ROUND_DIGITS),
+            "baseline_carbon_cost": round(sum(baseline_carbon), ROUND_DIGITS),
             "carbon_saving_pct": round(carbon_saving_value, ROUND_DIGITS) if carbon_saving_value is not None else None,
-            "actual_carbon_cost": _stats(actual_carbon),
-            "actual_baseline_carbon_cost": _stats(actual_baseline_carbon),
+            "actual_carbon_cost": round(sum(actual_carbon), ROUND_DIGITS),
+            "actual_baseline_carbon_cost": round(sum(actual_baseline_carbon), ROUND_DIGITS),
             "actual_carbon_saving_pct": round(actual_carbon_saving_value, ROUND_DIGITS) if actual_carbon_saving_value is not None else None,
             "confidence": _stats(confidences),
             "quality_score": _stats(qualities),

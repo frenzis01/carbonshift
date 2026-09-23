@@ -113,10 +113,23 @@ pub async fn register_task(
     if body.flavours.is_empty() {
         return Err(api_error(StatusCode::BAD_REQUEST, "flavours must not be empty"));
     }
-    println!("Registered max_error_threshold: {:?}", Some(body.max_error_threshold));
+    
+    let RegisterTaskPayload {
+        task_id,
+        flavours,
+        max_error_threshold,
+        capacity_tiers,
+    } = body;
+    println!("Registered max_error_threshold: {:?}", Some(max_error_threshold));
+    println!("Registered capacity_tiers: {:?}", capacity_tiers);
+    
     state.task_flavours.lock().unwrap().insert(
-        body.task_id,
-        crate::service::state::TaskConfig { flavours: body.flavours, max_error_threshold: body.max_error_threshold },
+        task_id,
+        crate::service::state::TaskConfig {
+            flavours,
+            max_error_threshold,
+            capacity_tiers,
+        },
     );
     Ok(StatusCode::NO_CONTENT)
 }
@@ -213,7 +226,7 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         }
     }
     drop(guard);
-    // TODO: Get error stats from state.rs, where there is TaskConfig with the proper error threhsold set 
+    // TODO: Get error stats from state.rs, where there is TaskConfig with the proper error threhshold set 
     let g = state.shared_state.get_global_error_stats();
     s.global_error_count = g.count;
     s.global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
@@ -230,6 +243,7 @@ pub async fn get_task_config(
     Json(TaskConfigResponse {
         flavours: state.flavours_for_task(&task_id),
         max_error_threshold: state.threshold_for_task(&task_id).unwrap_or(state.cfg.max_error_threshold),
+        capacity_tiers: state.capacity_tiers_for_task(&task_id).unwrap_or_else(|| state.cfg.capacity_tiers.clone()),
         task_id,
     })
 }
@@ -262,6 +276,7 @@ pub async fn submit_request(
     let task_id = body.task_id.clone().unwrap_or_else(|| "default".to_string());
     let task_flavours = state.flavours_for_task(&task_id);
     let task_threshold = state.threshold_for_task(&task_id);
+    let task_capacity_tiers = state.capacity_tiers_for_task(&task_id);
     let (baseline_carbon_cost, baseline_duration) = compute_baseline_carbon_cost(&state, current_slot, &task_flavours);
 
     state.tracked.lock().unwrap().insert(
@@ -282,6 +297,7 @@ pub async fn submit_request(
         task_id,
         task_flavours,
         task_threshold,
+        task_capacity_tiers,
     ));
 
     // TODO: remove this debug print

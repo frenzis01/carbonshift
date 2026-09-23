@@ -232,7 +232,7 @@ class JobQueue:
         }
         try:
             resp = requests.post(job.callback_url, json=payload, timeout=settings.callback_timeout_seconds)
-            logger.info("callback delivered request_id=%s status=%s payload=%s", job.request_id, resp.status_code, payload)
+            logger.info("callback delivered request_id=%s status=%s", job.request_id, resp.status_code)
         except requests.RequestException as exc:
             logger.warning("callback failed request_id=%s error=%s", job.request_id, exc)
 

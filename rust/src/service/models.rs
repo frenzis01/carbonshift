@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::CapacityTier;
+
 /// Body of `POST /v1/requests`.
 #[derive(Debug, Deserialize)]
 pub struct SubmitRequestPayload {
@@ -90,6 +92,11 @@ pub struct RegisterTaskPayload {
     /// ranges (see client/scripts/push_flavours.py for how this is chosen).
     #[serde(default)]
     pub max_error_threshold: Option<f64>,
+    /// Overrides `Config::capacity_tiers` for this task. `None` = use the global default.
+    /// Cap tiers are specified as a list of pairs indicating the capacity threshold and its corresponding multiplier.
+    /// Example: `[[50, 1.0], [100, 1.5]]` means up to 50 requests use a 1.0x multiplier, and up to 100 requests use a 1.5x multiplier.
+    #[serde(default)]
+    pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
 
 /// Body POSTed by this service to the executor at dispatch time, and in turn
@@ -152,6 +159,7 @@ pub struct TaskConfigResponse {
     /// Always a concrete value: the task's own override if registered,
     /// otherwise `Config::max_error_threshold` (the global default).
     pub max_error_threshold: f64,
+    pub capacity_tiers: Vec<CapacityTier>,
 }
 
 /// Response of `GET /v1/horizon` and (in abbreviated form) `GET /ready`.

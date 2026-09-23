@@ -37,7 +37,7 @@ def submit(deadline_seconds: float, callback_url: str, payload: dict[str, Any],
     return resp.json()
 
 
-def register_task(task_id: str, flavours: list[dict[str, Any]], max_error_threshold: float | None = None) -> None:
+def register_task(task_id: str, flavours: list[dict[str, Any]], max_error_threshold: float | None = None, capacity_tiers: list[dict[str, Any]] | None = None) -> None:
     """`POST /v1/tasks` — announces (or updates) a task's available
     flavours (`[{"name", "error", "duration"}, ...]`) on carbonshift, so
     requests submitted with this `task_id` are scheduled among them instead
@@ -51,6 +51,15 @@ def register_task(task_id: str, flavours: list[dict[str, Any]], max_error_thresh
     body: dict[str, Any] = {"task_id": task_id, "flavours": flavours}
     if max_error_threshold is not None:
         body["max_error_threshold"] = max_error_threshold
+    '''
+    Capacity tiers correct format for rust to interpret is
+    [{"max_requests": 30, "multiplier": 1.0},
+    {"max_requests": 50, "multiplier": 1.5},
+    {"max_requests": None, "multiplier": 3.0}]
+    '''
+    
+    if capacity_tiers is not None:
+        body["capacity_tiers"] = capacity_tiers
 
     try:
         resp = requests.post(

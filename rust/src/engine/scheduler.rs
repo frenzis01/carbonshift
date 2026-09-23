@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
 use crate::shared_state::{CommitOutcome, GlobalErrorStats, SharedState, SolverSnapshot};
-use crate::types::{get_capacity_multiplier, Assignment, Flavour, Request, RequestAssignment};
+use crate::types::{Assignment, CapacityTier, Flavour, Request, RequestAssignment, get_capacity_multiplier};
 
 // ─── internal state types ────────────────────────────────────────────────────
 
@@ -971,6 +971,10 @@ struct PreparedSolve {
     request_flavours: HashMap<u64, Vec<Flavour>>,
     /// Local/window feasibility threshold (%) for this batch — see `prepare_solve`.
     effective_error_threshold: f64,
+    /// Capacity tiers used for this batch solve; if a task-specific override was
+    /// registered for any request in the batch, use that override; otherwise the
+    /// global default from `Config` is used.
+    effective_capacity_tiers: Vec<CapacityTier>,
 }
 
 fn prepare_solve(
@@ -1131,6 +1135,15 @@ fn prepare_solve(
         .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a: f64| a.min(t))))
         .unwrap_or(cfg.max_error_threshold);
 
+    // Per-task capacity tiers: if any request in this batch registered its own
+    // `capacity_tiers`, use them; otherwise fall back to the default from the
+    // config. We keep an owned Vec here so the solver receives a slice with a
+    // stable lifetime, instead of borrowing from `pending`.
+    let effective_capacity_tiers = pending
+        .iter()
+        .find_map(|r| r.capacity_tiers.clone())
+        .unwrap_or_else(|| cfg.capacity_tiers.clone());
+
     PreparedSolve {
         pending_ids,
         window_start,
@@ -1146,6 +1159,7 @@ fn prepare_solve(
         solver_flavours,
         request_flavours,
         effective_error_threshold,
+        effective_capacity_tiers,
     }
 }
 
@@ -1176,6 +1190,7 @@ fn solve_dp(
         solver_flavours,
         request_flavours,
         effective_error_threshold,
+        effective_capacity_tiers,
     } = prepare_solve(current_slot, pending, shared_state, cfg, mutable);
 
     // ── Step 5: DP solve ────────────────────────────────────────────────────
@@ -1190,7 +1205,7 @@ fn solve_dp(
         requests: &dp_requests,
         current_slot,
         capacity_multiplier: 1.0,
-        capacity_tiers: &cfg.capacity_tiers,
+        capacity_tiers: &effective_capacity_tiers,
         baseline_slot_counts: &baseline_slot_counts,
         error_window_baseline: ErrorWindowBaseline {
             error_sum: error_baseline.error_sum,
@@ -2009,6 +2024,7 @@ mod tests {
             task_id: "default".to_string(),
             flavours: vec![],
             max_error_threshold: None,
+            capacity_tiers: None,
         }
     }
 
@@ -2211,7 +2227,7 @@ mod tests {
         let cfg = make_config(|_| {});
         let current_slot = 0;
         let task_flavour = Flavour { name: "OnlyForThisTask".to_string(), error: 1.23, duration: 45 };
-        let pending = vec![Request::new_for_task(20, 0, 5, "custom_task".to_string(), vec![task_flavour.clone()], None)];
+        let pending = vec![Request::new_for_task(20, 0, 5, "custom_task".to_string(), vec![task_flavour.clone()], None,None)];
         let (assignments, _ctx) = call_solve_dp(current_slot, &pending, &cfg);
 
         assert_eq!(assignments.len(), 1);
@@ -2233,13 +2249,13 @@ mod tests {
         let accurate = Flavour { name: "Accurate2".to_string(), error: 0.0, duration: 60 };
 
         let strict = vec![Request::new_for_task(
-            30, 0, 5, "t".to_string(), vec![cheap.clone(), accurate.clone()], None,
+            30, 0, 5, "t".to_string(), vec![cheap.clone(), accurate.clone()], None, None,
         )];
         let (assignments_strict, _ctx) = call_solve_dp(current_slot, &strict, &cfg);
         assert_eq!(assignments_strict[0].flavour_name, "Accurate2");
 
         let lenient = vec![Request::new_for_task(
-            31, 0, 5, "t".to_string(), vec![cheap, accurate], Some(50.0),
+            31, 0, 5, "t".to_string(), vec![cheap, accurate], Some(50.0), None,
         )];
         let (assignments_lenient, _ctx) = call_solve_dp(current_slot, &lenient, &cfg);
         assert_eq!(assignments_lenient[0].flavour_name, "Cheap");
