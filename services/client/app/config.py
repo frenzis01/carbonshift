@@ -28,6 +28,7 @@ class Settings:
     # used to call POST /admin/advance-slot directly — normal task traffic
     # always goes through carbonshift, never straight to the executor).
     executor_admin_url: str = os.environ.get("EXECUTOR_ADMIN_URL", "http://localhost:9000")
+    provider_epoch: float = float(os.environ.get("PROVIDER_EPOCH", "0"))
 
 
 settings = Settings()

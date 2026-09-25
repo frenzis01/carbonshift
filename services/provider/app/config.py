@@ -70,6 +70,7 @@ class Settings:
     # order with retries — see ARCHITECTURE.md §"Ordine".
     carbonshift_url: str = os.environ.get("CARBONSHIFT_URL", "http://localhost:8080")
     executor_url: str = os.environ.get("EXECUTOR_URL", "")
+    client_url: str = os.environ.get("CLIENT_URL", "http://localhost:8100")
     self_base_url: str = os.environ.get("PROVIDER_SELF_BASE_URL", "http://localhost:9100")
     notify_timeout_seconds: float = float(os.environ.get("PROVIDER_NOTIFY_TIMEOUT_SECONDS", "30"))
     notify_max_attempts: int = int(os.environ.get("PROVIDER_NOTIFY_MAX_ATTEMPTS", "3"))

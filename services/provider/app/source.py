@@ -24,6 +24,8 @@ from typing import Optional
 from . import forecast as forecast_model
 from .slots import as_utc, parse_epoch
 
+# TODO: (remote) resample half-hourly upstream buckets when slot_minutes != 30.
+#   Decision needed first: mean, max, or value-at-slot-start? See ARCHITECTURE.md §9.4
 
 @dataclass(frozen=True)
 class ForecastPoint:

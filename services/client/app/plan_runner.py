@@ -23,14 +23,6 @@ from .tracker import RequestTracker, TrackedRequest
 logger = logging.getLogger("client.plan_runner")
 
 
-def _perturbed_actual_ci(forecast: list[float], seed: int = 42, jitter: float = 0.05) -> list[float]:
-    """A plausible "real" carbon intensity reading per slot: the forecast
-    with small (default 5%) gaussian noise, standing in for the real-world
-    deviation the scheduler's forecast never perfectly predicts."""
-    rng = random.Random(seed)
-    return [max(0.0, v * (1.0 + rng.gauss(0.0, jitter))) for v in forecast]
-
-
 def run_plan(tracker: RequestTracker, requests_spec: list[dict[str, Any]], slot_minutes: float,
              mode: str, executor_url: Optional[str]) -> tuple[str, int]:
     batch_id = uuid.uuid4().hex
@@ -41,7 +33,46 @@ def run_plan(tracker: RequestTracker, requests_spec: list[dict[str, Any]], slot_
     ).start()
     return batch_id, len(slots)
 
+def get_batch_from_slot(requests_spec: list[dict[str, Any]], slot_minutes: float, slot_idx: int) -> list[dict[str, Any]]:
+    """Retrieve all requests belonging to a specific slot index."""
+    slotted = _group_by_slot(requests_spec, slot_minutes)
+    return slotted.get(slot_idx, [])
 
+def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],slot_minutes: float) -> None:
+    batch_id = uuid.uuid4().hex
+    for r in batch:
+        # TODO: should I add a _wait_until for the requests? 
+        # Is the submission time always at the start of the slot? If not, maybe we should wait
+        
+        # Add tracking information to the request
+        r["batch_id"] = batch_id
+        submitted_at = datetime.now(timezone.utc)
+        deadline_end = ceil_to_slot_end(r["deadline_at"],slot_minutes)
+        # Deadline seconds is the difference
+        deadline_seconds = max((deadline_end - submitted_at).total_seconds(),1.0)
+        payload = {"task": r["task"], "input": r["input"]}
+        # submit(r, callback_url=f"{settings.self_base_url}/callback")
+        callback_url = f"{settings.self_base_url}/callback"
+        try:
+            ack = submit(deadline_seconds, callback_url, payload, task_id=r["task"])
+        except CarbonshiftError as e:
+            logger.exception("failed to submit request in batch %s: %s", batch_id, e, exc_info=True)
+            # TODO: should I track the request as failed? I don't want issues when examining and computing stats on the data
+            continue
+        tracker.track(TrackedRequest(
+            batch_id=batch_id,
+            task_id=r["task"],
+            submitted_at=submitted_at,
+            deadline_at=deadline_seconds,
+            ack=ack,
+        ))
+        logger.info("submitted request in batch %s: task_id=%s, deadline_seconds=%.2f", batch_id, r["task"], deadline_seconds)
+        
+
+'''
+Given the list of requests with their `start_at` times and the slot duration in minutes, group the requests by their corresponding slot index.
+slot_minutes is the duration of each timeslot in minutes.
+'''
 def _group_by_slot(requests_spec: list[dict[str, Any]], slot_minutes: float) -> dict[int, list[dict[str, Any]]]:
     if not requests_spec:
         return {}
@@ -52,7 +83,11 @@ def _group_by_slot(requests_spec: list[dict[str, Any]], slot_minutes: float) -> 
         groups.setdefault(idx, []).append(r)
     return groups
 
-
+'''
+_run executes the plan by submitting requests to carbonshift according to the slot schedule.
+It handles both "realtime" and "emulated" modes, advancing slots and applying actual carbon intensity in emulated mode.
+It sends all slots according to the schedule, respecting the start times and deadlines of each request.
+'''
 def _run(tracker: RequestTracker, slots: dict[int, list[dict[str, Any]]], slot_minutes: float,
           mode: str, executor_url: Optional[str], batch_id: str) -> None:
     callback_url = f"{settings.self_base_url}/callback"
@@ -100,7 +135,6 @@ def _run(tracker: RequestTracker, slots: dict[int, list[dict[str, Any]]], slot_m
             actual = actual_ci[idx + 1] if idx + 1 < len(actual_ci) else None
             _advance_slot(executor_url, batch_id, idx, actual)
             
-
 
 def _wait_until(target: datetime) -> None:
     delay = (target - datetime.now(timezone.utc)).total_seconds()

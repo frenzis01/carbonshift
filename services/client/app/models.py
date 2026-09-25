@@ -60,7 +60,16 @@ class SendPlanRequest(BaseModel):
 
 
 class SendPlanResponse(BaseModel):
-    batch_id: str
+    plan_id: int
     count: int
     slots: int
 
+class TickRequest(BaseModel):
+    expected_slot : int
+    new_slot: int
+    
+class TickResponse(BaseModel):
+    slot: int
+    plan_index: list[int] = []
+    submitted: int = 0
+    

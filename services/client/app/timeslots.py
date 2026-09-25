@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# take EPOCH from settings
+from .config import settings
+_EPOCH = datetime.fromtimestamp(settings.provider_epoch, tz=timezone.utc)
 
 
 def _as_utc(dt: datetime) -> datetime:

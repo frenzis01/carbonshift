@@ -9,6 +9,7 @@ import threading
 from contextlib import asynccontextmanager
 from typing import Any
 
+from carbonshift.services.client.app.state import advance_slot, get_current_slot, get_plan, get_plans_with_reqs_in_slot, get_requests_from_plan, store_plan
 from fastapi import FastAPI, HTTPException
 
 from .carbonshift_client import CarbonshiftError, get_stats, get_task_config, get_carbon_intensity
@@ -19,8 +20,10 @@ from .models import (
     SendBatchResponse,
     SendPlanRequest,
     SendPlanResponse,
+    TickRequest,
+    TickResponse,
 )
-from .plan_runner import run_plan
+from .plan_runner import get_batch_from_slot, run_plan, send_slot_batch
 from .runner import send_batch
 from .tracker import RequestTracker
 
@@ -60,6 +63,27 @@ app = FastAPI(title="CarbonShift Client", lifespan=lifespan)
 async def health() -> str:
     return "ok"
 
+@app.post("/v1/tick")
+async def tick(body: TickRequest) -> TickResponse:
+    # TODO: should we worry about epoch disalignment here...?
+    if (body.expected_slot != get_current_slot()):
+        raise HTTPException(503, detail={"desynced": True, "expected_slot": body.expected_slot, "current_slot": get_current_slot()})
+    
+    current_slot = advance_slot()
+    requests_submitted = 0
+
+    # 1. work out which plan index this slot corresponds to
+    # Determine the plan indexes based on the current slot
+    plans_in_slot = get_plans_with_reqs_in_slot(current_slot)
+    # 2. submit that index's requests to carbonshift (synchronously with caller provider)
+    for plan_id in plans_in_slot:
+        plan = get_plan(plan_id)
+        slot_minutes = plan["slot_minutes"]
+        batch = get_batch_from_slot(get_requests_from_plan(plan_id), slot_minutes, current_slot)
+        send_slot_batch(tracker, batch, slot_minutes)
+        requests_submitted += len(batch)
+    return TickResponse(slot=current_slot, plan_index=plans_in_slot, submitted=requests_submitted)
+
 
 @app.post("/run/send-batch", status_code=202)
 async def run_send_batch(body: SendBatchRequest) -> SendBatchResponse:
@@ -70,8 +94,9 @@ async def run_send_batch(body: SendBatchRequest) -> SendBatchResponse:
 @app.post("/run/send-plan", status_code=202)
 async def run_send_plan(body: SendPlanRequest) -> SendPlanResponse:
     requests_spec = [r.model_dump() for r in body.requests]
-    batch_id, slots = run_plan(tracker, requests_spec, body.slot_minutes, body.mode, body.executor_url)
-    return SendPlanResponse(batch_id=batch_id, count=len(requests_spec), slots=slots)
+    # batch_id, slots = run_plan(tracker, requests_spec, body.slot_minutes, body.mode, body.executor_url)
+    plan_id = store_plan(requests_spec, body.slot_minutes, body.mode, body.executor_url)
+    return SendPlanResponse(plan_id=plan_id, count=len(requests_spec))
 
 
 @app.post("/callback")

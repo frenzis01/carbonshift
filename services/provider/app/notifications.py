@@ -37,9 +37,13 @@ import requests
 
 from .clock import ProviderClock, SlotTick
 from .source import CarbonIntensitySource, ObservedPoint
+from enum import Enum
 
 logger = logging.getLogger("provider.notifications")
 
+class Role(str,Enum):
+    CONSUMER = "consumer"
+    PRODUCER = "producer"
 
 @dataclass
 class Peer:
@@ -53,6 +57,8 @@ class Peer:
     name: str
     base_url: str
     advance_path: str
+    # Role should be an enum, either "consumer" or "producer"
+    role: Role
     order: int
 
     @property
@@ -236,12 +242,18 @@ def peers_from_settings(settings) -> list[Peer]:
     """
     peers = [
         Peer(
+            name="client",
+            base_url=settings.client_url,
+            advance_path="/v1/tick",
+            order=10,
+        ),
+        Peer(
             name="carbonshift",
             base_url=settings.carbonshift_url,
             # carbonshift already exposes exactly this endpoint; the provider
             # assumes the *role* of the clock driver the client plays today.
             advance_path="/v1/admin/advance-slot",
-            order=10,
+            order=20,
         )
     ]
     if settings.executor_url.strip():
@@ -250,7 +262,7 @@ def peers_from_settings(settings) -> list[Peer]:
                 name="executor",
                 base_url=settings.executor_url,
                 advance_path="/admin/advance-slot",
-                order=20,
+                order=30,
             )
         )
     return peers

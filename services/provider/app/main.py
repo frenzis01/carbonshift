@@ -262,6 +262,13 @@ async def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
             detail=f"slot mismatch: expected {request.expect_slot}, provider is at {current}",
         )
 
+    # Fail hard on fan-out failures: if any peer delivery fails, raise an exception.
+    if request.notify_peers and report.any_failed:
+        raise HTTPException(
+            status_code=503,
+            detail={"desynced": True, **report.to_dict()},
+        )
+
     report = rollover(notify=request.notify_peers)
     tick = report.tick
     return AdvanceResponse(
