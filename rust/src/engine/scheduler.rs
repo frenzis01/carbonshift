@@ -1857,10 +1857,79 @@ fn build_solver(
     }
 }
 
+
+/// TODO: use this in the tests, and remove older generate_carbon_forecast
+use rand_chacha::ChaCha8Rng;
+
+pub fn generate_carbon_intensity_forecast(
+    total_slots: usize,
+    carbon_intensity_cycle_slots: usize,
+    seed: u64,
+    night_max: f64,
+    day_min: f64,
+    sunrise_fraction: f64,
+    sunset_fraction: f64,
+    transition_slope: f64,
+    noise_std: f64,
+    noise_persistence: f64,
+    inverted: bool,
+    phase_shifted: bool,
+) -> Vec<f64> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let normal = Normal::new(0.0, noise_std).expect("Invalid normal distribution");
+    
+    let cycle = std::cmp::max(1, carbon_intensity_cycle_slots as i64) as usize;
+    let mut forecast: Vec<f64> = Vec::new();
+    let mut noise_state = 0.0;
+    
+    let normal_dist = Normal::new(0.0, noise_std).unwrap();
+        // .expect("Invalid normal distribution");
+    
+    for slot in 0..total_slots {
+        let mut x = ((slot % cycle) as f64) / (cycle as f64);
+        
+        if phase_shifted {
+            x = (x + 0.25) % 1.0;
+        }
+        
+        // Sigmoid function: 1 / (1 + exp(-k * (x - x0)))
+        let sigmoid = |k: f64, x0: f64, x: f64| -> f64 {
+            1.0 / (1.0 + (-k * (x - x0)).exp())
+        };
+        
+        let rise = sigmoid(transition_slope, sunrise_fraction, x);
+        let fall = sigmoid(transition_slope, sunset_fraction, x);
+        
+        let mut daylight_factor = rise - fall;
+        
+        if inverted {
+            daylight_factor = -daylight_factor;
+        }
+        
+        let trend = night_max - (night_max - day_min) * daylight_factor;
+        
+        // Aggiorna lo stato del rumore con autocorrelazione
+        let random_noise: f64 = Distribution::sample(
+            &normal_dist,
+            &mut rng,
+        );
+        noise_state = noise_persistence * noise_state + random_noise;
+        
+        let value = trend + noise_state;
+        
+        // max(1.0, value) e arrotonda a 6 decimali
+        let rounded = (value.max(1.0) * 1_000_000.0).round() / 1_000_000.0;
+        forecast.push(rounded);
+    }
+    
+    forecast
+}
+
 /// Generate a sinusoidal carbon-intensity forecast matching the Python scheduler.
 ///
 /// Uses K=6 slots per cycle, base_carbon=250, amplitude=200 (as in Python's
 /// `_get_carbon_forecast`).
+// TODO: remove this and change all the tests to use generate_carbon_intensity_forecast
 pub fn generate_carbon_forecast(cfg: &Config) -> Vec<f64> {
     let k = 6.0f64;
     let base = 250.0f64;
@@ -1873,6 +1942,7 @@ pub fn generate_carbon_forecast(cfg: &Config) -> Vec<f64> {
         })
         .collect()
 }
+
 
 /// Manually advance the virtual clock to the start of the next slot boundary.
 ///

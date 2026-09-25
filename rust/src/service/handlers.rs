@@ -23,6 +23,16 @@ pub struct AdvanceSlotQuery {
     pub actual_carbon_intensity: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CarbonIntensityQuery {
+    /// Upper bound slot to return. If omitted, use the current virtual slot.
+    #[serde(default)]
+    pub slot: Option<i32>,
+    /// Backwards-compatible alias for the same concept.
+    #[serde(default)]
+    pub until_slot: Option<i32>,
+}
+
 fn api_error(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(serde_json::json!({ "error": msg.into() })))
 }
@@ -246,6 +256,43 @@ pub async fn get_task_config(
         capacity_tiers: state.capacity_tiers_for_task(&task_id).unwrap_or_else(|| state.cfg.capacity_tiers.clone()),
         task_id,
     })
+}
+
+/// `GET /v1/carbon_intensity` — the carbon intensity up to a requested slot,
+/// both forecast and actual values.
+///
+/// Use this to inspect the original forecast the scheduler planned against and
+/// the actual value the client later reported for each slot.
+/// Example response:
+/// ```json
+/// [
+///   {"slot": 0, "forecast": 123.45, "actual": 120.12},
+///   {"slot": 1, "forecast": 132.56, "actual": 130.11},
+///   {"slot": 2, "forecast": 141.23, "actual": null}
+/// ]
+/// ```
+pub async fn carbon_intensity(
+    State(state): State<AppState>,
+    Query(query): Query<CarbonIntensityQuery>,
+) -> Json<Vec<serde_json::Value>> {
+    let upper = query.slot.or(query.until_slot).unwrap_or_else(|| state.shared_state.get_current_slot());
+    let upper = upper.max(0);
+    let forecast = state.carbon_forecast.as_ref();
+    let actual = state.actual_carbon_intensity.lock().unwrap();
+
+    let rows = (0..=upper)
+        .map(|slot| {
+            let forecast_ci = forecast.get(slot as usize).copied().unwrap_or(0.0);
+            let actual_ci = actual.get(&slot).copied();
+            serde_json::json!({
+                "slot": slot,
+                "forecast": forecast_ci,
+                "actual": actual_ci,
+            })
+        })
+        .collect();
+
+    Json(rows)
 }
 
 /// `POST /v1/requests` — submit a job, get back the assigned slot.
@@ -596,5 +643,44 @@ mod tests {
         let expected = carbon * 10.0 * cfg.carbon_cost_duration_scale; // "Precise"'s duration (lowest error), position 1 => multiplier 1.0
         assert!((baseline - expected).abs() < 1e-9, "baseline={baseline}, expected={expected}");
         assert_eq!(duration, 10);
+    }
+
+    #[tokio::test]
+    async fn carbon_intensity_endpoint_returns_forecast_and_actual_by_slot() {
+        use crate::engine::config::Config;
+        use crate::engine::shared_state::SharedState;
+        use crate::service::state::ServiceConfig;
+        use std::sync::Arc;
+
+        let cfg = Arc::new(Config::default());
+        let forecast = Arc::new(vec![100.0, 110.0, 120.0, 130.0]);
+        let service_cfg = ServiceConfig {
+            executor_url: None,
+            self_base_url: "http://localhost:0".to_string(),
+            submit_wait_timeout_secs: 0.2,
+            allow_private_callbacks: false,
+            api_key: None,
+            executor_token: None,
+            executor_max_retries: 3,
+            executor_retry_base_ms: 10,
+            executor_retry_max_ms: 100,
+            horizon_ready_threshold: 0.9,
+            dispatcher_poll_interval_ms: 20,
+        };
+        let state = AppState::new(SharedState::new(), cfg, service_cfg, forecast);
+        state.actual_carbon_intensity.lock().unwrap().insert(1, 115.0);
+        state.actual_carbon_intensity.lock().unwrap().insert(3, 128.0);
+
+        let response = carbon_intensity(
+            State(state),
+            Query(CarbonIntensityQuery { slot: Some(3), until_slot: None }),
+        )
+        .await;
+
+        let payload = response.0;
+        assert_eq!(payload.len(), 4);
+        assert_eq!(payload[0]["forecast"], serde_json::json!(100.0));
+        assert_eq!(payload[1]["actual"], serde_json::json!(115.0));
+        assert_eq!(payload[3]["actual"], serde_json::json!(128.0));
     }
 }

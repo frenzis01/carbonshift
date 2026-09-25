@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 
-from .carbonshift_client import CarbonshiftError, get_stats, get_task_config
+from .carbonshift_client import CarbonshiftError, get_stats, get_task_config, get_carbon_intensity
 from .config import settings
 from .models import (
     CallerCallbackPayload,
@@ -115,9 +115,11 @@ def _scheduler_snapshot() -> dict[str, Any]:
     snapshot: dict[str, Any] = {"global_error_avg": None, "global_error_count": None, "tasks": {}}
     try:
         stats = get_stats()
+        ci = get_carbon_intensity()
         global_error_avg = stats.get("global_error_avg")
         snapshot["global_error_avg"] = round(global_error_avg, 2) if global_error_avg is not None else None
         snapshot["global_error_count"] = stats.get("global_error_count")
+        snapshot["carbon_intensity"] = ci
     except CarbonshiftError:
         logger.warning("failed to fetch carbonshift /v1/stats for metrics/summary", exc_info=True)
 

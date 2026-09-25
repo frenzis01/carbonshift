@@ -20,6 +20,23 @@ pub struct Config {
     pub slot_duration_seconds: f64,
     /// Total number of time slots in the planning horizon.
     pub total_slots: i32,
+    /// Offset added to the engine's own (uptime-based) `current_slot` to get
+    /// the *provider's* global slot index, i.e.
+    /// `global_slot = current_slot + slot_epoch_offset`.
+    ///
+    /// Why this exists: `current_slot` here is derived from
+    /// `SharedState::virtual_elapsed_ms`, which starts at 0 when the process
+    /// starts — it is an uptime counter, not an absolute slot. An external
+    /// carbon-intensity provider (see `services/provider/`) publishes slots
+    /// derived from wall-clock time (`floor((now - epoch) / slot_duration)`),
+    /// which is a *different* number space entirely (e.g. 118015 vs 0).
+    ///
+    /// Anything that consumes a provider-reported slot (a pushed forecast, or
+    /// an `actual_carbon_intensity` reading) MUST convert through this field
+    /// rather than assuming the two spaces coincide. Default `0` keeps every
+    /// existing caller (offline simulation, tests, the built-in synthetic
+    /// forecast) behaving exactly as before.
+    pub slot_epoch_offset: i64,
 
     // ── flavours ──────────────────────────────────────────────────────────
     /// Available execution flavours (ordered from most accurate to fastest).
@@ -205,6 +222,7 @@ impl Default for Config {
             batch_size: 3,
             slot_duration_seconds: 10.0,
             total_slots: 24,
+            slot_epoch_offset: 0,
             flavours: vec![
                 Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 },
                 Flavour { name: "Balanced".to_string(), error: 2.5, duration: 30 },

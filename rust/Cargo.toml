@@ -23,7 +23,7 @@ path = "src/bin/service/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 csv = "1"
-rand = { version = "0.8", features = ["small_rng"] }
+rand = { version = "0.8", features = ["small_rng","std"] }
 rand_distr = "0.4"
 ctrlc = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
@@ -32,6 +32,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+rand_chacha = "0.3"
 
 [dev-dependencies]
 approx = "0.5"

@@ -141,6 +141,7 @@ dependencies = [
  "ctrlc",
  "http-body-util",
  "rand 0.8.6",
+ "rand_chacha",
  "rand_distr",
  "reqwest",
  "serde",

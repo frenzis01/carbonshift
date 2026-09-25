@@ -141,6 +141,32 @@ def get_task_config(task_id: str) -> dict[str, Any]:
     return resp.json()
 
 
+def get_carbon_intensity(slot: int | None = None, until_slot: int | None = None) -> list[dict[str, Any]]:
+    """`GET /v1/carbon_intensity` — the actual carbon intensity series, optionally up to a specified slot."""
+    headers = {}
+    if settings.carbonshift_api_key:
+        headers["X-API-Key"] = settings.carbonshift_api_key
+
+    params = {}
+    if slot is not None:
+        params["slot"] = slot
+    if until_slot is not None:
+        params["until_slot"] = until_slot
+
+    try:
+        resp = requests.get(
+            f"{settings.carbonshift_url}/v1/carbon_intensity",
+            headers=headers,
+            params=params,
+            timeout=settings.http_timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        raise CarbonshiftError(f"cannot reach carbonshift at {settings.carbonshift_url}: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise CarbonshiftError(f"carbonshift returned {resp.status_code}: {resp.text}")
+    return resp.json()
+
 def get_carbon_forecast() -> list[float]:
     """`GET /v1/carbon-forecast` — the forecast (index = slot) the DP solver
     is scheduling against, used to derive a plausible "actual" carbon

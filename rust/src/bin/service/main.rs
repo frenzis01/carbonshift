@@ -108,7 +108,21 @@ async fn main() {
     }
 
     let shared_state = SharedState::new();
-    let carbon_forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
+    let carbon_forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_intensity_forecast(
+        // TODO: remove hardcoded total_slots super high value
+        1024,
+        12,
+        26,
+        160.0,
+        70.0,
+        0.25,
+        0.75,
+        18.0,
+        2.0,
+        0.95,
+        false,
+        false,
+    ));
     let metrics_logger = Arc::new(MetricsLogger::new(
         cfg.enable_solver_logging,
         cfg.solver_runs_file.clone(),
