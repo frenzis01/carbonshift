@@ -65,6 +65,29 @@ peers = notifications.peers_from_settings(settings)
 #: there is no way to obtain a reading for a future slot, by construction.
 observed_readings: dict[int, ObservedPoint] = {}
 
+#: Set once a fan-out partially fails. After that the run is unrecoverable:
+#: the clock moved but not every peer followed, and there is no safe way to
+#: resynchronize automatically (see `_mark_desynced`). Every subsequent
+#: advance is refused until the process is restarted, so a desynced run can
+#: never quietly continue and produce plausible-looking metrics.
+_desynced: dict | None = None
+
+
+def _mark_desynced(report: notifications.RolloverReport) -> None:
+    global _desynced
+    if _desynced is None:
+        _desynced = report.to_dict()
+        logger.error(
+            "DESYNCED: slot %s advanced but not all peers acknowledged; "
+            "refusing further advances until restart. %s",
+            report.tick.global_slot if report.tick else None,
+            _desynced,
+        )
+
+
+def is_desynced() -> bool:
+    return _desynced is not None
+
 _auto_advance_stop = threading.Event()
 _auto_advance_thread: threading.Thread | None = None
 
@@ -174,14 +197,17 @@ async def health() -> JSONResponse:
     remote upstream is unreachable), so an orchestrator sees it."""
     info = source.health()
     body = {
-        "status": "ok" if info.get("ok") else "degraded",
+        "status": "ok" if info.get("ok") and not is_desynced() else "degraded",
         "source": info,
         "current_slot": clock.current_slot(),
         "manual_clock": clock.manual,
         # Non-zero is normal in a fast manual run (see clock.drift_slots).
         "drift_slots": clock.drift_slots(),
+        # Present only once a rollover has partially failed; see `_mark_desynced`.
+        "desynced": _desynced,
     }
-    return JSONResponse(body, status_code=200 if info.get("ok") else 503)
+    healthy = info.get("ok") and not is_desynced()
+    return JSONResponse(body, status_code=200 if healthy else 503)
 
 
 @app.get("/v1/meta")
@@ -254,6 +280,15 @@ async def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
     if not clock.manual:
         raise HTTPException(status_code=409, detail="PROVIDER_MANUAL_CLOCK is not enabled")
 
+    # A desynced run must not be allowed to continue: the clock has moved but
+    # at least one peer did not follow, so any further advance would compound
+    # the divergence. Restart the stack to recover.
+    if is_desynced():
+        raise HTTPException(
+            status_code=503,
+            detail={"desynced": True, "reason": "a previous rollover failed; restart the stack", **_desynced},
+        )
+
     request = body or AdvanceRequest()
     current = clock.current_slot()
     if request.expect_slot is not None and request.expect_slot != current:
@@ -262,15 +297,21 @@ async def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
             detail=f"slot mismatch: expected {request.expect_slot}, provider is at {current}",
         )
 
-    # Fail hard on fan-out failures: if any peer delivery fails, raise an exception.
+    report = rollover(notify=request.notify_peers)
+    tick = report.tick
+
+    # Fail hard on fan-out failures. The clock has ALREADY moved at this point
+    # and cannot be un-moved, so this is not "the advance didn't happen" — it
+    # is "the clock moved and not every peer followed". Rolling time back would
+    # be worse (some peers already advanced), so the honest response is to
+    # refuse to continue and make the operator restart the stack.
     if request.notify_peers and report.any_failed:
+        _mark_desynced(report)
         raise HTTPException(
             status_code=503,
             detail={"desynced": True, **report.to_dict()},
         )
 
-    report = rollover(notify=request.notify_peers)
-    tick = report.tick
     return AdvanceResponse(
         current_slot=tick.global_slot if tick else current,
         slot_start_utc=(tick.started_at_utc if tick else datetime.now(timezone.utc)).isoformat(),

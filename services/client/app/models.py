@@ -64,12 +64,31 @@ class SendPlanResponse(BaseModel):
     count: int
     slots: int
 
+
 class TickRequest(BaseModel):
-    expected_slot : int
-    new_slot: int
-    
+    """Body the provider POSTs on each rollover.
+
+    Mirrors the provider's push payload field-for-field (see
+    `provider/INTERFACE.md` §"Notification body"). Do not invent field names
+    here: the provider's payload *is* the contract, and a second, differently
+    named model is how the two services drift apart.
+
+    `current_slot` is a **global** slot (epoch-anchored), not a plan index —
+    see `state.get_plan_for_slot` for the translation.
+    """
+
+    current_slot: int
+    slot_start_utc: str
+    source: str = ""
+    observed: Optional[dict[str, Any]] = None
+    forecast: list[dict[str, Any]] = []
+
+
 class TickResponse(BaseModel):
     slot: int
-    plan_index: list[int] = []
+    #: (plan_id, plan_index) pairs handled for this tick.
+    plan_index: list[tuple[int, int]] = []
     submitted: int = 0
+    #: True when this tick was a retry of one already handled (idempotency).
+    duplicate: bool = False
     

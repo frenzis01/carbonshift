@@ -33,33 +33,46 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from enum import Enum
+
 import requests
 
 from .clock import ProviderClock, SlotTick
 from .source import CarbonIntensitySource, ObservedPoint
-from enum import Enum
 
 logger = logging.getLogger("provider.notifications")
 
-class Role(str,Enum):
+
+class Role(str, Enum):
+    """What a peer does with a slot rollover.
+
+    This is not decoration: it is the *reason* the fan-out order is what it is
+    (see the module docstring). A PRODUCER supplies the work for the slot that
+    is starting; a CONSUMER processes it. Producers must be notified first, or
+    their work arrives after the slot it belongs to has already been handled.
+    """
+
     CONSUMER = "consumer"
     PRODUCER = "producer"
+
 
 @dataclass
 class Peer:
     """A component to notify on each slot rollover.
 
     `advance_path` is per-peer rather than hard-coded so the same fan-out
-    works against carbonshift (`/v1/admin/advance-slot`) and the executor
-    (`/admin/advance-slot`), and can be retargeted without touching logic.
+    works against the client (`/v1/tick`), carbonshift
+    (`/v1/admin/advance-slot`) and the executor (`/admin/advance-slot`), and
+    can be retargeted without touching logic.
     """
 
     name: str
     base_url: str
     advance_path: str
-    # Role should be an enum, either "consumer" or "producer"
-    role: Role
     order: int
+    # Defaulted to CONSUMER because that is the common case; producers opt in
+    # explicitly at the one place that builds the list.
+    role: Role = Role.CONSUMER
 
     @property
     def url(self) -> str:
@@ -246,6 +259,7 @@ def peers_from_settings(settings) -> list[Peer]:
             base_url=settings.client_url,
             advance_path="/v1/tick",
             order=10,
+            role=Role.PRODUCER
         ),
         Peer(
             name="carbonshift",
@@ -254,6 +268,7 @@ def peers_from_settings(settings) -> list[Peer]:
             # assumes the *role* of the clock driver the client plays today.
             advance_path="/v1/admin/advance-slot",
             order=20,
+            role=Role.CONSUMER,
         )
     ]
     if settings.executor_url.strip():
@@ -263,6 +278,7 @@ def peers_from_settings(settings) -> list[Peer]:
                 base_url=settings.executor_url,
                 advance_path="/admin/advance-slot",
                 order=30,
+                role=Role.CONSUMER,
             )
         )
     return peers

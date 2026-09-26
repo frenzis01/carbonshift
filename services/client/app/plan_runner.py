@@ -1,21 +1,30 @@
-"""Runs a timeslot-aware request plan: either in real time (waits for each
-request's `start_at`) or in emulated time (fires each timeslot's requests
-immediately, then synchronizes via carbonshift's and the executor's
-`POST /admin/advance-slot` instead of waiting for real time to pass).
+"""Submits a plan's requests to carbonshift, one slot at a time.
+
+The client no longer drives the clock: the provider does (see
+`provider/ARCHITECTURE.md` §2). This module therefore contains no loop, no
+thread and no advance-slot call — it exposes exactly one operation, "submit
+the requests belonging to this slot", which `POST /v1/tick` invokes.
+
+What used to live here and is deliberately gone:
+
+* `run_plan` / `_run` — a thread that fired every slot in a loop and drove
+  carbonshift's and the executor's clocks itself. Superseded by the provider's
+  fan-out, which does the same thing in the correct order with retries.
+* `_perturbed_actual_ci` — the client inventing a "real" carbon intensity by
+  perturbing the forecast. The provider now owns that (and models it
+  correctly: a measurement is an event, not a property of a slot).
+* `_advance_slot` — the client calling the peers' advance endpoints. It
+  swallowed every failure (`logger.exception(...)` then `return`), which is
+  exactly the silent-desync behaviour the provider's 503-on-failure replaces.
 """
 from __future__ import annotations
 
 import logging
-import random
-import threading
-import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
-import requests
-
-from .carbonshift_client import CarbonshiftError, get_carbon_forecast, submit
+from .carbonshift_client import CarbonshiftError, submit
 from .config import settings
 from .timeslots import ceil_to_slot_end, slot_index
 from .tracker import RequestTracker, TrackedRequest
@@ -23,152 +32,65 @@ from .tracker import RequestTracker, TrackedRequest
 logger = logging.getLogger("client.plan_runner")
 
 
-def run_plan(tracker: RequestTracker, requests_spec: list[dict[str, Any]], slot_minutes: float,
-             mode: str, executor_url: Optional[str]) -> tuple[str, int]:
-    batch_id = uuid.uuid4().hex
-    slots = _group_by_slot(requests_spec, slot_minutes)
-    threading.Thread(
-        target=_run, args=(tracker, slots, slot_minutes, mode, executor_url, batch_id),
-        daemon=True, name=f"plan-{batch_id}",
-    ).start()
-    return batch_id, len(slots)
+def get_batch_from_slot(requests_spec: list[dict[str, Any]], slot_minutes: float,
+                        plan_index: int, reference: datetime) -> list[dict[str, Any]]:
+    """The requests belonging to `plan_index` within this plan.
 
-def get_batch_from_slot(requests_spec: list[dict[str, Any]], slot_minutes: float, slot_idx: int) -> list[dict[str, Any]]:
-    """Retrieve all requests belonging to a specific slot index."""
-    slotted = _group_by_slot(requests_spec, slot_minutes)
-    return slotted.get(slot_idx, [])
+    `reference` is the plan's own start instant (a slot boundary), passed in
+    rather than inferred from the data: deriving it from `min(start_at)` would
+    measure from a jittered mid-slot instant, which works only by luck.
+    """
+    slotted = _group_by_slot(requests_spec, slot_minutes, reference)
+    return slotted.get(plan_index, [])
 
-def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],slot_minutes: float) -> None:
+
+def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
+                    slot_minutes: float) -> int:
+    """Submit every request in `batch` to carbonshift, synchronously.
+
+    Returns the number actually submitted. Synchronous on purpose: the
+    provider blocks on this call, and that is what guarantees slot N's work is
+    in carbonshift's queue *before* carbonshift is told to process slot N.
+
+    A submission failure is logged and skipped rather than raised: one bad
+    request should not abort the whole slot. The request is simply not tracked,
+    so it never appears in the metrics — which is honest, since it was never
+    accepted.
+    """
     batch_id = uuid.uuid4().hex
+    submitted = 0
+    callback_url = f"{settings.self_base_url}/callback"
+
     for r in batch:
-        # TODO: should I add a _wait_until for the requests? 
-        # Is the submission time always at the start of the slot? If not, maybe we should wait
-        
-        # Add tracking information to the request
-        r["batch_id"] = batch_id
         submitted_at = datetime.now(timezone.utc)
-        deadline_end = ceil_to_slot_end(r["deadline_at"],slot_minutes)
-        # Deadline seconds is the difference
-        deadline_seconds = max((deadline_end - submitted_at).total_seconds(),1.0)
+        deadline_end = ceil_to_slot_end(r["deadline_at"], slot_minutes)
+        deadline_seconds = max((deadline_end - submitted_at).total_seconds(), 1.0)
         payload = {"task": r["task"], "input": r["input"]}
-        # submit(r, callback_url=f"{settings.self_base_url}/callback")
-        callback_url = f"{settings.self_base_url}/callback"
         try:
             ack = submit(deadline_seconds, callback_url, payload, task_id=r["task"])
-        except CarbonshiftError as e:
-            logger.exception("failed to submit request in batch %s: %s", batch_id, e, exc_info=True)
-            # TODO: should I track the request as failed? I don't want issues when examining and computing stats on the data
+        except CarbonshiftError:
+            logger.exception("batch %s: submit failed for task=%s", batch_id, r["task"])
             continue
-        tracker.track(TrackedRequest(
-            batch_id=batch_id,
-            task_id=r["task"],
-            submitted_at=submitted_at,
-            deadline_at=deadline_seconds,
-            ack=ack,
-        ))
-        logger.info("submitted request in batch %s: task_id=%s, deadline_seconds=%.2f", batch_id, r["task"], deadline_seconds)
-        
 
-'''
-Given the list of requests with their `start_at` times and the slot duration in minutes, group the requests by their corresponding slot index.
-slot_minutes is the duration of each timeslot in minutes.
-'''
-def _group_by_slot(requests_spec: list[dict[str, Any]], slot_minutes: float) -> dict[int, list[dict[str, Any]]]:
+        # `request_id` comes from carbonshift's ack, so the TrackedRequest can
+        # only be built *after* a successful submit.
+        tracker.add(TrackedRequest(
+            str(ack.get("request_id")), r["task"], deadline_seconds, submitted_at, ack,
+        ))
+        submitted += 1
+        logger.info("batch %s: submitted task=%s deadline_seconds=%.2f",
+                    batch_id, r["task"], deadline_seconds)
+
+    return submitted
+
+
+def _group_by_slot(requests_spec: list[dict[str, Any]], slot_minutes: float,
+                   reference: datetime) -> dict[int, list[dict[str, Any]]]:
+    """Group requests by their 0-based slot index relative to `reference`."""
     if not requests_spec:
         return {}
-    reference = min(r["start_at"] for r in requests_spec)
     groups: dict[int, list[dict[str, Any]]] = {}
     for r in requests_spec:
         idx = slot_index(r["start_at"], slot_minutes, reference)
         groups.setdefault(idx, []).append(r)
     return groups
-
-'''
-_run executes the plan by submitting requests to carbonshift according to the slot schedule.
-It handles both "realtime" and "emulated" modes, advancing slots and applying actual carbon intensity in emulated mode.
-It sends all slots according to the schedule, respecting the start times and deadlines of each request.
-'''
-def _run(tracker: RequestTracker, slots: dict[int, list[dict[str, Any]]], slot_minutes: float,
-          mode: str, executor_url: Optional[str], batch_id: str) -> None:
-    callback_url = f"{settings.self_base_url}/callback"
-    actual_ci: list[float] = []
-    if mode == "emulated":
-        try:
-            actual_ci = _perturbed_actual_ci(get_carbon_forecast())
-        except CarbonshiftError:
-            logger.warning("plan %s: could not fetch carbon forecast, skipping actual-CI reporting", batch_id,
-                            exc_info=True)
-
-    # The schulder will most likely have scheduled requests for slots beyond the last one,
-    # so we need to keep advancing the slot until all requests are dispatched.
-    
-    # TODO: remove hardcoded MAX_ADVANCE_ATTEMPTS and make it adapt to max_future_window
-    MAX_ADVANCE_ATTEMPTS = 14
-    # add to slots empty entries for future slots up to MAX_ADVANCE_ATTEMPTS
-    for i in range(1, MAX_ADVANCE_ATTEMPTS + 1):
-        slots.setdefault(max(slots) + i, [])
-    # TODO: assess whether this is creates problem with
-    #   - CI for future slots
-    #   - no waiting when advancing for empty future slots
-    
-    for idx in sorted(slots):
-        if mode == "realtime":
-            _wait_until(slots[idx][0]["start_at"])
-
-        for r in slots[idx]:
-            submitted_at = datetime.now(timezone.utc)
-            deadline_end = ceil_to_slot_end(r["deadline_at"], slot_minutes)
-            deadline_seconds = max((deadline_end - submitted_at).total_seconds(), 1.0)
-            payload = {"task": r["task"], "input": r["input"]}
-            try:
-                ack = submit(deadline_seconds, callback_url, payload, task_id=r["task"])
-            except CarbonshiftError:
-                logger.exception("plan %s slot %d: submit failed", batch_id, idx)
-                continue
-            request_id = str(ack.get("request_id"))
-            tracker.add(TrackedRequest(request_id, r["task"], deadline_seconds, submitted_at, ack))
-            logger.info("plan %s slot %d: submitted request_id=%s", batch_id, idx, request_id)
-
-        if mode == "emulated":
-            # `idx + 1` is the slot carbonshift's clock is about to enter
-            # (advance_to_next_slot always moves exactly one slot forward).
-            actual = actual_ci[idx + 1] if idx + 1 < len(actual_ci) else None
-            _advance_slot(executor_url, batch_id, idx, actual)
-            
-
-def _wait_until(target: datetime) -> None:
-    delay = (target - datetime.now(timezone.utc)).total_seconds()
-    if delay > 0:
-        time.sleep(delay)
-
-
-def _advance_slot(executor_url: Optional[str], batch_id: str, idx: int, actual_carbon_intensity: float | None) -> None:
-    # 1) carbonshift: flush this slot's requests and block until its own
-    #    dispatcher has handed them off to the executor.
-    try:
-        params = {}
-        if actual_carbon_intensity is not None:
-            params["actual_carbon_intensity"] = actual_carbon_intensity
-        resp = requests.post(f"{settings.carbonshift_url}/v1/admin/advance-slot",
-                              params=params, timeout=settings.admin_timeout_seconds)
-        try:
-            logger.info("response message: %s", resp.text)
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError:
-            logger.exception("plan %s: carbonshift advance-slot failed at slot %d", batch_id, idx)
-            logger.debug("Response content: %s", resp.content)
-            return
-
-        logger.info("plan %s: carbonshift advanced past slot %d -> %s", batch_id, idx, resp.json())
-    except requests.RequestException:
-        logger.exception("plan %s: carbonshift advance-slot failed at slot %d", batch_id, idx)
-        return
-
-    # 2) executor: run everything now due and block until it confirms done.
-    base_url = (executor_url or settings.executor_admin_url).rstrip("/")
-    try:
-        resp = requests.post(f"{base_url}/admin/advance-slot", timeout=settings.admin_timeout_seconds)
-        resp.raise_for_status()
-        logger.info("plan %s: executor advanced past slot %d -> %s", batch_id, idx, resp.json())
-    except requests.RequestException:
-        logger.exception("plan %s: executor advance-slot failed at slot %d", batch_id, idx)

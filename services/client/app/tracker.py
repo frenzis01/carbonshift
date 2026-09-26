@@ -132,6 +132,17 @@ class RequestTracker:
         with self._lock:
             self._by_id[tracked.request_id] = tracked
 
+    def reset(self) -> None:
+        """Drop every tracked request. Test helper.
+
+        `app.main.tracker` is module-level, so without this a test asserting on
+        `/requests` counts would depend on which tests ran before it. The
+        metrics JSONL on disk is deliberately left alone — it is append-only
+        and not read back.
+        """
+        with self._lock:
+            self._by_id.clear()
+
     def get(self, request_id: str) -> Optional[TrackedRequest]:
         with self._lock:
             return self._by_id.get(request_id)

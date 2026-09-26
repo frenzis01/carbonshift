@@ -7,13 +7,24 @@ import json
 import logging
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
-from carbonshift.services.client.app.state import advance_slot, get_current_slot, get_plan, get_plans_with_reqs_in_slot, get_requests_from_plan, store_plan
+from .state import (
+    get_plan,
+    get_plan_for_slot,
+    get_requests_from_plan,
+    is_slot_already_processed,
+    mark_slot_processed,
+    store_plan,
+)
+
 from fastapi import FastAPI, HTTPException
 
-from .carbonshift_client import CarbonshiftError, get_stats, get_task_config, get_carbon_intensity
+from .carbonshift_client import CarbonshiftError, get_stats, get_task_config
 from .config import settings
+from . import provider_client
+from .provider_client import ProviderError
 from .models import (
     CallerCallbackPayload,
     SendBatchRequest,
@@ -23,7 +34,7 @@ from .models import (
     TickRequest,
     TickResponse,
 )
-from .plan_runner import get_batch_from_slot, run_plan, send_slot_batch
+from .plan_runner import get_batch_from_slot, send_slot_batch
 from .runner import send_batch
 from .tracker import RequestTracker
 
@@ -65,24 +76,44 @@ async def health() -> str:
 
 @app.post("/v1/tick")
 async def tick(body: TickRequest) -> TickResponse:
-    # TODO: should we worry about epoch disalignment here...?
-    if (body.expected_slot != get_current_slot()):
-        raise HTTPException(503, detail={"desynced": True, "expected_slot": body.expected_slot, "current_slot": get_current_slot()})
-    
-    current_slot = advance_slot()
-    requests_submitted = 0
+    """The provider tells us the system has entered `body.current_slot`.
 
-    # 1. work out which plan index this slot corresponds to
-    # Determine the plan indexes based on the current slot
-    plans_in_slot = get_plans_with_reqs_in_slot(current_slot)
-    # 2. submit that index's requests to carbonshift (synchronously with caller provider)
-    for plan_id in plans_in_slot:
+    We answer with that slot's work. The client keeps **no clock of its own**:
+    the position is always derived from the slot we are told about, so a
+    retried or missed tick cannot make us drift out of step with the provider.
+
+    Returns 200 with `submitted: 0` for a slot outside the plan's range — the
+    provider ticks on its own schedule, which need not coincide with the
+    plan's, so "nothing to do" is a normal outcome, not an error.
+    """
+    slot = body.current_slot
+    handled: list[tuple[int, int]] = []
+    submitted = 0
+    duplicate = False
+
+    for plan_id, plan_index in get_plan_for_slot(slot):
+        # Idempotency: the provider retries on failure, so a tick we already
+        # processed must be a no-op rather than a double submission.
+        if is_slot_already_processed(plan_id, slot):
+            duplicate = True
+            continue
+
         plan = get_plan(plan_id)
-        slot_minutes = plan["slot_minutes"]
-        batch = get_batch_from_slot(get_requests_from_plan(plan_id), slot_minutes, current_slot)
-        send_slot_batch(tracker, batch, slot_minutes)
-        requests_submitted += len(batch)
-    return TickResponse(slot=current_slot, plan_index=plans_in_slot, submitted=requests_submitted)
+        if plan is None:  # cleared between the two lookups
+            continue
+
+        # The plan's own start instant is the reference for grouping, so the
+        # index is measured from a slot boundary rather than from a jittered
+        # mid-slot `min(start_at)`. `store_plan` normalised it to a datetime.
+        reference = plan["requests"][0]["start_at"]
+        batch = get_batch_from_slot(
+            get_requests_from_plan(plan_id), plan["slot_minutes"], plan_index, reference,
+        )
+        submitted += send_slot_batch(tracker, batch, plan["slot_minutes"])
+        mark_slot_processed(plan_id, slot)
+        handled.append((plan_id, plan_index))
+
+    return TickResponse(slot=slot, plan_index=handled, submitted=submitted, duplicate=duplicate)
 
 
 @app.post("/run/send-batch", status_code=202)
@@ -93,10 +124,11 @@ async def run_send_batch(body: SendBatchRequest) -> SendBatchResponse:
 
 @app.post("/run/send-plan", status_code=202)
 async def run_send_plan(body: SendPlanRequest) -> SendPlanResponse:
+    """Register a plan. It is *stored*, not started: the provider's ticks drive it."""
     requests_spec = [r.model_dump() for r in body.requests]
-    # batch_id, slots = run_plan(tracker, requests_spec, body.slot_minutes, body.mode, body.executor_url)
     plan_id = store_plan(requests_spec, body.slot_minutes, body.mode, body.executor_url)
-    return SendPlanResponse(plan_id=plan_id, count=len(requests_spec))
+    plan = get_plan(plan_id)
+    return SendPlanResponse(plan_id=plan_id, count=len(requests_spec), slots=plan["slot_count"])
 
 
 @app.post("/callback")
@@ -136,17 +168,28 @@ def _scheduler_snapshot() -> dict[str, Any]:
     design — see PLAN_SERVICE.md) and each seen task's *declared*
     `max_error_threshold`, so it's clear whether the run stayed within
     budget. Degrades to `null`s if carbonshift is unreachable, rather than
-    failing the whole `/metrics/summary` response."""
+    failing the whole `/metrics/summary` response.
+
+    Carbon intensity now comes from the **provider**, not carbonshift: the
+    provider owns the clock and the readings (see provider/ARCHITECTURE.md
+    §10). `observed` is the measurement taken for the current slot, which is
+    `null` until that slot has been reached — a measurement of a future slot
+    does not exist.
+    """
     snapshot: dict[str, Any] = {"global_error_avg": None, "global_error_count": None, "tasks": {}}
     try:
         stats = get_stats()
-        ci = get_carbon_intensity()
         global_error_avg = stats.get("global_error_avg")
         snapshot["global_error_avg"] = round(global_error_avg, 2) if global_error_avg is not None else None
         snapshot["global_error_count"] = stats.get("global_error_count")
-        snapshot["carbon_intensity"] = ci
     except CarbonshiftError:
         logger.warning("failed to fetch carbonshift /v1/stats for metrics/summary", exc_info=True)
+
+    try:
+        snapshot["carbon_intensity"] = provider_client.get_observed()
+    except ProviderError:
+        logger.warning("failed to fetch provider /v1/observed for metrics/summary", exc_info=True)
+        snapshot["carbon_intensity"] = None
 
     for task in sorted({item["task"] for item in tracker.all()}):
         try:

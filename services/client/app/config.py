@@ -28,7 +28,20 @@ class Settings:
     # used to call POST /admin/advance-slot directly — normal task traffic
     # always goes through carbonshift, never straight to the executor).
     executor_admin_url: str = os.environ.get("EXECUTOR_ADMIN_URL", "http://localhost:9000")
-    provider_epoch: float = float(os.environ.get("PROVIDER_EPOCH", "0"))
+
+    # ── carbon-intensity provider ─────────────────────────────────────────
+    # The provider owns the clock (see provider/ARCHITECTURE.md §2). The
+    # client is a *peer* it notifies, not a driver.
+    provider_url: str = os.environ.get("PROVIDER_URL", "http://localhost:9100")
+    # Slot origin. MUST match the provider's PROVIDER_EPOCH exactly — the
+    # default is part of the contract between the two services, so it is
+    # duplicated here deliberately rather than left to chance. A mismatch
+    # makes the client's slot boundaries disagree with the provider's, which
+    # silently mis-assigns requests to slots.
+    provider_epoch_iso: str = os.environ.get("PROVIDER_EPOCH", "2020-01-01T00:00:00+00:00")
+    # Slot length. MUST match the provider's PROVIDER_SLOT_MINUTES and
+    # carbonshift's SLOT_DURATION_SECONDS.
+    provider_slot_minutes: float = float(os.environ.get("PROVIDER_SLOT_MINUTES", "60"))
 
 
 settings = Settings()
