@@ -24,6 +24,10 @@ def client(monkeypatch):
         slot_minutes=30,
         epoch=parse_epoch(main.settings.epoch_iso),
     )
+    # The desync latch is module-level too: reset it, or one test's induced
+    # failure would make every later test see a permanently desynced provider.
+    main._desynced = None
+    main.observed_readings.clear()
     yield TestClient(main.app)
 
 
@@ -51,8 +55,11 @@ def test_meta_describes_the_effective_configuration(client):
 
 
 def test_meta_lists_the_peer_order(client):
+    """The client is first because it produces the slot's work; the consumers
+    follow. See notifications.Role."""
     peers = client.get("/v1/meta").json()["peers"]
-    assert peers and peers[0]["name"] == "carbonshift"
+    assert [p["name"] for p in peers] == ["client", "carbonshift"]
+    assert peers[0]["order"] < peers[1]["order"]
 
 
 def test_slot_endpoint_returns_a_consistent_view(client):
@@ -165,7 +172,11 @@ def test_advance_slot_moves_one_slot_and_reports_deliveries(client, monkeypatch)
     assert body["current_slot"] == before + 1
     assert body["local_step"] == 1
     assert body["all_ok"] is True
-    assert calls == ["http://localhost:8080/v1/admin/advance-slot"]
+    # Client first (producer), then carbonshift (consumer).
+    assert calls == [
+        "http://localhost:8100/v1/tick",
+        "http://localhost:8080/v1/admin/advance-slot",
+    ]
 
 
 def test_advance_slot_pushes_the_forecast_window_to_peers(client, monkeypatch):
@@ -207,11 +218,37 @@ def test_advance_slot_can_skip_notifying_peers(client):
     assert body["all_ok"] is False  # nothing was notified, so not "all ok"
 
 
-def test_advance_slot_surfaces_a_peer_failure(client, monkeypatch):
+def test_advance_slot_fails_hard_when_a_peer_does_not_ack(client, monkeypatch):
+    """A partial fan-out must not return 200: the clock moved but not every
+    peer followed, so the run is unrecoverable and must be reported as such."""
     monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
-    body = client.post("/v1/advance-slot", json={}).json()
-    assert body["all_ok"] is False
-    assert body["deliveries"][0]["ok"] is False
+    resp = client.post("/v1/advance-slot", json={})
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["desynced"] is True
+    assert detail["deliveries"][0]["ok"] is False
+
+
+def test_a_desynced_provider_refuses_all_further_advances(client, monkeypatch):
+    """The latch is what stops a desynced run from quietly continuing."""
+    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
+    assert client.post("/v1/advance-slot", json={}).status_code == 503
+
+    # Even with a healthy peer now, the run stays refused.
+    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    resp = client.post("/v1/advance-slot", json={})
+    assert resp.status_code == 503
+    assert "restart the stack" in resp.json()["detail"]["reason"]
+
+
+def test_health_reports_degraded_once_desynced(client, monkeypatch):
+    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
+    client.post("/v1/advance-slot", json={})
+
+    resp = client.get("/health")
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "degraded"
+    assert resp.json()["desynced"] is not None
 
 
 def test_advance_slot_refuses_when_the_clock_is_not_manual(client, monkeypatch):

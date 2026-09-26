@@ -176,12 +176,17 @@ seam where it actually pays off.
 
 Three design points that make the seam honest rather than decorative:
 
-* **`provides_actual_for_future_slots` is part of the contract.** A remote
-  source physically cannot know the real intensity of a future slot; the local
-  one fabricates it. Rather than let callers guess, the capability is declared.
-  This is what will force the emulation flow to change shape when the remote
-  role is enabled — correctly, because "pretend the forecast is a measurement"
-  is exactly the shortcut that must not survive into production.
+* **A measurement is an event, not a property of a slot.** A remote source
+  physically cannot know the real intensity of a future slot; the local one
+  could fabricate it, but must not. Rather than declare a capability flag
+  (`provides_actual_for_future_slots`, which this design originally had and
+  then removed — see §10), the *shape* of the API enforces it: `forecast()`
+  returns `ForecastPoint` (no `actual` field at all) and `observe()` returns
+  an `ObservedPoint` only for the slot being measured. There is no way to ask
+  for a future measurement, so "pretend the forecast is a measurement" is not
+  expressible. This is what will force the emulation flow to change shape when
+  the remote role is enabled — correctly, because that shortcut must not
+  survive into production.
 * **`actual` is `null`, never a copy of `forecast`.** Making an unknown
   measurement look like a known one is how a carbon-saving metric silently
   becomes fiction.
@@ -283,8 +288,11 @@ between slots) changes the assignment, which today it cannot.
 
 **Stage 4 — the remote role.**
 Implement `RemoteCarbonIntensitySource.forecast()` against
-`GET /intensity/{from}/fw24h`, resample if `slot_minutes != 30`, and decide
-what to do when `provides_actual_for_future_slots` is false.
+`GET /intensity/{from}/fw24h` and resample if `slot_minutes != 30`. No
+capability flag to consult: `observe()` already refuses any target other than
+the slot being measured, so the remote adapter simply implements
+`_observe_current()` against the live endpoint and inherits the correct
+"measurement is an event" behaviour for free.
 
 Stages 1–2 are pure plumbing and safe. **Stage 3 is an architectural change**
 and should not be smuggled into a refactor.
@@ -293,9 +301,12 @@ and should not be smuggled into a refactor.
 
 ## 9. Open questions still to settle
 
-1. **Does the client need to be notified?** Currently it is not in the peer
-   list; it can either poll `GET /v1/slot` or be added as `order: 30`. Polling
-   is simpler and keeps the client out of the clock protocol entirely.
+1. **Does the client need to be notified?** Yes — it is now peer `order: 10`
+   with `role: PRODUCER`, because the client is what *submits* slot N's work
+   and must do so before carbonshift is told to process slot N. It is not a
+   consumer of the clock (it keeps no counter of its own); it is a producer of
+   the slot's work, and the ordering is what makes the fan-out correct. See
+   §3 for why the client must come first.
 2. **Should a provider outage stop the simulation?** Today it returns
    `all_ok: false` and lets the caller decide. Failing the rollover outright is
    safer but more brittle.

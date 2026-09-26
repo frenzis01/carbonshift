@@ -47,11 +47,34 @@ setup from a real one without inspecting env vars.
   "forecast_horizon_slots": 24,
   "manual_clock": true,
   "auto_advance_clock": false,
-  "peers": [ { "name": "carbonshift",
+  "peers": [ { "name": "client",
+               "url": "http://client:8100/v1/tick",
+               "order": 10,
+               "role": "producer" },
+             { "name": "carbonshift",
                "url": "http://carbonshift:8080/v1/admin/advance-slot",
-               "order": 10 } ]
+               "order": 20,
+               "role": "consumer" },
+             { "name": "executor",
+               "url": "http://executor:9000/admin/advance-slot",
+               "order": 30,
+               "role": "consumer" } ]
 }
 ```
+
+Peers are notified in `order`, and the order is load-bearing:
+
+* **`client` (10, producer)** — submits slot N's work to carbonshift. It must
+  run *before* carbonshift is told to process slot N, or carbonshift would
+  process an empty slot.
+* **`carbonshift` (20, consumer)** — advances its own clock and processes the
+  work the client just queued.
+* **`executor` (30, consumer)** — advances its clock last, after the scheduler
+  that dispatches to it.
+
+`role` distinguishes a peer that *produces* the slot's work from one that merely
+*consumes* the clock tick. The executor peer is omitted entirely when
+`EXECUTOR_URL` is empty.
 
 ### `GET /v1/slot`
 
@@ -157,9 +180,19 @@ Response:
 3. The peers listed in `GET /v1/meta` are notified **in `order`**, each with
    bounded retries, and the fan-out **stops at the first peer that fails** —
    advancing a later peer while an earlier one is behind is precisely the
-   desynchronization hazard this protocol exists to prevent.
+   desynchronization hazard this protocol exists to prevent. Because the client
+   is `order: 10`, a client failure stops carbonshift and the executor from
+   advancing too, which is the correct outcome: the slot's work was never
+   queued.
 4. Each notification body carries the full forecast window (not just the current
    value), so a peer that missed one can recover from the next.
+5. **A partial fan-out latches the provider into a desynced state.** If any
+   peer fails after retries, the response is **503** (not 200 with
+   `all_ok: false`), and every subsequent `POST /v1/advance-slot` is refused
+   with 503 until the provider is restarted. `GET /health` reports
+   `desynced: true` and returns 503. This is deliberate: once peers disagree
+   about the current slot there is no safe way to continue, and a silent
+   `all_ok: false` would let a caller keep advancing into a corrupt timeline.
 
 ### Notification body (pushed to each peer)
 
@@ -191,9 +224,10 @@ Note the two fields are structurally different, not two views of one list:
 
 | Code | Meaning |
 |---|---|
-| 200 | Slot advanced (check `all_ok` for whether peers acked) |
+| 200 | Slot advanced and every peer acked (`all_ok: true`) |
 | 409 | Clock is not manual, **or** `expect_slot` did not match |
 | 422 | Malformed body |
+| 503 | A peer failed after retries — the provider is now **desynced** and will refuse all further advances until restarted |
 
 ---
 
