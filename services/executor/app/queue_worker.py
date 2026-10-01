@@ -238,7 +238,7 @@ class JobQueue:
         except requests.RequestException as exc:
             logger.warning("callback failed request_id=%s error=%s", job.request_id, exc)
 
-    def advance_slot(self, body: AdvanceSlotPayload) -> dict[str, Any]:
+    def advance_slot(self, body: Optional[AdvanceSlotPayload] = None) -> dict[str, Any]:
         """Test-only: bump the virtual clock to the next slot boundary, then
         block until every job that's now due has actually finished running
         (not just been dequeued — a job can be mid-execution, e.g. still
@@ -248,7 +248,7 @@ class JobQueue:
         
         new_now = self._clock.now()
         # check if this is the first announcement made to synchronize clocks
-        if body.kind == "announce":
+        if body and body.kind == "announce":
             logger.info("received announcement for slot synchronization from source=%s", body.source)
             # sync clock to the announced slot
             # set _virtual_now from body.slot_start_utc
@@ -260,7 +260,7 @@ class JobQueue:
             # for the virtual clock. Is it ok? When is slot_minutes set?
             self._clock.force_set(datetime.fromisoformat(body.slot_start_utc))
             new_now = self._clock.now()
-        elif body.kind == "rollover":
+        else:
             new_now = self._clock.advance_to_next_slot()
         self._wakeup.set()
 

@@ -16,7 +16,7 @@ from app.main import app
 _counter = itertools.count(1)
 
 
-def fake_submit(deadline_seconds, callback_url, payload, task_id=None):
+def fake_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
     return {
         "request_id": next(_counter),
         "status": "scheduled",

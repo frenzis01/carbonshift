@@ -249,7 +249,7 @@ pub async fn advance_slot(
             return Err(api_error(StatusCode::CONFLICT, "engine slot does not match the target slot on announce"));
         }
     } else {
-        println!("[Service] Advancing to new slot: {current_slot} -> {new_slot}", current_slot = state.shared_state.get_current_slot(), new_slot = body_current_slot);
+        println!("[Service] Advancing to new slot: {current_slot} -> {target_engine_slot} (global: {body_current_slot})", current_slot = state.shared_state.get_current_slot(), target_engine_slot = target_engine_slot, body_current_slot = body_current_slot);
         let new_slot = crate::engine::scheduler::advance_to_next_slot(&state.shared_state, &state.cfg);
         if new_slot != target_engine_slot {
             tracing::warn!(new_slot, target_engine_slot, "engine slot disagrees with the announced slot");
@@ -292,14 +292,20 @@ pub async fn advance_slot(
     }
         
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        // Wait until all pending or scheduled requests have been dispatched or the deadline is reached.
+    // Wait until all pending requests are solved and any request due at or before curr_slot
+    // has been dispatched to the executor.
     loop {
-        let still_dispatching = state
-            .tracked
-            .lock()
-            .unwrap()
-            .values()
-            .any(|t| matches!(t.status, RequestStatus::Pending | RequestStatus::Scheduled));
+        let assignments = state.shared_state.get_current_assignments();
+        let still_dispatching = {
+            let guard = state.tracked.lock().unwrap();
+            state.shared_state.get_pending_count() > 0
+                || assignments.iter().any(|(id, a)| {
+                    a.scheduled_slot <= curr_slot
+                        && guard.get(id).map_or(false, |t| {
+                            matches!(t.status, RequestStatus::Pending | RequestStatus::Scheduled)
+                        })
+                })
+        };
         if !still_dispatching || tokio::time::Instant::now() >= deadline {
             break;
         }

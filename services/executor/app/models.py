@@ -70,9 +70,9 @@ class ObservedPoint(BaseModel):
     actual: float
     
 class AdvanceSlotPayload(BaseModel):
-    source: str
-    kind: str
-    current_slot: int
+    source: str = ""
+    kind: str = "rollover"
+    current_slot: Optional[int] = None
     slot_start_utc: Optional[str] = None
     observed: Optional[ObservedPoint] = None
     forecast: Optional[list[ForecastPoint]] = None

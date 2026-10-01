@@ -45,7 +45,7 @@ def get_batch_from_slot(requests_spec: list[dict[str, Any]], slot_minutes: float
 
 
 def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
-                    slot_minutes: float, slot: int) -> int:
+                    slot_minutes: float, slot: int = 0) -> int:
     """Submit every request in `batch` to carbonshift, synchronously.
 
     Returns the number actually submitted. Synchronous on purpose: the

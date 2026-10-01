@@ -1,0 +1,652 @@
+provider-1  | INFO:     Started server process [1]
+provider-1     | INFO:     Waiting for application startup.
+provider-1     | 2026-10-01 20:37:35,331 INFO provider.main: provider started role=local source=local slot_minutes=60.0 manual_clock=True
+provider-1     | INFO:     Application startup complete.
+provider-1     | INFO:     Uvicorn running on http://0.0.0.0:9100 (Press CTRL+C to quit)
+provider-1     | INFO:     172.26.0.6:45304 - "GET /v1/slot HTTP/1.1" 200 OK
+provider-1     | 2026-10-01 20:37:54,801 WARNING provider.notifications: rollover fan-out aborted at peer=executor after 3 attempt(s): unexpected status 500
+provider-1     | 2026-10-01 20:38:02,382 WARNING provider.notifications: rollover fan-out aborted at peer=executor after 3 attempt(s): unexpected status 500
+provider-1     | 2026-10-01 20:38:02,383 ERROR provider.main: DESYNCED: slot 59181 advanced but not all peers acknowledged; refusing further advances until restart. {'slot': 59181, 'local_step': 1, 'all_ok': False, 'deliveries': [{'peer': 'client', 'url': 'http://client:8100/v1/tick', 'ok': True, 'attempts': 1, 'status_code': 200, 'error': None}, {'peer': 'carbonshift', 'url': 'http://carbonshift:8080/v1/admin/advance-slot', 'ok': True, 'attempts': 1, 'status_code': 200, 'error': None}, {'peer': 'executor', 'url': 'http://executor:9000/admin/advance-slot', 'ok': False, 'attempts': 3, 'status_code': None, 'error': 'unexpected status 500'}]}
+provider-1     | INFO:     172.26.0.6:45316 - "POST /v1/advance-slot HTTP/1.1" 503 Service Unavailable
+provider-1     | INFO:     127.0.0.1:47680 - "GET /health HTTP/1.1" 503 Service Unavailable
+provider-1     | INFO:     127.0.0.1:40222 - "GET /health HTTP/1.1" 503 Service Unavailable
+provider-1     | INFO:     127.0.0.1:34490 - "GET /health HTTP/1.1" 503 Service Unavailable
+provider-1     | INFO:     127.0.0.1:52748 - "GET /health HTTP/1.1" 503 Service Unavailable
+provider-1     | INFO:     Shutting down
+client-1    | INFO:     Started server process [1]
+client-1       | INFO:     Waiting for application startup.
+client-1       | 2026-10-01 20:37:35,773 INFO client.main: client started (carbonshift_url=http://carbonshift:8080, self_base_url=http://client:8100)
+provider-1     | INFO:     Waiting for application shutdown.
+client-1       | INFO:     Application startup complete.
+provider-1     | INFO:     Application shutdown complete.
+client-1       | INFO:     Uvicorn running on http://0.0.0.0:8100 (Press CTRL+C to quit)
+carbonshift-1  | Registered max_error_threshold: Some(Some(20.25602265505134))
+client-1       | INFO:     172.26.0.6:54756 - "POST /run/send-plan HTTP/1.1" 202 Accepted
+carbonshift-1  | Registered capacity_tiers: Some([CapacityTier { max_requests: Some(20), multiplier: 1.0 }, CapacityTier { max_requests: Some(40), multiplier: 1.5 }, CapacityTier { max_requests: None, multiplier: 5.0 }])
+provider-1     | INFO:     Finished server process [1]
+carbonshift-1  | [Service] Submitted request ID: 1
+carbonshift-1  | [Service] Request ID 1 scheduled at slot 1 / 0
+carbonshift-1  | [Service] Submitted request ID: 2
+carbonshift-1  | [Service] Submitted request ID: 3
+carbonshift-1  | [Service] Submitted request ID: 4
+client-1       | 2026-10-01 20:37:36,031 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1344.02
+client-1       | 2026-10-01 20:37:36,343 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1343.97
+client-1       | 2026-10-01 20:37:36,653 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1343.66
+client-1       | 2026-10-01 20:37:36,707 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1343.35
+client-1       | 2026-10-01 20:37:37,044 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1343.29
+client-1       | 2026-10-01 20:37:37,353 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1342.96
+client-1       | 2026-10-01 20:37:37,405 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1342.65
+client-1       | 2026-10-01 20:37:37,715 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1342.59
+client-1       | 2026-10-01 20:37:38,025 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1342.28
+client-1       | 2026-10-01 20:37:38,079 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1341.97
+client-1       | 2026-10-01 20:37:38,388 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1341.92
+client-1       | 2026-10-01 20:37:38,728 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1341.61
+client-1       | 2026-10-01 20:37:38,784 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1341.27
+client-1       | 2026-10-01 20:37:39,095 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1341.22
+client-1       | 2026-10-01 20:37:39,407 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1340.90
+client-1       | 2026-10-01 20:37:39,464 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1340.59
+client-1       | 2026-10-01 20:37:39,773 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1340.54
+client-1       | 2026-10-01 20:37:40,082 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1340.23
+client-1       | 2026-10-01 20:37:40,138 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1339.92
+client-1       | 2026-10-01 20:37:40,447 INFO client.plan_runner: batch 6fa1048561874ef7aeb4a561ddad969c: submitted task=question_answering deadline_seconds=1339.86
+client-1       | INFO:     172.26.0.3:57754 - "POST /v1/tick HTTP/1.1" 200 OK
+client-1       | INFO:     127.0.0.1:38332 - "GET /health HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:37:55,123 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4925.19
+client-1       | 2026-10-01 20:37:55,179 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4924.88
+executor-1  | INFO:     Started server process [1]
+executor-1     | INFO:     Waiting for application startup.
+executor-1     | 2026-10-01 20:37:35,129 INFO executor.main: executor worker started (device=auto, max_loaded_models=3)
+executor-1     | INFO:     Application startup complete.
+executor-1     | INFO:     Uvicorn running on http://0.0.0.0:9000 (Press CTRL+C to quit)
+executor-1     | INFO:     127.0.0.1:55814 - "GET /health HTTP/1.1" 200 OK
+executor-1     | INFO:     172.26.0.3:33272 - "POST /admin/advance-slot HTTP/1.1" 500 Internal Server Error
+executor-1     | ERROR:    Exception in ASGI application
+executor-1     | Traceback (most recent call last):
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/http/httptools_impl.py", line 422, in run_asgi
+executor-1     |     result = await app(  # type: ignore[func-returns-value]
+executor-1     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+client-1       | 2026-10-01 20:37:55,489 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4924.82
+client-1       | 2026-10-01 20:37:55,798 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4924.51
+client-1       | 2026-10-01 20:37:55,850 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4924.20
+client-1       | 2026-10-01 20:37:56,159 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4924.15
+client-1       | 2026-10-01 20:37:56,468 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4923.84
+carbonshift-1  | [Service] Request ID 4 scheduled at slot 1 / 0
+carbonshift-1  | [Service] Submitted request ID: 5
+carbonshift-1  | [Service] Submitted request ID: 6
+carbonshift-1  | [Service] Submitted request ID: 7
+carbonshift-1  | [Service] Request ID 7 scheduled at slot 1 / 0
+carbonshift-1  | [Service] Submitted request ID: 8
+carbonshift-1  | [Service] Submitted request ID: 9
+carbonshift-1  | [Service] Submitted request ID: 10
+carbonshift-1  | [Service] Request ID 10 scheduled at slot 1 / 0
+carbonshift-1  | [Service] Submitted request ID: 11
+carbonshift-1  | [Service] Submitted request ID: 12
+carbonshift-1  | [Service] Submitted request ID: 13
+carbonshift-1  | [Service] Request ID 13 scheduled at slot 1 / 0
+carbonshift-1  | [Service] Submitted request ID: 14
+carbonshift-1  | [Service] Submitted request ID: 15
+carbonshift-1  | [Service] Submitted request ID: 16
+carbonshift-1  | [Service] Request ID 16 scheduled at slot 1 / 0
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/middleware/proxy_headers.py", line 63, in __call__
+executor-1     |     return await self.app(scope, receive, send)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/applications.py", line 1163, in __call__
+executor-1     |     await super().__call__(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/applications.py", line 96, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 186, in __call__
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 164, in __call__
+executor-1     |     await self.app(scope, receive, _send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+executor-1     |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 670, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 2734, in app
+executor-1     |     await route.handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 1281, in handle
+carbonshift-1  | [Service] Submitted request ID: 17
+carbonshift-1  | [Service] Submitted request ID: 18
+carbonshift-1  | [Service] Submitted request ID: 19
+carbonshift-1  | [Service] Request ID 19 scheduled at slot 1 / 0
+carbonshift-1  | [Service] Submitted request ID: 20
+carbonshift-1  | [Service] Submitted request ID: 21
+carbonshift-1  | [Service] Submitted request ID: 22
+carbonshift-1  | [Service] Request ID 22 scheduled at slot 0 / 0
+carbonshift-1  | [Service] Submitted request ID: 23
+carbonshift-1  | [Service] Submitted request ID: 24
+carbonshift-1  | [Service] Submitted request ID: 25
+carbonshift-1  | [Service] Request ID 25 scheduled at slot 0 / 0
+carbonshift-1  | [Service] Submitted request ID: 26
+carbonshift-1  | [Service] Submitted request ID: 27
+carbonshift-1  | [Service] Submitted request ID: 28
+carbonshift-1  | [Service] Request ID 28 scheduled at slot 0 / 0
+carbonshift-1  | [Service] Submitted request ID: 29
+carbonshift-1  | [Service] Submitted request ID: 30
+carbonshift-1  | [Service] Submitted request ID: 31
+carbonshift-1  | [Service] Request ID 31 scheduled at slot 0 / 0
+carbonshift-1  | [Service] Submitted request ID: 32
+carbonshift-1  | [Service] Submitted request ID: 33
+carbonshift-1  | [Service] Submitted request ID: 34
+carbonshift-1  | [Service] Request ID 34 scheduled at slot 0 / 0
+carbonshift-1  | [Service] Submitted request ID: 35
+carbonshift-1  | [Service] Submitted request ID: 36
+carbonshift-1  | [Service] Submitted request ID: 37
+carbonshift-1  | [Service] Request ID 37 scheduled at slot 0 / 0
+carbonshift-1  | [Service] Submitted request ID: 38
+carbonshift-1  | [Service] Submitted request ID: 39
+carbonshift-1  | [Service] Submitted request ID: 40
+carbonshift-1  | [Service] Request ID 40 scheduled at slot 0 / 0
+carbonshift-1  | [Service] Advancing to new slot: 0 -> 59181
+executor-1     |     await super().handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 280, in handle
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 158, in app
+executor-1     |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 144, in app
+executor-1     |     response = await f(request)
+executor-1     |                ^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 706, in app
+executor-1     |     raw_response = await run_endpoint_function(
+executor-1     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 352, in run_endpoint_function
+executor-1     |     return await dependant.call(**values)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/app/app/main.py", line 116, in advance_slot
+executor-1     |     return job_queue.advance_slot()
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     | TypeError: JobQueue.advance_slot() missing 1 required positional argument: 'body'
+executor-1     | INFO:     172.26.0.3:33282 - "POST /admin/advance-slot HTTP/1.1" 500 Internal Server Error
+executor-1     | ERROR:    Exception in ASGI application
+executor-1     | Traceback (most recent call last):
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/http/httptools_impl.py", line 422, in run_asgi
+executor-1     |     result = await app(  # type: ignore[func-returns-value]
+executor-1     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/middleware/proxy_headers.py", line 63, in __call__
+client-1       | 2026-10-01 20:37:56,521 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4923.53
+client-1       | 2026-10-01 20:37:56,830 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4923.48
+client-1       | 2026-10-01 20:37:57,139 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4923.17
+executor-1     |     return await self.app(scope, receive, send)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/applications.py", line 1163, in __call__
+executor-1     |     await super().__call__(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/applications.py", line 96, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 186, in __call__
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 164, in __call__
+executor-1     |     await self.app(scope, receive, _send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+executor-1     |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+client-1       | 2026-10-01 20:37:57,192 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4922.86
+client-1       | 2026-10-01 20:37:57,501 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4922.81
+client-1       | 2026-10-01 20:37:57,810 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4922.50
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 670, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 2734, in app
+executor-1     |     await route.handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 1281, in handle
+executor-1     |     await super().handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 280, in handle
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 158, in app
+executor-1     |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 144, in app
+executor-1     |     response = await f(request)
+executor-1     |                ^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 706, in app
+executor-1     |     raw_response = await run_endpoint_function(
+executor-1     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 352, in run_endpoint_function
+executor-1     |     return await dependant.call(**values)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/app/app/main.py", line 116, in advance_slot
+executor-1     |     return job_queue.advance_slot()
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     | TypeError: JobQueue.advance_slot() missing 1 required positional argument: 'body'
+executor-1     | INFO:     172.26.0.3:52076 - "POST /admin/advance-slot HTTP/1.1" 500 Internal Server Error
+executor-1     | ERROR:    Exception in ASGI application
+executor-1     | Traceback (most recent call last):
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/http/httptools_impl.py", line 422, in run_asgi
+executor-1     |     result = await app(  # type: ignore[func-returns-value]
+executor-1     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/middleware/proxy_headers.py", line 63, in __call__
+executor-1     |     return await self.app(scope, receive, send)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+client-1       | 2026-10-01 20:37:57,863 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4922.19
+client-1       | 2026-10-01 20:37:58,171 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4922.14
+client-1       | 2026-10-01 20:37:58,481 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4921.83
+client-1       | 2026-10-01 20:37:58,533 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4921.52
+client-1       | 2026-10-01 20:37:58,843 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4921.47
+client-1       | 2026-10-01 20:37:59,151 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4921.16
+client-1       | 2026-10-01 20:37:59,204 INFO client.plan_runner: batch 23b65937213c4bdeb3a886607ad62ab5: submitted task=question_answering deadline_seconds=4920.85
+client-1       | INFO:     172.26.0.3:38286 - "POST /v1/tick HTTP/1.1" 200 OK
+client-1       | INFO:     127.0.0.1:57722 - "GET /health HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:03,887 INFO client.main: received callback for request_id=22, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:04,017 INFO client.main: received callback for request_id=21, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:04,156 INFO client.main: received callback for request_id=20, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,162 INFO client.main: received callback for request_id=24, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,250 INFO client.main: received callback for request_id=25, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,328 INFO client.main: received callback for request_id=23, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,415 INFO client.main: received callback for request_id=26, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,523 INFO client.main: received callback for request_id=27, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,625 INFO client.main: received callback for request_id=28, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,702 INFO client.main: received callback for request_id=31, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/applications.py", line 1163, in __call__
+executor-1     |     await super().__call__(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/applications.py", line 96, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 186, in __call__
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 164, in __call__
+executor-1     |     await self.app(scope, receive, _send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+executor-1     |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 670, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 2734, in app
+executor-1     |     await route.handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 1281, in handle
+executor-1     |     await super().handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 280, in handle
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 158, in app
+executor-1     |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 144, in app
+executor-1     |     response = await f(request)
+executor-1     |                ^^^^^^^^^^^^^^^^
+client-1       | 2026-10-01 20:38:06,787 INFO client.main: received callback for request_id=30, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,873 INFO client.main: received callback for request_id=29, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:06,967 INFO client.main: received callback for request_id=33, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 706, in app
+executor-1     |     raw_response = await run_endpoint_function(
+executor-1     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 352, in run_endpoint_function
+executor-1     |     return await dependant.call(**values)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/app/app/main.py", line 116, in advance_slot
+executor-1     |     return job_queue.advance_slot()
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     | TypeError: JobQueue.advance_slot() missing 1 required positional argument: 'body'
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     127.0.0.1:38954 - "GET /health HTTP/1.1" 200 OK
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.4:41010 - "POST /dispatch HTTP/1.1" 202 Accepted
+executor-1     | INFO:     172.26.0.3:52090 - "POST /admin/advance-slot HTTP/1.1" 500 Internal Server Error
+executor-1     | ERROR:    Exception in ASGI application
+executor-1     | Traceback (most recent call last):
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/http/httptools_impl.py", line 422, in run_asgi
+executor-1     |     result = await app(  # type: ignore[func-returns-value]
+executor-1     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/middleware/proxy_headers.py", line 63, in __call__
+client-1       | 2026-10-01 20:38:07,065 INFO client.main: received callback for request_id=32, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,181 INFO client.main: received callback for request_id=34, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,268 INFO client.main: received callback for request_id=37, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,352 INFO client.main: received callback for request_id=36, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,426 INFO client.main: received callback for request_id=35, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,513 INFO client.main: received callback for request_id=37, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,609 INFO client.main: received callback for request_id=6, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,692 INFO client.main: received callback for request_id=7, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,794 INFO client.main: received callback for request_id=8, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,887 INFO client.main: received callback for request_id=9, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:07,962 INFO client.main: received callback for request_id=17, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,043 INFO client.main: received callback for request_id=4, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,169 INFO client.main: received callback for request_id=38, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,274 INFO client.main: received callback for request_id=19, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,398 INFO client.main: received callback for request_id=2, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,521 INFO client.main: received callback for request_id=11, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,623 INFO client.main: received callback for request_id=14, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,725 INFO client.main: received callback for request_id=15, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,850 INFO client.main: received callback for request_id=40, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:08,968 INFO client.main: received callback for request_id=39, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,054 INFO client.main: received callback for request_id=1, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,148 INFO client.main: received callback for request_id=13, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,250 INFO client.main: received callback for request_id=10, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,385 INFO client.main: received callback for request_id=16, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,492 INFO client.main: received callback for request_id=3, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,604 INFO client.main: received callback for request_id=12, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,686 INFO client.main: received callback for request_id=5, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | 2026-10-01 20:38:09,783 INFO client.main: received callback for request_id=18, success=True
+client-1       | INFO:     172.26.0.4:48532 - "POST /callback HTTP/1.1" 200 OK
+client-1       | INFO:     127.0.0.1:48312 - "GET /health HTTP/1.1" 200 OK
+client-1       | INFO:     127.0.0.1:32872 - "GET /health HTTP/1.1" 200 OK
+client-1       | INFO:     Shutting down
+client-1       | INFO:     Waiting for application shutdown.
+executor-1     |     return await self.app(scope, receive, send)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/applications.py", line 1163, in __call__
+executor-1     |     await super().__call__(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/applications.py", line 96, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 186, in __call__
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 164, in __call__
+executor-1     |     await self.app(scope, receive, _send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+executor-1     |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 670, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 2734, in app
+executor-1     |     await route.handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 1281, in handle
+executor-1     |     await super().handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 280, in handle
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 158, in app
+executor-1     |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 144, in app
+executor-1     |     response = await f(request)
+executor-1     |                ^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 706, in app
+executor-1     |     raw_response = await run_endpoint_function(
+executor-1     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 352, in run_endpoint_function
+executor-1     |     return await dependant.call(**values)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/app/app/main.py", line 116, in advance_slot
+executor-1     |     return job_queue.advance_slot()
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     | TypeError: JobQueue.advance_slot() missing 1 required positional argument: 'body'
+executor-1     | 2026-10-01 20:37:59,777 INFO executor.inference: loading model task=question_answering flavour=balanced model=deepset/roberta-base-squad2 device=-1
+executor-1     | 2026-10-01 20:38:00,217 INFO httpx: HTTP Request: HEAD https://huggingface.co/deepset/roberta-base-squad2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+executor-1     | Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+executor-1     | 2026-10-01 20:38:00,217 WARNING huggingface_hub.utils._http: Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+executor-1     | 2026-10-01 20:38:00,289 INFO httpx: HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/deepset/roberta-base-squad2/adc3b06f79f797d1c575d5479d6f5efe54a9e3b4/config.json?%2Fdeepset%2Froberta-base-squad2%2Fresolve%2Fmain%2Fconfig.json=&etag=%22a1f66a8df792b74eb796ed468eb1fcb1d739d558%22 "HTTP/1.1 200 OK"
+executor-1     | INFO:     172.26.0.3:52096 - "POST /admin/advance-slot HTTP/1.1" 500 Internal Server Error
+executor-1     | ERROR:    Exception in ASGI application
+executor-1     | Traceback (most recent call last):
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/http/httptools_impl.py", line 422, in run_asgi
+executor-1     |     result = await app(  # type: ignore[func-returns-value]
+executor-1     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/middleware/proxy_headers.py", line 63, in __call__
+executor-1     |     return await self.app(scope, receive, send)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/applications.py", line 1163, in __call__
+executor-1     |     await super().__call__(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/applications.py", line 96, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 186, in __call__
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 164, in __call__
+executor-1     |     await self.app(scope, receive, _send)
+client-1       | INFO:     Application shutdown complete.
+client-1       | INFO:     Finished server process [1]
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+executor-1     |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 670, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 2734, in app
+executor-1     |     await route.handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 1281, in handle
+executor-1     |     await super().handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 280, in handle
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 158, in app
+executor-1     |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 144, in app
+executor-1     |     response = await f(request)
+executor-1     |                ^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 706, in app
+executor-1     |     raw_response = await run_endpoint_function(
+executor-1     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 352, in run_endpoint_function
+executor-1     |     return await dependant.call(**values)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/app/app/main.py", line 116, in advance_slot
+executor-1     |     return job_queue.advance_slot()
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     | TypeError: JobQueue.advance_slot() missing 1 required positional argument: 'body'
+executor-1     | 2026-10-01 20:38:00,460 INFO httpx: HTTP Request: HEAD https://huggingface.co/deepset/roberta-base-squad2/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+executor-1     | 2026-10-01 20:38:00,531 INFO httpx: HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/deepset/roberta-base-squad2/adc3b06f79f797d1c575d5479d6f5efe54a9e3b4/tokenizer_config.json?%2Fdeepset%2Froberta-base-squad2%2Fresolve%2Fmain%2Ftokenizer_config.json=&etag=%22716c99719ef143bc426aac25d0c843c52a1bac8f%22 "HTTP/1.1 200 OK"
+executor-1     | 2026-10-01 20:38:00,700 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/deepset/roberta-base-squad2/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+executor-1     | 2026-10-01 20:38:00,941 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/deepset/roberta-base-squad2/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+executor-1     | 2026-10-01 20:38:01,204 INFO httpx: HTTP Request: HEAD https://huggingface.co/deepset/roberta-base-squad2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+executor-1     | 2026-10-01 20:38:01,275 INFO httpx: HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/deepset/roberta-base-squad2/adc3b06f79f797d1c575d5479d6f5efe54a9e3b4/config.json?%2Fdeepset%2Froberta-base-squad2%2Fresolve%2Fmain%2Fconfig.json=&etag=%22a1f66a8df792b74eb796ed468eb1fcb1d739d558%22 "HTTP/1.1 200 OK"
+executor-1     | Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 3781.94it/s]
+executor-1     | 2026-10-01 20:38:01,657 INFO executor.inference: loading model task=question_answering flavour=accurate model=deepset/bert-large-uncased-whole-word-masking-squad2 device=-1
+executor-1     | 2026-10-01 20:38:01,830 INFO httpx: HTTP Request: HEAD https://huggingface.co/deepset/bert-large-uncased-whole-word-masking-squad2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+executor-1     | 2026-10-01 20:38:01,913 INFO httpx: HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/deepset/bert-large-uncased-whole-word-masking-squad2/0a489d6caaf651c1983e8ecd8a418c7f65993d72/config.json?%2Fdeepset%2Fbert-large-uncased-whole-word-masking-squad2%2Fresolve%2Fmain%2Fconfig.json=&etag=%22173b2a4e340b70e4df03a2e26e36783701d4955c%22 "HTTP/1.1 200 OK"
+executor-1     | 2026-10-01 20:38:02,146 INFO httpx: HTTP Request: HEAD https://huggingface.co/deepset/bert-large-uncased-whole-word-masking-squad2/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+executor-1     | 2026-10-01 20:38:02,226 INFO httpx: HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/deepset/bert-large-uncased-whole-word-masking-squad2/0a489d6caaf651c1983e8ecd8a418c7f65993d72/tokenizer_config.json?%2Fdeepset%2Fbert-large-uncased-whole-word-masking-squad2%2Fresolve%2Fmain%2Ftokenizer_config.json=&etag=%2266051e65c65b3ec5e0b437496d1e545c5d8934b4%22 "HTTP/1.1 200 OK"
+executor-1     | INFO:     172.26.0.3:52098 - "POST /admin/advance-slot HTTP/1.1" 500 Internal Server Error
+executor-1     | ERROR:    Exception in ASGI application
+executor-1     | Traceback (most recent call last):
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/protocols/http/httptools_impl.py", line 422, in run_asgi
+executor-1     |     result = await app(  # type: ignore[func-returns-value]
+executor-1     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/uvicorn/middleware/proxy_headers.py", line 63, in __call__
+executor-1     |     return await self.app(scope, receive, send)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/applications.py", line 1163, in __call__
+executor-1     |     await super().__call__(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/applications.py", line 96, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 186, in __call__
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/errors.py", line 164, in __call__
+executor-1     |     await self.app(scope, receive, _send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+executor-1     |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 670, in __call__
+executor-1     |     await self.middleware_stack(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 2734, in app
+executor-1     |     await route.handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 1281, in handle
+executor-1     |     await super().handle(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/routing.py", line 280, in handle
+executor-1     |     await self.app(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 158, in app
+executor-1     |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+executor-1     |     raise exc
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+executor-1     |     await app(scope, receive, sender)
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 144, in app
+executor-1     |     response = await f(request)
+executor-1     |                ^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 706, in app
+executor-1     |     raw_response = await run_endpoint_function(
+executor-1     |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/usr/local/lib/python3.11/site-packages/fastapi/routing.py", line 352, in run_endpoint_function
+executor-1     |     return await dependant.call(**values)
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     |   File "/app/app/main.py", line 116, in advance_slot
+executor-1     |     return job_queue.advance_slot()
+executor-1     |            ^^^^^^^^^^^^^^^^^^^^^^^^
+executor-1     | TypeError: JobQueue.advance_slot() missing 1 required positional argument: 'body'
+executor-1     | 2026-10-01 20:38:02,394 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/deepset/bert-large-uncased-whole-word-masking-squad2/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+executor-1     | 2026-10-01 20:38:02,560 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/deepset/bert-large-uncased-whole-word-masking-squad2/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+executor-1     | 2026-10-01 20:38:02,841 INFO httpx: HTTP Request: HEAD https://huggingface.co/deepset/bert-large-uncased-whole-word-masking-squad2/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+executor-1     | 2026-10-01 20:38:02,918 INFO httpx: HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/deepset/bert-large-uncased-whole-word-masking-squad2/0a489d6caaf651c1983e8ecd8a418c7f65993d72/config.json?%2Fdeepset%2Fbert-large-uncased-whole-word-masking-squad2%2Fresolve%2Fmain%2Fconfig.json=&etag=%22173b2a4e340b70e4df03a2e26e36783701d4955c%22 "HTTP/1.1 200 OK"
+executor-1     | Loading weights:   0%|          | 0/391 [00:00<?, ?it/s]Loading weights:  53%|█████▎    | 206/391 [00:00<00:00, 2049.94it/s]Loading weights: 100%|██████████| 391/391 [00:00<00:00, 2959.56it/s]
+executor-1     | 2026-10-01 20:38:03,885 INFO executor.queue: callback delivered request_id=22 status=200
+executor-1     | 2026-10-01 20:38:04,016 INFO executor.queue: callback delivered request_id=21 status=200
+executor-1     | 2026-10-01 20:38:04,155 INFO executor.queue: callback delivered request_id=20 status=200
+executor-1     | 2026-10-01 20:38:04,156 INFO executor.inference: loading model task=question_answering flavour=fast model=distilbert-base-cased-distilled-squad device=-1
+executor-1     | 2026-10-01 20:38:04,318 INFO httpx: HTTP Request: HEAD https://huggingface.co/distilbert-base-cased-distilled-squad/resolve/main/config.json "HTTP/1.1 200 OK"
+executor-1     | 2026-10-01 20:38:04,496 INFO httpx: HTTP Request: HEAD https://huggingface.co/distilbert-base-cased-distilled-squad/resolve/main/tokenizer_config.json "HTTP/1.1 200 OK"
+executor-1     | 2026-10-01 20:38:04,718 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/distilbert-base-cased-distilled-squad/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 307 Temporary Redirect"
+executor-1     | 2026-10-01 20:38:04,880 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/distilbert/distilbert-base-cased-distilled-squad/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+executor-1     | 2026-10-01 20:38:05,073 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/distilbert-base-cased-distilled-squad/tree/main?recursive=true&expand=false "HTTP/1.1 307 Temporary Redirect"
+executor-1     | 2026-10-01 20:38:05,315 INFO httpx: HTTP Request: GET https://huggingface.co/api/models/distilbert/distilbert-base-cased-distilled-squad/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+executor-1     | 2026-10-01 20:38:05,566 INFO httpx: HTTP Request: HEAD https://huggingface.co/distilbert-base-cased-distilled-squad/resolve/main/config.json "HTTP/1.1 200 OK"
+executor-1     | Loading weights:   0%|          | 0/102 [00:00<?, ?it/s]Loading weights: 100%|██████████| 102/102 [00:00<00:00, 3253.65it/s]
+executor-1     | 2026-10-01 20:38:06,162 INFO executor.queue: callback delivered request_id=24 status=200
+executor-1     | 2026-10-01 20:38:06,249 INFO executor.queue: callback delivered request_id=25 status=200
+executor-1     | 2026-10-01 20:38:06,328 INFO executor.queue: callback delivered request_id=23 status=200
+executor-1     | 2026-10-01 20:38:06,414 INFO executor.queue: callback delivered request_id=26 status=200
+executor-1     | 2026-10-01 20:38:06,522 INFO executor.queue: callback delivered request_id=27 status=200
+executor-1     | 2026-10-01 20:38:06,625 INFO executor.queue: callback delivered request_id=28 status=200
+executor-1     | 2026-10-01 20:38:06,702 INFO executor.queue: callback delivered request_id=31 status=200
+executor-1     | 2026-10-01 20:38:06,786 INFO executor.queue: callback delivered request_id=30 status=200
+executor-1     | 2026-10-01 20:38:06,873 INFO executor.queue: callback delivered request_id=29 status=200
+executor-1     | 2026-10-01 20:38:06,967 INFO executor.queue: callback delivered request_id=33 status=200
+executor-1     | 2026-10-01 20:38:07,065 INFO executor.queue: callback delivered request_id=32 status=200
+executor-1     | 2026-10-01 20:38:07,181 INFO executor.queue: callback delivered request_id=34 status=200
+executor-1     | 2026-10-01 20:38:07,268 INFO executor.queue: callback delivered request_id=37 status=200
+executor-1     | 2026-10-01 20:38:07,351 INFO executor.queue: callback delivered request_id=36 status=200
+executor-1     | 2026-10-01 20:38:07,426 INFO executor.queue: callback delivered request_id=35 status=200
+executor-1     | 2026-10-01 20:38:07,513 INFO executor.queue: callback delivered request_id=37 status=200
+executor-1     | 2026-10-01 20:38:07,609 INFO executor.queue: callback delivered request_id=6 status=200
+executor-1     | 2026-10-01 20:38:07,692 INFO executor.queue: callback delivered request_id=7 status=200
+executor-1     | 2026-10-01 20:38:07,794 INFO executor.queue: callback delivered request_id=8 status=200
+executor-1     | 2026-10-01 20:38:07,887 INFO executor.queue: callback delivered request_id=9 status=200
+executor-1     | 2026-10-01 20:38:07,962 INFO executor.queue: callback delivered request_id=17 status=200
+executor-1     | 2026-10-01 20:38:08,043 INFO executor.queue: callback delivered request_id=4 status=200
+executor-1     | 2026-10-01 20:38:08,169 INFO executor.queue: callback delivered request_id=38 status=200
+executor-1     | 2026-10-01 20:38:08,273 INFO executor.queue: callback delivered request_id=19 status=200
+executor-1     | 2026-10-01 20:38:08,398 INFO executor.queue: callback delivered request_id=2 status=200
+executor-1     | 2026-10-01 20:38:08,521 INFO executor.queue: callback delivered request_id=11 status=200
+executor-1     | 2026-10-01 20:38:08,623 INFO executor.queue: callback delivered request_id=14 status=200
+executor-1     | 2026-10-01 20:38:08,724 INFO executor.queue: callback delivered request_id=15 status=200
+executor-1     | 2026-10-01 20:38:08,849 INFO executor.queue: callback delivered request_id=40 status=200
+executor-1     | 2026-10-01 20:38:08,967 INFO executor.queue: callback delivered request_id=39 status=200
+executor-1     | 2026-10-01 20:38:09,053 INFO executor.queue: callback delivered request_id=1 status=200
+executor-1     | 2026-10-01 20:38:09,148 INFO executor.queue: callback delivered request_id=13 status=200
+executor-1     | 2026-10-01 20:38:09,250 INFO executor.queue: callback delivered request_id=10 status=200
+executor-1     | 2026-10-01 20:38:09,385 INFO executor.queue: callback delivered request_id=16 status=200
+executor-1     | 2026-10-01 20:38:09,492 INFO executor.queue: callback delivered request_id=3 status=200
+executor-1     | 2026-10-01 20:38:09,604 INFO executor.queue: callback delivered request_id=12 status=200
+executor-1     | 2026-10-01 20:38:09,685 INFO executor.queue: callback delivered request_id=5 status=200
+executor-1     | 2026-10-01 20:38:09,783 INFO executor.queue: callback delivered request_id=18 status=200
+executor-1     | INFO:     127.0.0.1:58492 - "GET /health HTTP/1.1" 200 OK
+executor-1     | INFO:     127.0.0.1:53638 - "GET /health HTTP/1.1" 200 OK
+executor-1     | INFO:     127.0.0.1:57088 - "GET /health HTTP/1.1" 200 OK
+executor-1     | INFO:     Shutting down
+executor-1     | INFO:     Waiting for application shutdown.
+executor-1     | INFO:     Application shutdown complete.
+executor-1     | INFO:     Finished server process [1]

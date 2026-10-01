@@ -20,7 +20,7 @@ def make_fake_submit():
     calls = []
     counter = iter(range(1, 10_000))
 
-    def fake_submit(deadline_seconds, callback_url, payload, task_id=None):
+    def fake_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
         rid = next(counter)
         calls.append({"deadline_seconds": deadline_seconds, "payload": payload, "task_id": task_id})
         return {"request_id": rid, "status": "scheduled", "scheduled_slot": 1,
@@ -108,7 +108,7 @@ def test_send_slot_batch_skips_a_failed_submit_without_aborting_the_slot(monkeyp
 
     calls = []
 
-    def flaky_submit(deadline_seconds, callback_url, payload, task_id=None):
+    def flaky_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
         calls.append(task_id)
         if len(calls) == 1:
             raise CarbonshiftError("boom")

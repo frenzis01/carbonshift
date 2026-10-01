@@ -174,6 +174,10 @@ def test_advance_slot_moves_one_slot_and_reports_deliveries(client, monkeypatch)
     assert body["all_ok"] is True
     # Client first (producer), then carbonshift (consumer).
     assert calls == [
+        # First advance triggers announce (slot 0)
+        "http://localhost:8100/v1/tick",
+        "http://localhost:8080/v1/admin/advance-slot",
+        # Followed by rollover (slot 1)
         "http://localhost:8100/v1/tick",
         "http://localhost:8080/v1/admin/advance-slot",
     ]

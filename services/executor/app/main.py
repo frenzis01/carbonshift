@@ -110,10 +110,10 @@ async def get_queue() -> dict[str, list[str]]:
 
 
 @app.post("/admin/advance-slot")
-async def advance_slot(body: AdvanceSlotPayload) -> dict:
+async def advance_slot(body: Optional[AdvanceSlotPayload] = None) -> dict:
     if not settings.manual_clock:
         raise HTTPException(status_code=409, detail="EXECUTOR_MANUAL_CLOCK is not enabled")
-    return job_queue.advance_slot()
+    return job_queue.advance_slot(body)
 
 
 @app.get("/metrics/summary")
