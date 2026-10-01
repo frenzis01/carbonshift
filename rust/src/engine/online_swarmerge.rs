@@ -741,16 +741,51 @@ mod tests {
         let cfg = test_cfg();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
+        let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
         let requests = vec![make_request(1, 0, 5), make_request(2, 0, 5), make_request(3, 0, 5)];
 
         let mut legacy = crate::online_swarm::OnlineAcoState::new(
-            6, &carbon_forecast, &cfg, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7,
+            6,
+            shared_forecast.clone(),
+            &cfg,
+            4,
+            3,
+            1.0,
+            2.0,
+            0.3,
+            1.0,
+            1.0,
+            7,
         );
         legacy.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
 
-        let baseline = OnlineAcoState::new(6, &carbon_forecast, &cfg, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
+        let baseline = OnlineAcoState::new(
+            6,
+            shared_forecast.clone(),
+            &cfg,
+            4,
+            3,
+            1.0,
+            2.0,
+            0.3,
+            1.0,
+            1.0,
+            7,
+        );
         let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
-        let mut merged = OnlineAcoState::new(6, &carbon_forecast, &cfg, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
+        let mut merged = OnlineAcoState::new(
+            6,
+            shared_forecast,
+            &cfg,
+            4,
+            3,
+            1.0,
+            2.0,
+            0.3,
+            1.0,
+            1.0,
+            7,
+        );
         merged.merge_delta(delta);
 
         for i in 0..6 {
@@ -768,12 +803,37 @@ mod tests {
         let cfg = test_cfg();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
+        let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
         let requests = vec![make_request(1, 0, 5), make_request(2, 0, 5), make_request(3, 0, 5)];
 
-        let baseline = OnlineAcoState::new(6, &carbon_forecast, &cfg, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
+        let baseline = OnlineAcoState::new(
+            6,
+            shared_forecast.clone(),
+            &cfg,
+            4,
+            3,
+            1.0,
+            2.0,
+            0.3,
+            1.0,
+            1.0,
+            7,
+        );
 
         let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
-        let mut merged = OnlineAcoState::new(6, &carbon_forecast, &cfg, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
+        let mut merged = OnlineAcoState::new(
+            6,
+            shared_forecast,
+            &cfg,
+            4,
+            3,
+            1.0,
+            2.0,
+            0.3,
+            1.0,
+            1.0,
+            7,
+        );
         merged.merge_delta(delta);
 
         // The merged tau must differ from the untouched baseline tau0 vector

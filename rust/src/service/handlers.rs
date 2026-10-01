@@ -209,12 +209,9 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HorizonRe
 /// See PLAN_SERVICE.md "Emulazione a tempo fittizio" for the full protocol
 /// this enables together with the executor's own `/admin/advance-slot`.
 ///
-/// `?actual_carbon_intensity=<f64>` (optional): the client's real (not
-/// forecast) carbon intensity reading for the slot being advanced into —
-/// piggybacked here since the client already calls this once per slot, to
-/// avoid a separate synchronization channel (see PLAN_SERVICE.md). Used to
-/// correct already-committed `carbon_cost` once a request in that slot
-/// completes (see `executor_callback`); never fed back into live scheduling.
+/// The JSON body carries the provider's current global slot, optional observed
+/// reading, and forecast window. Observations correct committed costs after
+/// execution; they are kept separate from the forecast used for scheduling.
 pub async fn advance_slot(
     State(state): State<AppState>,
     // We must have a real body struct carrying slot, observed, forecast and current_slot, all #[serde(default)]
@@ -326,10 +323,9 @@ fn update_slot_epoch_offset(state: &AppState, slot_0: i64) -> Option<i32> {
 }
 
 
-/// `GET /v1/carbon-forecast` — the forecast the DP solver is scheduling
-/// against (index = slot). Read-only: lets the client derive a plausible
-/// "actual" carbon intensity series (e.g. the forecast with small jitter)
-/// to report back via `POST /v1/admin/advance-slot?actual_carbon_intensity=`.
+/// `GET /v1/carbon-forecast` — the shared forecast indexed by engine slot.
+/// The provider updates it through the advance-slot request's `forecast` field;
+/// measured values are stored separately through its `observed` field.
 pub async fn carbon_forecast(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "forecast": *state.carbon_forecast }))
 }
@@ -706,6 +702,7 @@ pub async fn executor_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
 
     #[test]
     fn rejects_non_http_scheme() {
@@ -752,7 +749,7 @@ mod tests {
             Flavour { name: "Precise".to_string(), error: 0.0, duration: 10 },
         ];
         let cfg = Arc::new(cfg);
-        let forecast = Arc::new(generate_carbon_forecast(&cfg));
+        let forecast = Arc::new(RwLock::new(generate_carbon_forecast(&cfg)));
         let service_cfg = ServiceConfig {
             executor_url: None,
             self_base_url: "http://localhost:0".to_string(),
@@ -768,9 +765,8 @@ mod tests {
         };
         let state = AppState::new(SharedState::new(), cfg.clone(), service_cfg, forecast);
 
-        let baseline = compute_baseline_carbon_cost(&state, 0, &cfg.flavours);
         let (baseline, duration) = compute_baseline_carbon_cost(&state, 0, &cfg.flavours);
-        let carbon = state.carbon_forecast[0];
+        let carbon = state.carbon_forecast.read().unwrap()[0];
         let expected = carbon * 10.0 * cfg.carbon_cost_duration_scale; // "Precise"'s duration (lowest error), position 1 => multiplier 1.0
         assert!((baseline - expected).abs() < 1e-9, "baseline={baseline}, expected={expected}");
         assert_eq!(duration, 10);
@@ -784,7 +780,7 @@ mod tests {
         use std::sync::Arc;
 
         let cfg = Arc::new(Config::default());
-        let forecast = Arc::new(vec![100.0, 110.0, 120.0, 130.0]);
+        let forecast = Arc::new(RwLock::new(vec![100.0, 110.0, 120.0, 130.0]));
         let service_cfg = ServiceConfig {
             executor_url: None,
             self_base_url: "http://localhost:0".to_string(),

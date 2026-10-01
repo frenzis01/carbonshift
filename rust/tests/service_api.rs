@@ -2,7 +2,7 @@
 //! validation, 404s) via in-process `tower::oneshot` calls against the
 //! router, plus one end-to-end test with a real running scheduler.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -42,9 +42,14 @@ fn test_engine_config() -> Config {
     cfg
 }
 
+fn test_forecast(cfg: &Config) -> Arc<RwLock<Vec<f64>>> {
+    let forecast = carbonshift_rs::engine::scheduler::generate_carbon_forecast(cfg);
+    Arc::new(RwLock::new(forecast))
+}
+
 fn test_state(service_cfg: ServiceConfig) -> AppState {
     let cfg = Arc::new(test_engine_config());
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
+    let forecast = test_forecast(&cfg);
     AppState::new(SharedState::new(), cfg, service_cfg, forecast)
 }
 
@@ -207,12 +212,17 @@ async fn stats_reports_global_error_avg_after_scheduling() {
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state, cfg, svc_cfg, forecast);
     let app = build_router(state);
 
@@ -257,12 +267,17 @@ async fn end_to_end_submit_gets_scheduled() {
 
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state, cfg, svc_cfg, forecast);
     let app = build_router(state);
 
@@ -307,12 +322,17 @@ async fn task_flavours_registered_via_v1_tasks_are_used_for_scheduling() {
 
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state, cfg, svc_cfg, forecast);
     let app = build_router(state);
 
@@ -341,12 +361,17 @@ async fn executor_callback_with_actual_error_pct_corrects_global_error() {
 
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast);
     let app = build_router(state);
 
@@ -385,31 +410,45 @@ async fn executor_callback_with_actual_error_pct_corrects_global_error() {
 async fn advance_slot_rejects_when_manual_clock_disabled() {
     let app = build_router(test_state(test_service_cfg()));
     let resp = app
-        .oneshot(Request::builder().method("POST").uri("/v1/admin/advance-slot").body(Body::empty()).unwrap())
+        .oneshot(json_request("POST", "/v1/admin/advance-slot", "{}"))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
-async fn advance_slot_accepts_actual_carbon_intensity_query_param() {
+async fn advance_slot_applies_forecast_and_observed_values_from_body() {
     let mut cfg = test_engine_config();
     cfg.manual_clock = true;
     let cfg = Arc::new(cfg);
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
-    let state = AppState::new(SharedState::new(), cfg, test_service_cfg(), forecast);
+    let forecast = test_forecast(&cfg);
+    let state = AppState::new(
+        SharedState::new(),
+        cfg,
+        test_service_cfg(),
+        forecast.clone(),
+    );
     let app = build_router(state);
+    let body = r#"{"kind":"announce","current_slot":0,"observed":{"slot":0,"observed_at_slot":0,"actual":123.4},"forecast":[{"slot":0,"forecast":120.0}]}"#;
+    let resp = app
+        .clone()
+        .oneshot(json_request("POST", "/v1/admin/advance-slot", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
     let resp = app
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/v1/admin/advance-slot?actual_carbon_intensity=123.4")
+                .uri("/v1/carbon_intensity?slot=0")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = json_body(resp).await;
+    assert_eq!(rows[0]["forecast"], 120.0);
+    assert_eq!(rows[0]["actual"], 123.4);
 }
 
 /// The client's reported actual carbon intensity for an assignment's slot
@@ -421,12 +460,17 @@ async fn executor_callback_corrects_carbon_cost_with_actual_carbon_intensity() {
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast.clone());
     let app = build_router(state.clone());
 
@@ -442,7 +486,7 @@ async fn executor_callback_corrects_carbon_cost_with_actual_carbon_intensity() {
     let predicted_cost = json["carbon_cost"].as_f64().unwrap();
 
     // Actual carbon intensity turns out to be double the forecast for that slot.
-    let actual_ci = forecast[scheduled_slot as usize] * 2.0;
+    let actual_ci = forecast.read().unwrap()[scheduled_slot as usize] * 2.0;
     state.actual_carbon_intensity.lock().unwrap().insert(scheduled_slot, actual_ci);
 
     let resp = app
@@ -469,13 +513,18 @@ async fn advance_slot_moves_clock_and_waits_for_dispatch() {
 
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
     svc_cfg.dispatcher_poll_interval_ms = 5;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast);
     tokio::spawn(carbonshift_rs::service::dispatcher::run(state.clone()));
     let app = build_router(state.clone());
@@ -493,7 +542,7 @@ async fn advance_slot_moves_clock_and_waits_for_dispatch() {
     assert_eq!(shared_state.get_current_slot(), 0);
 
     let resp = app
-        .oneshot(Request::builder().method("POST").uri("/v1/admin/advance-slot").body(Body::empty()).unwrap())
+        .oneshot(json_request("POST", "/v1/admin/advance-slot", r#"{"current_slot":1}"#))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -526,13 +575,18 @@ async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
 
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 0.02; // times out well before any flush/advance
     svc_cfg.dispatcher_poll_interval_ms = 5;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast);
     tokio::spawn(carbonshift_rs::service::dispatcher::run(state.clone()));
     let app = build_router(state.clone());
@@ -560,7 +614,7 @@ async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
     // Advancing the slot flushes + assigns it; the dispatcher must still
     // deliver it despite the tracked status never having become `Scheduled`.
     let resp = app
-        .oneshot(Request::builder().method("POST").uri("/v1/admin/advance-slot").body(Body::empty()).unwrap())
+        .oneshot(json_request("POST", "/v1/admin/advance-slot", r#"{"current_slot":1}"#))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -583,12 +637,17 @@ async fn executor_callback_corrects_carbon_cost_with_actual_execution_time() {
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast.clone());
     let app = build_router(state.clone());
 
@@ -633,12 +692,12 @@ async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
-    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, None);
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(shared_state.clone(), cfg.clone(), metrics_logger, forecast.clone());
     scheduler.start();
 
     let mut svc_cfg = test_service_cfg();
     svc_cfg.submit_wait_timeout_secs = 5.0;
-    let forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg));
     let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast.clone());
     let app = build_router(state.clone());
 
@@ -659,7 +718,7 @@ async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and
     };
 
     // Actual CI for arrival_slot turns out to be 1.5x forecast
-    let actual_ci = forecast[arrival_slot as usize] * 1.5;
+    let actual_ci = forecast.read().unwrap()[arrival_slot as usize] * 1.5;
     state.actual_carbon_intensity.lock().unwrap().insert(arrival_slot, actual_ci);
 
     // Baseline execution time turns out to be 0.75x nominal baseline duration

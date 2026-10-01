@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use carbonshift_rs::config::Config;
@@ -39,7 +39,11 @@ impl Online2System {
             ),
             None => RequestGenerator::new(shared_state.clone(), cfg.clone()),
         };
-        let scheduler = BatchScheduler::new(shared_state, cfg.clone(), ml, scenario_forecast);
+        let carbon_forecast = scenario_forecast.unwrap_or_else(|| {
+            carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg)
+        });
+        let carbon_forecast = Arc::new(RwLock::new(carbon_forecast));
+        let scheduler = BatchScheduler::new(shared_state, cfg.clone(), ml, carbon_forecast);
 
         Self { generator, scheduler, cfg }
     }

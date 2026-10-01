@@ -2062,7 +2062,8 @@ mod tests {
 
     fn make_mutable_state(cfg: &Config) -> Arc<Mutex<SchedulerMutableState>> {
         let base = cfg.infeasibility_mock_influence.clamp(0.0, 1.0);
-        let carbon_forecast = generate_carbon_forecast(cfg);
+        let carbon_forecast =
+            Arc::new(RwLock::new(generate_carbon_forecast(cfg)));
         Arc::new(Mutex::new(SchedulerMutableState {
             active_workers: 0,
             last_infeasible: None,

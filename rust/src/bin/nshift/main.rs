@@ -90,7 +90,7 @@ mod swarm;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use carbonshift_rs::config::Config;
 use carbonshift_rs::generator::RequestGenerator;
 use carbonshift_rs::metrics_logger::MetricsLogger;
@@ -1438,7 +1438,7 @@ fn run_single_n(
         shared_state.clone(),
         cfg.clone(),
         ml,
-        Some(scenario.carbon_forecast.clone()),
+        Arc::new(RwLock::new(scenario.carbon_forecast.clone())),
     );
 
     sched.start();
