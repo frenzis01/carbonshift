@@ -31,6 +31,11 @@ rolling_window_dp.py
 **.bak
 implementation_plan.md
 
+*.md
+!README.md
+!**/README.md
+!carbonshift/services/provider/INTERFACE.md
+
 ignore
 
 TODO.md
