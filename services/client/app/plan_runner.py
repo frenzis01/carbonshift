@@ -45,7 +45,7 @@ def get_batch_from_slot(requests_spec: list[dict[str, Any]], slot_minutes: float
 
 
 def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
-                    slot_minutes: float) -> int:
+                    slot_minutes: float, slot: int) -> int:
     """Submit every request in `batch` to carbonshift, synchronously.
 
     Returns the number actually submitted. Synchronous on purpose: the
@@ -67,7 +67,7 @@ def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
         deadline_seconds = max((deadline_end - submitted_at).total_seconds(), 1.0)
         payload = {"task": r["task"], "input": r["input"]}
         try:
-            ack = submit(deadline_seconds, callback_url, payload, task_id=r["task"])
+            ack = submit(deadline_seconds, callback_url, payload, task_id=r["task"], arrival_slot_global=slot)
         except CarbonshiftError:
             logger.exception("batch %s: submit failed for task=%s", batch_id, r["task"])
             continue

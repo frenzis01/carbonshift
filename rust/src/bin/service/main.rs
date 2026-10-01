@@ -49,6 +49,7 @@ use carbonshift_rs::engine::shared_state::SharedState;
 use carbonshift_rs::service::dispatcher;
 use carbonshift_rs::service::server::build_router;
 use carbonshift_rs::service::state::{AppState, ServiceConfig};
+use tokio::sync::RwLock;
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -110,7 +111,7 @@ async fn main() {
     let shared_state = SharedState::new();
     let carbon_forecast = Arc::new(carbonshift_rs::engine::scheduler::generate_carbon_intensity_forecast(
         // TODO: remove hardcoded total_slots super high value
-        1024,
+        cfg.total_slots as usize,
         12,
         26,
         160.0,
@@ -123,6 +124,10 @@ async fn main() {
         false,
         false,
     ));
+
+    // build one Arc<RwLock<Vec<f64>>> and hand the same Arc to both BatchScheduler::new and AppState::new.
+    let shared_carbon_forecast = Arc::new(RwLock::new(vec![0.0; cfg.total_slots as usize]));
+
     let metrics_logger = Arc::new(MetricsLogger::new(
         cfg.enable_solver_logging,
         cfg.solver_runs_file.clone(),
@@ -136,7 +141,8 @@ async fn main() {
         shared_state.clone(),
         cfg.clone(),
         metrics_logger,
-        Some((*carbon_forecast).clone()),
+        // Some((*carbon_forecast).clone()),
+        shared_carbon_forecast,
     );
     scheduler.start();
 
@@ -153,7 +159,7 @@ async fn main() {
         horizon_ready_threshold: env_or("HORIZON_READY_THRESHOLD", "0.9").parse().expect("HORIZON_READY_THRESHOLD must be a number"),
         dispatcher_poll_interval_ms: env_or("DISPATCHER_POLL_INTERVAL_MS", "200").parse().expect("DISPATCHER_POLL_INTERVAL_MS must be an integer"),
     };
-    let state = AppState::new(shared_state, cfg, service_cfg, carbon_forecast);
+    let state = AppState::new(shared_state, cfg, service_cfg, shared_carbon_forecast);
     tokio::spawn(dispatcher::run(state.clone()));
 
     let app = build_router(state);

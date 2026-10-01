@@ -95,7 +95,8 @@ struct Inner {
     /// Active assignments (request_id → Assignment).
     assignments: HashMap<u64, Assignment>,
     /// Current time slot (updated by the scheduler loop).
-    current_slot: i32,
+    current_slot: i32,  // TODO: consider changing to i64 to match other slot representations...
+                        // Probably won't use 64 bit slots in practice...
     /// Cumulative statistics (never reset by archiving).
     total_received: u64,
     total_scheduled: u64,

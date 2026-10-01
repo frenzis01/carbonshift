@@ -12,8 +12,11 @@ class CarbonshiftError(RuntimeError):
     pass
 
 
+# arrival_slot_global is optional and only included in the request body if provided
+# it is needed when./run/send-plan is used. It is not included when /run/send-batch
+# TODO: is send-batch dead code...? Is /run/send-batch actually still used?
 def submit(deadline_seconds: float, callback_url: str, payload: dict[str, Any],
-           task_id: str | None = None) -> dict[str, Any]:
+           task_id: str | None = None, arrival_slot_global: int | None = None) -> dict[str, Any]:
     headers = {}
     if settings.carbonshift_api_key:
         headers["X-API-Key"] = settings.carbonshift_api_key
@@ -21,6 +24,8 @@ def submit(deadline_seconds: float, callback_url: str, payload: dict[str, Any],
     body: dict[str, Any] = {"deadline_seconds": deadline_seconds, "callback_url": callback_url, "payload": payload}
     if task_id is not None:
         body["task_id"] = task_id
+    if arrival_slot_global is not None:
+        body["arrival_slot_global"] = arrival_slot_global
 
     try:
         resp = requests.post(

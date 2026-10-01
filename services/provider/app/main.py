@@ -142,6 +142,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CarbonShift Carbon Intensity Provider", lifespan=lifespan)
 
+def announce(notify: bool) -> notifications.RolloverReport:
+    """Tell every peer which slot we are in, without crossing a boundary.
+
+    This is the "hello": it lets each peer align its own clock and seed its
+    forecast from the same instant, before any slot has been crossed. Without
+    it, the first slot the peers ever hear about is the one *after* the one
+    the provider started in, and that starting slot is never described.
+    """
+    current = clock.current_slot()
+    reading = source.observe(current)
+    if reading is not None:
+        observed_readings[current] = reading
+    payload = notifications.build_rollover_payload(
+        clock, source, horizon_slots=settings.forecast_horizon_slots, reading=reading,
+    )
+    payload["kind"] = "announce"
+    deliveries = notifications.notify_peers(
+        peers, payload,
+        timeout_seconds=settings.notify_timeout_seconds,
+        max_attempts=settings.notify_max_attempts,
+        backoff_seconds=settings.notify_retry_backoff_seconds,
+    ) if notify and peers else []
+    return notifications.RolloverReport(tick=None, deliveries=deliveries)
 
 def rollover(*, notify: bool) -> notifications.RolloverReport:
     """Advance the clock one slot, observe the new slot, then notify peers.
@@ -289,6 +312,7 @@ async def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
             detail={"desynced": True, "reason": "a previous rollover failed; restart the stack", **_desynced},
         )
 
+
     request = body or AdvanceRequest()
     current = clock.current_slot()
     if request.expect_slot is not None and request.expect_slot != current:
@@ -297,7 +321,10 @@ async def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
             detail=f"slot mismatch: expected {request.expect_slot}, provider is at {current}",
         )
 
-    report = rollover(notify=request.notify_peers)
+    # If this is the first local step, announce the current slot to all peers before rolling over.
+    if clock.local_step() == 0:
+        announce(notify=request.notify_peers)       # slot G
+    report = rollover(notify=request.notify_peers)  # slot G+1
     tick = report.tick
 
     # Fail hard on fan-out failures. The clock has ALREADY moved at this point

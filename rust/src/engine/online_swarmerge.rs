@@ -40,6 +40,7 @@
 //! update is ever discarded, and full parallelism is preserved.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -353,7 +354,7 @@ impl OnlineAcoState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         total_slots: usize,
-        carbon_forecast: &[f64],
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
         cfg: &Config,
         n_ants: usize,
         n_iterations: usize,
@@ -369,7 +370,8 @@ impl OnlineAcoState {
             .expect("at least one flavour");
         let eta: Vec<f64> = (0..total_slots)
             .map(|s| {
-                let ci = carbon_forecast.get(s).copied().unwrap_or(1.0);
+                // TODO: is it ok to unwrap here? Technically carbon_forecast gets updated as we go on...
+                let ci = carbon_forecast.read().unwrap().get(s).copied().unwrap_or(1.0);
                 let base = ci * cheapest.duration as f64 * cfg.carbon_cost_duration_scale;
                 if base > 0.0 { 1.0 / base } else { 1e9 }
             })
@@ -552,7 +554,9 @@ pub enum SwarmDelta {
 impl OnlineSwarmState {
     /// Build the appropriate state from `cfg.solver_strategy`.
     /// `carbon_forecast` is required for computing ACO's static heuristic.
-    pub fn from_config(cfg: &Config, carbon_forecast: &[f64]) -> Self {
+    pub fn from_config(cfg: &Config, carbon_forecast: &Arc<RwLock<Vec<f64>>>) -> Self {
+        // Clone internally carbon_forecast
+        let carbon_forecast = Arc::clone(carbon_forecast);
         match cfg.solver_strategy.as_str() {
             "bandit" => Self::Bandit(OnlineBanditState::new(
                 cfg.total_slots as usize,

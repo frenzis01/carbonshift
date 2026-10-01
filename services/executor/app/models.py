@@ -26,6 +26,57 @@ class JobSubmitResponse(BaseModel):
     queue_position: int
 
 
+'''
+pub struct AdvanceSlotBody {
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub current_slot: i64,
+    #[serde(default)]
+    pub slot_start_utc: Option<String>,
+    // observed is a dict with "slot", "observed_at_slot", and "actual" keys
+    // the latter being the actual observed carbon intensity.
+    #[serde(default)]
+    pub observed: Option<ObservedPoint>,
+    // forecast is a list of dictionaries of slot + forecast value
+    #[serde(default)]
+    // pub forecast: Option<std::collections::HashMap<usize, f64>>,
+    pub forecast: Option<Vec<ForecastPoint>>,
+}
+
+// TODO: is Clone ok? Does it actually work?
+#[derive(Debug, Deserialize, Clone)]
+pub struct ForecastPoint {
+    pub slot: i64,
+    pub forecast: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ObservedPoint {
+    pub slot: i64,
+    pub observed_at_slot: i64,
+    pub actual: f64,
+}'''
+
+class ForecastPoint(BaseModel):
+    slot: int
+    forecast: float
+    
+class ObservedPoint(BaseModel):
+    slot: int
+    observed_at_slot: int
+    actual: float
+    
+class AdvanceSlotPayload(BaseModel):
+    source: str
+    kind: str
+    current_slot: int
+    slot_start_utc: Optional[str] = None
+    observed: Optional[ObservedPoint] = None
+    forecast: Optional[list[ForecastPoint]] = None
+
 class CarbonshiftDispatchPayload(BaseModel):
     """Body of `POST /dispatch` — matches carbonshift's `ExecutorDispatchPayload`
     (see carbonshift/rust/src/service/models.rs) verbatim, so `EXECUTOR_URL`

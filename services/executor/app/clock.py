@@ -28,6 +28,11 @@ class VirtualClock:
         assert self._virtual_now is not None
         self._virtual_now = _floor_to_slot(self._virtual_now, self.slot_minutes) + timedelta(minutes=self.slot_minutes)
         return self._virtual_now
+    
+    def force_set(self, new_time: datetime) -> None:
+        if not self.manual:
+            raise RuntimeError("force_set() requires EXECUTOR_MANUAL_CLOCK=1")
+        self._virtual_now = _floor_to_slot(new_time, self.slot_minutes)
 
 
 def _floor_to_slot(dt: datetime, slot_minutes: float) -> datetime:

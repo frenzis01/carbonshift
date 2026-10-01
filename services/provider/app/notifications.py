@@ -155,6 +155,7 @@ def build_rollover_payload(
 
     return {
         "source": source.name,
+        "kind": "rollover",
         "current_slot": current,
         "slot_start_utc": clock.slot_start(current).isoformat(),
         "observed": reading.to_dict() if reading is not None else None,

@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 
 from .config import ALL_TASKS, MODEL_REGISTRY, settings
 from .metrics import metrics_store
-from .models import CarbonshiftDispatchPayload, JobSubmitRequest, JobSubmitResponse
+from .models import AdvanceSlotPayload, CarbonshiftDispatchPayload, JobSubmitRequest, JobSubmitResponse
 from .queue_worker import job_queue
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -110,7 +110,7 @@ async def get_queue() -> dict[str, list[str]]:
 
 
 @app.post("/admin/advance-slot")
-async def advance_slot() -> dict:
+async def advance_slot(body: AdvanceSlotPayload) -> dict:
     if not settings.manual_clock:
         raise HTTPException(status_code=409, detail="EXECUTOR_MANUAL_CLOCK is not enabled")
     return job_queue.advance_slot()

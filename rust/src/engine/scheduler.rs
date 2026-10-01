@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
+use std::sync::RwLock;
 
 use crate::config::Config;
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
@@ -70,7 +71,7 @@ enum SwarmBackend {
 }
 
 impl SwarmBackend {
-    fn from_config(cfg: &Config, carbon_forecast: &[f64]) -> Self {
+    fn from_config(cfg: &Config, carbon_forecast: &Arc<RwLock<Vec<f64>>>) -> Self {
         if cfg.online_swarm_mode == "merge" {
             Self::Merge(crate::online_swarmerge::OnlineSwarmState::from_config(cfg, carbon_forecast))
         } else {
@@ -164,7 +165,7 @@ pub struct BatchScheduler {
     shared_state: SharedState,
     cfg: Arc<Config>,
     /// Pre-computed carbon intensity forecast for all slots (sinusoidal pattern).
-    carbon_forecast: Arc<Vec<f64>>,
+    carbon_forecast: Arc<RwLock<Vec<f64>>>,
     /// flavour_name → duration_seconds lookup (immutable after construction).
     flavour_duration_by_name: Arc<HashMap<String, i32>>,
     running: Arc<AtomicBool>,
@@ -178,11 +179,9 @@ impl BatchScheduler {
         shared_state: SharedState,
         cfg: Arc<Config>,
         metrics_logger: Arc<MetricsLogger>,
-        carbon_forecast: Option<Vec<f64>>,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
-        let carbon_forecast = Arc::new(
-            carbon_forecast.unwrap_or_else(|| generate_carbon_forecast(&cfg)),
-        );
+        let carbon_forecast = carbon_forecast;
         let swarm_state = SwarmBackend::from_config(&cfg, &carbon_forecast);
         let flavour_duration_by_name: HashMap<String, i32> =
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
@@ -296,7 +295,7 @@ fn main_loop(
     running: Arc<AtomicBool>,
     shared_state: SharedState,
     cfg: Arc<Config>,
-    carbon_forecast: Arc<Vec<f64>>,
+    carbon_forecast: Arc<RwLock<Vec<f64>>>,
     fdb: Arc<HashMap<String, i32>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
     ml: Arc<MetricsLogger>,
@@ -369,6 +368,9 @@ fn main_loop(
 
         let mut did_something = false;
 
+        // unwrap carbon_forecast here so that we get a consistent snapshot for this batch.
+        let cf = Arc::new(carbon_forecast.read().unwrap().clone());
+
         if pending_count >= cfg.batch_size && active_workers < cfg.max_batch_solver_parallelism {
             if cfg.verbose {
                 println!(
@@ -381,7 +383,7 @@ fn main_loop(
                 current_slot,
                 &shared_state,
                 &cfg,
-                &carbon_forecast,
+                &cf,
                 &fdb,
                 &mutable,
                 &ml,
@@ -405,7 +407,7 @@ fn main_loop(
                 current_slot,
                 &shared_state,
                 &cfg,
-                &carbon_forecast,
+                &cf,
                 &fdb,
                 &mutable,
                 &ml,
@@ -433,7 +435,7 @@ fn main_loop(
                         current_slot,
                         &shared_state,
                         &cfg,
-                        &carbon_forecast,
+                        &cf,
                         &fdb,
                         &mutable,
                         &ml,
@@ -1876,7 +1878,6 @@ pub fn generate_carbon_intensity_forecast(
     phase_shifted: bool,
 ) -> Vec<f64> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let normal = Normal::new(0.0, noise_std).expect("Invalid normal distribution");
     
     let cycle = std::cmp::max(1, carbon_intensity_cycle_slots as i64) as usize;
     let mut forecast: Vec<f64> = Vec::new();

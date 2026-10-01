@@ -18,10 +18,37 @@ use crate::service::state::{AppState, TrackedRequest};
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
 #[derive(Debug, Deserialize)]
-pub struct AdvanceSlotQuery {
+pub struct AdvanceSlotBody {
     #[serde(default)]
-    pub actual_carbon_intensity: Option<f64>,
+    pub source: String,
+    #[serde(default)]
+    pub kind: String,
+    pub current_slot: Option<i64>,
+    #[serde(default)]
+    pub slot_start_utc: Option<String>,
+    // observed is a dict with "slot", "observed_at_slot", and "actual" keys
+    // the latter being the actual observed carbon intensity.
+    #[serde(default)]
+    pub observed: Option<ObservedPoint>,
+    // forecast is a list of dictionaries of slot + forecast value
+    #[serde(default)]
+    // pub forecast: Option<std::collections::HashMap<usize, f64>>,
+    pub forecast: Option<Vec<ForecastPoint>>,
 }
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ForecastPoint {
+    pub slot: i64,
+    pub forecast: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ObservedPoint {
+    pub slot: i64,
+    pub observed_at_slot: i64,
+    pub actual: f64,
+}
+
 
 #[derive(Debug, Deserialize)]
 pub struct CarbonIntensityQuery {
@@ -101,7 +128,12 @@ fn compute_baseline_carbon_cost(state: &AppState, arrival_slot: i32, flavours: &
         *c += 1;
         *c
     };
-    let carbon = state.carbon_forecast.get(arrival_slot as usize).copied().unwrap_or(0.0);
+    let carbon = state.carbon_forecast
+        .read()
+        .unwrap()
+        .get(arrival_slot as usize)
+        .copied()
+        .unwrap_or(0.0);
     let mult = get_capacity_multiplier(&state.cfg.capacity_tiers, position);
     let accurate = flavours
         .iter()
@@ -185,17 +217,85 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HorizonRe
 /// completes (see `executor_callback`); never fed back into live scheduling.
 pub async fn advance_slot(
     State(state): State<AppState>,
-    Query(query): Query<AdvanceSlotQuery>,
+    // We must have a real body struct carrying slot, observed, forecast and current_slot, all #[serde(default)]
+    Json(body): Json<AdvanceSlotBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !state.cfg.manual_clock {
         return Err(api_error(StatusCode::CONFLICT, "MANUAL_CLOCK is not enabled on this instance"));
     }
-    let new_slot = crate::engine::scheduler::advance_to_next_slot(&state.shared_state, &state.cfg);
-    if let Some(ci) = query.actual_carbon_intensity {
-        state.actual_carbon_intensity.lock().unwrap().insert(new_slot, ci);
+    // TODO: too much slot naming here... evaluate if it's possible to simplify.
+
+
+    // Fail loudly if there we cannot set offset
+    if body.current_slot.is_none() {
+        tracing::error!("Current slot is not provided in the request body");
+        return Err(api_error(StatusCode::CONFLICT, "Current slot is not provided in the request body"));
     }
 
+    let body_current_slot = body.current_slot.unwrap();
+    
+    // Update the slot epoch offset upon the first slot advancement.
+    let slot_epoch_offset = update_slot_epoch_offset(&state, body_current_slot).unwrap_or(0);
+    
+    // let Some(offset) = slot_epoch_offset else { /* 409 */ };
+    let target_engine_slot = (body_current_slot - slot_epoch_offset as i64) as i32;   // i64
+
+    // init here
+
+    // The announce is the first message, before any advance
+    if body.kind == "announce" {
+        // Sync: the engine is already at the target (0). Do NOT advance. We only update the forecast
+        // debug_assert_eq!(state.shared_state.get_current_slot() as i64, target_engine_slot);
+        if state.shared_state.get_current_slot() != target_engine_slot {
+            tracing::warn!(current_slot = state.shared_state.get_current_slot(), target_engine_slot, "engine slot does not match the target slot on announce");
+            // fail loudly
+            return Err(api_error(StatusCode::CONFLICT, "engine slot does not match the target slot on announce"));
+        }
+    } else {
+        println!("[Service] Advancing to new slot: {current_slot} -> {new_slot}", current_slot = state.shared_state.get_current_slot(), new_slot = body_current_slot);
+        let new_slot = crate::engine::scheduler::advance_to_next_slot(&state.shared_state, &state.cfg);
+        if new_slot != target_engine_slot {
+            tracing::warn!(new_slot, target_engine_slot, "engine slot disagrees with the announced slot");
+        }
+    }
+
+    let curr_slot = state.shared_state.get_current_slot();
+        
+    if let Some(observed) = &body.observed {
+        // Set actual carbon intensity for the current slot, so that we can adjust
+        // in executor callbacks the carbon intensity and the carbon cost.
+        
+        // assert, just for safety that observed.slot is the current slot
+        if target_engine_slot != observed.slot as i32 {
+            tracing::warn!("Observed slot does not match the current slot");
+        }
+        state.actual_carbon_intensity.lock().unwrap().insert(target_engine_slot, observed.actual);
+        // Since we already know the actual carbon intensity for the current slot
+        // we use the actual value for such slot for the scheduler to decide
+        // However we cannot overwrite here the forecast for the current slot,
+        // since it would silently drop the correction we do later on between forecast/actual values,
+        // TODO: allow the scheduler to have access to the real value ONLY for the current slot.
+    }
+    
+    if let Some(forecast) = &body.forecast {
+        // Update the forecast for the next K(=24) slots in the state.carbon_forecast hashmap.
+        let mut carbon_forecast = state.carbon_forecast.write().unwrap();
+        for point in forecast {
+            let idx  = point.slot - slot_epoch_offset as i64;
+            // range check for subtraction
+            if idx < 0 { 
+                tracing::warn!(slot = point.slot, offset = slot_epoch_offset, "forecast point precedes the engine horizon; skipping");
+                continue; } // before our horizon
+                let idx = idx as usize;
+                if idx < carbon_forecast.len() {
+                carbon_forecast[idx] = point.forecast;
+            }
+            
+        }
+    }
+        
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        // Wait until all pending or scheduled requests have been dispatched or the deadline is reached.
     loop {
         let still_dispatching = state
             .tracked
@@ -209,10 +309,22 @@ pub async fn advance_slot(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // TODO: remove this debug print
-    println!("[Service] Advanced to new slot: {current_slot} -> {new_slot}", current_slot = state.shared_state.get_current_slot(), new_slot = new_slot);
-    Ok(Json(serde_json::json!({ "current_slot": new_slot })))
+    Ok(Json(serde_json::json!({ "current_slot": curr_slot })))
 }
+
+
+/// Function invoked upon the first slot advancement to set the slot epoch offset.
+/// Recall that the slot epoch offset is the difference between the provider's global slot numbering and carbonshift's local slot numbering.
+fn update_slot_epoch_offset(state: &AppState, slot_0: i64) -> Option<i32> {
+    let mut offset = state.slot_epoch_offset.lock().unwrap();
+    if offset.is_none() {
+        // TODO: change every i32 into i64 to avoid these issues... or every i64 in i32, but Python sends everything as i64
+        *offset = Some((slot_0 - state.shared_state.get_current_slot() as i64) as i32);
+        tracing::info!("Slot epoch offset set to {}", offset.unwrap());
+    }
+    return offset.clone();
+}
+
 
 /// `GET /v1/carbon-forecast` — the forecast the DP solver is scheduling
 /// against (index = slot). Read-only: lets the client derive a plausible
@@ -282,7 +394,12 @@ pub async fn carbon_intensity(
 
     let rows = (0..=upper)
         .map(|slot| {
-            let forecast_ci = forecast.get(slot as usize).copied().unwrap_or(0.0);
+            let forecast_ci = forecast
+                .read()
+                .unwrap()
+                .get(slot as usize)
+                .copied()
+                .unwrap_or(0.0);
             let actual_ci = actual.get(&slot).copied();
             serde_json::json!({
                 "slot": slot,
@@ -317,6 +434,19 @@ pub async fn submit_request(
 
     let request_id = state.next_request_id();
     let current_slot = state.shared_state.get_current_slot();
+    let arrival_slot = match (body.arrival_slot_global, *state.slot_epoch_offset.lock().unwrap()) {
+        (Some(global), Some(offset)) => {
+            let engine = global - offset;
+            if engine < 0 || engine >= state.cfg.total_slots {
+                tracing::warn!(global, offset, engine, "arrival_slot_global out of range; falling back to current_slot");
+                current_slot
+            } else {
+                engine as i32
+            }
+        }
+        _ => current_slot,   // offset not yet known, or client didn't send it
+    };
+
     let eff_slot_dur = state.cfg.effective_slot_duration_secs();
     let slots_ahead = ((body.deadline_seconds / eff_slot_dur).ceil() as i32).max(1);
     let deadline_slot = (current_slot + slots_ahead).min(state.cfg.total_slots - 1);
@@ -324,7 +454,8 @@ pub async fn submit_request(
     let task_flavours = state.flavours_for_task(&task_id);
     let task_threshold = state.threshold_for_task(&task_id);
     let task_capacity_tiers = state.capacity_tiers_for_task(&task_id);
-    let (baseline_carbon_cost, baseline_duration) = compute_baseline_carbon_cost(&state, current_slot, &task_flavours);
+    let (baseline_carbon_cost, baseline_duration) = compute_baseline_carbon_cost(&state, arrival_slot, &task_flavours);
+
 
     state.tracked.lock().unwrap().insert(
         request_id,
@@ -333,13 +464,13 @@ pub async fn submit_request(
             body.payload.clone(),
             baseline_carbon_cost,
             baseline_duration,
-            current_slot,
+            arrival_slot,
         ),
     );
 
     state.shared_state.add_request(EngineRequest::new_for_task(
         request_id,
-        current_slot,
+        arrival_slot,
         deadline_slot,
         task_id,
         task_flavours,

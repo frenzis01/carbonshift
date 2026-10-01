@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 import requests
 
+from .models import AdvanceSlotPayload
+
 from .clock import VirtualClock
 from .config import settings
 from .inference import run_task
@@ -236,14 +238,30 @@ class JobQueue:
         except requests.RequestException as exc:
             logger.warning("callback failed request_id=%s error=%s", job.request_id, exc)
 
-    def advance_slot(self) -> dict[str, Any]:
+    def advance_slot(self, body: AdvanceSlotPayload) -> dict[str, Any]:
         """Test-only: bump the virtual clock to the next slot boundary, then
         block until every job that's now due has actually finished running
         (not just been dequeued — a job can be mid-execution, e.g. still
         downloading its model) — mirrors carbonshift's
         `POST /v1/admin/advance-slot`.
         """
-        new_now = self._clock.advance_to_next_slot()
+        
+        new_now = self._clock.now()
+        # check if this is the first announcement made to synchronize clocks
+        if body.kind == "announce":
+            logger.info("received announcement for slot synchronization from source=%s", body.source)
+            # sync clock to the announced slot
+            # set _virtual_now from body.slot_start_utc
+            # body.slot_start_utc is an Optional[str] representing the UTC time of the slot start
+            if body.slot_start_utc is None:
+                logger.error("slot_start_utc is None for announce kind")
+                raise ValueError("slot_start_utc must be provided for announce kind")
+            # TODO: This will still apply floor_to_slot internally using the slot_minutes configured 
+            # for the virtual clock. Is it ok? When is slot_minutes set?
+            self._clock.force_set(datetime.fromisoformat(body.slot_start_utc))
+            new_now = self._clock.now()
+        elif body.kind == "rollover":
+            new_now = self._clock.advance_to_next_slot()
         self._wakeup.set()
 
         deadline = time.monotonic() + 120.0

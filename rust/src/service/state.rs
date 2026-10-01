@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::engine::config::Config;
@@ -124,7 +124,7 @@ pub struct AppState {
     /// Precomputed carbon-intensity forecast (index = slot), used only to
     /// compute `TrackedRequest::baseline_carbon_cost` — the real scheduling
     /// decision is entirely the engine's own concern.
-    pub carbon_forecast: Arc<Vec<f64>>,
+    pub carbon_forecast: Arc<RwLock<Vec<f64>>>,
     /// How many requests have arrived at each slot so far, used to give the
     /// hypothetical baseline the same per-slot capacity-tier repricing an
     /// immediate/no-batching execution would have faced.
@@ -142,6 +142,18 @@ pub struct AppState {
     /// `handlers::executor_callback`) — never fed back into the live DP
     /// solver, which keeps planning against the original forecast.
     pub actual_carbon_intensity: Arc<Mutex<HashMap<i32, f64>>>,
+
+    /// This is the offset between the provider's global slot numbering (based on the fixed epoch)
+    /// and carbonshift's local slot numbering.
+    /// We cannot use it inside cfg because cfg is shared and immutable, while this 
+    /// offset is discovered at runtime
+    /// carbonshift's `current_slot` starts at **0** and counts up from process start
+    /// (`virtual_elapsed_ms` is an uptime counter). The provider publishes **global**
+    /// slots aligned to a fixed epoch — measured live, `118015` right now. The two are
+    /// off by the process-uptime offset, so a pushed forecast indexed by global slot
+    /// would be read by the scheduler at the wrong index — and because it would land
+    /// outside its array it would be **silently ignored**, not obviously broken.
+    pub slot_epoch_offset: Arc<Mutex<Option<i32>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -150,11 +162,12 @@ impl AppState {
         shared_state: SharedState,
         cfg: Arc<Config>,
         service_cfg: ServiceConfig,
-        carbon_forecast: Arc<Vec<f64>>,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
         let mut task_flavours = HashMap::new();
         task_flavours.insert("default".to_string(), TaskConfig { flavours: cfg.flavours.clone(), max_error_threshold: None, capacity_tiers: None });
         Self {
+            slot_epoch_offset: Arc::new(Mutex::new(None)),
             shared_state,
             cfg,
             http: reqwest::Client::new(),
@@ -177,7 +190,7 @@ impl AppState {
     /// to correct with).
     pub fn carbon_intensity_ratio(&self, slot: i32) -> Option<f64> {
         let actual = *self.actual_carbon_intensity.lock().unwrap().get(&slot)?;
-        let forecast = self.carbon_forecast.get(slot as usize).copied().unwrap_or(0.0);
+        let forecast = *self.carbon_forecast.read().unwrap().get(slot as usize)?;
         if forecast <= 0.0 { None } else { Some(actual / forecast) }
     }
 

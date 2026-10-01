@@ -23,6 +23,10 @@ pub struct SubmitRequestPayload {
     /// unregistered ⇒ falls back to the `"default"` task (`Config::flavours`).
     #[serde(default)]
     pub task_id: Option<String>,
+
+    // TODO: i32 or i64?
+    #[serde(default)]
+    pub arrival_slot_global: Option<i32>,
 }
 
 /// Status returned to callers, mirroring `TrackedRequest`'s lifecycle.

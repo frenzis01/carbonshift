@@ -109,7 +109,7 @@ async def tick(body: TickRequest) -> TickResponse:
         batch = get_batch_from_slot(
             get_requests_from_plan(plan_id), plan["slot_minutes"], plan_index, reference,
         )
-        submitted += send_slot_batch(tracker, batch, plan["slot_minutes"])
+        submitted += send_slot_batch(tracker, batch, plan["slot_minutes"], slot)
         mark_slot_processed(plan_id, slot)
         handled.append((plan_id, plan_index))
 
