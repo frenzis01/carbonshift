@@ -183,3 +183,70 @@ pub struct HorizonResponse {
     pub near_exhaustion: bool,
 }
 
+// ─── Fine-grained monitoring DTOs ───────────────────────────────────────────
+
+/// Query parameters for `GET /v1/assignments`.
+#[derive(Debug, Deserialize, Default)]
+pub struct AssignmentsQuery {
+    #[serde(default)]
+    pub from_slot: Option<i32>,
+    #[serde(default)]
+    pub to_slot: Option<i32>,
+    #[serde(default)]
+    pub flavour: Option<String>,
+}
+
+/// DTO for a single assignment returned in `GET /v1/assignments`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AssignmentItem {
+    pub request_id: u64,
+    pub scheduled_slot: i32,
+    pub flavour_name: String,
+    pub carbon_cost: f64,
+    pub error: f64,
+    pub flavour_duration: i32,
+    pub arrival_slot: Option<i32>,
+    pub deadline_slot: Option<i32>,
+    pub assignment_time: f64,
+}
+
+/// Detailed slot status for `GET /v1/slots/{slot}`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SlotDetailResponse {
+    pub slot: i32,
+    pub total_requests: usize,
+    pub flavour_counts: std::collections::HashMap<String, usize>,
+    pub total_carbon_cost: f64,
+    pub capacity_multiplier: f64,
+    pub forecast_carbon_intensity: Option<f64>,
+    pub actual_carbon_intensity: Option<f64>,
+}
+
+/// Fine-grained cost breakdown for `GET /v1/metrics/costs`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CostMetricsResponse {
+    pub current_actual_carbon_cost: f64,
+    pub current_actual_baseline_carbon_cost: f64,
+    pub actual_carbon_saving_pct: Option<f64>,
+    pub forecasted_pending_carbon_cost: f64,
+    pub total_forecasted_carbon_cost: f64,
+    pub total_baseline_carbon_cost: f64,
+}
+
+/// Slot error item for `GET /v1/metrics/error-history`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SlotErrorItem {
+    pub slot: i32,
+    pub request_count: usize,
+    pub average_error: f64,
+}
+
+/// Error history response for `GET /v1/metrics/error-history`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ErrorHistoryResponse {
+    pub current_slot: i32,
+    pub global_error_avg: Option<f64>,
+    pub max_error_threshold: f64,
+    pub slots: Vec<SlotErrorItem>,
+}
+

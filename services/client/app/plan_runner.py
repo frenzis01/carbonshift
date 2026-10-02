@@ -75,7 +75,7 @@ def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
         # `request_id` comes from carbonshift's ack, so the TrackedRequest can
         # only be built *after* a successful submit.
         tracker.add(TrackedRequest(
-            str(ack.get("request_id")), r["task"], deadline_seconds, submitted_at, ack,
+            str(ack.get("request_id")), r["task"], deadline_seconds, submitted_at, ack, arrival_slot=slot
         ))
         submitted += 1
         logger.info("batch %s: submitted task=%s deadline_seconds=%.2f",

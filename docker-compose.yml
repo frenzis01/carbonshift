@@ -71,6 +71,20 @@ services:
       # - client
       # - executor
 
+  visualizer:
+    build: ./services/visualizer
+    ports:
+      - "8500:8500"
+    environment:
+      VISUALIZER_HOST: 0.0.0.0
+      VISUALIZER_PORT: 8500
+      CARBONSHIFT_URL: http://carbonshift:8080
+      CLIENT_URL: http://client:8100
+      PROVIDER_URL: http://provider:9100
+    depends_on:
+      - carbonshift
+      - client
+
   # One-off runner for the fake-time emulation test (see client/README.md
   # §"Emulazione a tempo fittizio"). Not started by `docker compose up`
   # (profile-gated); run explicitly once the stack above is up:

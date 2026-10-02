@@ -41,12 +41,14 @@ class TrackedRequest:
     (status/scheduled_slot/eta_seconds/flavour/carbon_cost)."""
 
     def __init__(self, request_id: str, task: str, deadline_seconds: float,
-                 submitted_at: datetime, ack: dict[str, Any]):
+                 submitted_at: datetime, ack: dict[str, Any],
+                 arrival_slot: Optional[int] = None):
         self.request_id = request_id
         self.task = task
         self.deadline_seconds = deadline_seconds
         self.submitted_at = submitted_at
         self.ack = ack
+        self.arrival_slot = arrival_slot
         self.ack_received_at = datetime.now(timezone.utc)
         self.callback_received_at: Optional[datetime] = None
         self.status = "submitted"  # submitted -> completed | failed | timed_out
@@ -92,6 +94,7 @@ class TrackedRequest:
             "request_id": self.request_id,
             "task": self.task,
             "status": self.status,
+            "arrival_slot": self.arrival_slot,
             "deadline_seconds": self.deadline_seconds,
             "submitted_at": self.submitted_at.isoformat(),
             "ack_latency_seconds": (self.ack_received_at - self.submitted_at).total_seconds(),

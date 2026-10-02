@@ -29,6 +29,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/horizon", get(handlers::horizon))
         .route("/v1/carbon-forecast", get(handlers::carbon_forecast))
         .route("/v1/carbon_intensity", get(handlers::carbon_intensity))
+        .route("/v1/assignments", get(handlers::get_assignments))
+        .route("/v1/slots/:slot", get(handlers::get_slot_detail))
+        .route("/v1/metrics/costs", get(handlers::get_cost_metrics))
+        .route("/v1/metrics/error-history", get(handlers::get_error_history))
         .route("/v1/admin/advance-slot", post(handlers::advance_slot));
 
     public_routes.merge(caller_routes).merge(executor_routes).with_state(state)
