@@ -105,6 +105,7 @@ pub struct ServiceConfig {
 #[derive(Clone)]
 pub struct TaskConfig {
     pub flavours: Vec<Flavour>,
+    // TODO: why is max_error_threshold inside TaskConfig if it is applied globally to all tasks?
     /// Overrides `Config::max_error_threshold` (%) for this task's own
     /// requests' local/window feasibility check. `None` = use the global
     /// default. Never affects the (task-agnostic by design) global error
@@ -135,6 +136,7 @@ pub struct AppState {
     /// requests that don't reference a registered task (or CLI/simulation
     /// tools) keep using the predefined default flavours, unchanged.
     pub task_flavours: Arc<Mutex<HashMap<String, TaskConfig>>>,
+    // TODO: actually now we have the provider...
     /// Real (not forecast) carbon intensity per slot, reported by the client
     /// piggybacked on `POST /v1/admin/advance-slot` (see
     /// `handlers::advance_slot`). Used only to correct already-committed
