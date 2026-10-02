@@ -1307,7 +1307,11 @@ fn solve_dp(
         .map(|dp_a| {
             let (arrival, deadline) =
                 assignment_metadata.get(&dp_a.request_id).copied().unwrap_or((0, 0));
-            let dur = fdb.get(&dp_a.flavour_name).copied().unwrap_or(0);
+            let dur = request_flavours
+                .get(&dp_a.request_id)
+                .and_then(|flavours| flavours.iter().find(|f| f.name == dp_a.flavour_name))
+                .map(|f| f.duration)
+                .unwrap_or_else(|| fdb.get(&dp_a.flavour_name).copied().unwrap_or(0));
             Assignment::new(
                 dp_a.request_id,
                 dp_a.slot,
@@ -1509,7 +1513,12 @@ fn solve_greedy_singleton(
         .map(|ra| {
             let (arrival, deadline) =
                 prep.assignment_metadata.get(&ra.request_id).copied().unwrap_or((0, 0));
-            let dur = fdb.get(&ra.flavour_name).copied().unwrap_or(0);
+            let dur = prep
+                .request_flavours
+                .get(&ra.request_id)
+                .and_then(|flavours| flavours.iter().find(|f| f.name == ra.flavour_name))
+                .map(|f| f.duration)
+                .unwrap_or_else(|| fdb.get(&ra.flavour_name).copied().unwrap_or(0));
             Assignment::new(
                 ra.request_id,
                 ra.slot,
