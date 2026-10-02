@@ -10,8 +10,10 @@ use serde::Deserialize;
 
 use crate::engine::types::{get_capacity_multiplier, Flavour, Request as EngineRequest};
 use crate::service::models::{
-    CallerCallbackPayload, ExecutorCallbackPayload, HorizonResponse, RegisterTaskPayload,
-    RequestStatus, RequestStatusResponse, StatsResponse, SubmitRequestPayload, TaskConfigResponse,
+    AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse,
+    ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, RegisterTaskPayload,
+    RequestStatus, RequestStatusResponse, SlotDetailResponse, StatsResponse,
+    SubmitRequestPayload, TaskConfigResponse,
 };
 use crate::service::state::{AppState, TrackedRequest};
 
@@ -412,6 +414,86 @@ pub async fn carbon_intensity(
         .collect();
 
     Json(rows)
+}
+
+// ─── Fine-grained monitoring endpoints (exercise stubs) ─────────────────────
+
+/// `GET /v1/assignments` — list currently committed assignments across the engine.
+///
+/// Supports query filters:
+/// - `from_slot`: minimum scheduled slot (inclusive)
+/// - `to_slot`: maximum scheduled slot (inclusive)
+/// - `flavour`: filter by flavour name (e.g. "Fast", "Balanced", "Accurate")
+///
+/// Returns a list of `AssignmentItem` records snapshot from `state.shared_state.get_current_assignments()`.
+pub async fn get_assignments(
+    State(_state): State<AppState>,
+    Query(_query): Query<AssignmentsQuery>,
+) -> Result<Json<Vec<AssignmentItem>>, ApiError> {
+    // TODO (Student implementation):
+    // 1. Fetch current assignments via `_state.shared_state.get_current_assignments()`.
+    // 2. Filter by `_query.from_slot`, `_query.to_slot`, and `_query.flavour` if provided.
+    // 3. Map to `AssignmentItem` DTOs and sort by `(scheduled_slot, request_id)`.
+    // 4. Return `Ok(Json(assignments))`.
+    todo!("Student exercise: implement get_assignments to expose committed assignments from SharedState")
+}
+
+/// `GET /v1/slots/:slot` — fine-grained breakdown and status for a specific time slot.
+///
+/// Returns:
+/// - Number of total requests scheduled in this slot
+/// - Breakdown of request counts by flavour (e.g. `{"Fast": 12, "Accurate": 3}`)
+/// - Total carbon cost accumulated in this slot
+/// - Capacity multiplier currently in effect based on slot occupancy
+/// - Both forecasted and observed carbon intensity for this slot
+pub async fn get_slot_detail(
+    State(_state): State<AppState>,
+    Path(_slot): Path<i32>,
+) -> Result<Json<SlotDetailResponse>, ApiError> {
+    // TODO (Student implementation):
+    // 1. Validate `_slot >= 0` and within horizon.
+    // 2. Get assignments in `_slot` via `_state.shared_state.get_requests_in_slot(_slot)`.
+    // 3. Compute counts by flavour and total carbon cost.
+    // 4. Lookup capacity multiplier from `_state.cfg.capacity_tiers`.
+    // 5. Lookup forecast CI and observed CI from `_state.carbon_forecast` and `_state.actual_carbon_intensity`.
+    // 6. Return `Ok(Json(SlotDetailResponse { ... }))`.
+    todo!("Student exercise: implement get_slot_detail to expose per-slot breakdown")
+}
+
+/// `GET /v1/metrics/costs` — fine-grained carbon cost totals and savings.
+///
+/// Returns:
+/// - `current_actual_carbon_cost`: sum of corrected actual carbon costs for completed requests
+/// - `current_actual_baseline_carbon_cost`: sum of corrected actual baseline costs for completed requests
+/// - `actual_carbon_saving_pct`: percentage saved: `(baseline - actual) / baseline * 100`
+/// - `forecasted_pending_carbon_cost`: predicted carbon cost of requests still pending or scheduled for future slots
+/// - `total_forecasted_carbon_cost`: total predicted cost of all scheduled requests
+/// - `total_baseline_carbon_cost`: total baseline cost of all requests
+pub async fn get_cost_metrics(
+    State(_state): State<AppState>,
+) -> Result<Json<CostMetricsResponse>, ApiError> {
+    // TODO (Student implementation):
+    // 1. Iterate over `_state.tracked.lock().unwrap()` and `_state.shared_state.get_current_assignments()`.
+    // 2. Accumulate actual vs baseline carbon costs for completed requests.
+    // 3. Accumulate forecasted costs for pending / not-yet-dispatched requests.
+    // 4. Return `Ok(Json(CostMetricsResponse { ... }))`.
+    todo!("Student exercise: implement get_cost_metrics to calculate real-time carbon cost metrics")
+}
+
+/// `GET /v1/metrics/error-history` — slot-by-slot average error over time.
+///
+/// Allows external visualizers to plot error trends across time slots against
+/// the configured error threshold.
+pub async fn get_error_history(
+    State(_state): State<AppState>,
+    Query(_query): Query<AssignmentsQuery>,
+) -> Result<Json<ErrorHistoryResponse>, ApiError> {
+    // TODO (Student implementation):
+    // 1. Determine slot range `[from_slot, to_slot]` (defaults to `0..=_state.shared_state.get_current_slot()`).
+    // 2. For each slot, calculate average error of completed/scheduled assignments.
+    // 3. Include `global_error_avg` and `max_error_threshold`.
+    // 4. Return `Ok(Json(ErrorHistoryResponse { ... }))`.
+    todo!("Student exercise: implement get_error_history to return error tracking per slot")
 }
 
 /// `POST /v1/requests` — submit a job, get back the assigned slot.
