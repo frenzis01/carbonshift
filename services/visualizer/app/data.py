@@ -28,6 +28,11 @@ def get_dashboard_data() -> Dict[str, Any]:
     stats_info: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/stats") or {}
     provider_slot: Dict[str, Any] = fetch_json(f"{settings.provider_url}/v1/slot") or {}
 
+    # Fetch newly available fine-grained Carbonshift endpoints
+    cost_metrics: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/costs") or {}
+    error_history: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/error-history") or {}
+    engine_assignments: Optional[List[Dict[str, Any]]] = fetch_json(f"{settings.carbonshift_url}/v1/assignments")
+
     current_slot = horizon_info.get("current_slot", stats_info.get("current_slot", 0))
     total_slots = horizon_info.get("total_slots", 8640)
     global_slot = provider_slot.get("current_slot")
@@ -35,11 +40,9 @@ def get_dashboard_data() -> Dict[str, Any]:
     # 2. Extract Task Configurations (Capacity tiers & error threshold)
     scheduler_snapshot = client_summary.get("scheduler", {})
     tasks_cfg = scheduler_snapshot.get("tasks", {})
-    max_error_threshold = 20.0
+    max_error_threshold = error_history.get("max_error_threshold", 20.0)
     capacity_tiers = []
     for t_name, t_info in tasks_cfg.items():
-        if t_info.get("max_error_threshold") is not None:
-            max_error_threshold = float(t_info["max_error_threshold"])
         if t_info.get("capacity_tiers"):
             capacity_tiers = t_info["capacity_tiers"]
             break
@@ -48,29 +51,34 @@ def get_dashboard_data() -> Dict[str, Any]:
     completed_requests = [r for r in client_requests if r.get("status") == "completed"]
     scheduled_requests = [r for r in client_requests if r.get("scheduled_slot") is not None]
     
-    # Cost calculations
-    actual_cost_sum = sum(
-        r["actual_carbon_cost"] if r.get("actual_carbon_cost") is not None else (r.get("carbon_cost") or 0.0)
-        for r in completed_requests
-    )
-    actual_baseline_cost_sum = sum(
-        r["actual_baseline_carbon_cost"] if r.get("actual_baseline_carbon_cost") is not None else (r.get("baseline_carbon_cost") or 0.0)
-        for r in completed_requests
-    )
-    actual_carbon_saving_pct = None
-    if actual_baseline_cost_sum > 0:
-        actual_carbon_saving_pct = round(
-            ((actual_baseline_cost_sum - actual_cost_sum) / actual_baseline_cost_sum) * 100.0, 2
+    # Cost calculations (prefer fine-grained engine metrics, fallback to client tracking)
+    if "current_actual_carbon_cost" in cost_metrics and cost_metrics["current_actual_baseline_carbon_cost"] > 0:
+        actual_cost_sum = cost_metrics["current_actual_carbon_cost"]
+        actual_baseline_cost_sum = cost_metrics["current_actual_baseline_carbon_cost"]
+        actual_carbon_saving_pct = cost_metrics.get("actual_carbon_saving_pct")
+        if actual_carbon_saving_pct is not None:
+            actual_carbon_saving_pct = round(actual_carbon_saving_pct, 2)
+        pending_forecasted_cost = cost_metrics.get("forecasted_pending_carbon_cost", 0.0)
+    else:
+        actual_cost_sum = sum(
+            r["actual_carbon_cost"] if r.get("actual_carbon_cost") is not None else (r.get("carbon_cost") or 0.0)
+            for r in completed_requests
         )
-
-    # Forecasted cost for not-yet-processed requests
-    # (requests either submitted/pending or scheduled for current/future slots that haven't finished yet)
-    pending_forecasted_cost = sum(
-        (r.get("carbon_cost") or 0.0)
-        for r in client_requests
-        if r.get("status") in ("submitted", "scheduled", "pending")
-        and (r.get("scheduled_slot") is None or r.get("scheduled_slot") >= current_slot)
-    )
+        actual_baseline_cost_sum = sum(
+            r["actual_baseline_carbon_cost"] if r.get("actual_baseline_carbon_cost") is not None else (r.get("baseline_carbon_cost") or 0.0)
+            for r in completed_requests
+        )
+        actual_carbon_saving_pct = None
+        if actual_baseline_cost_sum > 0:
+            actual_carbon_saving_pct = round(
+                ((actual_baseline_cost_sum - actual_cost_sum) / actual_baseline_cost_sum) * 100.0, 2
+            )
+        pending_forecasted_cost = sum(
+            (r.get("carbon_cost") or 0.0)
+            for r in client_requests
+            if r.get("status") in ("submitted", "scheduled", "pending")
+            and (r.get("scheduled_slot") is None or r.get("scheduled_slot") >= current_slot)
+        )
 
     # Execution times overall & per flavour
     exec_times_all = [
@@ -147,11 +155,15 @@ def get_dashboard_data() -> Dict[str, Any]:
     ci_forecast_series = [ci_by_slot.get(s, {}).get("forecast") for s in slot_axis]
     ci_actual_series = [ci_by_slot.get(s, {}).get("actual") for s in slot_axis]
 
-    # Error per slot
-    slot_error_avg = [
+    # Error per slot: prefer engine error_history endpoint if available
+    base_error_avg = [
         (slot_error_sum[i] / slot_error_count[i]) if slot_error_count[i] > 0 else None
         for i in range(len(slot_axis))
     ]
+    slot_error_avg = base_error_avg
+    if error_history.get("slots"):
+        err_map = {s["slot"]: s["average_error"] for s in error_history["slots"] if s.get("request_count", 0) > 0}
+        slot_error_avg = [err_map.get(s, base_error_avg[i]) for i, s in enumerate(slot_axis)]
 
     # 6. Request Input Distribution (arrival_slot vs CI)
     input_arrival_counts = [0] * len(slot_axis)

@@ -613,13 +613,26 @@ pub async fn get_error_history(
     let g = _state.shared_state.get_global_error_stats();
     let global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
 
-    let max_error_threshold = _state
+    let task_thresholds: HashMap<String, f64> = _state
         .task_flavours
         .lock()
         .unwrap()
-        .values()
-        .find_map(|t| t.max_error_threshold)
-        .unwrap_or(_state.cfg.max_error_threshold);
+        .iter()
+        .filter_map(|(id, t)| t.max_error_threshold.map(|th| (id.clone(), th)))
+        .collect();
+
+    let max_error_threshold = if let Some(target_task) = &_query.task_id {
+        task_thresholds
+            .get(target_task)
+            .copied()
+            .unwrap_or(_state.cfg.max_error_threshold)
+    } else {
+        task_thresholds
+            .values()
+            .copied()
+            .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a| a.min(t))))
+            .unwrap_or(_state.cfg.max_error_threshold)
+    };
 
     let mut slots = Vec::with_capacity((to - from + 1) as usize);
     for slot in from..=to {
@@ -635,6 +648,7 @@ pub async fn get_error_history(
         current_slot,
         global_error_avg,
         max_error_threshold,
+        task_thresholds,
         slots,
     }))
 }

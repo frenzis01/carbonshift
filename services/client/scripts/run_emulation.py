@@ -117,8 +117,9 @@ def main() -> None:
     # Subsequent advances trigger rollover(slot 2, 3, ...).
     # max(1, args.slots - 1) advances cover all plan slots [0 .. args.slots - 1].
     advances_for_plan = max(1, args.slots - 1)
+    advance_timeout = max(args.timeout, 180.0)
     for step in range(advances_for_plan):
-        adv_resp = requests.post(f"{args.provider_url}/v1/advance-slot", json={}, timeout=60)
+        adv_resp = requests.post(f"{args.provider_url}/v1/advance-slot", json={}, timeout=advance_timeout)
         adv_resp.raise_for_status()
         adv_data = adv_resp.json()
         print(f"  [Step {step + 1}/{advances_for_plan}] Advanced provider to slot {adv_data.get('current_slot')}")
@@ -149,7 +150,7 @@ def main() -> None:
             # in later slots, issue an extra advance to move the simulation forward!
             if sent > resolved:
                 try:
-                    requests.post(f"{args.provider_url}/v1/advance-slot", json={}, timeout=60)
+                    requests.post(f"{args.provider_url}/v1/advance-slot", json={}, timeout=advance_timeout)
                 except Exception as adv_err:
                     logger.debug("extra advance tick error: %s", adv_err)
 

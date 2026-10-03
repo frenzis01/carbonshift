@@ -185,7 +185,7 @@ pub struct HorizonResponse {
 
 // ─── Fine-grained monitoring DTOs ───────────────────────────────────────────
 
-/// Query parameters for `GET /v1/assignments`.
+/// Query parameters for `GET /v1/assignments` and `GET /v1/metrics/error-history`.
 #[derive(Debug, Deserialize, Default)]
 pub struct AssignmentsQuery {
     #[serde(default)]
@@ -194,6 +194,8 @@ pub struct AssignmentsQuery {
     pub to_slot: Option<i32>,
     #[serde(default)]
     pub flavour: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 /// DTO for a single assignment returned in `GET /v1/assignments`.
@@ -247,6 +249,7 @@ pub struct ErrorHistoryResponse {
     pub current_slot: i32,
     pub global_error_avg: Option<f64>,
     pub max_error_threshold: f64,
+    pub task_thresholds: std::collections::HashMap<String, f64>,
     pub slots: Vec<SlotErrorItem>,
 }
 
