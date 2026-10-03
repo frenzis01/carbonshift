@@ -405,6 +405,20 @@ impl SharedState {
         Some(actual_carbon_cost)
     }
 
+
+    /// Returns the error statistics for a given slot, including the number of assignments and the average error.
+    /// TODO: write tests
+    pub fn get_slot_error_stats(&self, slot: i32) -> SlotErrorStats {
+        let g = self.inner.lock().unwrap();
+        let count = g.assignments.values().filter(|a| a.scheduled_slot == slot).count() as u64;
+        let error_sum = g.assignments.values().filter(|a| a.scheduled_slot == slot).map(|a| a.error).sum::<f64>();
+        let average = if count > 0 { error_sum / count as f64 } else { 0.0 };
+        SlotErrorStats {
+            count,
+            average,
+        }
+    }
+
     // ── slot management ───────────────────────────────────────────────────
 
     pub fn set_current_slot(&self, slot: i32) {
@@ -588,6 +602,12 @@ pub struct GlobalErrorStats {
     pub error_sum: f64,
     pub count: u64,
     pub avg: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlotErrorStats {
+    pub count: u64,
+    pub average: f64,
 }
 
 #[derive(Debug, Clone)]

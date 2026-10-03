@@ -742,3 +742,81 @@ async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and
 
     scheduler.stop();
 }
+
+#[tokio::test]
+async fn fine_grained_monitoring_endpoints_work() {
+    let mut cfg = test_engine_config();
+    cfg.batch_size = 1;
+    let cfg = Arc::new(cfg);
+
+    let shared_state = SharedState::new();
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
+    let forecast = test_forecast(&cfg);
+    let mut scheduler = BatchScheduler::new(
+        shared_state.clone(),
+        cfg.clone(),
+        metrics_logger,
+        forecast.clone(),
+    );
+    scheduler.start();
+
+    let mut svc_cfg = test_service_cfg();
+    svc_cfg.submit_wait_timeout_secs = 5.0;
+    let state = AppState::new(shared_state.clone(), cfg.clone(), svc_cfg, forecast);
+    let app = build_router(state.clone());
+
+    // Submit a request to get an assignment
+    let resp = app
+        .clone()
+        .oneshot(json_request("POST", "/v1/requests", r#"{"deadline_seconds": 3600}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let req_id = body["request_id"].as_u64().unwrap();
+    let scheduled_slot = body["scheduled_slot"].as_i64().unwrap() as i32;
+
+    // 1. Test GET /v1/assignments
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/v1/assignments").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let assignments = json_body(resp).await;
+    assert_eq!(assignments.as_array().unwrap().len(), 1);
+    assert_eq!(assignments[0]["request_id"], req_id);
+
+    // 2. Test GET /v1/slots/:slot
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(&format!("/v1/slots/{scheduled_slot}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let slot_detail = json_body(resp).await;
+    assert_eq!(slot_detail["slot"], scheduled_slot);
+    assert_eq!(slot_detail["total_requests"], 1);
+
+    // 3. Test GET /v1/metrics/costs
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/v1/metrics/costs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let costs = json_body(resp).await;
+    assert!(costs["total_baseline_carbon_cost"].as_f64().unwrap() > 0.0);
+
+    // 4. Test GET /v1/metrics/error-history
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/v1/metrics/error-history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let err_hist = json_body(resp).await;
+    assert!(err_hist["slots"].as_array().unwrap().len() >= 1);
+
+    scheduler.stop();
+}

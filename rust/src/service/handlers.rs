@@ -1,5 +1,6 @@
 //! HTTP handlers: job submission, status polling, executor callback, health.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -10,10 +11,7 @@ use serde::Deserialize;
 
 use crate::engine::types::{get_capacity_multiplier, Flavour, Request as EngineRequest};
 use crate::service::models::{
-    AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse,
-    ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, RegisterTaskPayload,
-    RequestStatus, RequestStatusResponse, SlotDetailResponse, StatsResponse,
-    SubmitRequestPayload, TaskConfigResponse,
+    AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse, ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, RegisterTaskPayload, RequestStatus, RequestStatusResponse, SlotDetailResponse, SlotErrorItem, StatsResponse, SubmitRequestPayload, TaskConfigResponse,
 };
 use crate::service::state::{AppState, TrackedRequest};
 
@@ -416,7 +414,7 @@ pub async fn carbon_intensity(
     Json(rows)
 }
 
-// ─── Fine-grained monitoring endpoints (exercise stubs) ─────────────────────
+// ─── Fine-grained monitoring endpoints ─────────────────────
 
 /// `GET /v1/assignments` — list currently committed assignments across the engine.
 ///
@@ -430,12 +428,39 @@ pub async fn get_assignments(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<Vec<AssignmentItem>>, ApiError> {
-    // TODO (Student implementation):
-    // 1. Fetch current assignments via `_state.shared_state.get_current_assignments()`.
-    // 2. Filter by `_query.from_slot`, `_query.to_slot`, and `_query.flavour` if provided.
-    // 3. Map to `AssignmentItem` DTOs and sort by `(scheduled_slot, request_id)`.
-    // 4. Return `Ok(Json(assignments))`.
-    todo!("Student exercise: implement get_assignments to expose committed assignments from SharedState")
+    
+    let curr_assignments = _state.shared_state.get_current_assignments();
+    let filtered_assignments: Vec<_> = curr_assignments
+    .into_iter()
+    .filter(|(_, assignment)| {
+        (_query.from_slot.map_or(true, |from| assignment.scheduled_slot >= from))
+        && (_query.to_slot.map_or(true, |to| assignment.scheduled_slot <= to))
+        && (_query.flavour.as_ref().map_or(true, |flavour| &assignment.flavour_name == flavour))
+    })
+    .collect();
+    
+    let items = {
+        let mut items: Vec<AssignmentItem> = filtered_assignments
+            .into_iter()
+            .map(|(_req_id, assignment)| AssignmentItem {
+                request_id: assignment.request_id,
+                scheduled_slot: assignment.scheduled_slot,
+                flavour_name: assignment.flavour_name,
+                carbon_cost: assignment.carbon_cost,
+                error: assignment.error,
+                flavour_duration: assignment.flavour_duration,
+                arrival_slot: assignment.arrival_slot,
+                deadline_slot: assignment.deadline_slot,
+                assignment_time: assignment.assignment_time,
+            })
+            // .sort_by_key(|item| (item.scheduled_slot, item.request_id))
+            .collect::<Vec<_>>();
+        
+        items.sort_by_key(|item| (item.scheduled_slot, item.request_id));
+        items
+    };
+
+    Ok(Json(items))
 }
 
 /// `GET /v1/slots/:slot` — fine-grained breakdown and status for a specific time slot.
@@ -450,14 +475,62 @@ pub async fn get_slot_detail(
     State(_state): State<AppState>,
     Path(_slot): Path<i32>,
 ) -> Result<Json<SlotDetailResponse>, ApiError> {
-    // TODO (Student implementation):
-    // 1. Validate `_slot >= 0` and within horizon.
-    // 2. Get assignments in `_slot` via `_state.shared_state.get_requests_in_slot(_slot)`.
-    // 3. Compute counts by flavour and total carbon cost.
-    // 4. Lookup capacity multiplier from `_state.cfg.capacity_tiers`.
-    // 5. Lookup forecast CI and observed CI from `_state.carbon_forecast` and `_state.actual_carbon_intensity`.
-    // 6. Return `Ok(Json(SlotDetailResponse { ... }))`.
-    todo!("Student exercise: implement get_slot_detail to expose per-slot breakdown")
+    let carbon_forecast = _state.carbon_forecast.read().unwrap().clone();
+    
+    // horizon is yielded by max(current_slot + assignment_max_future_slots, carbon_forecast length)
+    let horizon = std::cmp::max(
+        _state.shared_state.get_current_slot() + _state.cfg.assignment_max_future_slots,
+        carbon_forecast.len() as i32,
+    );
+
+    // Status code 400 Bad Request for invalid slot
+    if _slot < 0 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Slot cannot be negative"));
+    }
+    if _slot >= horizon {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Slot exceeds horizon"));
+    }
+
+    let assignments = _state.shared_state.get_requests_in_slot(_slot);
+    // compute flavour counts
+    let flavour_counts: HashMap<String, usize> = assignments
+        .iter()
+        .fold(HashMap::new(), |mut acc, assignment| {
+            let flavour = assignment.flavour_name.clone();
+            *acc.entry(flavour).or_insert(0) += 1;
+            acc
+        });
+    
+    let total_carbon_cost: f64 = assignments
+        .iter()
+        .map(|assignment| assignment.carbon_cost)
+        .sum();
+
+    let capacity_multiplier: f64 = _state.cfg.capacity_tiers
+        .iter()
+        // find highest tier where assignments.len() <= tier.max_requests
+        // max_requests being None means infinite
+        .filter(|tier| assignments.len() as i64 <= tier.max_requests.unwrap_or(i64::MAX))
+        .map(|tier| tier.multiplier)
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(1.0);
+
+    let actual_carbon_intensity = _state
+        .actual_carbon_intensity
+        .lock()
+        .unwrap()
+        .get(&_slot)
+        .copied();
+
+    Ok(Json(SlotDetailResponse {
+        slot: _slot,
+        total_requests: assignments.len(),
+        flavour_counts,
+        total_carbon_cost,
+        capacity_multiplier,
+        forecast_carbon_intensity: carbon_forecast.get(_slot as usize).copied(),
+        actual_carbon_intensity,
+    }))
 }
 
 /// `GET /v1/metrics/costs` — fine-grained carbon cost totals and savings.
@@ -472,12 +545,45 @@ pub async fn get_slot_detail(
 pub async fn get_cost_metrics(
     State(_state): State<AppState>,
 ) -> Result<Json<CostMetricsResponse>, ApiError> {
-    // TODO (Student implementation):
-    // 1. Iterate over `_state.tracked.lock().unwrap()` and `_state.shared_state.get_current_assignments()`.
-    // 2. Accumulate actual vs baseline carbon costs for completed requests.
-    // 3. Accumulate forecasted costs for pending / not-yet-dispatched requests.
-    // 4. Return `Ok(Json(CostMetricsResponse { ... }))`.
-    todo!("Student exercise: implement get_cost_metrics to calculate real-time carbon cost metrics")
+    let assignments = _state.shared_state.get_current_assignments();
+    let tracked = _state.tracked.lock().unwrap();
+
+    let mut current_actual_carbon_cost = 0.0;
+    let mut current_actual_baseline_carbon_cost = 0.0;
+    let mut forecasted_pending_carbon_cost = 0.0;
+    let mut total_baseline_carbon_cost = 0.0;
+
+    for (req_id, t) in tracked.iter() {
+        total_baseline_carbon_cost += t.baseline_carbon_cost;
+
+        if t.status == RequestStatus::Completed {
+            current_actual_baseline_carbon_cost += t.baseline_carbon_cost;
+            if let Some(a) = assignments.get(req_id) {
+                current_actual_carbon_cost += a.carbon_cost;
+            }
+        } else if t.status != RequestStatus::Failed {
+            if let Some(a) = assignments.get(req_id) {
+                forecasted_pending_carbon_cost += a.carbon_cost;
+            }
+        }
+    }
+
+    let actual_carbon_saving_pct = if current_actual_baseline_carbon_cost > 0.0 {
+        Some(((current_actual_baseline_carbon_cost - current_actual_carbon_cost) / current_actual_baseline_carbon_cost) * 100.0)
+    } else {
+        None
+    };
+
+    let total_forecasted_carbon_cost: f64 = assignments.values().map(|a| a.carbon_cost).sum();
+
+    Ok(Json(CostMetricsResponse {
+        current_actual_carbon_cost,
+        current_actual_baseline_carbon_cost,
+        actual_carbon_saving_pct,
+        forecasted_pending_carbon_cost,
+        total_forecasted_carbon_cost,
+        total_baseline_carbon_cost,
+    }))
 }
 
 /// `GET /v1/metrics/error-history` — slot-by-slot average error over time.
@@ -488,12 +594,49 @@ pub async fn get_error_history(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<ErrorHistoryResponse>, ApiError> {
-    // TODO (Student implementation):
-    // 1. Determine slot range `[from_slot, to_slot]` (defaults to `0..=_state.shared_state.get_current_slot()`).
-    // 2. For each slot, calculate average error of completed/scheduled assignments.
-    // 3. Include `global_error_avg` and `max_error_threshold`.
-    // 4. Return `Ok(Json(ErrorHistoryResponse { ... }))`.
-    todo!("Student exercise: implement get_error_history to return error tracking per slot")
+    let current_slot = _state.shared_state.get_current_slot();
+    let horizon = _state.cfg.total_slots;
+
+    let from = _query.from_slot.unwrap_or(0);
+    let to = _query.to_slot.unwrap_or(current_slot);
+
+    if from > to {
+        return Err(api_error(StatusCode::BAD_REQUEST, "`from_slot` cannot be greater than `to_slot`"));
+    }
+    if to < 0 || from < 0 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "`from_slot` and `to_slot` must be >= 0"));
+    }
+    if to >= horizon {
+        return Err(api_error(StatusCode::BAD_REQUEST, "`to_slot` exceeds the horizon"));
+    }
+
+    let g = _state.shared_state.get_global_error_stats();
+    let global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
+
+    let max_error_threshold = _state
+        .task_flavours
+        .lock()
+        .unwrap()
+        .values()
+        .find_map(|t| t.max_error_threshold)
+        .unwrap_or(_state.cfg.max_error_threshold);
+
+    let mut slots = Vec::with_capacity((to - from + 1) as usize);
+    for slot in from..=to {
+        let stats = _state.shared_state.get_slot_error_stats(slot);
+        slots.push(SlotErrorItem {
+            slot,
+            average_error: stats.average,
+            request_count: stats.count as usize,
+        });
+    }
+
+    Ok(Json(ErrorHistoryResponse {
+        current_slot,
+        global_error_avg,
+        max_error_threshold,
+        slots,
+    }))
 }
 
 /// `POST /v1/requests` — submit a job, get back the assigned slot.
