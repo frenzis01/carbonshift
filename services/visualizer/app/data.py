@@ -8,6 +8,15 @@ from .config import settings
 
 logger = logging.getLogger("visualizer.data")
 
+# Persistent cache across polling ticks so transient timeouts never wipe the UI
+_cache: Dict[str, Any] = {
+    "client_requests": [],
+    "client_summary": {},
+    "capacity_tiers": [],
+    "max_error_threshold": 20.26,
+    "carbon_ci_list": [],
+}
+
 
 def fetch_json(url: str, timeout: float = settings.request_timeout_seconds) -> Optional[Any]:
     try:
@@ -21,38 +30,94 @@ def fetch_json(url: str, timeout: float = settings.request_timeout_seconds) -> O
 
 def get_dashboard_data() -> Dict[str, Any]:
     # 1. Fetch raw data from microservices in parallel / sequence
-    client_requests: List[Dict[str, Any]] = fetch_json(f"{settings.client_url}/requests") or []
-    client_summary: Dict[str, Any] = fetch_json(f"{settings.client_url}/metrics/summary") or {}
-    carbon_ci_list: List[Dict[str, Any]] = fetch_json(f"{settings.carbonshift_url}/v1/carbon_intensity") or []
+    raw_client_requests: Optional[List[Dict[str, Any]]] = fetch_json(f"{settings.client_url}/requests")
+    if raw_client_requests:
+        _cache["client_requests"] = raw_client_requests
+    client_requests: List[Dict[str, Any]] = _cache["client_requests"]
+
+    raw_client_summary: Optional[Dict[str, Any]] = fetch_json(f"{settings.client_url}/metrics/summary")
+    if raw_client_summary:
+        _cache["client_summary"] = raw_client_summary
+    client_summary: Dict[str, Any] = _cache["client_summary"]
+
     horizon_info: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/horizon") or {}
     stats_info: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/stats") or {}
     provider_slot: Dict[str, Any] = fetch_json(f"{settings.provider_url}/v1/slot") or {}
-
-    # Fetch newly available fine-grained Carbonshift endpoints
-    cost_metrics: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/costs") or {}
-    error_history: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/error-history") or {}
-    engine_assignments: Optional[List[Dict[str, Any]]] = fetch_json(f"{settings.carbonshift_url}/v1/assignments")
 
     current_slot = horizon_info.get("current_slot", stats_info.get("current_slot", 0))
     total_slots = horizon_info.get("total_slots", 8640)
     global_slot = provider_slot.get("current_slot")
 
+    # Fetch with lookahead so carbon intensity and forecast for future slots are always available
+    lookahead_slot = current_slot + 24
+    raw_ci_list: Optional[List[Dict[str, Any]]] = fetch_json(
+        f"{settings.carbonshift_url}/v1/carbon_intensity?until_slot={lookahead_slot}"
+    )
+    if raw_ci_list:
+        _cache["carbon_ci_list"] = raw_ci_list
+    carbon_ci_list: List[Dict[str, Any]] = _cache["carbon_ci_list"]
+
+    # Fetch fine-grained Carbonshift endpoints
+    cost_metrics: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/costs") or {}
+    error_history: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/error-history") or {}
+    engine_assignments: Optional[List[Dict[str, Any]]] = fetch_json(f"{settings.carbonshift_url}/v1/assignments")
+
     # 2. Extract Task Configurations (Capacity tiers & error threshold)
     scheduler_snapshot = client_summary.get("scheduler", {})
     tasks_cfg = scheduler_snapshot.get("tasks", {})
-    max_error_threshold = error_history.get("max_error_threshold", 20.0)
+    if error_history.get("max_error_threshold"):
+        _cache["max_error_threshold"] = float(error_history["max_error_threshold"])
+    max_error_threshold = _cache["max_error_threshold"]
+
     capacity_tiers = []
     for t_name, t_info in tasks_cfg.items():
         if t_info.get("capacity_tiers"):
             capacity_tiers = t_info["capacity_tiers"]
+            _cache["capacity_tiers"] = capacity_tiers
             break
 
-    # 3. Calculate KPI Indicators
-    completed_requests = [r for r in client_requests if r.get("status") == "completed"]
-    scheduled_requests = [r for r in client_requests if r.get("scheduled_slot") is not None]
-    
+    if not capacity_tiers:
+        # Fallback to direct query on carbonshift
+        for task_candidate in ("question_answering", "default", "text_generation", "ner"):
+            task_resp = fetch_json(f"{settings.carbonshift_url}/v1/tasks/{task_candidate}")
+            if task_resp and task_resp.get("capacity_tiers"):
+                capacity_tiers = task_resp["capacity_tiers"]
+                _cache["capacity_tiers"] = capacity_tiers
+                break
+
+    if not capacity_tiers and _cache["capacity_tiers"]:
+        capacity_tiers = _cache["capacity_tiers"]
+
+    # 3. Combine client_requests and engine_assignments
+    seen_req_ids = set()
+    all_req_items = []
+    for r in client_requests:
+        r_id = str(r.get("request_id"))
+        seen_req_ids.add(r_id)
+        all_req_items.append(r)
+    for a in (engine_assignments or []):
+        a_id = str(a.get("request_id"))
+        if a_id not in seen_req_ids:
+            all_req_items.append({
+                "request_id": a.get("request_id"),
+                "scheduled_slot": a.get("scheduled_slot"),
+                "arrival_slot": a.get("arrival_slot"),
+                "flavour": a.get("flavour_name"),
+                "carbon_cost": a.get("carbon_cost"),
+                "actual_error_pct": a.get("error"),
+            })
+
+    completed_requests = [r for r in all_req_items if r.get("status") == "completed"]
+    scheduled_requests = [r for r in all_req_items if r.get("scheduled_slot") is not None]
+
+    # Calculate KPI Indicators
+    total_req_count = len(all_req_items) if all_req_items else stats_info.get("total", 0)
+    scheduled_req_count = len(scheduled_requests) if scheduled_requests else (stats_info.get("scheduled", 0) + stats_info.get("completed", 0))
+    completed_req_count = len(completed_requests) if completed_requests else stats_info.get("completed", 0)
+    pending_req_count = max(0, total_req_count - scheduled_req_count)
+
     # Cost calculations (prefer fine-grained engine metrics, fallback to client tracking)
-    if "current_actual_carbon_cost" in cost_metrics and cost_metrics["current_actual_baseline_carbon_cost"] > 0:
+    if "current_actual_carbon_cost" in cost_metrics and cost_metrics.get("current_actual_baseline_carbon_cost", 0) > 0:
         actual_cost_sum = cost_metrics["current_actual_carbon_cost"]
         actual_baseline_cost_sum = cost_metrics["current_actual_baseline_carbon_cost"]
         actual_carbon_saving_pct = cost_metrics.get("actual_carbon_saving_pct")
@@ -75,7 +140,7 @@ def get_dashboard_data() -> Dict[str, Any]:
             )
         pending_forecasted_cost = sum(
             (r.get("carbon_cost") or 0.0)
-            for r in client_requests
+            for r in all_req_items
             if r.get("status") in ("submitted", "scheduled", "pending")
             and (r.get("scheduled_slot") is None or r.get("scheduled_slot") >= current_slot)
         )
@@ -115,10 +180,11 @@ def get_dashboard_data() -> Dict[str, Any]:
             }
 
     # 5. Build Assignment Plot Data
-    # Determine slot range for visualization
+    # Determine slot range for visualization: ALWAYS extend at least 12 slots into the future!
     assigned_slots = [r["scheduled_slot"] for r in scheduled_requests if r.get("scheduled_slot") is not None]
+    max_assigned = max(assigned_slots) if assigned_slots else current_slot
     min_vis_slot = 0
-    max_vis_slot = max(assigned_slots + [current_slot, max_known_slot, 5])
+    max_vis_slot = max(max_assigned, current_slot + 12, max_known_slot)
 
     slot_axis = list(range(min_vis_slot, max_vis_slot + 1))
     
@@ -127,10 +193,19 @@ def get_dashboard_data() -> Dict[str, Any]:
     balanced_counts = [0] * len(slot_axis)
     accurate_counts = [0] * len(slot_axis)
     slot_carbon_cost = [0.0] * len(slot_axis)
-    slot_error_sum = [0.0] * len(slot_axis)
-    slot_error_count = [0] * len(slot_axis)
+    slot_total_reqs = [0] * len(slot_axis)
 
-    for r in client_requests:
+    # Error sums per flavour per slot
+    fast_error_sum = [0.0] * len(slot_axis)
+    balanced_error_sum = [0.0] * len(slot_axis)
+    accurate_error_sum = [0.0] * len(slot_axis)
+
+    assign_map = {
+        str(a.get("request_id")): a
+        for a in (engine_assignments or [])
+    }
+
+    for r in all_req_items:
         s = r.get("scheduled_slot")
         if s is not None and min_vis_slot <= s <= max_vis_slot:
             idx = s - min_vis_slot
@@ -141,39 +216,161 @@ def get_dashboard_data() -> Dict[str, Any]:
                 balanced_counts[idx] += 1
             elif flv == "accurate":
                 accurate_counts[idx] += 1
+            slot_total_reqs[idx] += 1
             
             c_cost = r.get("actual_carbon_cost") if r.get("actual_carbon_cost") is not None else r.get("carbon_cost")
             if c_cost:
                 slot_carbon_cost[idx] += float(c_cost)
 
-            # Error tracking
+            # Error tracking: prioritize actual_error_pct if reported, else fallback to assignment/flavour error
             err = r.get("actual_error_pct")
+            if err is None:
+                a_info = assign_map.get(str(r.get("request_id")))
+                if a_info:
+                    err = a_info.get("error")
             if err is not None:
-                slot_error_sum[idx] += float(err)
-                slot_error_count[idx] += 1
+                err_val = float(err)
+                if flv == "fast":
+                    fast_error_sum[idx] += err_val
+                elif flv == "balanced":
+                    balanced_error_sum[idx] += err_val
+                elif flv == "accurate":
+                    accurate_error_sum[idx] += err_val
 
     ci_forecast_series = [ci_by_slot.get(s, {}).get("forecast") for s in slot_axis]
     ci_actual_series = [ci_by_slot.get(s, {}).get("actual") for s in slot_axis]
 
-    # Error per slot: prefer engine error_history endpoint if available
-    base_error_avg = [
-        (slot_error_sum[i] / slot_error_count[i]) if slot_error_count[i] > 0 else None
-        for i in range(len(slot_axis))
-    ]
-    slot_error_avg = base_error_avg
-    if error_history.get("slots"):
-        err_map = {s["slot"]: s["average_error"] for s in error_history["slots"] if s.get("request_count", 0) > 0}
-        slot_error_avg = [err_map.get(s, base_error_avg[i]) for i, s in enumerate(slot_axis)]
+    # Stacked fractional error contributions (sum == slot average error %)
+    fast_error_contrib = []
+    balanced_error_contrib = []
+    accurate_error_contrib = []
+    slot_error_avg = []
+
+    for i in range(len(slot_axis)):
+        n = slot_total_reqs[i]
+        if n > 0:
+            f_c = round(fast_error_sum[i] / n, 2)
+            b_c = round(balanced_error_sum[i] / n, 2)
+            a_c = round(accurate_error_sum[i] / n, 2)
+            fast_error_contrib.append(f_c)
+            balanced_error_contrib.append(b_c)
+            accurate_error_contrib.append(a_c)
+            slot_error_avg.append(round(f_c + b_c + a_c, 2))
+        else:
+            fast_error_contrib.append(0.0)
+            balanced_error_contrib.append(0.0)
+            accurate_error_contrib.append(0.0)
+            slot_error_avg.append(None)
+
+    # Running cumulative global error trace across time slots
+    err_hist_slots = {s["slot"]: s for s in error_history.get("slots", [])} if error_history else {}
+    running_err_sum = 0.0
+    running_req_cnt = 0
+    global_error_trace = []
+    for idx, s in enumerate(slot_axis):
+        if s in err_hist_slots and err_hist_slots[s].get("cumulative_error") is not None:
+            global_error_trace.append(round(err_hist_slots[s]["cumulative_error"], 2))
+        else:
+            tot_slot_err = fast_error_sum[idx] + balanced_error_sum[idx] + accurate_error_sum[idx]
+            running_err_sum += tot_slot_err
+            running_req_cnt += slot_total_reqs[idx]
+            global_error_trace.append(round(running_err_sum / running_req_cnt, 2) if running_req_cnt > 0 else None)
+
+    # Window error average trace across time slots
+    window_error_trace = []
+    w_past = error_history.get("window_past", 12)
+    w_future = error_history.get("window_future", 12)
+    for idx, s in enumerate(slot_axis):
+        if s in err_hist_slots and err_hist_slots[s].get("window_error") is not None:
+            window_error_trace.append(round(err_hist_slots[s]["window_error"], 2))
+        else:
+            w_start = max(0, s - w_past)
+            w_end = s + w_future
+            w_sum = 0.0
+            w_cnt = 0
+            for w_s in range(w_start, w_end + 1):
+                if min_vis_slot <= w_s <= max_vis_slot:
+                    w_idx = w_s - min_vis_slot
+                    w_sum += (fast_error_sum[w_idx] + balanced_error_sum[w_idx] + accurate_error_sum[w_idx])
+                    w_cnt += slot_total_reqs[w_idx]
+            window_error_trace.append(round(w_sum / w_cnt, 2) if w_cnt > 0 else None)
 
     # 6. Request Input Distribution (arrival_slot vs CI)
     input_arrival_counts = [0] * len(slot_axis)
-    for r in client_requests:
-        arr = r.get("arrival_slot")
-        if arr is None:
-            # fallback: estimate arrival slot
-            arr = r.get("scheduled_slot", 0)
-        if min_vis_slot <= arr <= max_vis_slot:
-            input_arrival_counts[arr - min_vis_slot] += 1
+    offset = (global_slot - current_slot) if (global_slot is not None and current_slot is not None) else None
+    assign_arrival_map = {
+        str(a.get("request_id")): a.get("arrival_slot")
+        for a in (engine_assignments or [])
+        if a.get("arrival_slot") is not None
+    }
+
+    for r in all_req_items:
+        req_id = str(r.get("request_id"))
+        local_arr = assign_arrival_map.get(req_id)
+        if local_arr is None:
+            raw_arr = r.get("arrival_slot")
+            if raw_arr is not None:
+                if offset and raw_arr >= offset:
+                    local_arr = raw_arr - offset
+                elif raw_arr < 1000:
+                    local_arr = raw_arr
+        if local_arr is None:
+            local_arr = r.get("scheduled_slot", current_slot)
+
+        if local_arr is not None and min_vis_slot <= local_arr <= max_vis_slot:
+            input_arrival_counts[local_arr - min_vis_slot] += 1
+
+    return {
+        "indicators": {
+            "total_requests": total_req_count,
+            "completed_requests": completed_req_count,
+            "scheduled_requests": scheduled_req_count,
+            "pending_requests": pending_req_count,
+            "current_slot": current_slot,
+            "global_slot": global_slot,
+            "total_slots": total_slots,
+            "actual_carbon_cost": round(actual_cost_sum, 4),
+            "actual_baseline_carbon_cost": round(actual_baseline_cost_sum, 4),
+            "actual_carbon_saving_pct": actual_carbon_saving_pct,
+            "forecasted_pending_carbon_cost": round(pending_forecasted_cost, 4),
+            "overall_avg_exec_sec": round(overall_avg_exec_sec, 4) if overall_avg_exec_sec is not None else None,
+            "overall_baseline_exec_sec": round(overall_baseline_exec_sec, 4) if overall_baseline_exec_sec is not None else None,
+            "by_flavour": by_flavour_stats,
+            "global_error_avg": scheduler_snapshot.get("global_error_avg"),
+            "max_error_threshold": max_error_threshold,
+        },
+        "assignment_plot": {
+            "slots": slot_axis,
+            "fast": fast_counts,
+            "balanced": balanced_counts,
+            "accurate": accurate_counts,
+            "carbon_cost": [round(c, 3) for c in slot_carbon_cost],
+            "carbon_intensity_forecast": ci_forecast_series,
+            "carbon_intensity_actual": ci_actual_series,
+            "capacity_tiers": capacity_tiers,
+            "flavour_colors": {
+                "Fast": "#1f77b4",
+                "Balanced": "#2ca02c",
+                "Accurate": "#ff7f0e",
+            },
+        },
+        "error_plot": {
+            "slots": slot_axis,
+            "fast_error": fast_error_contrib,
+            "balanced_error": balanced_error_contrib,
+            "accurate_error": accurate_error_contrib,
+            "slot_error_avg": slot_error_avg,
+            "window_error_avg": window_error_trace,
+            "global_error_avg": global_error_trace,
+            "max_error_threshold": max_error_threshold,
+        },
+        "input_plot": {
+            "slots": slot_axis,
+            "arrived_requests": input_arrival_counts,
+            "carbon_intensity_forecast": ci_forecast_series,
+            "carbon_intensity_actual": ci_actual_series,
+        },
+    }
 
     return {
         "indicators": {
@@ -211,8 +408,17 @@ def get_dashboard_data() -> Dict[str, Any]:
         },
         "error_plot": {
             "slots": slot_axis,
-            "error_avg": slot_error_avg,
+            "fast_error": fast_error_contrib,
+            "balanced_error": balanced_error_contrib,
+            "accurate_error": accurate_error_contrib,
+            "slot_error_avg": slot_error_avg,
+            "window_error_avg": window_error_trace,
+            "global_error_avg": global_error_trace,
             "max_error_threshold": max_error_threshold,
+        },
+        "input_plot": {
+            "slots": slot_axis,
+            "arrived_requests": input_arrival_counts,
             "global_error_avg": scheduler_snapshot.get("global_error_avg"),
         },
         "input_plot": {

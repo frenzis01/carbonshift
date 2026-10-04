@@ -634,13 +634,48 @@ pub async fn get_error_history(
             .unwrap_or(_state.cfg.max_error_threshold)
     };
 
+    let window_past = _state.cfg.error_window_past;
+    let window_future = _state.cfg.error_window_future;
+
     let mut slots = Vec::with_capacity((to - from + 1) as usize);
+    let mut running_error_sum = 0.0;
+    let mut running_count = 0u64;
+
+    for s in 0..from {
+        let stats = _state.shared_state.get_slot_error_stats(s);
+        running_error_sum += stats.average * (stats.count as f64);
+        running_count += stats.count;
+    }
+
     for slot in from..=to {
         let stats = _state.shared_state.get_slot_error_stats(slot);
+        running_error_sum += stats.average * (stats.count as f64);
+        running_count += stats.count;
+
+        let cumulative_error = if running_count > 0 {
+            Some(running_error_sum / running_count as f64)
+        } else {
+            None
+        };
+
+        let win_stats = _state.shared_state.get_window_error_stats(
+            slot,
+            window_past,
+            window_future,
+            &std::collections::HashSet::new(),
+        );
+        let window_error = if win_stats.count > 0 {
+            Some(win_stats.average)
+        } else {
+            None
+        };
+
         slots.push(SlotErrorItem {
             slot,
             average_error: stats.average,
             request_count: stats.count as usize,
+            window_error,
+            cumulative_error,
         });
     }
 
@@ -649,6 +684,8 @@ pub async fn get_error_history(
         global_error_avg,
         max_error_threshold,
         task_thresholds,
+        window_past,
+        window_future,
         slots,
     }))
 }

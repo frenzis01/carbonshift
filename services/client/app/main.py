@@ -75,7 +75,7 @@ async def health() -> str:
     return "ok"
 
 @app.post("/v1/tick")
-async def tick(body: TickRequest) -> TickResponse:
+def tick(body: TickRequest) -> TickResponse:
     """The provider tells us the system has entered `body.current_slot`.
 
     We answer with that slot's work. The client keeps **no clock of its own**:
@@ -117,13 +117,13 @@ async def tick(body: TickRequest) -> TickResponse:
 
 
 @app.post("/run/send-batch", status_code=202)
-async def run_send_batch(body: SendBatchRequest) -> SendBatchResponse:
+def run_send_batch(body: SendBatchRequest) -> SendBatchResponse:
     batch_id = send_batch(tracker, body.task, body.count, body.deadline_seconds, body.source, body.seed)
     return SendBatchResponse(batch_id=batch_id, count=body.count)
 
 
 @app.post("/run/send-plan", status_code=202)
-async def run_send_plan(body: SendPlanRequest) -> SendPlanResponse:
+def run_send_plan(body: SendPlanRequest) -> SendPlanResponse:
     """Register a plan. It is *stored*, not started: the provider's ticks drive it."""
     requests_spec = [r.model_dump() for r in body.requests]
     plan_id = store_plan(requests_spec, body.slot_minutes, body.mode, body.executor_url)
@@ -132,7 +132,7 @@ async def run_send_plan(body: SendPlanRequest) -> SendPlanResponse:
 
 
 @app.post("/callback")
-async def callback(body: CallerCallbackPayload) -> dict[str, str]:
+def callback(body: CallerCallbackPayload) -> dict[str, str]:
     logger.info("received callback for request_id=%s, success=%s", body.request_id, body.success)
     found = tracker.on_callback(str(body.request_id), body.success, body.result, body.error,
                                  body.actual_carbon_cost, body.actual_baseline_carbon_cost,
@@ -143,12 +143,12 @@ async def callback(body: CallerCallbackPayload) -> dict[str, str]:
 
 
 @app.get("/requests")
-async def list_requests() -> list[dict[str, Any]]:
+def list_requests() -> list[dict[str, Any]]:
     return tracker.all()
 
 
 @app.get("/requests/{request_id}")
-async def get_request(request_id: str) -> dict[str, Any]:
+def get_request(request_id: str) -> dict[str, Any]:
     t = tracker.get(request_id)
     if t is None:
         raise HTTPException(status_code=404, detail="unknown request_id")
@@ -156,7 +156,7 @@ async def get_request(request_id: str) -> dict[str, Any]:
 
 
 @app.get("/metrics/summary")
-async def metrics_summary() -> dict[str, Any]:
+def metrics_summary() -> dict[str, Any]:
     summary = tracker.summary()
     summary["scheduler"] = _scheduler_snapshot()
     return summary

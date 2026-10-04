@@ -191,11 +191,13 @@ def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: st
     source = scenario.get("source", "synthetic")
     seed = int(scenario.get("seed", 42))
     mode = scenario.get("mode", "emulated")
+    pattern = scenario.get("pattern", "flat")
 
     print(f"[{scenario['id']}] task={task} count={count} source={source} mode={mode}")
 
+    total_slots = max(1, count // per_slot) if per_slot > 0 else 1
     before_ids = {str(i["request_id"]) for i in _get_requests(client_url)}
-    plan = build_requests(task, count, per_slot, slot_minutes, source, seed)
+    plan = build_requests(task, total_slots, per_slot, slot_minutes, source, seed, pattern=pattern)
 
     t0 = time.monotonic()
     resp = requests.post(f"{client_url}/run/send-plan", json={
@@ -203,7 +205,7 @@ def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: st
     })
     resp.raise_for_status()
 
-    items = _wait_for_scenario(client_url, before_ids, count, mode, carbonshift_url, executor_url,
+    items = _wait_for_scenario(client_url, before_ids, len(plan), mode, carbonshift_url, executor_url,
                                poll_interval, poll_timeout, admin_timeout)
     elapsed = time.monotonic() - t0
 
@@ -220,7 +222,7 @@ def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: st
     print(f"  -> {metrics['requests_completed']}/{metrics['requests_sent']} completed, "
           f"avg_carbon_saving_pct={metrics['avg_carbon_saving_pct']}, elapsed={elapsed:.1f}s")
 
-    row = {"scenario_id": scenario["id"], "task": task, "mode": mode, "source": source, "count": count}
+    row = {"scenario_id": scenario["id"], "task": task, "mode": mode, "source": source, "count": len(plan)}
     row.update(metrics)
     return row
 

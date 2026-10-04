@@ -19,7 +19,7 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/api/data")
-async def api_data() -> JSONResponse:
+def api_data() -> JSONResponse:
     data = get_dashboard_data()
     return JSONResponse(data)
 
@@ -313,7 +313,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chart-header">
       <div>
         <div class="chart-title">Error Tracking Over Time Slots</div>
-        <div class="chart-desc">Average actual error % per scheduled slot against declared threshold and global error avg</div>
+        <div class="chart-desc">Stacked slot error contributions by flavour, with sliding window error avg and running global error avg curves</div>
       </div>
     </div>
     <div id="error-plot" class="plot-wrapper"></div>
@@ -324,7 +324,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chart-header">
       <div>
         <div class="chart-title">Input Load & Carbon Intensity Wave</div>
-        <div class="chart-desc">Arrived requests by slot vs forecasted and observed carbon intensity</div>
+        <div class="chart-desc">Arrived requests by arrival slot vs forecasted and observed carbon intensity</div>
       </div>
     </div>
     <div id="input-plot" class="plot-wrapper"></div>
@@ -626,19 +626,53 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderErrorPlot(plot) {
-      const filtered = filterAndResample(plot.slots, [plot.error_avg], resampleBin);
+      const filtered = filterAndResample(
+        plot.slots,
+        [plot.fast_error, plot.balanced_error, plot.accurate_error, plot.window_error_avg, plot.global_error_avg],
+        resampleBin
+      );
       const slots = filtered.slots;
-      const [errorAvg] = filtered.arrays;
+      const [fastErr, balErr, accErr, winErr, globErr] = filtered.arrays;
 
       const traces = [
         {
           x: slots,
-          y: errorAvg,
-          name: 'Avg Error %',
+          y: fastErr,
+          name: 'Fast Error (Slot Contrib)',
+          type: 'bar',
+          marker: { color: FLAVOUR_COLORS['Fast'] },
+        },
+        {
+          x: slots,
+          y: balErr,
+          name: 'Balanced Error (Slot Contrib)',
+          type: 'bar',
+          marker: { color: FLAVOUR_COLORS['Balanced'] },
+        },
+        {
+          x: slots,
+          y: accErr,
+          name: 'Accurate Error (Slot Contrib)',
+          type: 'bar',
+          marker: { color: FLAVOUR_COLORS['Accurate'] },
+        },
+        {
+          x: slots,
+          y: winErr,
+          name: 'Window Error Avg',
           type: 'scatter',
           mode: 'lines+markers',
-          marker: { size: 6, color: '#38bdf8' },
-          line: { color: '#38bdf8', width: 2 }
+          marker: { size: 5, color: '#eab308' },
+          line: { color: '#eab308', width: 2.2 },
+        },
+        {
+          x: slots,
+          y: globErr,
+          name: 'Global Error Avg (Running)',
+          type: 'scatter',
+          mode: 'lines+markers',
+          marker: { size: 5, color: '#a855f7' },
+          line: { color: '#a855f7', width: 2.5 },
         }
       ];
 
@@ -667,29 +701,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         });
       }
 
-      if (plot.global_error_avg) {
-        shapes.push({
-          type: 'line',
-          xref: 'paper',
-          x0: 0,
-          x1: 1,
-          y0: plot.global_error_avg,
-          y1: plot.global_error_avg,
-          line: { color: '#a78bfa', width: 1.2, dash: 'dot' }
-        });
-        annotations.push({
-          xref: 'paper',
-          x: 0.01,
-          y: plot.global_error_avg,
-          xanchor: 'left',
-          yanchor: 'bottom',
-          text: `Global Avg: ${plot.global_error_avg}%`,
-          showarrow: false,
-          font: { size: 10, color: '#a78bfa' }
-        });
-      }
-
       const layout = {
+        barmode: 'stack',
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: { color: '#f8fafc', family: 'inherit' },
@@ -701,7 +714,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           rangeslider: { visible: true, thickness: 0.05, bgcolor: '#1e293b' }
         },
         yaxis: {
-          title: 'Average Error (%)',
+          title: 'Error (%)',
           gridcolor: '#334155',
           zerolinecolor: '#475569'
         },

@@ -94,6 +94,8 @@ services:
   emulation:
     build: ./services/client
     profiles: ["emulation"]
+    healthcheck:
+      disable: true
     depends_on:
       - client
       - provider

@@ -241,6 +241,10 @@ pub struct SlotErrorItem {
     pub slot: i32,
     pub request_count: usize,
     pub average_error: f64,
+    #[serde(default)]
+    pub window_error: Option<f64>,
+    #[serde(default)]
+    pub cumulative_error: Option<f64>,
 }
 
 /// Error history response for `GET /v1/metrics/error-history`.
@@ -250,6 +254,10 @@ pub struct ErrorHistoryResponse {
     pub global_error_avg: Option<f64>,
     pub max_error_threshold: f64,
     pub task_thresholds: std::collections::HashMap<String, f64>,
+    #[serde(default)]
+    pub window_past: i32,
+    #[serde(default)]
+    pub window_future: i32,
     pub slots: Vec<SlotErrorItem>,
 }
 

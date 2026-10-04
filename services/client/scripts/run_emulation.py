@@ -71,6 +71,8 @@ def main() -> None:
                          choices=["text_generation", "ner", "question_answering"])
     parser.add_argument("--slots", type=int, default=3)
     parser.add_argument("--per-slot", type=int, default=20)
+    parser.add_argument("--pattern", default="sinusoidal", choices=["flat", "sinusoidal", "random"],
+                         help="Pattern for request generation per slot (default: flat).")
     parser.add_argument("--slot-minutes", type=float, default=30.0)
     parser.add_argument("--source", default="synthetic", choices=["synthetic", "dataset"])
     parser.add_argument("--seed", type=int, default=None,
@@ -101,8 +103,8 @@ def main() -> None:
     except Exception as e:
         print(f"Notice: could not query provider at {args.provider_url}/v1/slot ({e}); using wall clock")
 
-    plan = build_requests(args.task, args.slots * args.per_slot, args.per_slot,
-                           args.slot_minutes, args.source, seed, reference=reference)
+    plan = build_requests(args.task, args.slots, args.per_slot,
+                           args.slot_minutes, args.source, seed, pattern=args.pattern, reference=reference)
     resp = requests.post(f"{args.client_url}/run/send-plan", json={
         "requests": plan, "slot_minutes": args.slot_minutes, "mode": "emulated",
         "executor_url": args.executor_url,
@@ -110,7 +112,7 @@ def main() -> None:
     resp.raise_for_status()
     print("Plan registered:", json.dumps(resp.json(), indent=2))
 
-    total_expected = args.slots * args.per_slot
+    total_expected = len(plan)
     print(f"\nDriving emulation: {args.slots} slots, {total_expected} requests total...")
 
     # First advance on provider triggers announce(slot 0) + rollover(slot 1).

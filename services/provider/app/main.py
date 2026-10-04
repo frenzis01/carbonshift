@@ -292,7 +292,7 @@ async def observed(slot: int | None = Query(default=None)) -> dict:
 
 
 @app.post("/v1/advance-slot")
-async def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
+def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
     """Manual-clock only: roll exactly one slot, then fan out.
 
     409 if the clock is not manual (same convention as carbonshift and the
