@@ -285,3 +285,46 @@ fn generate_request(
     let deadline_slot = (arrival_slot + slack).min(cfg.total_slots - 1);
     Request::new(id, arrival_slot, deadline_slot)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn generator_projection_preserves_custom_settings_and_deadline_behavior() {
+        let mut config = Config::default();
+        config.slot_duration_seconds = 120.0;
+        config.simulation.slot_speed_scale = 0.5;
+        config.total_slots = 37;
+        config.simulation.predicted_requests_per_slot = 17.0;
+        config.simulation.request_rate_std_factor = 0.37;
+        config.simulation.deadline_min_slack = 2;
+        config.simulation.deadline_max_slack = 4;
+        config.simulation.skip_empty_slots = false;
+        config.simulation.generator_realtime_chunk_size = 3;
+        config.infeasibility.prehistory_random_seed = 901;
+        config.logging.verbose = false;
+
+        let generator_config = RequestGeneratorConfig::from_config(&config);
+
+        assert_eq!(generator_config.slot_duration_secs, 60.0);
+        assert_eq!(generator_config.total_slots, 37);
+        assert_eq!(generator_config.requests_per_slot, 17.0);
+        assert_eq!(generator_config.request_rate_std_factor, 0.37);
+        assert_eq!(generator_config.deadline_min_slack, 2);
+        assert_eq!(generator_config.deadline_max_slack, 4);
+        assert!(!generator_config.skip_empty_slots);
+        assert_eq!(generator_config.realtime_chunk_size, 3);
+        assert_eq!(generator_config.prehistory_random_seed, 901);
+        assert!(!generator_config.verbose);
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let first = generate_request(5, &generator_config, &counter);
+        let second = generate_request(5, &generator_config, &counter);
+        let clipped = generate_request(35, &generator_config, &counter);
+        assert_eq!(first.deadline_slot, 7);
+        assert_eq!(second.deadline_slot, 8);
+        assert_eq!(clipped.deadline_slot, 36);
+    }
+}

@@ -259,3 +259,52 @@ impl AppState {
         self.task_flavours.lock().unwrap().get(task_id).and_then(|t| t.capacity_tiers.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::config::Config;
+
+    #[test]
+    fn service_scheduler_projection_preserves_custom_runtime_settings() {
+        let mut cfg = Config::default();
+        cfg.total_slots = 37;
+        cfg.slot_duration_seconds = 120.0;
+        cfg.simulation.slot_speed_scale = 0.25;
+        cfg.simulation.manual_clock = true;
+        cfg.flavours = vec![Flavour {
+            name: "ServiceSentinel".to_string(),
+            error: 3.75,
+            duration: 91,
+        }];
+        cfg.capacity_tiers = vec![
+            CapacityTier { max_requests: Some(9), multiplier: 2.25 },
+            CapacityTier { max_requests: None, multiplier: 7.0 },
+        ];
+        cfg.carbon_cost_duration_scale = 0.375;
+        cfg.max_error_threshold = 8.25;
+        cfg.error_window_past = 5;
+        cfg.error_window_future = 7;
+        cfg.assignment_max_future_slots = 11;
+
+        let service = ServiceSchedulerConfig::from_config(&cfg);
+
+        assert_eq!(service.total_slots, 37);
+        assert_eq!(service.effective_slot_duration_secs, 30.0);
+        assert!(service.manual_clock);
+        assert_eq!(service.flavours.len(), 1);
+        assert_eq!(service.flavours[0].name, "ServiceSentinel");
+        assert_eq!(service.flavours[0].error, 3.75);
+        assert_eq!(service.flavours[0].duration, 91);
+        assert_eq!(service.capacity_tiers.len(), 2);
+        assert_eq!(service.capacity_tiers[0].max_requests, Some(9));
+        assert_eq!(service.capacity_tiers[0].multiplier, 2.25);
+        assert_eq!(service.capacity_tiers[1].max_requests, None);
+        assert_eq!(service.capacity_tiers[1].multiplier, 7.0);
+        assert_eq!(service.carbon_cost_duration_scale, 0.375);
+        assert_eq!(service.max_error_threshold, 8.25);
+        assert_eq!(service.error_window_past, 5);
+        assert_eq!(service.error_window_future, 7);
+        assert_eq!(service.assignment_max_future_slots, 11);
+    }
+}

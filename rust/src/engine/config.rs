@@ -419,4 +419,48 @@ mod tests {
         assert_eq!(cfg.total_slots, 24);
         assert_eq!(cfg.max_error_threshold, 4.0);
     }
+
+    #[test]
+    fn assignment_policy_projects_custom_core_settings() {
+        let mut cfg = Config::default();
+        cfg.flavours = vec![Flavour {
+            name: "PolicySentinel".to_string(),
+            error: 6.25,
+            duration: 137,
+        }];
+        cfg.capacity_tiers = vec![
+            CapacityTier { max_requests: Some(7), multiplier: 2.75 },
+            CapacityTier { max_requests: None, multiplier: 8.5 },
+        ];
+        cfg.total_slots = 73;
+        cfg.carbon_cost_duration_scale = 0.125;
+        cfg.max_error_threshold = 6.75;
+        cfg.error_window_past = 11;
+        cfg.error_window_future = 13;
+        cfg.error_window_past_decay_slots = 17;
+        cfg.assignment_max_future_slots = 19;
+        cfg.global_error_constraint_enabled = false;
+        cfg.global_error_constraint_hard = false;
+
+        let policy = cfg.assignment_policy();
+
+        assert_eq!(policy.flavours.len(), 1);
+        assert_eq!(policy.flavours[0].name, "PolicySentinel");
+        assert_eq!(policy.flavours[0].error, 6.25);
+        assert_eq!(policy.flavours[0].duration, 137);
+        assert_eq!(policy.capacity_tiers.len(), 2);
+        assert_eq!(policy.capacity_tiers[0].max_requests, Some(7));
+        assert_eq!(policy.capacity_tiers[0].multiplier, 2.75);
+        assert_eq!(policy.capacity_tiers[1].max_requests, None);
+        assert_eq!(policy.capacity_tiers[1].multiplier, 8.5);
+        assert_eq!(policy.total_slots, 73);
+        assert_eq!(policy.carbon_cost_duration_scale, 0.125);
+        assert_eq!(policy.max_error_threshold, 6.75);
+        assert_eq!(policy.error_window_past, 11);
+        assert_eq!(policy.error_window_future, 13);
+        assert_eq!(policy.error_window_past_decay_slots, 17);
+        assert_eq!(policy.assignment_max_future_slots, 19);
+        assert!(!policy.global_error_constraint_enabled);
+        assert!(!policy.global_error_constraint_hard);
+    }
 }
