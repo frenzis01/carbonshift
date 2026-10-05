@@ -58,7 +58,7 @@ def build_capacity_tiers(requests_per_slot: int) -> list[dict]:
     base = max(1, requests_per_slot)
     return [
         {"max_requests": base, "multiplier": 1.0},
-        {"max_requests": base * 2, "multiplier": 1.5},
+        {"max_requests": (int)(base * 1.5), "multiplier": 1.5},
         {"max_requests": None, "multiplier": 5.0},
     ]
 
@@ -115,6 +115,9 @@ def main() -> None:
     total_expected = len(plan)
     print(f"\nDriving emulation: {args.slots} slots, {total_expected} requests total...")
 
+    # time counter for measuring how long the emulation takes
+    start_emulation = time.time()
+
     # First advance on provider triggers announce(slot 0) + rollover(slot 1).
     # Subsequent advances trigger rollover(slot 2, 3, ...).
     # max(1, args.slots - 1) advances cover all plan slots [0 .. args.slots - 1].
@@ -162,6 +165,9 @@ def main() -> None:
         time.sleep(args.poll_interval)
     else:
         print(f"\nWarning: timed out after {args.timeout}s waiting for emulation to finish.")
+    
+    end_emulation = time.time()
+    print(f"Total emulation time: {end_emulation - start_emulation:.2f}s")
 
     # Fetch and display final summary
     print("\n=== Final Metrics Summary ===")

@@ -15,6 +15,7 @@ _cache: Dict[str, Any] = {
     "capacity_tiers": [],
     "max_error_threshold": 20.26,
     "carbon_ci_list": [],
+    "error_metrics_by_slot": {},
 }
 
 
@@ -262,38 +263,40 @@ def get_dashboard_data() -> Dict[str, Any]:
             accurate_error_contrib.append(0.0)
             slot_error_avg.append(None)
 
-    # Running cumulative global error trace across time slots
-    err_hist_slots = {s["slot"]: s for s in error_history.get("slots", [])} if error_history else {}
-    running_err_sum = 0.0
-    running_req_cnt = 0
-    global_error_trace = []
-    for idx, s in enumerate(slot_axis):
-        if s in err_hist_slots and err_hist_slots[s].get("cumulative_error") is not None:
-            global_error_trace.append(round(err_hist_slots[s]["cumulative_error"], 2))
-        else:
-            tot_slot_err = fast_error_sum[idx] + balanced_error_sum[idx] + accurate_error_sum[idx]
-            running_err_sum += tot_slot_err
-            running_req_cnt += slot_total_reqs[idx]
-            global_error_trace.append(round(running_err_sum / running_req_cnt, 2) if running_req_cnt > 0 else None)
+    # These are live scheduler snapshots, not values to project across slots.
+    error_current_slot = error_history.get("current_slot", current_slot)
+    current_slot_error = next(
+        (
+            item
+            for item in error_history.get("slots", [])
+            if item.get("slot") == error_current_slot
+        ),
+        {},
+    )
+    global_error_avg = error_history.get("global_error_avg")
+    if global_error_avg is not None:
+        global_error_avg = round(float(global_error_avg), 2)
+    window_error_avg = current_slot_error.get("window_error")
+    if window_error_avg is not None:
+        window_error_avg = round(float(window_error_avg), 2)
 
-    # Window error average trace across time slots
-    window_error_trace = []
-    w_past = error_history.get("window_past", 12)
-    w_future = error_history.get("window_future", 12)
-    for idx, s in enumerate(slot_axis):
-        if s in err_hist_slots and err_hist_slots[s].get("window_error") is not None:
-            window_error_trace.append(round(err_hist_slots[s]["window_error"], 2))
-        else:
-            w_start = max(0, s - w_past)
-            w_end = s + w_future
-            w_sum = 0.0
-            w_cnt = 0
-            for w_s in range(w_start, w_end + 1):
-                if min_vis_slot <= w_s <= max_vis_slot:
-                    w_idx = w_s - min_vis_slot
-                    w_sum += (fast_error_sum[w_idx] + balanced_error_sum[w_idx] + accurate_error_sum[w_idx])
-                    w_cnt += slot_total_reqs[w_idx]
-            window_error_trace.append(round(w_sum / w_cnt, 2) if w_cnt > 0 else None)
+    error_metrics_by_slot = _cache["error_metrics_by_slot"]
+    if "current_slot" in error_history:
+        if error_metrics_by_slot and error_current_slot < max(error_metrics_by_slot):
+            error_metrics_by_slot.clear()
+        error_metrics_by_slot[error_current_slot] = {
+            "global_error_avg": global_error_avg,
+            "window_error_avg": window_error_avg,
+        }
+    error_history_slots = sorted(error_metrics_by_slot)
+    global_error_history = [
+        error_metrics_by_slot[slot]["global_error_avg"]
+        for slot in error_history_slots
+    ]
+    window_error_history = [
+        error_metrics_by_slot[slot]["window_error_avg"]
+        for slot in error_history_slots
+    ]
 
     # 6. Request Input Distribution (arrival_slot vs CI)
     input_arrival_counts = [0] * len(slot_axis)
@@ -336,7 +339,7 @@ def get_dashboard_data() -> Dict[str, Any]:
             "overall_avg_exec_sec": round(overall_avg_exec_sec, 4) if overall_avg_exec_sec is not None else None,
             "overall_baseline_exec_sec": round(overall_baseline_exec_sec, 4) if overall_baseline_exec_sec is not None else None,
             "by_flavour": by_flavour_stats,
-            "global_error_avg": scheduler_snapshot.get("global_error_avg"),
+            "global_error_avg": global_error_avg,
             "max_error_threshold": max_error_threshold,
         },
         "assignment_plot": {
@@ -360,66 +363,12 @@ def get_dashboard_data() -> Dict[str, Any]:
             "balanced_error": balanced_error_contrib,
             "accurate_error": accurate_error_contrib,
             "slot_error_avg": slot_error_avg,
-            "window_error_avg": window_error_trace,
-            "global_error_avg": global_error_trace,
+            "window_error_avg": window_error_avg,
+            "global_error_avg": global_error_avg,
+            "error_history_slots": error_history_slots,
+            "window_error_history": window_error_history,
+            "global_error_history": global_error_history,
             "max_error_threshold": max_error_threshold,
-        },
-        "input_plot": {
-            "slots": slot_axis,
-            "arrived_requests": input_arrival_counts,
-            "carbon_intensity_forecast": ci_forecast_series,
-            "carbon_intensity_actual": ci_actual_series,
-        },
-    }
-
-    return {
-        "indicators": {
-            "total_requests": len(client_requests),
-            "completed_requests": len(completed_requests),
-            "scheduled_requests": len(scheduled_requests),
-            "pending_requests": len(client_requests) - len(scheduled_requests),
-            "current_slot": current_slot,
-            "global_slot": global_slot,
-            "total_slots": total_slots,
-            "actual_carbon_cost": round(actual_cost_sum, 4),
-            "actual_baseline_carbon_cost": round(actual_baseline_cost_sum, 4),
-            "actual_carbon_saving_pct": actual_carbon_saving_pct,
-            "forecasted_pending_carbon_cost": round(pending_forecasted_cost, 4),
-            "overall_avg_exec_sec": round(overall_avg_exec_sec, 4) if overall_avg_exec_sec is not None else None,
-            "overall_baseline_exec_sec": round(overall_baseline_exec_sec, 4) if overall_baseline_exec_sec is not None else None,
-            "by_flavour": by_flavour_stats,
-            "global_error_avg": scheduler_snapshot.get("global_error_avg"),
-            "max_error_threshold": max_error_threshold,
-        },
-        "assignment_plot": {
-            "slots": slot_axis,
-            "fast": fast_counts,
-            "balanced": balanced_counts,
-            "accurate": accurate_counts,
-            "carbon_cost": [round(c, 3) for c in slot_carbon_cost],
-            "carbon_intensity_forecast": ci_forecast_series,
-            "carbon_intensity_actual": ci_actual_series,
-            "capacity_tiers": capacity_tiers,
-            "flavour_colors": {
-                "Fast": "#1f77b4",
-                "Balanced": "#2ca02c",
-                "Accurate": "#ff7f0e",
-            },
-        },
-        "error_plot": {
-            "slots": slot_axis,
-            "fast_error": fast_error_contrib,
-            "balanced_error": balanced_error_contrib,
-            "accurate_error": accurate_error_contrib,
-            "slot_error_avg": slot_error_avg,
-            "window_error_avg": window_error_trace,
-            "global_error_avg": global_error_trace,
-            "max_error_threshold": max_error_threshold,
-        },
-        "input_plot": {
-            "slots": slot_axis,
-            "arrived_requests": input_arrival_counts,
-            "global_error_avg": scheduler_snapshot.get("global_error_avg"),
         },
         "input_plot": {
             "slots": slot_axis,

@@ -204,6 +204,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       font-size: 0.8rem;
       color: var(--text-muted);
     }
+    .chart-current-metrics {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+    .chart-current-metrics strong {
+      color: var(--text-main);
+    }
     .plot-wrapper {
       width: 100%;
       min-height: 380px;
@@ -312,8 +322,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <section class="chart-container">
     <div class="chart-header">
       <div>
-        <div class="chart-title">Error Tracking Over Time Slots</div>
-        <div class="chart-desc">Stacked slot error contributions by flavour, with sliding window error avg and running global error avg curves</div>
+        <div class="chart-title">Error Tracking by Scheduled Slot</div>
+        <div class="chart-desc">Stacked per-slot error contributions; average traces show the last scheduler snapshot measured in each slot.</div>
+      </div>
+      <div class="chart-current-metrics">
+        <span>Current global error avg: <strong id="plot-global-error-avg">-</strong></span>
+        <span>Current window error avg: <strong id="plot-window-error-avg">-</strong></span>
       </div>
     </div>
     <div id="error-plot" class="plot-wrapper"></div>
@@ -419,6 +433,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       renderAll();
     }
 
+    function displaySlotValue(slot) {
+      if (slot === null || slot === undefined || slot === '') return slot;
+      const numeric = Number(slot);
+      return Number.isFinite(numeric) ? numeric + 1 : slot;
+    }
+
+    function displaySlotAxis(slots) {
+      return slots.map(displaySlotValue);
+    }
+
     function filterAndResample(slots, arrays, binSize) {
       if (!slots || slots.length === 0) return { slots: [], arrays: arrays.map(() => []) };
       
@@ -434,7 +458,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const fArrays = arrays.map(arr => arr.slice(startIdx, endIdx));
 
       if (binSize <= 1 || fSlots.length === 0) {
-        return { slots: fSlots, arrays: fArrays };
+        return { slots: displaySlotAxis(fSlots), arrays: fArrays };
       }
 
       // Bin aggregation
@@ -457,7 +481,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
       }
 
-      return { slots: bSlots, arrays: bArrays };
+      return { slots: displaySlotAxis(bSlots), arrays: bArrays };
     }
 
     function renderAll() {
@@ -469,8 +493,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderKPIs(ind) {
-      document.getElementById('kpi-current-slot').textContent = `Slot ${ind.current_slot}`;
-      document.getElementById('kpi-global-slot').textContent = ind.global_slot ? `Global Epoch Slot: ${ind.global_slot}` : `Local Horizon: ${ind.total_slots}`;
+      document.getElementById('kpi-current-slot').textContent = `Slot ${displaySlotValue(ind.current_slot)}`;
+      const globalSlot = ind.global_slot !== null && ind.global_slot !== undefined ? displaySlotValue(ind.global_slot) : null;
+      document.getElementById('kpi-global-slot').textContent = globalSlot !== null ? `Global Epoch Slot: ${globalSlot}` : `Local Horizon: ${ind.total_slots}`;
       document.getElementById('kpi-assigned-count').textContent = ind.scheduled_requests;
       document.getElementById('kpi-assigned-breakdown').textContent = `${ind.completed_requests} completed, ${ind.pending_requests} pending`;
       
@@ -564,28 +589,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
       ];
 
-      // Capacity tier shape lines
+      // Capacity tier shape lines: omit the implicit baseline x1 band and
+      // label each subsequent tier by the request count where the next multiplier
+      // starts taking effect.
       const shapes = [];
       const annotations = [];
       if (plot.capacity_tiers && plot.capacity_tiers.length > 0) {
-        for (const tier of plot.capacity_tiers) {
-          if (tier.max_requests) {
+        const tiers = plot.capacity_tiers.filter(tier => tier && typeof tier === 'object');
+        if (tiers.length > 0) {
+          const baselineIndex = tiers.findIndex(tier => Number(tier.multiplier) === 1);
+          const startIndex = baselineIndex >= 0 ? baselineIndex + 1 : 0;
+
+          for (let i = startIndex; i < tiers.length; i++) {
+            const tier = tiers[i];
+            const previousTier = i > 0 ? tiers[i - 1] : null;
+            const threshold = previousTier && previousTier.max_requests != null && previousTier.max_requests !== undefined
+              ? Number(previousTier.max_requests)
+              : null;
+
+            if (threshold === null || !Number.isFinite(threshold)) continue;
+
             shapes.push({
               type: 'line',
               xref: 'paper',
               x0: 0,
               x1: 1,
-              y0: tier.max_requests,
-              y1: tier.max_requests,
+              y0: threshold,
+              y1: threshold,
               line: { color: '#94a3b8', width: 1.2, dash: 'dash' }
             });
             annotations.push({
               xref: 'paper',
               x: 0.99,
-              y: tier.max_requests,
+              y: threshold,
               xanchor: 'right',
               yanchor: 'bottom',
-              text: `cap <= ${tier.max_requests} (x${tier.multiplier})`,
+              text: `cap > ${threshold} (x${tier.multiplier})`,
               showarrow: false,
               font: { size: 10, color: '#94a3b8' }
             });
@@ -626,13 +665,35 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderErrorPlot(plot) {
+      document.getElementById('plot-global-error-avg').textContent =
+        plot.global_error_avg !== null && plot.global_error_avg !== undefined
+          ? `${plot.global_error_avg}%`
+          : '-';
+      document.getElementById('plot-window-error-avg').textContent =
+        plot.window_error_avg !== null && plot.window_error_avg !== undefined
+          ? `${plot.window_error_avg}%`
+          : '-';
+
       const filtered = filterAndResample(
         plot.slots,
-        [plot.fast_error, plot.balanced_error, plot.accurate_error, plot.window_error_avg, plot.global_error_avg],
+        [plot.fast_error, plot.balanced_error, plot.accurate_error],
         resampleBin
       );
       const slots = filtered.slots;
-      const [fastErr, balErr, accErr, winErr, globErr] = filtered.arrays;
+      const [fastErr, balErr, accErr] = filtered.arrays;
+
+      let historyStartIdx = 0;
+      if (selectedRange !== 'all') {
+        historyStartIdx = Math.max(0, plot.slots.length - parseInt(selectedRange));
+      }
+      const historyStartSlot = plot.slots[historyStartIdx];
+      const historyEndSlot = plot.slots[plot.slots.length - 1];
+      const historyIndexes = (plot.error_history_slots || [])
+        .map((slot, index) => ({ slot, index }))
+        .filter(({ slot }) => slot >= historyStartSlot && slot <= historyEndSlot);
+      const historySlots = displaySlotAxis(historyIndexes.map(({ slot }) => slot));
+      const globalHistory = historyIndexes.map(({ index }) => plot.global_error_history[index]);
+      const windowHistory = historyIndexes.map(({ index }) => plot.window_error_history[index]);
 
       const traces = [
         {
@@ -656,25 +717,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           type: 'bar',
           marker: { color: FLAVOUR_COLORS['Accurate'] },
         },
-        {
-          x: slots,
-          y: winErr,
-          name: 'Window Error Avg',
-          type: 'scatter',
-          mode: 'lines+markers',
-          marker: { size: 5, color: '#eab308' },
-          line: { color: '#eab308', width: 2.2 },
-        },
-        {
-          x: slots,
-          y: globErr,
-          name: 'Global Error Avg (Running)',
-          type: 'scatter',
-          mode: 'lines+markers',
-          marker: { size: 5, color: '#a855f7' },
-          line: { color: '#a855f7', width: 2.5 },
-        }
       ];
+      if (historySlots.length > 0) {
+        traces.push(
+          {
+            x: historySlots,
+            y: windowHistory,
+            name: 'Window Error Avg (last per slot)',
+            type: 'scatter',
+            mode: 'lines+markers',
+            connectgaps: false,
+            marker: { size: 5, color: '#eab308' },
+            line: { color: '#eab308', width: 2.2 },
+            hovertemplate: 'Slot %{x}<br>Window Error Avg: %{y:.2f}%<extra></extra>',
+          },
+          {
+            x: historySlots,
+            y: globalHistory,
+            name: 'Global Error Avg (last per slot)',
+            type: 'scatter',
+            mode: 'lines+markers',
+            connectgaps: false,
+            marker: { size: 5, color: '#a855f7' },
+            line: { color: '#a855f7', width: 2.5 },
+            hovertemplate: 'Slot %{x}<br>Global Error Avg: %{y:.2f}%<extra></extra>',
+          }
+        );
+      }
 
       const shapes = [];
       const annotations = [];
