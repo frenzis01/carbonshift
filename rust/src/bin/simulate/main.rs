@@ -41,7 +41,20 @@ impl Online2System {
             None => RequestGenerator::new(shared_state.clone(), generator_cfg),
         };
         let carbon_forecast = scenario_forecast.unwrap_or_else(|| {
-            carbonshift_rs::engine::scheduler::generate_carbon_forecast(cfg.total_slots)
+            carbonshift_rs::engine::scheduler::generate_carbon_intensity_forecast(
+                cfg.total_slots as usize,
+                12,
+                26,
+                160.0,
+                70.0,
+                0.25,
+                0.75,
+                18.0,
+                2.0,
+                0.95,
+                false,
+                false,
+            )
         });
         let carbon_forecast = Arc::new(RwLock::new(carbon_forecast));
         let scheduler = BatchScheduler::new(shared_state, cfg.clone(), ml, carbon_forecast);

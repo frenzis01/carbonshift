@@ -1,6 +1,6 @@
 /// Integration test: full slot-by-slot scheduling of the canonical scenario.
 ///
-/// Loads `tests/Nshift_speed/scenario_seed_2030.json` from the Python test
+/// Loads `tests/battery/scenarios/scenario_seed_2026.json` from the Python test
 /// suite, groups requests by arrival slot, and processes them with the
 /// CarbonShift DP solver.
 ///
@@ -233,11 +233,11 @@ fn drain_pending_with_dp(
 // ─── the test ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn scenario_seed_2030_all_requests_scheduled_correctly() {
+fn scenario_seed_2026_all_requests_scheduled_correctly() {
     // Locate the scenario file relative to the manifest directory.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let scenario_path = format!(
-        "{}/../online2/tests/Nshift_speed/scenario_seed_2030.json",
+        "{}/../tests/battery/scenarios/json/scenario_seed_2026.json",
         manifest_dir
     );
 

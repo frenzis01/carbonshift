@@ -43,7 +43,20 @@ fn test_engine_config() -> Config {
 }
 
 fn test_forecast(total_slots: i32) -> Arc<RwLock<Vec<f64>>> {
-    let forecast = carbonshift_rs::engine::scheduler::generate_carbon_forecast(total_slots);
+    let forecast = carbonshift_rs::engine::scheduler::generate_carbon_intensity_forecast(
+        total_slots as usize,
+        12,
+        26,
+        160.0,
+        70.0,
+        0.25,
+        0.75,
+        18.0,
+        2.0,
+        0.95,
+        false,
+        false,
+    );
     Arc::new(RwLock::new(forecast))
 }
 

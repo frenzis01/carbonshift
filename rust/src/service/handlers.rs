@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn baseline_carbon_cost_uses_lowest_error_flavour() {
         use crate::engine::config::Config;
-        use crate::engine::scheduler::generate_carbon_forecast;
+        use crate::engine::scheduler::generate_carbon_intensity_forecast;
         use crate::engine::shared_state::SharedState;
         use crate::engine::types::Flavour;
         use crate::service::state::ServiceConfig;
@@ -1035,7 +1035,20 @@ mod tests {
             Flavour { name: "Precise".to_string(), error: 0.0, duration: 10 },
         ];
         let cfg = Arc::new(cfg);
-        let forecast = Arc::new(RwLock::new(generate_carbon_forecast(cfg.total_slots)));
+        let forecast = Arc::new(RwLock::new(generate_carbon_intensity_forecast(
+            cfg.total_slots as usize,
+            12,
+            26,
+            160.0,
+            70.0,
+            0.25,
+            0.75,
+            18.0,
+            2.0,
+            0.95,
+            false,
+            false,
+        )));
         let service_cfg = ServiceConfig {
             executor_url: None,
             self_base_url: "http://localhost:0".to_string(),
