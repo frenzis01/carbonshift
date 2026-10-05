@@ -134,12 +134,12 @@ fn compute_baseline_carbon_cost(state: &AppState, arrival_slot: i32, flavours: &
         .get(arrival_slot as usize)
         .copied()
         .unwrap_or(0.0);
-    let mult = get_capacity_multiplier(&state.cfg.capacity_tiers, position);
+    let mult = get_capacity_multiplier(&state.scheduler.capacity_tiers, position);
     let accurate = flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("task must have at least one flavour");
-    let cost = carbon * mult * accurate.duration as f64 * state.cfg.carbon_cost_duration_scale;
+    let cost = carbon * mult * accurate.duration as f64 * state.scheduler.carbon_cost_duration_scale;
     (cost, accurate.duration)
 }
 
@@ -178,7 +178,7 @@ pub async fn register_task(
 
 fn compute_horizon(state: &AppState) -> HorizonResponse {
     let current_slot = state.shared_state.get_current_slot();
-    let total_slots = state.cfg.total_slots.max(1);
+    let total_slots = state.scheduler.total_slots.max(1);
     let used_fraction = (current_slot as f64 / total_slots as f64).clamp(0.0, 1.0);
     HorizonResponse {
         current_slot,
@@ -217,7 +217,7 @@ pub async fn advance_slot(
     // We must have a real body struct carrying slot, observed, forecast and current_slot, all #[serde(default)]
     Json(body): Json<AdvanceSlotBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.cfg.simulation.manual_clock {
+    if !state.scheduler.manual_clock {
         return Err(api_error(StatusCode::CONFLICT, "MANUAL_CLOCK is not enabled on this instance"));
     }
     // TODO: too much slot naming here... evaluate if it's possible to simplify.
@@ -250,7 +250,11 @@ pub async fn advance_slot(
         }
     } else {
         println!("[Service] Advancing to new slot: {current_slot} -> {target_engine_slot} (global: {body_current_slot})", current_slot = state.shared_state.get_current_slot(), target_engine_slot = target_engine_slot, body_current_slot = body_current_slot);
-        let new_slot = crate::engine::scheduler::advance_to_next_slot(&state.shared_state, &state.cfg);
+        let new_slot = crate::engine::scheduler::advance_to_next_slot(
+            &state.shared_state,
+            state.scheduler.total_slots,
+            state.scheduler.effective_slot_duration_secs,
+        );
         if new_slot != target_engine_slot {
             tracing::warn!(new_slot, target_engine_slot, "engine slot disagrees with the announced slot");
         }
@@ -366,8 +370,8 @@ pub async fn get_task_config(
 ) -> Json<TaskConfigResponse> {
     Json(TaskConfigResponse {
         flavours: state.flavours_for_task(&task_id),
-        max_error_threshold: state.threshold_for_task(&task_id).unwrap_or(state.cfg.max_error_threshold),
-        capacity_tiers: state.capacity_tiers_for_task(&task_id).unwrap_or_else(|| state.cfg.capacity_tiers.clone()),
+        max_error_threshold: state.threshold_for_task(&task_id).unwrap_or(state.scheduler.max_error_threshold),
+        capacity_tiers: state.capacity_tiers_for_task(&task_id).unwrap_or_else(|| state.scheduler.capacity_tiers.clone()),
         task_id,
     })
 }
@@ -479,7 +483,7 @@ pub async fn get_slot_detail(
     
     // horizon is yielded by max(current_slot + assignment_max_future_slots, carbon_forecast length)
     let horizon = std::cmp::max(
-        _state.shared_state.get_current_slot() + _state.cfg.assignment_max_future_slots,
+        _state.shared_state.get_current_slot() + _state.scheduler.assignment_max_future_slots,
         carbon_forecast.len() as i32,
     );
 
@@ -506,7 +510,7 @@ pub async fn get_slot_detail(
         .map(|assignment| assignment.carbon_cost)
         .sum();
 
-    let capacity_multiplier: f64 = _state.cfg.capacity_tiers
+    let capacity_multiplier: f64 = _state.scheduler.capacity_tiers
         .iter()
         // find highest tier where assignments.len() <= tier.max_requests
         // max_requests being None means infinite
@@ -595,7 +599,7 @@ pub async fn get_error_history(
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<ErrorHistoryResponse>, ApiError> {
     let current_slot = _state.shared_state.get_current_slot();
-    let horizon = _state.cfg.total_slots;
+    let horizon = _state.scheduler.total_slots;
 
     let from = _query.from_slot.unwrap_or(0);
     let to = _query.to_slot.unwrap_or(current_slot);
@@ -625,17 +629,17 @@ pub async fn get_error_history(
         task_thresholds
             .get(target_task)
             .copied()
-            .unwrap_or(_state.cfg.max_error_threshold)
+            .unwrap_or(_state.scheduler.max_error_threshold)
     } else {
         task_thresholds
             .values()
             .copied()
             .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a| a.min(t))))
-            .unwrap_or(_state.cfg.max_error_threshold)
+            .unwrap_or(_state.scheduler.max_error_threshold)
     };
 
-    let window_past = _state.cfg.error_window_past;
-    let window_future = _state.cfg.error_window_future;
+    let window_past = _state.scheduler.error_window_past;
+    let window_future = _state.scheduler.error_window_future;
 
     let mut slots = Vec::with_capacity((to - from + 1) as usize);
     let mut running_error_sum = 0.0;
@@ -715,7 +719,7 @@ pub async fn submit_request(
     let arrival_slot = match (body.arrival_slot_global, *state.slot_epoch_offset.lock().unwrap()) {
         (Some(global), Some(offset)) => {
             let engine = global - offset;
-            if engine < 0 || engine >= state.cfg.total_slots {
+            if engine < 0 || engine >= state.scheduler.total_slots {
                 tracing::warn!(global, offset, engine, "arrival_slot_global out of range; falling back to current_slot");
                 current_slot
             } else {
@@ -725,9 +729,9 @@ pub async fn submit_request(
         _ => current_slot,   // offset not yet known, or client didn't send it
     };
 
-    let eff_slot_dur = state.cfg.effective_slot_duration_secs();
+    let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
     let slots_ahead = ((body.deadline_seconds / eff_slot_dur).ceil() as i32).max(1);
-    let deadline_slot = (current_slot + slots_ahead).min(state.cfg.total_slots - 1);
+    let deadline_slot = (current_slot + slots_ahead).min(state.scheduler.total_slots - 1);
     let task_id = body.task_id.clone().unwrap_or_else(|| "default".to_string());
     let task_flavours = state.flavours_for_task(&task_id);
     let task_threshold = state.threshold_for_task(&task_id);
@@ -823,7 +827,7 @@ pub async fn get_request_status(
 
     let assignments = state.shared_state.get_current_assignments();
     let assignment = assignments.get(&request_id);
-    let eff_slot_dur = state.cfg.effective_slot_duration_secs();
+    let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
     let eta = assignment.map(|a| {
         ((a.scheduled_slot - state.shared_state.get_current_slot()).max(0)) as f64 * eff_slot_dur
     });
@@ -1031,7 +1035,7 @@ mod tests {
             Flavour { name: "Precise".to_string(), error: 0.0, duration: 10 },
         ];
         let cfg = Arc::new(cfg);
-        let forecast = Arc::new(RwLock::new(generate_carbon_forecast(&cfg)));
+        let forecast = Arc::new(RwLock::new(generate_carbon_forecast(cfg.total_slots)));
         let service_cfg = ServiceConfig {
             executor_url: None,
             self_base_url: "http://localhost:0".to_string(),

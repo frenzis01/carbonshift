@@ -91,8 +91,8 @@ mod swarm;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use carbonshift_rs::config::Config;
-use carbonshift_rs::generator::RequestGenerator;
+use carbonshift_rs::config::{AssignmentPolicy, Config};
+use carbonshift_rs::generator::{RequestGenerator, RequestGeneratorConfig};
 use carbonshift_rs::metrics_logger::MetricsLogger;
 use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
@@ -672,17 +672,18 @@ fn recompute_carbon_costs(
 /// flavour (lowest error; mirrors Python's `run_greedy_baseline`).
 fn run_greedy_baseline(
     scenario: &Scenario,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let flav = cfg.flavours.iter().min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
-        .expect("Config must have at least one flavour");
-    let slot_dur = cfg.slot_duration_seconds;
+    let flav = assignment.flavours.iter().min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+        .expect("assignment policy must have at least one flavour");
+    let slot_dur = slot_duration_seconds;
     let carbon   = &scenario.carbon_forecast;
     let by_slot  = scenario.requests_by_slot();
-    let tiers    = &cfg.capacity_tiers;
-    let scale    = cfg.carbon_cost_duration_scale;
+    let tiers    = assignment.capacity_tiers;
+    let scale    = assignment.carbon_cost_duration_scale;
 
     let mut per_req: Vec<PerRequest> = Vec::new();
     let mut batch_timings: Vec<BatchTiming> = Vec::new();
@@ -766,26 +767,27 @@ fn run_greedy_baseline(
 /// feasible (slot, flavour) pair exists.
 fn run_greedy_cheapest(
     scenario: &Scenario,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let slot_dur = cfg.slot_duration_seconds;
+    let slot_dur = slot_duration_seconds;
     let carbon   = &scenario.carbon_forecast;
-    let tiers    = &cfg.capacity_tiers;
-    let scale    = cfg.carbon_cost_duration_scale;
-    let max_future   = cfg.assignment_max_future_slots;
-    let total_slots  = cfg.total_slots;
-    let win_past     = cfg.error_window_past;
-    let win_future   = cfg.error_window_future;
-    let max_err      = cfg.max_error_threshold;
+    let tiers = assignment.capacity_tiers;
+    let scale = assignment.carbon_cost_duration_scale;
+    let max_future = assignment.assignment_max_future_slots;
+    let total_slots = assignment.total_slots;
+    let win_past = assignment.error_window_past;
+    let win_future = assignment.error_window_future;
+    let max_err = assignment.max_error_threshold;
 
     // Sort flavours cheapest-first (shortest duration = lowest carbon cost per slot).
-    let mut sorted_flavours: Vec<&Flavour> = cfg.flavours.iter().collect();
+    let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
     sorted_flavours.sort_by_key(|f| f.duration);
 
     // Fallback flavour = minimum error (for infeasible cases).
-    let fallback_flav = cfg.flavours
+    let fallback_flav = assignment.flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("no flavours");
@@ -814,10 +816,10 @@ fn run_greedy_cheapest(
         // mirrors solve_dp's step-function behaviour (Step 4 in solve_dp).
         let global_avg = if global_count > 0 { global_error_sum / global_count as f64 } else { 0.0 };
         let global_constraint_active =
-            cfg.global_error_constraint_enabled && global_count > 0 && global_avg > max_err;
+            assignment.global_error_constraint_enabled && global_count > 0 && global_avg > max_err;
         // If the hard constraint would exclude every flavour, fall back to the
         // full set (safety net identical to solve_dp's "never remove all flavours").
-        let allowed_flavours: Vec<&Flavour> = if global_constraint_active && cfg.global_error_constraint_hard {
+        let allowed_flavours: Vec<&Flavour> = if global_constraint_active && assignment.global_error_constraint_hard {
             let filtered: Vec<&Flavour> = sorted_flavours
                 .iter()
                 .filter(|f| f.error <= max_err)
@@ -937,12 +939,13 @@ fn convert_swarm_to_outputs(
     raw: Vec<swarm::SwarmAssignment>,
     mode_name: &str,
     scenario: &Scenario,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let slot_dur = cfg.slot_duration_seconds;
-    let best_flav = cfg.flavours
+    let slot_dur = slot_duration_seconds;
+    let best_flav = assignment.flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("no flavours");
@@ -1005,42 +1008,79 @@ fn convert_swarm_to_outputs(
 
 fn run_bandit_strategy(
     scenario: &Scenario,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
     let params = swarm::BanditParams::default();
     let mut requests: Vec<_> = scenario.requests.clone();
     requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
-    let raw = swarm::run_bandit(&requests, &scenario.carbon_forecast, cfg, &params);
-    convert_swarm_to_outputs(raw, "bandit", scenario, cfg, realtime_slots, realtime_speed_scale)
+    let raw = swarm::run_bandit(&requests, &scenario.carbon_forecast, assignment, &params);
+    convert_swarm_to_outputs(
+        raw,
+        "bandit",
+        scenario,
+        assignment,
+        slot_duration_seconds,
+        realtime_slots,
+        realtime_speed_scale,
+    )
 }
 
 fn run_ant_colony_strategy(
     scenario: &Scenario,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
     let params = swarm::AcoParams::default();
     let mut requests: Vec<_> = scenario.requests.clone();
     requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
-    let raw = swarm::run_ant_colony(&requests, &scenario.carbon_forecast, cfg, &params);
-    convert_swarm_to_outputs(raw, "ant_colony", scenario, cfg, realtime_slots, realtime_speed_scale)
+    let raw = swarm::run_ant_colony(&requests, &scenario.carbon_forecast, assignment, &params);
+    convert_swarm_to_outputs(
+        raw,
+        "ant_colony",
+        scenario,
+        assignment,
+        slot_duration_seconds,
+        realtime_slots,
+        realtime_speed_scale,
+    )
 }
 
 /// Dispatch an additional strategy by name.
 fn run_strategy(
     name: &str,
     scenario: &Scenario,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
     match name {
-        "greedy_cheapest" => run_greedy_cheapest(scenario, cfg, realtime_slots, realtime_speed_scale),
-        "bandit"          => run_bandit_strategy(scenario, cfg, realtime_slots, realtime_speed_scale),
-        "ant_colony"      => run_ant_colony_strategy(scenario, cfg, realtime_slots, realtime_speed_scale),
+        "greedy_cheapest" => run_greedy_cheapest(
+            scenario,
+            assignment,
+            slot_duration_seconds,
+            realtime_slots,
+            realtime_speed_scale,
+        ),
+        "bandit" => run_bandit_strategy(
+            scenario,
+            assignment,
+            slot_duration_seconds,
+            realtime_slots,
+            realtime_speed_scale,
+        ),
+        "ant_colony" => run_ant_colony_strategy(
+            scenario,
+            assignment,
+            slot_duration_seconds,
+            realtime_slots,
+            realtime_speed_scale,
+        ),
         other             => panic!("Unknown strategy: '{other}'"),
     }
 }
@@ -1317,15 +1357,16 @@ fn write_run_outputs(
 fn schedule_late_requests(
     remaining: Vec<carbonshift_rs::types::Request>,
     carbon_forecast: &[f64],
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
 ) -> Vec<PerRequest> {
     if remaining.is_empty() { return Vec::new(); }
 
-    let slot_dur   = cfg.slot_duration_seconds;
-    let tiers      = &cfg.capacity_tiers;
-    let scale      = cfg.carbon_cost_duration_scale;
-    let total_slots = cfg.total_slots;
-    let fallback_flav = cfg.flavours
+    let slot_dur = slot_duration_seconds;
+    let tiers = assignment.capacity_tiers;
+    let scale = assignment.carbon_cost_duration_scale;
+    let total_slots = assignment.total_slots;
+    let fallback_flav = assignment.flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("no flavours");
@@ -1433,7 +1474,9 @@ fn run_single_n(
     ));
 
     let by_slot = scenario.requests_by_slot();
-    let mut generator = RequestGenerator::new_from_scenario(shared_state.clone(), cfg.clone(), by_slot);
+    let generator_cfg = RequestGeneratorConfig::from_config(&cfg);
+    let mut generator =
+        RequestGenerator::new_from_scenario(shared_state.clone(), generator_cfg, by_slot);
     let mut sched = BatchScheduler::new(
         shared_state.clone(),
         cfg.clone(),
@@ -1499,7 +1542,12 @@ fn run_single_n(
     // expired while waiting in the pending queue) and schedule them late.
     let remaining = shared_state.drain_pending_requests();
     if !remaining.is_empty() {
-        let late = schedule_late_requests(remaining, &scenario.carbon_forecast, base_cfg);
+        let late = schedule_late_requests(
+            remaining,
+            &scenario.carbon_forecast,
+            &base_cfg.assignment_policy(),
+            base_cfg.slot_duration_seconds,
+        );
         per_req.extend(late);
     }
     // Correct per-request carbon costs using final committed state to eliminate
@@ -1646,7 +1694,13 @@ fn main() {
     // ── greedy baseline ────────────────────────────────────────────────────
     if bcfg.include_greedy_baseline {
         let (per_req, batch_timings, summary) =
-            run_greedy_baseline(&scenario, &base_cfg, realtime_slots, speed_scale);
+            run_greedy_baseline(
+                &scenario,
+                &base_cfg.assignment_policy(),
+                base_cfg.slot_duration_seconds,
+                realtime_slots,
+                speed_scale,
+            );
         baseline_cost = Some(summary.total_carbon_cost);
         let per_ts = compute_per_timeslot(
             &per_req,
@@ -1815,7 +1869,14 @@ fn main() {
         let strat_dir = bcfg.output_dir.join(format!("strategy_{strategy}"));
         let strat_t0 = std::time::Instant::now();
         let (per_req, batch_timings, mut summary) =
-            run_strategy(strategy, &scenario, &base_cfg, realtime_slots, speed_scale);
+            run_strategy(
+                strategy,
+                &scenario,
+                &base_cfg.assignment_policy(),
+                base_cfg.slot_duration_seconds,
+                realtime_slots,
+                speed_scale,
+            );
         summary.run_elapsed_seconds = strat_t0.elapsed().as_secs_f64();
 
         if let Some(bc) = baseline_cost {

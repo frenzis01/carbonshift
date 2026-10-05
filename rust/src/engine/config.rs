@@ -177,6 +177,33 @@ pub struct Config {
     pub capacity_tiers: Vec<CapacityTier>,
 }
 
+/// Borrowed view of only the core settings used to evaluate assignments.
+#[derive(Debug, Clone, Copy)]
+pub struct AssignmentPolicy<'a> {
+    /// Default flavours used when a request has no task-specific override.
+    pub flavours: &'a [Flavour],
+    /// Capacity multipliers used to price assignments.
+    pub capacity_tiers: &'a [CapacityTier],
+    /// Planning horizon in slots.
+    pub total_slots: i32,
+    /// Scale converting flavour duration to carbon cost.
+    pub carbon_cost_duration_scale: f64,
+    /// Maximum allowed average error (%).
+    pub max_error_threshold: f64,
+    /// Number of past slots in the error window.
+    pub error_window_past: i32,
+    /// Number of future slots in the error window.
+    pub error_window_future: i32,
+    /// Additional past slots included with linearly decayed weight.
+    pub error_window_past_decay_slots: i32,
+    /// Maximum scheduling shift in slots.
+    pub assignment_max_future_slots: i32,
+    /// Whether to enforce the task-agnostic global error constraint.
+    pub global_error_constraint_enabled: bool,
+    /// Whether global-constraint violations exclude flavours.
+    pub global_error_constraint_hard: bool,
+}
+
 impl Default for SolverConfig {
     fn default() -> Self {
         Self {
@@ -297,6 +324,24 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Creates a borrowed assignment-policy view without exposing unrelated
+    /// simulation, logging, recovery, or online-strategy settings.
+    pub fn assignment_policy(&self) -> AssignmentPolicy<'_> {
+        AssignmentPolicy {
+            flavours: &self.flavours,
+            capacity_tiers: &self.capacity_tiers,
+            total_slots: self.total_slots,
+            carbon_cost_duration_scale: self.carbon_cost_duration_scale,
+            max_error_threshold: self.max_error_threshold,
+            error_window_past: self.error_window_past,
+            error_window_future: self.error_window_future,
+            error_window_past_decay_slots: self.error_window_past_decay_slots,
+            assignment_max_future_slots: self.assignment_max_future_slots,
+            global_error_constraint_enabled: self.global_error_constraint_enabled,
+            global_error_constraint_hard: self.global_error_constraint_hard,
+        }
+    }
+
     /// Convenience: total error window size (past + 1 + future).
     pub fn error_window_size(&self) -> i32 {
         self.error_window_past + 1 + self.error_window_future

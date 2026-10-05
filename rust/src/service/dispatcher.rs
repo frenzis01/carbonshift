@@ -67,7 +67,7 @@ fn warn_if_near_horizon(state: &AppState, current_slot: i32, warned: &mut bool) 
     if *warned {
         return;
     }
-    let total = state.cfg.total_slots;
+    let total = state.scheduler.total_slots;
     if total > 0 && current_slot as f64 >= total as f64 * state.service_cfg.horizon_ready_threshold {
         tracing::warn!(
             current_slot,

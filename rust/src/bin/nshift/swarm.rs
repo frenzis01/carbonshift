@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use carbonshift_rs::config::Config;
+use carbonshift_rs::config::AssignmentPolicy;
 use carbonshift_rs::scenario::ScenarioRequest;
 use carbonshift_rs::types::{CapacityTier, Flavour};
 
@@ -152,24 +152,24 @@ impl Default for BanditParams {
 pub fn run_bandit(
     requests: &[ScenarioRequest],
     carbon_forecast: &[f64],
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
     params: &BanditParams,
 ) -> Vec<SwarmAssignment> {
-    let tiers    = &cfg.capacity_tiers;
-    let scale    = cfg.carbon_cost_duration_scale;
-    let max_future   = cfg.assignment_max_future_slots;
-    let total_slots  = cfg.total_slots;
-    let win_past     = cfg.error_window_past;
-    let win_future   = cfg.error_window_future;
-    let max_err      = cfg.max_error_threshold;
+    let tiers = assignment.capacity_tiers;
+    let scale = assignment.carbon_cost_duration_scale;
+    let max_future = assignment.assignment_max_future_slots;
+    let total_slots = assignment.total_slots;
+    let win_past = assignment.error_window_past;
+    let win_future = assignment.error_window_future;
+    let max_err = assignment.max_error_threshold;
 
     // Flavours sorted cheapest-first; fallback = minimum-error flavour.
-    let mut sorted_flavours: Vec<&Flavour> = cfg.flavours.iter().collect();
+    let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
     sorted_flavours.sort_by_key(|f| f.duration);
-    let fallback_flav = cfg.flavours
+    let fallback_flav = assignment.flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
-        .expect("Config must have at least one flavour");
+        .expect("assignment policy must have at least one flavour");
 
     // Q[s] = running-mean carbon cost achieved at slot s; n[s] = sample count.
     let mut q: Vec<f64> = vec![params.initial_q; total_slots as usize];
@@ -201,7 +201,7 @@ pub fn run_bandit(
         let (chosen_flav, cost) = pick_feasible_flavour(
             chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
             global_error_sum, global_count, scale, &sorted_flavours,
-            max_err, win_past, win_future, cfg.global_error_constraint_enabled,
+            max_err, win_past, win_future, assignment.global_error_constraint_enabled,
         ).unwrap_or_else(|| {
             let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
             (fallback_flav, c)
@@ -282,24 +282,24 @@ impl Default for AcoParams {
 pub fn run_ant_colony(
     requests: &[ScenarioRequest],
     carbon_forecast: &[f64],
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
     params: &AcoParams,
 ) -> Vec<SwarmAssignment> {
-    let tiers        = &cfg.capacity_tiers;
-    let scale        = cfg.carbon_cost_duration_scale;
-    let max_future   = cfg.assignment_max_future_slots;
-    let total_slots  = cfg.total_slots;
-    let win_past     = cfg.error_window_past;
-    let win_future   = cfg.error_window_future;
-    let max_err      = cfg.max_error_threshold;
+    let tiers = assignment.capacity_tiers;
+    let scale = assignment.carbon_cost_duration_scale;
+    let max_future = assignment.assignment_max_future_slots;
+    let total_slots = assignment.total_slots;
+    let win_past = assignment.error_window_past;
+    let win_future = assignment.error_window_future;
+    let max_err = assignment.max_error_threshold;
 
     // Flavours sorted cheapest-first; fallback = minimum-error flavour.
-    let mut sorted_flavours: Vec<&Flavour> = cfg.flavours.iter().collect();
+    let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
     sorted_flavours.sort_by_key(|f| f.duration);
-    let fallback_flav = cfg.flavours
+    let fallback_flav = assignment.flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
-        .expect("Config must have at least one flavour");
+        .expect("assignment policy must have at least one flavour");
 
     // Heuristic: rough per-slot cost using cheapest flavour, position=1, mult=1.
     let cheapest = sorted_flavours[0];
@@ -367,7 +367,7 @@ pub fn run_ant_colony(
                 let (chosen_flav, cost) = pick_feasible_flavour(
                     chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
                     global_error_sum, global_count, scale, &sorted_flavours,
-                    max_err, win_past, win_future, cfg.global_error_constraint_enabled,
+                    max_err, win_past, win_future, assignment.global_error_constraint_enabled,
                 ).unwrap_or_else(|| {
                     let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
                     (fallback_flav, c)

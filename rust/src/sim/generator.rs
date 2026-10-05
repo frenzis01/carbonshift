@@ -22,9 +22,42 @@ use crate::types::Request;
 
 // ─── RequestGenerator ────────────────────────────────────────────────────────
 
+/// Runtime settings required by the request generator alone.
+#[derive(Debug, Clone)]
+pub struct RequestGeneratorConfig {
+    slot_duration_secs: f64,
+    total_slots: i32,
+    requests_per_slot: f64,
+    request_rate_std_factor: f64,
+    deadline_min_slack: i32,
+    deadline_max_slack: i32,
+    skip_empty_slots: bool,
+    realtime_chunk_size: usize,
+    prehistory_random_seed: u64,
+    verbose: bool,
+}
+
+impl RequestGeneratorConfig {
+    /// Copies the generator's dependencies from the application-level config.
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            slot_duration_secs: config.effective_slot_duration_secs(),
+            total_slots: config.total_slots,
+            requests_per_slot: config.simulation.predicted_requests_per_slot,
+            request_rate_std_factor: config.simulation.request_rate_std_factor,
+            deadline_min_slack: config.simulation.deadline_min_slack,
+            deadline_max_slack: config.simulation.deadline_max_slack,
+            skip_empty_slots: config.simulation.skip_empty_slots,
+            realtime_chunk_size: config.simulation.generator_realtime_chunk_size,
+            prehistory_random_seed: config.infeasibility.prehistory_random_seed,
+            verbose: config.logging.verbose,
+        }
+    }
+}
+
 pub struct RequestGenerator {
     shared_state: SharedState,
-    cfg: Arc<Config>,
+    cfg: Arc<RequestGeneratorConfig>,
     /// Monotonically increasing request-id counter (shared with the thread).
     request_counter: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
@@ -35,10 +68,10 @@ pub struct RequestGenerator {
 }
 
 impl RequestGenerator {
-    pub fn new(shared_state: SharedState, cfg: Arc<Config>) -> Self {
+    pub fn new(shared_state: SharedState, cfg: RequestGeneratorConfig) -> Self {
         Self {
             shared_state,
-            cfg,
+            cfg: Arc::new(cfg),
             request_counter: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             thread: None,
@@ -52,12 +85,12 @@ impl RequestGenerator {
     /// that arrive at that slot.  Use `Scenario::requests_by_slot()` to build it.
     pub fn new_from_scenario(
         shared_state: SharedState,
-        cfg: Arc<Config>,
+        cfg: RequestGeneratorConfig,
         by_slot: Vec<Vec<Request>>,
     ) -> Self {
         Self {
             shared_state,
-            cfg,
+            cfg: Arc::new(cfg),
             request_counter: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             thread: None,
@@ -77,12 +110,12 @@ impl RequestGenerator {
         let counter = self.request_counter.clone();
         let scenario = self.scenario_by_slot.clone();
 
-        if cfg.logging.verbose {
+        if cfg.verbose {
             match &scenario {
                 Some(_) => println!("[RequestGenerator] Started: scenario replay mode"),
                 None => println!(
                     "[RequestGenerator] Started: {:.1} req/slot (stochastic)",
-                    cfg.simulation.predicted_requests_per_slot
+                    cfg.requests_per_slot
                 ),
             }
         }
@@ -98,7 +131,7 @@ impl RequestGenerator {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        if self.cfg.logging.verbose {
+        if self.cfg.verbose {
             println!("[RequestGenerator] Stopped");
         }
     }
@@ -114,21 +147,21 @@ impl RequestGenerator {
 fn generator_loop(
     running: Arc<AtomicBool>,
     shared_state: SharedState,
-    cfg: Arc<Config>,
+    cfg: Arc<RequestGeneratorConfig>,
     counter: Arc<AtomicU64>,
     scenario_by_slot: Option<Arc<Vec<Vec<Request>>>>,
 ) {
-    let slot_duration = cfg.effective_slot_duration_secs();
-    let rate = cfg.simulation.predicted_requests_per_slot;
-    let sigma = (rate * cfg.simulation.request_rate_std_factor).max(1.0);
+    let slot_duration = cfg.slot_duration_secs;
+    let rate = cfg.requests_per_slot;
+    let sigma = (rate * cfg.request_rate_std_factor).max(1.0);
     let dist = Normal::new(rate, sigma).expect("valid Normal distribution");
-    let base_seed = cfg.infeasibility.prehistory_random_seed;
+    let base_seed = cfg.prehistory_random_seed;
 
     let mut last_slot: i32 = -1;
     // True realtime pacing only makes sense when the virtual clock actually
     // tracks wall-clock time (skip_empty_slots=false); in fast/skip mode the
     // clock jumps ahead as soon as the queue drains, so bursting is correct.
-    let realtime_pacing = !cfg.simulation.skip_empty_slots;
+    let realtime_pacing = !cfg.skip_empty_slots;
     const LOCK_BATCH_SIZE: usize = 50;
 
     while running.load(Ordering::Relaxed) {
@@ -169,7 +202,7 @@ fn generator_loop(
                     // Spread the slot's requests evenly across its real-time
                     // duration, sending at most `generator_realtime_chunk_size`
                     // at a time and sleeping the proportional inter-chunk delay.
-                    let chunk_size = cfg.simulation.generator_realtime_chunk_size.max(1);
+                    let chunk_size = cfg.realtime_chunk_size.max(1);
                     let per_request_secs = slot_duration / num_requests as f64;
                     for chunk in requests.chunks(chunk_size) {
                         if !running.load(Ordering::Relaxed) {
@@ -188,7 +221,7 @@ fn generator_loop(
 
                 shared_state.set_generator_processed_slot(slot);
 
-                if cfg.logging.verbose {
+                if cfg.verbose {
                     println!("[RequestGenerator] Slot {slot}: {num_requests} requests");
                 }
 
@@ -240,11 +273,15 @@ fn sleep_interruptible(running: &Arc<AtomicBool>, secs: f64) {
     }
 }
 
-fn generate_request(arrival_slot: i32, cfg: &Config, counter: &Arc<AtomicU64>) -> Request {
+fn generate_request(
+    arrival_slot: i32,
+    cfg: &RequestGeneratorConfig,
+    counter: &Arc<AtomicU64>,
+) -> Request {
     let id = counter.fetch_add(1, Ordering::Relaxed);
-    let slack_range = (cfg.simulation.deadline_max_slack - cfg.simulation.deadline_min_slack).max(0);
+    let slack_range = (cfg.deadline_max_slack - cfg.deadline_min_slack).max(0);
     // Deterministic slack based on request id so replays match.
-    let slack = cfg.simulation.deadline_min_slack + (id as i32 % (slack_range + 1));
+    let slack = cfg.deadline_min_slack + (id as i32 % (slack_range + 1));
     let deadline_slot = (arrival_slot + slack).min(cfg.total_slots - 1);
     Request::new(id, arrival_slot, deadline_slot)
 }

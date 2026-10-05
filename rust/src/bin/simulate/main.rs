@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use carbonshift_rs::config::Config;
-use carbonshift_rs::generator::RequestGenerator;
+use carbonshift_rs::generator::{RequestGenerator, RequestGeneratorConfig};
 use carbonshift_rs::metrics_logger::MetricsLogger;
 use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
@@ -18,6 +18,7 @@ impl Online2System {
     fn new(cfg: Config, scenario_forecast: Option<Vec<f64>>, scenario_requests: Option<Vec<Vec<carbonshift_rs::types::Request>>>) -> Self {
         let cfg = Arc::new(cfg);
         let shared_state = SharedState::new();
+        let generator_cfg = RequestGeneratorConfig::from_config(&cfg);
 
         let ml = Arc::new(MetricsLogger::new(
             cfg.logging.enable_solver_logging,
@@ -34,13 +35,13 @@ impl Online2System {
         let generator = match scenario_requests {
             Some(by_slot) => RequestGenerator::new_from_scenario(
                 shared_state.clone(),
-                cfg.clone(),
+                generator_cfg,
                 by_slot,
             ),
-            None => RequestGenerator::new(shared_state.clone(), cfg.clone()),
+            None => RequestGenerator::new(shared_state.clone(), generator_cfg),
         };
         let carbon_forecast = scenario_forecast.unwrap_or_else(|| {
-            carbonshift_rs::engine::scheduler::generate_carbon_forecast(&cfg)
+            carbonshift_rs::engine::scheduler::generate_carbon_forecast(cfg.total_slots)
         });
         let carbon_forecast = Arc::new(RwLock::new(carbon_forecast));
         let scheduler = BatchScheduler::new(shared_state, cfg.clone(), ml, carbon_forecast);

@@ -45,7 +45,7 @@ use std::sync::{Arc, RwLock};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use crate::config::Config;
+use crate::config::{AssignmentPolicy, SolverConfig, SwarmConfig};
 use crate::online_swarm::SwarmContext;
 use crate::types::{Assignment, CapacityTier, Flavour, Request};
 
@@ -148,12 +148,12 @@ fn make_assignment(req: &Request, slot: i32, flav: &Flavour, cost: f64) -> Assig
     )
 }
 
-fn sorted_flavours_and_fallback(cfg: &Config) -> (Vec<&Flavour>, &Flavour) {
-    let mut sorted: Vec<&Flavour> = cfg.flavours.iter().collect();
+fn sorted_flavours_and_fallback(flavours: &[Flavour]) -> (Vec<&Flavour>, &Flavour) {
+    let mut sorted: Vec<&Flavour> = flavours.iter().collect();
     sorted.sort_by_key(|f| f.duration);
-    let fallback = cfg.flavours.iter()
+    let fallback = flavours.iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
-        .expect("Config must have at least one flavour");
+        .expect("assignment policy must have at least one flavour");
     (sorted, fallback)
 }
 
@@ -207,16 +207,17 @@ impl OnlineBanditState {
         pending: &[Request],
         carbon_forecast: &[f64],
         ctx: &SwarmContext,
-        cfg: &Config,
+        assignment: &AssignmentPolicy<'_>,
     ) -> (Vec<Assignment>, BanditDelta) {
-        let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(cfg);
-        let tiers = &cfg.capacity_tiers;
-        let scale = cfg.carbon_cost_duration_scale;
-        let max_future = cfg.assignment_max_future_slots;
-        let total_slots = cfg.total_slots;
-        let win_past = cfg.error_window_past;
-        let win_future_cfg = cfg.error_window_future;
-        let max_err = cfg.max_error_threshold;
+        let (sorted_flavours, fallback_flav) =
+            sorted_flavours_and_fallback(assignment.flavours);
+        let tiers = assignment.capacity_tiers;
+        let scale = assignment.carbon_cost_duration_scale;
+        let max_future = assignment.assignment_max_future_slots;
+        let total_slots = assignment.total_slots;
+        let win_past = assignment.error_window_past;
+        let win_future_cfg = assignment.error_window_future;
+        let max_err = assignment.max_error_threshold;
 
         // Start from committed state; update within-batch as we go.
         let mut slot_count = ctx.slot_count.clone();
@@ -255,7 +256,7 @@ impl OnlineBanditState {
             let (chosen_flav, cost) = pick_feasible_flavour(
                 chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
                 global_error_sum, global_count, scale, &sorted_flavours,
-                max_err, win_past, win_future_cfg, cfg.global_error_constraint_enabled,
+                max_err, win_past, win_future_cfg, assignment.global_error_constraint_enabled,
             ).unwrap_or_else(|| {
                 let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
                 (fallback_flav, c)
@@ -355,7 +356,8 @@ impl OnlineAcoState {
     pub fn new(
         total_slots: usize,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
-        cfg: &Config,
+        flavours: &[Flavour],
+        carbon_cost_duration_scale: f64,
         n_ants: usize,
         n_iterations: usize,
         alpha: f64,
@@ -365,14 +367,14 @@ impl OnlineAcoState {
         tau0: f64,
         seed: u64,
     ) -> Self {
-        let cheapest = cfg.flavours.iter()
+        let cheapest = flavours.iter()
             .min_by_key(|f| f.duration)
             .expect("at least one flavour");
         let eta: Vec<f64> = (0..total_slots)
             .map(|s| {
                 // TODO: is it ok to unwrap here? Technically carbon_forecast gets updated as we go on...
                 let ci = carbon_forecast.read().unwrap().get(s).copied().unwrap_or(1.0);
-                let base = ci * cheapest.duration as f64 * cfg.carbon_cost_duration_scale;
+                let base = ci * cheapest.duration as f64 * carbon_cost_duration_scale;
                 if base > 0.0 { 1.0 / base } else { 1e9 }
             })
             .collect();
@@ -400,16 +402,17 @@ impl OnlineAcoState {
         pending: &[Request],
         carbon_forecast: &[f64],
         ctx: &SwarmContext,
-        cfg: &Config,
+        assignment: &AssignmentPolicy<'_>,
     ) -> (Vec<Assignment>, AcoDelta) {
-        let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(cfg);
-        let tiers = &cfg.capacity_tiers;
-        let scale = cfg.carbon_cost_duration_scale;
-        let max_future = cfg.assignment_max_future_slots;
-        let total_slots = cfg.total_slots;
-        let win_past = cfg.error_window_past;
-        let win_future_cfg = cfg.error_window_future;
-        let max_err = cfg.max_error_threshold;
+        let (sorted_flavours, fallback_flav) =
+            sorted_flavours_and_fallback(assignment.flavours);
+        let tiers = assignment.capacity_tiers;
+        let scale = assignment.carbon_cost_duration_scale;
+        let max_future = assignment.assignment_max_future_slots;
+        let total_slots = assignment.total_slots;
+        let win_past = assignment.error_window_past;
+        let win_future_cfg = assignment.error_window_future;
+        let max_err = assignment.max_error_threshold;
 
         let mut best_cost = f64::INFINITY;
         let mut best_solution: Vec<Assignment> = Vec::new();
@@ -461,7 +464,7 @@ impl OnlineAcoState {
                     let (chosen_flav, cost) = pick_feasible_flavour(
                         chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
                         global_error_sum, global_count, scale, &sorted_flavours,
-                        max_err, win_past, win_future_cfg, cfg.global_error_constraint_enabled,
+                        max_err, win_past, win_future_cfg, assignment.global_error_constraint_enabled,
                     ).unwrap_or_else(|| {
                         let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
                         (fallback_flav, c)
@@ -554,28 +557,34 @@ pub enum SwarmDelta {
 impl OnlineSwarmState {
     /// Build the appropriate state from `cfg.solver.solver_strategy`.
     /// `carbon_forecast` is required for computing ACO's static heuristic.
-    pub fn from_config(cfg: &Config, carbon_forecast: &Arc<RwLock<Vec<f64>>>) -> Self {
+    pub fn from_config(
+        solver: &SolverConfig,
+        swarm: &SwarmConfig,
+        assignment: &AssignmentPolicy<'_>,
+        carbon_forecast: &Arc<RwLock<Vec<f64>>>,
+    ) -> Self {
         // Clone internally carbon_forecast
         let carbon_forecast = Arc::clone(carbon_forecast);
-        match cfg.solver.solver_strategy.as_str() {
+        match solver.solver_strategy.as_str() {
             "bandit" => Self::Bandit(OnlineBanditState::new(
-                cfg.total_slots as usize,
-                cfg.swarm.bandit_initial_q,
-                cfg.swarm.bandit_epsilon,
-                cfg.swarm.bandit_seed,
+                assignment.total_slots as usize,
+                swarm.bandit_initial_q,
+                swarm.bandit_epsilon,
+                swarm.bandit_seed,
             )),
             "ant_colony" => Self::Aco(OnlineAcoState::new(
-                cfg.total_slots as usize,
+                assignment.total_slots as usize,
                 carbon_forecast,
-                cfg,
-                cfg.swarm.aco_n_ants,
-                cfg.swarm.aco_n_iterations,
-                cfg.swarm.aco_alpha,
-                cfg.swarm.aco_beta,
-                cfg.swarm.aco_rho,
-                cfg.swarm.aco_q,
-                cfg.swarm.aco_tau0,
-                cfg.swarm.aco_seed,
+                assignment.flavours,
+                assignment.carbon_cost_duration_scale,
+                swarm.aco_n_ants,
+                swarm.aco_n_iterations,
+                swarm.aco_alpha,
+                swarm.aco_beta,
+                swarm.aco_rho,
+                swarm.aco_q,
+                swarm.aco_tau0,
+                swarm.aco_seed,
             )),
             _ => Self::None, // "dp" (default) or unrecognised
         }
@@ -606,16 +615,18 @@ impl OnlineSwarmState {
         _slot: i32,
         carbon_forecast: &[f64],
         ctx: &SwarmContext,
-        cfg: &Config,
+        assignment: &AssignmentPolicy<'_>,
     ) -> (Vec<Assignment>, SwarmDelta) {
         match self {
             Self::None => (vec![], SwarmDelta::None),
             Self::Bandit(b) => {
-                let (assignments, delta) = b.solve_batch(pending, carbon_forecast, ctx, cfg);
+                let (assignments, delta) =
+                    b.solve_batch(pending, carbon_forecast, ctx, assignment);
                 (assignments, SwarmDelta::Bandit(delta))
             }
             Self::Aco(a) => {
-                let (assignments, delta) = a.solve_batch(pending, carbon_forecast, ctx, cfg);
+                let (assignments, delta) =
+                    a.solve_batch(pending, carbon_forecast, ctx, assignment);
                 (assignments, SwarmDelta::Aco(delta))
             }
         }
@@ -636,6 +647,7 @@ impl OnlineSwarmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     fn test_cfg() -> Config {
         let mut cfg = Config::default();
@@ -667,6 +679,7 @@ mod tests {
     #[test]
     fn bandit_merge_combines_disjoint_batches() {
         let cfg = test_cfg();
+        let assignment = cfg.assignment_policy();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0; 6];
 
@@ -677,15 +690,15 @@ mod tests {
         let batch_b = vec![make_request(3, 2, 2), make_request(4, 3, 3)];
 
         let baseline = OnlineBanditState::new(6, 10.0, 0.0, 42);
-        let (_, delta_a) = baseline.solve_batch(&batch_a, &carbon_forecast, &ctx, &cfg);
-        let (_, delta_b) = baseline.solve_batch(&batch_b, &carbon_forecast, &ctx, &cfg);
+        let (_, delta_a) = baseline.solve_batch(&batch_a, &carbon_forecast, &ctx, &assignment);
+        let (_, delta_b) = baseline.solve_batch(&batch_b, &carbon_forecast, &ctx, &assignment);
         let mut merged = OnlineBanditState::new(6, 10.0, 0.0, 42);
         merged.merge_delta(delta_a);
         merged.merge_delta(delta_b);
 
         let mut sequential = OnlineBanditState::new(6, 10.0, 0.0, 42);
         let all: Vec<Request> = batch_a.into_iter().chain(batch_b).collect();
-        let (assignments, delta) = sequential.solve_batch(&all, &carbon_forecast, &ctx, &cfg);
+        let (assignments, delta) = sequential.solve_batch(&all, &carbon_forecast, &ctx, &assignment);
         assert_eq!(assignments.len(), 4);
         sequential.merge_delta(delta);
 
@@ -709,6 +722,7 @@ mod tests {
     #[test]
     fn bandit_single_call_matches_serialized_variant() {
         let cfg = test_cfg();
+        let assignment = cfg.assignment_policy();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
         let requests = vec![
@@ -717,10 +731,10 @@ mod tests {
         ];
 
         let mut legacy = crate::online_swarm::OnlineBanditState::new(6, 10.0, 0.2, 99);
-        legacy.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
+        legacy.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
 
         let baseline = OnlineBanditState::new(6, 10.0, 0.2, 99);
-        let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
+        let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
         let mut merged = OnlineBanditState::new(6, 10.0, 0.2, 99);
         merged.merge_delta(delta);
 
@@ -739,6 +753,7 @@ mod tests {
     #[test]
     fn aco_single_call_matches_serialized_variant() {
         let cfg = test_cfg();
+        let assignment = cfg.assignment_policy();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
         let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
@@ -747,7 +762,8 @@ mod tests {
         let mut legacy = crate::online_swarm::OnlineAcoState::new(
             6,
             shared_forecast.clone(),
-            &cfg,
+            &cfg.flavours,
+            cfg.carbon_cost_duration_scale,
             4,
             3,
             1.0,
@@ -757,12 +773,13 @@ mod tests {
             1.0,
             7,
         );
-        legacy.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
+        legacy.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
 
         let baseline = OnlineAcoState::new(
             6,
             shared_forecast.clone(),
-            &cfg,
+            &cfg.flavours,
+            cfg.carbon_cost_duration_scale,
             4,
             3,
             1.0,
@@ -772,11 +789,12 @@ mod tests {
             1.0,
             7,
         );
-        let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
+        let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
         let mut merged = OnlineAcoState::new(
             6,
             shared_forecast,
-            &cfg,
+            &cfg.flavours,
+            cfg.carbon_cost_duration_scale,
             4,
             3,
             1.0,
@@ -801,6 +819,7 @@ mod tests {
     #[test]
     fn aco_merge_matches_direct_application() {
         let cfg = test_cfg();
+        let assignment = cfg.assignment_policy();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
         let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
@@ -809,7 +828,8 @@ mod tests {
         let baseline = OnlineAcoState::new(
             6,
             shared_forecast.clone(),
-            &cfg,
+            &cfg.flavours,
+            cfg.carbon_cost_duration_scale,
             4,
             3,
             1.0,
@@ -820,11 +840,12 @@ mod tests {
             7,
         );
 
-        let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &cfg);
+        let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
         let mut merged = OnlineAcoState::new(
             6,
             shared_forecast,
-            &cfg,
+            &cfg.flavours,
+            cfg.carbon_cost_duration_scale,
             4,
             3,
             1.0,
@@ -852,20 +873,21 @@ mod tests {
     #[test]
     fn bandit_merge_is_order_independent() {
         let cfg = test_cfg();
+        let assignment = cfg.assignment_policy();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0; 6];
         let batch_a = vec![make_request(1, 0, 5)];
         let batch_b = vec![make_request(2, 0, 5)];
 
         let baseline = OnlineBanditState::new(6, 10.0, 0.0, 1);
-        let (_, delta_a1) = baseline.solve_batch(&batch_a, &carbon_forecast, &ctx, &cfg);
-        let (_, delta_b1) = baseline.solve_batch(&batch_b, &carbon_forecast, &ctx, &cfg);
+        let (_, delta_a1) = baseline.solve_batch(&batch_a, &carbon_forecast, &ctx, &assignment);
+        let (_, delta_b1) = baseline.solve_batch(&batch_b, &carbon_forecast, &ctx, &assignment);
         let mut order1 = OnlineBanditState::new(6, 10.0, 0.0, 1);
         order1.merge_delta(delta_a1);
         order1.merge_delta(delta_b1);
 
-        let (_, delta_a2) = baseline.solve_batch(&batch_a, &carbon_forecast, &ctx, &cfg);
-        let (_, delta_b2) = baseline.solve_batch(&batch_b, &carbon_forecast, &ctx, &cfg);
+        let (_, delta_a2) = baseline.solve_batch(&batch_a, &carbon_forecast, &ctx, &assignment);
+        let (_, delta_b2) = baseline.solve_batch(&batch_b, &carbon_forecast, &ctx, &assignment);
         let mut order2 = OnlineBanditState::new(6, 10.0, 0.0, 1);
         order2.merge_delta(delta_b2);
         order2.merge_delta(delta_a2);

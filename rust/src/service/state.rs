@@ -115,10 +115,52 @@ pub struct TaskConfig {
     pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
 
+/// The subset of scheduler configuration needed by the HTTP service.
+#[derive(Clone)]
+pub struct ServiceSchedulerConfig {
+    /// Number of slots in the scheduler's finite planning horizon.
+    pub total_slots: i32,
+    /// Effective wall-clock duration of one slot after speed scaling.
+    pub effective_slot_duration_secs: f64,
+    /// Whether slot advancement is controlled through the manual-clock API.
+    pub manual_clock: bool,
+    /// Default execution flavours for requests without a task override.
+    pub flavours: Vec<Flavour>,
+    /// Default capacity tiers used to price assignments and baseline costs.
+    pub capacity_tiers: Vec<CapacityTier>,
+    /// Conversion factor from intensity and duration to carbon cost.
+    pub carbon_cost_duration_scale: f64,
+    /// Global maximum average error accepted by the scheduler.
+    pub max_error_threshold: f64,
+    /// Number of preceding slots included in the error window.
+    pub error_window_past: i32,
+    /// Number of following slots included in the error window.
+    pub error_window_future: i32,
+    /// Maximum number of slots into the future for an assignment.
+    pub assignment_max_future_slots: i32,
+}
+
+impl ServiceSchedulerConfig {
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            total_slots: cfg.total_slots,
+            effective_slot_duration_secs: cfg.effective_slot_duration_secs(),
+            manual_clock: cfg.simulation.manual_clock,
+            flavours: cfg.flavours.clone(),
+            capacity_tiers: cfg.capacity_tiers.clone(),
+            carbon_cost_duration_scale: cfg.carbon_cost_duration_scale,
+            max_error_threshold: cfg.max_error_threshold,
+            error_window_past: cfg.error_window_past,
+            error_window_future: cfg.error_window_future,
+            assignment_max_future_slots: cfg.assignment_max_future_slots,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub shared_state: SharedState,
-    pub cfg: Arc<Config>,
+    pub scheduler: ServiceSchedulerConfig,
     pub http: reqwest::Client,
     pub service_cfg: Arc<ServiceConfig>,
     pub tracked: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
@@ -171,7 +213,7 @@ impl AppState {
         Self {
             slot_epoch_offset: Arc::new(Mutex::new(None)),
             shared_state,
-            cfg,
+            scheduler: ServiceSchedulerConfig::from_config(&cfg),
             http: reqwest::Client::new(),
             service_cfg: Arc::new(service_cfg),
             tracked: Arc::new(Mutex::new(HashMap::new())),
@@ -204,7 +246,7 @@ impl AppState {
             .get(task_id)
             .or_else(|| guard.get("default"))
             .map(|t| t.flavours.clone())
-            .unwrap_or_else(|| self.cfg.flavours.clone())
+            .unwrap_or_else(|| self.scheduler.flavours.clone())
     }
 
     /// `task_id`'s registered `max_error_threshold` override (%), if any.

@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::config::Config;
+use crate::config::{AssignmentPolicy, SolverConfig};
 use crate::types::{get_capacity_multiplier, CapacityTier, Flavour, RequestAssignment};
 
 /// Shared, `'static` empty map used as the default `request_flavours` when a
@@ -138,15 +138,15 @@ pub struct DpSolver {
 }
 
 impl DpSolver {
-    pub fn new(cfg: &Config) -> Self {
+    pub fn new(solver: &SolverConfig, assignment: &AssignmentPolicy<'_>) -> Self {
         Self {
-            flavours: cfg.flavours.clone(),
-            carbon_forecast: vec![0.0; cfg.total_slots as usize],
-            window_size: cfg.total_slots,
-            pruning: cfg.solver.dp_pruning_method.clone(),
-            pruning_k: cfg.solver.dp_pruning_k,
-            timeout: cfg.solver.dp_timeout,
-            carbon_cost_scale: cfg.carbon_cost_duration_scale,
+            flavours: assignment.flavours.to_vec(),
+            carbon_forecast: vec![0.0; assignment.total_slots as usize],
+            window_size: assignment.total_slots,
+            pruning: solver.dp_pruning_method.clone(),
+            pruning_k: solver.dp_pruning_k,
+            timeout: solver.dp_timeout,
+            carbon_cost_scale: assignment.carbon_cost_duration_scale,
         }
     }
 
@@ -708,7 +708,8 @@ mod tests {
 
     fn make_solver(forecast: Vec<f64>) -> DpSolver {
         let cfg = Config::default();
-        DpSolver::new(&cfg).with_carbon_forecast(forecast)
+        let assignment = cfg.assignment_policy();
+        DpSolver::new(&cfg.solver, &assignment).with_carbon_forecast(forecast)
     }
 
     fn flat_forecast(n: usize, value: f64) -> Vec<f64> {

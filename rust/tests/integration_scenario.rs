@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use carbonshift_rs::config::{
-    Config, InfeasibilityConfig, LoggingConfig, SimulationConfig, SolverConfig,
+    AssignmentPolicy, Config, InfeasibilityConfig, LoggingConfig, SimulationConfig, SolverConfig,
 };
 use carbonshift_rs::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use carbonshift_rs::shared_state::SharedState;
@@ -94,11 +94,11 @@ fn config_from_meta(meta: &ScenarioMeta) -> Config {
 fn drain_pending_with_dp(
     ss: &SharedState,
     solver: &DpSolver,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    batch_size: usize,
     current_slot: i32,
     all_assignments: &mut Vec<Assignment>,
 ) {
-    let batch_size = cfg.solver.batch_size;
     loop {
         let pending_count = ss.get_pending_count();
         if pending_count < batch_size {
@@ -117,7 +117,7 @@ fn drain_pending_with_dp(
         let requests: Vec<(u64, i32)> = batch
             .iter()
             .map(|r| {
-                let capped = r.deadline_slot.max(current_slot).min(cfg.total_slots - 1);
+                let capped = r.deadline_slot.max(current_slot).min(assignment.total_slots - 1);
                 (r.id, capped)
             })
             .collect();
@@ -132,25 +132,26 @@ fn drain_pending_with_dp(
         // Get real window error baseline from shared state.
         let ws = ss.get_window_error_stats(
             current_slot,
-            cfg.error_window_past,
-            cfg.error_window_future,
+            assignment.error_window_past,
+            assignment.error_window_future,
             &std::collections::HashSet::new(),
         );
 
-        let window_end = (current_slot + cfg.error_window_future).min(cfg.total_slots - 1);
+        let window_end =
+            (current_slot + assignment.error_window_future).min(assignment.total_slots - 1);
         let input = SolveBatchInput {
             requests: &requests,
             current_slot,
             capacity_multiplier: 1.0,
-            capacity_tiers: &cfg.capacity_tiers,
+            capacity_tiers: assignment.capacity_tiers,
             baseline_slot_counts: &base_counts,
             error_window_baseline: ErrorWindowBaseline {
                 error_sum: ws.error_sum,
                 request_count: ws.count as f64,
             },
-            max_error_threshold: Some(cfg.max_error_threshold),
-            error_window_past: cfg.error_window_past,
-            error_window_future: cfg.error_window_future,
+            max_error_threshold: Some(assignment.max_error_threshold),
+            error_window_past: assignment.error_window_past,
+            error_window_future: assignment.error_window_future,
             assignment_max_slot: Some(window_end),
             dynamic_mock_pool: MockPool::default(),
             request_flavours: &HashMap::new(),
@@ -162,13 +163,15 @@ fn drain_pending_with_dp(
             // Infeasible batch: greedy fallback.
             let deadlines: Vec<i32> = requests.iter().map(|(_, d)| *d).collect();
             let base_counts_arr: Vec<i32> =
-                (0..cfg.total_slots).map(|s| base_counts.get(&s).copied().unwrap_or(0)).collect();
+                (0..assignment.total_slots)
+                    .map(|s| base_counts.get(&s).copied().unwrap_or(0))
+                    .collect();
 
             let greedy = solver.greedy_fallback(
                 &requests,
                 &deadlines,
                 current_slot,
-                &cfg.capacity_tiers,
+                assignment.capacity_tiers,
                 &base_counts_arr,
                 &HashMap::new(),
             );
@@ -182,7 +185,12 @@ fn drain_pending_with_dp(
                     ra.flavour_name.clone(),
                     ra.carbon_cost,
                     ra.error,
-                    cfg.flavours.iter().find(|f| f.name == ra.flavour_name).map(|f| f.duration).unwrap_or(0),
+                    assignment
+                        .flavours
+                        .iter()
+                        .find(|f| f.name == ra.flavour_name)
+                        .map(|f| f.duration)
+                        .unwrap_or(0),
                     Some(req.arrival_slot),
                     Some(req.deadline_slot),
                 ))
@@ -193,7 +201,7 @@ fn drain_pending_with_dp(
             let req_meta: HashMap<u64, (i32, i32)> =
                 batch.iter().map(|r| (r.id, (r.arrival_slot, r.deadline_slot))).collect();
             let dur_by_name: HashMap<String, i32> =
-                cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
+                assignment.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
 
             let assignments: Vec<Assignment> = dp_result
                 .iter()
@@ -255,7 +263,9 @@ fn scenario_seed_2030_all_requests_scheduled_correctly() {
         meta.total_slots as usize,
         "carbon_forecast length mismatch"
     );
-    let solver = DpSolver::new(&cfg).with_carbon_forecast(scenario.carbon_forecast.clone());
+    let assignment = cfg.assignment_policy();
+    let solver = DpSolver::new(&cfg.solver, &assignment)
+        .with_carbon_forecast(scenario.carbon_forecast.clone());
 
     let ss = SharedState::new();
     let mut all_assignments: Vec<Assignment> = Vec::new();
@@ -280,12 +290,26 @@ fn scenario_seed_2030_all_requests_scheduled_correctly() {
             }
         }
 
-        drain_pending_with_dp(&ss, &solver, &cfg, slot, &mut all_assignments);
+        drain_pending_with_dp(
+            &ss,
+            &solver,
+            &assignment,
+            cfg.solver.batch_size,
+            slot,
+            &mut all_assignments,
+        );
     }
 
     // Final drain: handle any remaining pending.
     let last_slot = meta.total_slots - 1;
-    drain_pending_with_dp(&ss, &solver, &cfg, last_slot, &mut all_assignments);
+    drain_pending_with_dp(
+        &ss,
+        &solver,
+        &assignment,
+        cfg.solver.batch_size,
+        last_slot,
+        &mut all_assignments,
+    );
 
     // ── correctness assertions ────────────────────────────────────────────────
 

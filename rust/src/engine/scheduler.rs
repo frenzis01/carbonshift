@@ -22,7 +22,7 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use std::sync::RwLock;
 
-use crate::config::Config;
+use crate::config::{AssignmentPolicy, Config, InfeasibilityConfig, SimulationConfig, SolverConfig, SwarmConfig};
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::metrics_logger::MetricsLogger;
 use crate::shared_state::{CommitOutcome, GlobalErrorStats, SharedState, SolverSnapshot};
@@ -71,11 +71,26 @@ enum SwarmBackend {
 }
 
 impl SwarmBackend {
-    fn from_config(cfg: &Config, carbon_forecast: &Arc<RwLock<Vec<f64>>>) -> Self {
-        if cfg.swarm.mode == "merge" {
-            Self::Merge(crate::online_swarmerge::OnlineSwarmState::from_config(cfg, carbon_forecast))
+    fn from_config(
+        solver: &SolverConfig,
+        swarm: &SwarmConfig,
+        assignment: &AssignmentPolicy<'_>,
+        carbon_forecast: &Arc<RwLock<Vec<f64>>>,
+    ) -> Self {
+        if swarm.mode == "merge" {
+            Self::Merge(crate::online_swarmerge::OnlineSwarmState::from_config(
+                solver,
+                swarm,
+                assignment,
+                carbon_forecast,
+            ))
         } else {
-            Self::Serialized(crate::online_swarm::OnlineSwarmState::from_config(cfg, carbon_forecast))
+            Self::Serialized(crate::online_swarm::OnlineSwarmState::from_config(
+                solver,
+                swarm,
+                assignment,
+                carbon_forecast,
+            ))
         }
     }
 
@@ -182,7 +197,13 @@ impl BatchScheduler {
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
         let carbon_forecast = carbon_forecast;
-        let swarm_state = SwarmBackend::from_config(&cfg, &carbon_forecast);
+        let assignment = cfg.assignment_policy();
+        let swarm_state = SwarmBackend::from_config(
+            &cfg.solver,
+            &cfg.swarm,
+            &assignment,
+            &carbon_forecast,
+        );
         let flavour_duration_by_name: HashMap<String, i32> =
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mock_influence_base = cfg.infeasibility.mock_influence.clamp(0.0, 1.0);
@@ -593,9 +614,20 @@ fn batch_worker_entry(
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
 ) -> bool {
+    let assignment = cfg.assignment_policy();
+
     // Fork: swarm strategies bypass the DP solver entirely.
     if mutable.lock().unwrap().swarm_state.is_active() {
-        return batch_worker_entry_swarm(slot, pending, shared_state, cfg, carbon_forecast, mutable, ml);
+        return batch_worker_entry_swarm(
+            slot,
+            pending,
+            shared_state,
+            &assignment,
+            &cfg.solver.solver_strategy,
+            carbon_forecast,
+            mutable,
+            ml,
+        );
     }
 
     if cfg.logging.verbose {
@@ -610,9 +642,35 @@ fn batch_worker_entry(
         let wall_start = unix_now_f64();
 
         let (assignments, ctx, baseline_slot_counts) = if is_greedy_singleton {
-            solve_greedy_singleton(slot, &pending, shared_state, cfg, carbon_forecast, fdb, mutable, ml)
+            solve_greedy_singleton(
+                slot,
+                &pending,
+                shared_state,
+                &assignment,
+                &cfg.solver,
+                &cfg.simulation,
+                &cfg.infeasibility,
+                cfg.logging.verbose,
+                carbon_forecast,
+                fdb,
+                mutable,
+                ml,
+            )
         } else {
-            solve_dp(slot, &pending, shared_state, cfg, carbon_forecast, fdb, mutable, ml)
+            solve_dp(
+                slot,
+                &pending,
+                shared_state,
+                &assignment,
+                &cfg.solver,
+                &cfg.simulation,
+                &cfg.infeasibility,
+                cfg.logging.verbose,
+                carbon_forecast,
+                fdb,
+                mutable,
+                ml,
+            )
         };
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -641,7 +699,7 @@ fn batch_worker_entry(
         let outcome = shared_state.try_add_assignments_checked(
             &assignments,
             &expected_per_slot,
-            &cfg.capacity_tiers,
+            assignment.capacity_tiers,
             force_commit,
             consecutive_rollbacks,
         );
@@ -798,16 +856,35 @@ fn batch_worker_entry_swarm(
     slot: i32,
     pending: Vec<Request>,
     shared_state: &SharedState,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    solver_strategy: &str,
     carbon_forecast: &[f64],
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
 ) -> bool {
     let is_merge = matches!(mutable.lock().unwrap().swarm_state, SwarmBackend::Merge(_));
     if is_merge {
-        batch_worker_entry_swarm_merge(slot, pending, shared_state, cfg, carbon_forecast, mutable, ml)
+        batch_worker_entry_swarm_merge(
+            slot,
+            pending,
+            shared_state,
+            assignment,
+            solver_strategy,
+            carbon_forecast,
+            mutable,
+            ml,
+        )
     } else {
-        batch_worker_entry_swarm_serialized(slot, pending, shared_state, cfg, carbon_forecast, mutable, ml)
+        batch_worker_entry_swarm_serialized(
+            slot,
+            pending,
+            shared_state,
+            assignment,
+            solver_strategy,
+            carbon_forecast,
+            mutable,
+            ml,
+        )
     }
 }
 
@@ -820,7 +897,8 @@ fn batch_worker_entry_swarm_serialized(
     slot: i32,
     pending: Vec<Request>,
     shared_state: &SharedState,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    solver_strategy: &str,
     carbon_forecast: &[f64],
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
@@ -833,7 +911,7 @@ fn batch_worker_entry_swarm_serialized(
         let SwarmBackend::Serialized(swarm) = &mut g.swarm_state else {
             unreachable!("batch_worker_entry_swarm dispatched Serialized mode");
         };
-        swarm.solve_batch(&pending, slot, carbon_forecast, &ctx, cfg)
+        swarm.solve_batch(&pending, slot, carbon_forecast, &ctx, assignment)
     };
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -842,7 +920,16 @@ fn batch_worker_entry_swarm_serialized(
         return false;
     }
 
-    finish_swarm_batch(slot, &pending, assignments, elapsed_ms, shared_state, cfg, mutable, ml)
+    finish_swarm_batch(
+        slot,
+        &pending,
+        assignments,
+        elapsed_ms,
+        shared_state,
+        solver_strategy,
+        mutable,
+        ml,
+    )
 }
 
 /// Merge backend: clones the swarm state, solves lock-free against the
@@ -853,7 +940,8 @@ fn batch_worker_entry_swarm_merge(
     slot: i32,
     pending: Vec<Request>,
     shared_state: &SharedState,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    solver_strategy: &str,
     carbon_forecast: &[f64],
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
@@ -872,7 +960,8 @@ fn batch_worker_entry_swarm_merge(
 
     // 2. Solve lock-free against the snapshot; returns assignments plus a
     //    delta describing only this batch's net effect on the shared state.
-    let (assignments, delta) = swarm_snapshot.solve_batch(&pending, slot, carbon_forecast, &ctx, cfg);
+    let (assignments, delta) =
+        swarm_snapshot.solve_batch(&pending, slot, carbon_forecast, &ctx, assignment);
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if assignments.is_empty() {
@@ -889,7 +978,16 @@ fn batch_worker_entry_swarm_merge(
         }
     }
 
-    finish_swarm_batch(slot, &pending, assignments, elapsed_ms, shared_state, cfg, mutable, ml)
+    finish_swarm_batch(
+        slot,
+        &pending,
+        assignments,
+        elapsed_ms,
+        shared_state,
+        solver_strategy,
+        mutable,
+        ml,
+    )
 }
 
 /// Shared tail for both swarm backends: commit assignments, update stats,
@@ -900,7 +998,7 @@ fn finish_swarm_batch(
     assignments: Vec<Assignment>,
     elapsed_ms: f64,
     shared_state: &SharedState,
-    cfg: &Config,
+    solver_strategy: &str,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
 ) -> bool {
@@ -935,7 +1033,7 @@ fn finish_swarm_batch(
         run_row.insert("total_assignments".into(), new_count.to_string());
         run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
         run_row.insert("total_carbon_cost".into(), total_cost.to_string());
-        run_row.insert("solver_mode".into(), cfg.solver.solver_strategy.clone());
+        run_row.insert("solver_mode".into(), solver_strategy.to_string());
         run_row.insert("solver_status".into(), "ok".into());
         ml.log_solver_run(&run_row, &assignment_rows, &[]);
     }
@@ -983,18 +1081,22 @@ fn prepare_solve(
     current_slot: i32,
     pending: &[Request],
     shared_state: &SharedState,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    solver: &SolverConfig,
+    simulation: &SimulationConfig,
+    recovery: &InfeasibilityConfig,
+    verbose: bool,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) -> PreparedSolve {
     let pending_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
 
     // Deadline cap = end of error window.
-    let window_start = (current_slot - cfg.error_window_past).max(0);
-    let window_end = (current_slot + cfg.error_window_future).min(cfg.total_slots - 1);
+    let window_start = (current_slot - assignment.error_window_past).max(0);
+    let window_end = (current_slot + assignment.error_window_future).min(assignment.total_slots - 1);
     let assignment_cap = window_end;
 
     let cap_deadline = |d: i32| -> i32 {
-        d.max(current_slot).min(assignment_cap).min(cfg.total_slots - 1)
+        d.max(current_slot).min(assignment_cap).min(assignment.total_slots - 1)
     };
 
     // ── Step 1 (pre-solve): capture a consistent snapshot of shared state ────
@@ -1021,7 +1123,7 @@ fn prepare_solve(
     let mut fixed_future: Vec<Assignment> = Vec::new();
     let mut movable_future_ids: HashSet<u64> = HashSet::new();
 
-    if cfg.solver.dp_lock_future_assignments {
+    if solver.dp_lock_future_assignments {
         fixed_future = future_assignments.clone();
     } else {
         movable_future_ids = future_assignments.iter().map(|a| a.request_id).collect();
@@ -1046,8 +1148,8 @@ fn prepare_solve(
     // 3a. Real window error from snapshot.
     let ws = snapshot.get_window_error_stats(
         current_slot,
-        cfg.error_window_past,
-        cfg.error_window_future,
+        assignment.error_window_past,
+        assignment.error_window_future,
         &movable_future_ids,
     );
     let mut error_baseline = ErrorBaseline::new(ws.error_sum, ws.count as f64);
@@ -1056,41 +1158,54 @@ fn prepare_solve(
     error_baseline = augment_with_decayed_past(
         current_slot,
         error_baseline,
-        cfg,
+        assignment,
         &snapshot,
         &movable_future_ids,
     );
 
     // 3c. Virtual prehistory for startup slots (disabled by default).
-    error_baseline = augment_with_virtual_prehistory(current_slot, error_baseline, cfg);
+    error_baseline = augment_with_virtual_prehistory(
+        current_slot,
+        error_baseline,
+        assignment,
+        simulation,
+        recovery,
+    );
 
     // 3d. Infeasibility recovery: inject mock low-error requests to dilute the baseline.
-    let (augmented_baseline, mock_pool_input) =
-        apply_infeasibility_recovery(current_slot, error_baseline.clone(), cfg, &snapshot, mutable);
+    let (augmented_baseline, mock_pool_input) = apply_infeasibility_recovery(
+        current_slot,
+        error_baseline.clone(),
+        assignment,
+        simulation,
+        recovery,
+        &snapshot,
+        mutable,
+    );
     let error_baseline = augmented_baseline;
 
     // ── Step 4: global error constraint ────────────────────────────────────
     let global_stats = snapshot.get_global_error_stats();
-    let mut solver_flavours = cfg.flavours.clone();
+    let mut solver_flavours = assignment.flavours.to_vec();
     let global_constraint_active;
 
-    if cfg.global_error_constraint_enabled
+    if assignment.global_error_constraint_enabled
         && global_stats.count > 0
-        && global_stats.avg > cfg.max_error_threshold
+        && global_stats.avg > assignment.max_error_threshold
     {
         global_constraint_active = true;
-        if cfg.global_error_constraint_hard {
+        if assignment.global_error_constraint_hard {
             let before = solver_flavours.len();
-            solver_flavours.retain(|f| f.error <= cfg.max_error_threshold);
+            solver_flavours.retain(|f| f.error <= assignment.max_error_threshold);
             if solver_flavours.is_empty() {
                 // Safety: never remove all flavours.
-                solver_flavours = cfg.flavours.clone();
-            } else if cfg.logging.verbose && solver_flavours.len() < before {
+                solver_flavours = assignment.flavours.to_vec();
+            } else if verbose && solver_flavours.len() < before {
                 println!(
                     "[Scheduler] ⚠ Global error constraint (HARD): \
                      global_avg={:.4}% > {:.2}% → {} flavours remaining",
                     global_stats.avg,
-                    cfg.max_error_threshold,
+                    assignment.max_error_threshold,
                     solver_flavours.len()
                 );
             }
@@ -1103,7 +1218,7 @@ fn prepare_solve(
     // dynamically registered (see `service::handlers::register_task`) carry
     // their own `flavours` list, resolved once at intake. Requests with no
     // override (empty `flavours`, e.g. CLI/simulation tools) fall back to
-    // `solver_flavours`/`cfg.flavours` inside the solver, unaffected by this
+    // `solver_flavours`/`assignment.flavours` inside the solver, unaffected by this
     // map. The global error constraint above is task-agnostic by design
     // (it reflects overall scheduler error, not any one task) but must still
     // be honoured by these overrides too, so apply the same hard filter.
@@ -1112,10 +1227,10 @@ fn prepare_solve(
         .filter(|r| !r.flavours.is_empty())
         .map(|r| (r.id, r.flavours.clone()))
         .collect();
-    if global_constraint_active && cfg.global_error_constraint_hard {
+    if global_constraint_active && assignment.global_error_constraint_hard {
         for flavours in request_flavours.values_mut() {
             let filtered: Vec<Flavour> =
-                flavours.iter().cloned().filter(|f| f.error <= cfg.max_error_threshold).collect();
+                flavours.iter().cloned().filter(|f| f.error <= assignment.max_error_threshold).collect();
             if !filtered.is_empty() {
                 *flavours = filtered;
             } // else: never remove all flavours for a request (same safety rule as solver_flavours).
@@ -1130,12 +1245,12 @@ fn prepare_solve(
     // be 20%+, so the global 4% default would make it permanently
     // infeasible); this only affects the local/window check below, never
     // the (task-agnostic by design) global error constraint above, which
-    // always uses `cfg.max_error_threshold`.
+    // always uses `assignment.max_error_threshold`.
     let effective_error_threshold = pending
         .iter()
         .filter_map(|r| r.max_error_threshold)
         .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a: f64| a.min(t))))
-        .unwrap_or(cfg.max_error_threshold);
+        .unwrap_or(assignment.max_error_threshold);
 
     // Per-task capacity tiers: if any request in this batch registered its own
     // `capacity_tiers`, use them; otherwise fall back to the default from the
@@ -1144,7 +1259,7 @@ fn prepare_solve(
     let effective_capacity_tiers = pending
         .iter()
         .find_map(|r| r.capacity_tiers.clone())
-        .unwrap_or_else(|| cfg.capacity_tiers.clone());
+        .unwrap_or_else(|| assignment.capacity_tiers.to_vec());
 
     PreparedSolve {
         pending_ids,
@@ -1171,7 +1286,11 @@ fn solve_dp(
     current_slot: i32,
     pending: &[Request],
     shared_state: &SharedState,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    solver_config: &SolverConfig,
+    simulation_config: &SimulationConfig,
+    recovery_config: &InfeasibilityConfig,
+    verbose: bool,
     carbon_forecast: &[f64],
     fdb: &HashMap<String, i32>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
@@ -1193,13 +1312,29 @@ fn solve_dp(
         request_flavours,
         effective_error_threshold,
         effective_capacity_tiers,
-    } = prepare_solve(current_slot, pending, shared_state, cfg, mutable);
+    } = prepare_solve(
+        current_slot,
+        pending,
+        shared_state,
+        assignment,
+        solver_config,
+        simulation_config,
+        recovery_config,
+        verbose,
+        mutable,
+    );
 
     // ── Step 5: DP solve ────────────────────────────────────────────────────
-    let effective_pruning = get_effective_pruning_mode(pending.len(), cfg);
-    let solver = build_solver(&solver_flavours, carbon_forecast, cfg, &effective_pruning);
+    let effective_pruning = get_effective_pruning_mode(pending.len(), solver_config);
+    let solver = build_solver(
+        &solver_flavours,
+        carbon_forecast,
+        assignment,
+        solver_config,
+        &effective_pruning,
+    );
 
-    let base_counts_arr: Vec<i32> = (0..cfg.total_slots)
+    let base_counts_arr: Vec<i32> = (0..assignment.total_slots)
         .map(|s| baseline_slot_counts.get(&s).copied().unwrap_or(0))
         .collect();
 
@@ -1214,8 +1349,8 @@ fn solve_dp(
             request_count: error_baseline.request_count,
         },
         max_error_threshold: Some(effective_error_threshold),
-        error_window_past: cfg.error_window_past,
-        error_window_future: cfg.error_window_future,
+        error_window_past: assignment.error_window_past,
+        error_window_future: assignment.error_window_future,
         assignment_max_slot: Some(assignment_cap),
         dynamic_mock_pool: mock_pool_input.clone(),
         request_flavours: &request_flavours,
@@ -1233,7 +1368,7 @@ fn solve_dp(
 
     if scheduled_pending_ids.len() != pending_ids.len() {
         let cap_deadline = |d: i32| -> i32 {
-            d.max(current_slot).min(assignment_cap).min(cfg.total_slots - 1)
+            d.max(current_slot).min(assignment_cap).min(assignment.total_slots - 1)
         };
         // Greedy fallback: the error constraint is never relaxed/removed — on
         // infeasibility (even after mock-pool dilution, if the recovery mode
@@ -1251,7 +1386,7 @@ fn solve_dp(
             .filter(|r| !scheduled_pending_ids.contains(&r.id))
             .map(|r| (r.id, cap_deadline(r.deadline_slot)))
             .collect();
-        if cfg.logging.verbose {
+        if verbose {
             println!(
                 "[Scheduler] ⚠ Infeasible ({}/{} pending covered): greedy fallback for {} request(s).",
                 scheduled_pending_ids.len(),
@@ -1270,12 +1405,13 @@ fn solve_dp(
             }
         }
 
-        let greedy_solver = build_solver(&cfg.flavours, carbon_forecast, cfg, "none");
+        let greedy_solver =
+            build_solver(assignment.flavours, carbon_forecast, assignment, solver_config, "none");
         let greedy = greedy_solver.greedy_fallback(
             &unscheduled,
             &deadlines,
             current_slot,
-            &cfg.capacity_tiers,
+            assignment.capacity_tiers,
             &fallback_base_counts,
             &request_flavours,
         );
@@ -1291,7 +1427,7 @@ fn solve_dp(
         .count();
 
     if final_pending_covered != pending_ids.len() {
-        if cfg.logging.verbose {
+        if verbose {
             println!("[Scheduler] ⚠ Infeasible batch; retrying later.");
         }
         return (
@@ -1343,7 +1479,13 @@ fn solve_dp(
         }
     }
     let mock_consumed = (mock_pool_input.initial_count - mock_remaining).max(0);
-    consume_mock_pool(current_slot, &solve_mode, mock_consumed, cfg, mutable);
+    consume_mock_pool(
+        current_slot,
+        &solve_mode,
+        mock_consumed,
+        &recovery_config.recovery_mode,
+        mutable,
+    );
 
     let ctx = SolveContext {
         status: solve_status,
@@ -1361,7 +1503,7 @@ fn solve_dp(
         window_start_slot: window_start,
         window_end_slot: window_end,
         mock_recovery_consumed: mock_consumed,
-        recovery_mode: cfg.infeasibility.recovery_mode.clone(),
+        recovery_mode: recovery_config.recovery_mode.clone(),
         solver_elapsed_ms: 0.0, // filled by the caller
     };
 
@@ -1398,13 +1540,17 @@ fn solve_greedy_singleton(
     current_slot: i32,
     pending: &[Request],
     shared_state: &SharedState,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    solver_config: &SolverConfig,
+    simulation_config: &SimulationConfig,
+    recovery_config: &InfeasibilityConfig,
+    verbose: bool,
     carbon_forecast: &[f64],
     fdb: &HashMap<String, i32>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     _ml: &MetricsLogger,
 ) -> (Vec<Assignment>, SolveContext, HashMap<i32, i32>) {
-    if cfg.logging.verbose && pending.len() > 1 {
+    if verbose && pending.len() > 1 {
         println!(
             "[Scheduler] ⚠ greedy_singleton received a batch of {} pending requests; \
              it only supports batch_size=1 — scheduling them sequentially.",
@@ -1412,7 +1558,17 @@ fn solve_greedy_singleton(
         );
     }
 
-    let prep = prepare_solve(current_slot, pending, shared_state, cfg, mutable);
+    let prep = prepare_solve(
+        current_slot,
+        pending,
+        shared_state,
+        assignment,
+        solver_config,
+        simulation_config,
+        recovery_config,
+        verbose,
+        mutable,
+    );
 
     // ── Step 5: exhaustive greedy scan over (slot, flavour) ─────────────────
     let mut sorted_flavours: Vec<&Flavour> = prep.solver_flavours.iter().collect();
@@ -1425,8 +1581,8 @@ fn solve_greedy_singleton(
 
     let global_avg = if prep.global_stats.count > 0 { prep.global_stats.avg } else { 0.0 };
     let global_constraint_active = prep.global_constraint_active
-        && cfg.global_error_constraint_hard
-        && global_avg > cfg.max_error_threshold;
+        && assignment.global_error_constraint_hard
+        && global_avg > assignment.max_error_threshold;
 
     // Local mutable slot counts, seeded from the baseline (pinned future
     // assignments) and updated as each request in `solve_requests` is
@@ -1446,13 +1602,13 @@ fn solve_greedy_singleton(
         for slot in start_slot..=deadline {
             let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
             let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-            let mult = get_capacity_multiplier(&cfg.capacity_tiers, position as i64);
+            let mult = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
 
             for flav in &sorted_flavours {
                 // Global error constraint: retrospective (average error
                 // *before* this request), matching solve_dp's step-function
                 // behaviour rather than a per-candidate forward projection.
-                if global_constraint_active && flav.error > cfg.max_error_threshold {
+                if global_constraint_active && flav.error > assignment.max_error_threshold {
                     continue;
                 }
 
@@ -1460,8 +1616,9 @@ fn solve_greedy_singleton(
                 // decision moment), not to the candidate `slot` being tried —
                 // mirrors solve_dp, which centers the window on current_slot
                 // regardless of where the request ends up being placed.
-                let win_start = (arrival - cfg.error_window_past).max(0);
-                let win_end = (arrival + cfg.error_window_future).min(cfg.total_slots - 1);
+                let win_start = (arrival - assignment.error_window_past).max(0);
+                let win_end =
+                    (arrival + assignment.error_window_future).min(assignment.total_slots - 1);
                 let mut win_sum = prep.error_baseline.error_sum + flav.error;
                 let mut win_cnt = prep.error_baseline.request_count + 1.0;
                 for a in &solved {
@@ -1470,11 +1627,12 @@ fn solve_greedy_singleton(
                         win_cnt += 1.0;
                     }
                 }
-                if win_cnt > 0.0 && win_sum / win_cnt > cfg.max_error_threshold {
+                if win_cnt > 0.0 && win_sum / win_cnt > assignment.max_error_threshold {
                     continue;
                 }
 
-                let cost = ci * mult * flav.duration as f64 * cfg.carbon_cost_duration_scale;
+                let cost =
+                    ci * mult * flav.duration as f64 * assignment.carbon_cost_duration_scale;
                 if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
                     best = Some((cost, slot, flav));
                 }
@@ -1489,8 +1647,11 @@ fn solve_greedy_singleton(
         let (chosen_cost, chosen_slot, chosen_flav) = best.unwrap_or_else(|| {
             let ci = carbon_forecast.get(start_slot as usize).copied().unwrap_or(1.0);
             let position = *slot_count.get(&start_slot).unwrap_or(&0) + 1;
-            let mult = get_capacity_multiplier(&cfg.capacity_tiers, position as i64);
-            let cost = ci * mult * fallback_flav.duration as f64 * cfg.carbon_cost_duration_scale;
+            let mult = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
+            let cost = ci
+                * mult
+                * fallback_flav.duration as f64
+                * assignment.carbon_cost_duration_scale;
             (cost, start_slot, fallback_flav)
         });
 
@@ -1550,7 +1711,13 @@ fn solve_greedy_singleton(
         }
     }
     let mock_consumed = (prep.mock_pool_input.initial_count - mock_remaining).max(0);
-    consume_mock_pool(current_slot, &solve_mode, mock_consumed, cfg, mutable);
+    consume_mock_pool(
+        current_slot,
+        &solve_mode,
+        mock_consumed,
+        &recovery_config.recovery_mode,
+        mutable,
+    );
 
     let ctx = SolveContext {
         status: solve_status,
@@ -1568,7 +1735,7 @@ fn solve_greedy_singleton(
         window_start_slot: prep.window_start,
         window_end_slot: prep.window_end,
         mock_recovery_consumed: mock_consumed,
-        recovery_mode: cfg.infeasibility.recovery_mode.clone(),
+        recovery_mode: recovery_config.recovery_mode.clone(),
         solver_elapsed_ms: 0.0, // filled by the caller
     };
 
@@ -1583,11 +1750,11 @@ fn solve_greedy_singleton(
 fn augment_with_decayed_past(
     current_slot: i32,
     baseline: ErrorBaseline,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
     snapshot: &SolverSnapshot,
     exclude: &HashSet<u64>,
 ) -> ErrorBaseline {
-    let decay_slots = cfg.error_window_past_decay_slots.max(0) as usize;
+    let decay_slots = assignment.error_window_past_decay_slots.max(0) as usize;
     if decay_slots == 0 {
         return baseline;
     }
@@ -1597,7 +1764,7 @@ fn augment_with_decayed_past(
     let denominator = (decay_slots + 1) as f64;
 
     for idx in 1..=decay_slots {
-        let slot = current_slot - cfg.error_window_past - idx as i32;
+        let slot = current_slot - assignment.error_window_past - idx as i32;
         let slot_assignments: Vec<_> = snapshot
             .get_requests_in_slot(slot)
             .into_iter()
@@ -1628,27 +1795,29 @@ fn augment_with_decayed_past(
 fn augment_with_virtual_prehistory(
     current_slot: i32,
     baseline: ErrorBaseline,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    simulation: &SimulationConfig,
+    recovery: &InfeasibilityConfig,
 ) -> ErrorBaseline {
-    if !cfg.infeasibility.prehistory_use_virtual_past {
+    if !recovery.prehistory_use_virtual_past {
         return baseline;
     }
-    let missing = (cfg.error_window_past - current_slot).max(0);
+    let missing = (assignment.error_window_past - current_slot).max(0);
     if missing == 0 {
         return baseline;
     }
 
-    let rate = cfg.simulation.predicted_requests_per_slot;
-    let sigma = (rate * cfg.simulation.request_rate_std_factor).max(1.0);
-    let virtual_avg_err = cfg.max_error_threshold * cfg.infeasibility.prehistory_error_ratio_of_threshold;
+    let rate = simulation.predicted_requests_per_slot;
+    let sigma = (rate * simulation.request_rate_std_factor).max(1.0);
+    let virtual_avg_err =
+        assignment.max_error_threshold * recovery.prehistory_error_ratio_of_threshold;
 
     let mut virtual_requests = 0i32;
     for offset in 0..missing {
-        let seed = cfg
-            .infeasibility
+        let seed = recovery
             .prehistory_random_seed
             .wrapping_add((current_slot as u64).wrapping_sub(missing as u64 + offset as u64));
-        let count = if cfg.infeasibility.prehistory_stochastic_counts {
+        let count = if recovery.prehistory_stochastic_counts {
             let dist = Normal::new(rate, sigma).unwrap();
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             (dist.sample(&mut rng) as i32).max(1)
@@ -1673,14 +1842,22 @@ fn augment_with_virtual_prehistory(
 fn apply_infeasibility_recovery(
     current_slot: i32,
     baseline: ErrorBaseline,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    simulation: &SimulationConfig,
+    recovery: &InfeasibilityConfig,
     snapshot: &SolverSnapshot,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) -> (ErrorBaseline, MockPool) {
-    let mode = cfg.infeasibility.recovery_mode.trim().to_lowercase();
+    let mode = recovery.recovery_mode.trim().to_lowercase();
 
     // Update mock influence once per slot (needs the current baseline avg).
-    update_mock_influence(current_slot, baseline.average_error, cfg, mutable);
+    update_mock_influence(
+        current_slot,
+        baseline.average_error,
+        assignment.max_error_threshold,
+        recovery,
+        mutable,
+    );
 
     if mode == "min_error_greedy" {
         // No mock injection; reset any persistent pool.
@@ -1689,8 +1866,15 @@ fn apply_infeasibility_recovery(
     }
 
     // Retrieve (or seed) the persistent mock pool for this slot/mode.
-    let (mock_count, mock_error, _source) =
-        get_or_seed_mock_pool(current_slot, &mode, cfg, snapshot, mutable);
+    let (mock_count, mock_error, _source) = get_or_seed_mock_pool(
+        current_slot,
+        &mode,
+        assignment,
+        simulation,
+        recovery,
+        snapshot,
+        mutable,
+    );
 
     if mock_count <= 0 || mock_error <= 0.0 {
         return (baseline, MockPool::default());
@@ -1709,17 +1893,18 @@ fn apply_infeasibility_recovery(
 fn update_mock_influence(
     slot: i32,
     baseline_avg: f64,
-    cfg: &Config,
+    max_error_threshold: f64,
+    recovery: &InfeasibilityConfig,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) {
     let mut g = mutable.lock().unwrap();
     if g.mock_influence.last_eval_slot == Some(slot) {
         return;
     }
-    let base = cfg.infeasibility.mock_influence.clamp(0.0, 1.0);
-    let decay = cfg.infeasibility.mock_influence_decay_step.max(0.0);
+    let base = recovery.mock_influence.clamp(0.0, 1.0);
+    let decay = recovery.mock_influence_decay_step.max(0.0);
     g.mock_influence.base = base;
-    if baseline_avg > cfg.max_error_threshold {
+    if baseline_avg > max_error_threshold {
         g.mock_influence.above_threshold_streak += 1;
         g.mock_influence.effective =
             (base - g.mock_influence.above_threshold_streak as f64 * decay).max(0.0);
@@ -1737,7 +1922,9 @@ fn update_mock_influence(
 fn get_or_seed_mock_pool(
     slot: i32,
     mode: &str,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    simulation: &SimulationConfig,
+    recovery: &InfeasibilityConfig,
     snapshot: &SolverSnapshot,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) -> (i32, f64, &'static str) {
@@ -1757,7 +1944,15 @@ fn get_or_seed_mock_pool(
         let g = mutable.lock().unwrap();
         g.mock_influence.effective
     };
-    let (new_count, new_error) = compute_mock_seed(slot, mode, cfg, influence, snapshot);
+    let (new_count, new_error) = compute_mock_seed(
+        slot,
+        mode,
+        assignment,
+        simulation,
+        recovery,
+        influence,
+        snapshot,
+    );
 
     // Second lock: store the new values.
     let mut g = mutable.lock().unwrap();
@@ -1771,13 +1966,15 @@ fn get_or_seed_mock_pool(
 fn compute_mock_seed(
     slot: i32,
     mode: &str,
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    simulation: &SimulationConfig,
+    recovery: &InfeasibilityConfig,
     influence: f64,
     snapshot: &SolverSnapshot,
 ) -> (i32, f64) {
     let (mut count, error) = match mode {
         "carryover" => {
-            let window_start = (slot - cfg.error_window_past).max(0);
+            let window_start = (slot - assignment.error_window_past).max(0);
             let dropped_slot = window_start - 1;
             if dropped_slot < 0 {
                 return (0, 0.0);
@@ -1788,18 +1985,19 @@ fn compute_mock_seed(
                 return (0, 0.0);
             }
             let avg_err = dropped.iter().map(|a| a.error).sum::<f64>() / n as f64;
-            let mock_err = resolve_mock_error(avg_err, cfg);
+            let mock_err = resolve_mock_error(avg_err, recovery);
             (n, mock_err)
         }
         "forecast" => {
-            let rate = cfg.simulation.predicted_requests_per_slot;
-            let sigma = (rate * cfg.simulation.request_rate_std_factor).max(1.0);
-            let seed = cfg.infeasibility.prehistory_random_seed.wrapping_add(slot as u64);
+            let rate = simulation.predicted_requests_per_slot;
+            let sigma = (rate * simulation.request_rate_std_factor).max(1.0);
+            let seed = recovery.prehistory_random_seed.wrapping_add(slot as u64);
             let dist = Normal::new(rate, sigma).unwrap();
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             let n = (dist.sample(&mut rng) as i32).max(0);
-            let default_err = cfg.max_error_threshold * cfg.infeasibility.forecast_error_ratio_of_threshold;
-            (n, resolve_mock_error(default_err, cfg))
+            let default_err =
+                assignment.max_error_threshold * recovery.forecast_error_ratio_of_threshold;
+            (n, resolve_mock_error(default_err, recovery))
         }
         _ => return (0, 0.0),
     };
@@ -1810,8 +2008,8 @@ fn compute_mock_seed(
     (count.max(0), error.max(0.0))
 }
 
-fn resolve_mock_error(fallback: f64, cfg: &Config) -> f64 {
-    match cfg.infeasibility.mock_error_per_request {
+fn resolve_mock_error(fallback: f64, recovery: &InfeasibilityConfig) -> f64 {
+    match recovery.mock_error_per_request {
         Some(v) => v.max(0.0),
         None => fallback.max(0.0),
     }
@@ -1821,10 +2019,10 @@ fn consume_mock_pool(
     slot: i32,
     mode: &str,
     consumed: i32,
-    cfg: &Config,
+    recovery_mode: &str,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
 ) {
-    if cfg.infeasibility.recovery_mode.trim().to_lowercase() == "min_error_greedy" {
+    if recovery_mode.trim().to_lowercase() == "min_error_greedy" {
         return;
     }
     let mut g = mutable.lock().unwrap();
@@ -1843,30 +2041,27 @@ fn reset_mock_pool(mutable: &Arc<Mutex<SchedulerMutableState>>) {
 
 // ─── misc helpers ─────────────────────────────────────────────────────────────
 
-fn get_effective_pruning_mode(batch_size: usize, cfg: &Config) -> String {
-    let threshold = cfg.solver.dp_pruning_min_batch_size;
+fn get_effective_pruning_mode(batch_size: usize, solver: &SolverConfig) -> String {
+    let threshold = solver.dp_pruning_min_batch_size;
     if threshold == 0 || batch_size < threshold {
         "none".to_string()
     } else {
-        cfg.solver.dp_pruning_method.trim().to_lowercase()
+        solver.dp_pruning_method.trim().to_lowercase()
     }
 }
 
 fn build_solver(
     flavours: &[Flavour],
     carbon_forecast: &[f64],
-    cfg: &Config,
+    assignment: &AssignmentPolicy<'_>,
+    solver_config: &SolverConfig,
     pruning: &str,
 ) -> DpSolver {
-    DpSolver {
-        flavours: flavours.to_vec(),
-        carbon_forecast: carbon_forecast.to_vec(),
-        window_size: cfg.total_slots,
-        pruning: pruning.to_string(),
-        pruning_k: cfg.solver.dp_pruning_k,
-        timeout: cfg.solver.dp_timeout,
-        carbon_cost_scale: cfg.carbon_cost_duration_scale,
-    }
+    let mut solver = DpSolver::new(solver_config, assignment)
+        .with_carbon_forecast(carbon_forecast.to_vec());
+    solver.flavours = flavours.to_vec();
+    solver.pruning = pruning.to_string();
+    solver
 }
 
 
@@ -1941,11 +2136,11 @@ pub fn generate_carbon_intensity_forecast(
 /// Uses K=6 slots per cycle, base_carbon=250, amplitude=200 (as in Python's
 /// `_get_carbon_forecast`).
 // TODO: remove this and change all the tests to use generate_carbon_intensity_forecast
-pub fn generate_carbon_forecast(cfg: &Config) -> Vec<f64> {
+pub fn generate_carbon_forecast(total_slots: i32) -> Vec<f64> {
     let k = 6.0f64;
     let base = 250.0f64;
     let amplitude = 200.0f64;
-    (0..cfg.total_slots)
+    (0..total_slots)
         .map(|slot| {
             let phase = 2.0 * std::f64::consts::PI * (slot as f64 % k) / k;
             let value = base + amplitude * (1.0 + 0.8 * phase.cos());
@@ -1966,14 +2161,18 @@ pub fn generate_carbon_forecast(cfg: &Config) -> Vec<f64> {
 /// function blocks briefly for that drain so the caller (the REST service's
 /// `/v1/admin/advance-slot`) can rely on "call returned" meaning "this
 /// slot's requests all got a DP assignment", not just "the clock moved".
-pub fn advance_to_next_slot(shared_state: &SharedState, cfg: &Config) -> i32 {
+pub fn advance_to_next_slot(
+    shared_state: &SharedState,
+    total_slots: i32,
+    effective_slot_duration_secs: f64,
+) -> i32 {
     let current_slot = shared_state.get_current_slot();
-    let slot_ms = (cfg.effective_slot_duration_secs() * 1000.0) as u64;
+    let slot_ms = (effective_slot_duration_secs * 1000.0) as u64;
     let next_ms = (current_slot as u64 + 1) * slot_ms;
     shared_state.set_virtual_elapsed_ms(next_ms);
 
-    let eff_slot_dur = cfg.effective_slot_duration_secs();
-    let new_slot = (((next_ms as f64 / 1000.0) / eff_slot_dur) as i32).min(cfg.total_slots - 1);
+    let new_slot =
+        (((next_ms as f64 / 1000.0) / effective_slot_duration_secs) as i32).min(total_slots - 1);
     // Set directly rather than relying on `main_loop`'s next tick to derive
     // it from `virtual_elapsed_ms`: makes this function self-consistent for
     // rapid back-to-back calls (and unit-testable without a live scheduler).
@@ -2082,7 +2281,8 @@ mod tests {
     fn make_mutable_state(cfg: &Config) -> Arc<Mutex<SchedulerMutableState>> {
         let base = cfg.infeasibility.mock_influence.clamp(0.0, 1.0);
         let carbon_forecast =
-            Arc::new(RwLock::new(generate_carbon_forecast(cfg)));
+            Arc::new(RwLock::new(generate_carbon_forecast(cfg.total_slots)));
+        let assignment = cfg.assignment_policy();
         Arc::new(Mutex::new(SchedulerMutableState {
             active_workers: 0,
             last_infeasible: None,
@@ -2094,7 +2294,12 @@ mod tests {
                 above_threshold_streak: 0,
                 last_eval_slot: None,
             },
-            swarm_state: SwarmBackend::from_config(cfg, &carbon_forecast),
+            swarm_state: SwarmBackend::from_config(
+                &cfg.solver,
+                &cfg.swarm,
+                &assignment,
+                &carbon_forecast,
+            ),
         }))
     }
 
@@ -2131,7 +2336,21 @@ mod tests {
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mutable = make_mutable_state(cfg);
         let ml = disabled_logger();
-        let (a, c, _) = solve_dp(current_slot, pending, &ss, cfg, &forecast, &fdb, &mutable, &ml);
+        let assignment = cfg.assignment_policy();
+        let (a, c, _) = solve_dp(
+            current_slot,
+            pending,
+            &ss,
+            &assignment,
+            &cfg.solver,
+            &cfg.simulation,
+            &cfg.infeasibility,
+            cfg.logging.verbose,
+            &forecast,
+            &fdb,
+            &mutable,
+            &ml,
+        );
         (a, c)
     }
 
@@ -2147,7 +2366,21 @@ mod tests {
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mutable = make_mutable_state(cfg);
         let ml = disabled_logger();
-        let (a, c, _) = solve_dp(current_slot, pending, ss, cfg, &forecast, &fdb, &mutable, &ml);
+        let assignment = cfg.assignment_policy();
+        let (a, c, _) = solve_dp(
+            current_slot,
+            pending,
+            ss,
+            &assignment,
+            &cfg.solver,
+            &cfg.simulation,
+            &cfg.infeasibility,
+            cfg.logging.verbose,
+            &forecast,
+            &fdb,
+            &mutable,
+            &ml,
+        );
         (a, c)
     }
 
@@ -2163,7 +2396,21 @@ mod tests {
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mutable = make_mutable_state(cfg);
         let ml = disabled_logger();
-        let (a, c, _) = solve_dp(current_slot, pending, ss, cfg, forecast, &fdb, &mutable, &ml);
+        let assignment = cfg.assignment_policy();
+        let (a, c, _) = solve_dp(
+            current_slot,
+            pending,
+            ss,
+            &assignment,
+            &cfg.solver,
+            &cfg.simulation,
+            &cfg.infeasibility,
+            cfg.logging.verbose,
+            forecast,
+            &fdb,
+            &mutable,
+            &ml,
+        );
         (a, c)
     }
 
@@ -2275,9 +2522,9 @@ mod tests {
             c.solver.dp_pruning_min_batch_size = 5;
             c.solver.dp_pruning_method = "beam".to_string();
         });
-        assert_eq!(get_effective_pruning_mode(3, &cfg), "none");
-        assert_eq!(get_effective_pruning_mode(5, &cfg), "beam");
-        assert_eq!(get_effective_pruning_mode(10, &cfg), "beam");
+        assert_eq!(get_effective_pruning_mode(3, &cfg.solver), "none");
+        assert_eq!(get_effective_pruning_mode(5, &cfg.solver), "beam");
+        assert_eq!(get_effective_pruning_mode(10, &cfg.solver), "beam");
     }
 
     /// `get_effective_pruning_mode` returns "none" when the threshold is 0
@@ -2288,7 +2535,7 @@ mod tests {
             c.solver.dp_pruning_min_batch_size = 0;
             c.solver.dp_pruning_method = "beam".to_string();
         });
-        assert_eq!(get_effective_pruning_mode(100, &cfg), "none");
+        assert_eq!(get_effective_pruning_mode(100, &cfg.solver), "none");
     }
 
     /// All pending requests should appear in the result even when deadlines vary.
@@ -2365,11 +2612,19 @@ mod tests {
         let ss = SharedState::new();
         assert_eq!(ss.get_current_slot(), 0);
 
-        let new_slot = advance_to_next_slot(&ss, &cfg);
+        let new_slot = advance_to_next_slot(
+            &ss,
+            cfg.total_slots,
+            cfg.effective_slot_duration_secs(),
+        );
         assert_eq!(new_slot, 1);
         assert_eq!(ss.virtual_elapsed_secs(), 1800.0);
 
-        let new_slot = advance_to_next_slot(&ss, &cfg);
+        let new_slot = advance_to_next_slot(
+            &ss,
+            cfg.total_slots,
+            cfg.effective_slot_duration_secs(),
+        );
         assert_eq!(new_slot, 2);
         assert_eq!(ss.virtual_elapsed_secs(), 3600.0);
     }
@@ -2385,7 +2640,11 @@ mod tests {
         ss.set_virtual_elapsed_ms(((cfg.total_slots - 1) as u64) * (cfg.slot_duration_seconds * 1000.0) as u64);
         ss.set_current_slot(cfg.total_slots - 1);
 
-        let new_slot = advance_to_next_slot(&ss, &cfg);
+        let new_slot = advance_to_next_slot(
+            &ss,
+            cfg.total_slots,
+            cfg.effective_slot_duration_secs(),
+        );
         assert_eq!(new_slot, cfg.total_slots - 1);
     }
 
@@ -2403,8 +2662,21 @@ mod tests {
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mutable = make_mutable_state(cfg);
         let ml = disabled_logger();
-        let (a, c, _) =
-            solve_greedy_singleton(current_slot, pending, ss, cfg, &forecast, &fdb, &mutable, &ml);
+        let assignment = cfg.assignment_policy();
+        let (a, c, _) = solve_greedy_singleton(
+            current_slot,
+            pending,
+            ss,
+            &assignment,
+            &cfg.solver,
+            &cfg.simulation,
+            &cfg.infeasibility,
+            cfg.logging.verbose,
+            &forecast,
+            &fdb,
+            &mutable,
+            &ml,
+        );
         (a, c)
     }
 
@@ -2420,8 +2692,21 @@ mod tests {
             cfg.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
         let mutable = make_mutable_state(cfg);
         let ml = disabled_logger();
-        let (a, c, _) =
-            solve_greedy_singleton(current_slot, pending, ss, cfg, forecast, &fdb, &mutable, &ml);
+        let assignment = cfg.assignment_policy();
+        let (a, c, _) = solve_greedy_singleton(
+            current_slot,
+            pending,
+            ss,
+            &assignment,
+            &cfg.solver,
+            &cfg.simulation,
+            &cfg.infeasibility,
+            cfg.logging.verbose,
+            forecast,
+            &fdb,
+            &mutable,
+            &ml,
+        );
         (a, c)
     }
 
