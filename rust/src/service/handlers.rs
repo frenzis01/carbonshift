@@ -203,7 +203,7 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HorizonRe
 }
 
 /// `POST /v1/admin/advance-slot` — test-only: force the virtual clock to
-/// the next slot boundary (`Config::manual_clock` must be enabled), then
+/// the next slot boundary (`Config::simulation.manual_clock` must be enabled), then
 /// block until every assignment produced for the slot just left has been
 /// handed off to the executor (status `Dispatched`, not just `Scheduled`).
 /// See PLAN_SERVICE.md "Emulazione a tempo fittizio" for the full protocol
@@ -217,7 +217,7 @@ pub async fn advance_slot(
     // We must have a real body struct carrying slot, observed, forecast and current_slot, all #[serde(default)]
     Json(body): Json<AdvanceSlotBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if !state.cfg.manual_clock {
+    if !state.cfg.simulation.manual_clock {
         return Err(api_error(StatusCode::CONFLICT, "MANUAL_CLOCK is not enabled on this instance"));
     }
     // TODO: too much slot naming here... evaluate if it's possible to simplify.

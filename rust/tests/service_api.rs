@@ -35,10 +35,10 @@ fn test_service_cfg() -> ServiceConfig {
 fn test_engine_config() -> Config {
     let mut cfg = Config::default();
     cfg.total_slots = 50;
-    cfg.enable_solver_logging = false;
-    cfg.enable_infeasibility_debug_logging = false;
-    cfg.enable_progress_display = false;
-    cfg.verbose = false;
+    cfg.logging.enable_solver_logging = false;
+    cfg.logging.enable_infeasibility_debug_logging = false;
+    cfg.logging.enable_progress_display = false;
+    cfg.logging.verbose = false;
     cfg
 }
 
@@ -208,7 +208,7 @@ async fn get_task_config_returns_registered_override() {
 #[tokio::test]
 async fn stats_reports_global_error_avg_after_scheduling() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
+    cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
@@ -262,7 +262,7 @@ async fn ready_returns_503_near_horizon_exhaustion() {
 #[tokio::test]
 async fn end_to_end_submit_gets_scheduled() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1; // schedule as soon as one request arrives
+    cfg.solver.batch_size = 1; // schedule as soon as one request arrives
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
@@ -317,7 +317,7 @@ async fn submit_response_includes_positive_baseline_carbon_cost() {
 #[tokio::test]
 async fn task_flavours_registered_via_v1_tasks_are_used_for_scheduling() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
+    cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
@@ -356,7 +356,7 @@ async fn task_flavours_registered_via_v1_tasks_are_used_for_scheduling() {
 #[tokio::test]
 async fn executor_callback_with_actual_error_pct_corrects_global_error() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
+    cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
@@ -419,7 +419,7 @@ async fn advance_slot_rejects_when_manual_clock_disabled() {
 #[tokio::test]
 async fn advance_slot_applies_forecast_and_observed_values_from_body() {
     let mut cfg = test_engine_config();
-    cfg.manual_clock = true;
+    cfg.simulation.manual_clock = true;
     let cfg = Arc::new(cfg);
     let forecast = test_forecast(&cfg);
     let state = AppState::new(
@@ -456,7 +456,7 @@ async fn advance_slot_applies_forecast_and_observed_values_from_body() {
 #[tokio::test]
 async fn executor_callback_corrects_carbon_cost_with_actual_carbon_intensity() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
+    cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
@@ -507,8 +507,8 @@ async fn executor_callback_corrects_carbon_cost_with_actual_carbon_intensity() {
 #[tokio::test]
 async fn advance_slot_moves_clock_and_waits_for_dispatch() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
-    cfg.manual_clock = true;
+    cfg.solver.batch_size = 1;
+    cfg.simulation.manual_clock = true;
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
@@ -570,7 +570,7 @@ async fn advance_slot_moves_clock_and_waits_for_dispatch() {
 #[tokio::test]
 async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
     let mut cfg = test_engine_config();
-    cfg.manual_clock = true;
+    cfg.simulation.manual_clock = true;
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
@@ -633,7 +633,7 @@ async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
 #[tokio::test]
 async fn executor_callback_corrects_carbon_cost_with_actual_execution_time() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
+    cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
@@ -688,7 +688,7 @@ async fn executor_callback_corrects_carbon_cost_with_actual_execution_time() {
 #[tokio::test]
 async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and_arrival_ci() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
+    cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new(), String::new(), None));
@@ -746,7 +746,7 @@ async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and
 #[tokio::test]
 async fn fine_grained_monitoring_endpoints_work() {
     let mut cfg = test_engine_config();
-    cfg.batch_size = 1;
+    cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();

@@ -81,13 +81,13 @@ async fn main() {
     cfg.slot_duration_seconds = slot_duration_seconds;
     // Live service: the slot clock must track wall-clock time, never skip
     // ahead (skip_empty_slots is only correct for finite offline replays).
-    cfg.skip_empty_slots = false;
-    cfg.slot_speed_scale = 1.0;
-    cfg.manual_clock = manual_clock;
-    cfg.verbose = false;
-    cfg.enable_progress_display = false;
-    cfg.enable_solver_logging = env_or("CARBONSHIFT_ENABLE_SOLVER_LOGGING", "0") == "1";
-    cfg.enable_infeasibility_debug_logging = false;
+    cfg.simulation.skip_empty_slots = false;
+    cfg.simulation.slot_speed_scale = 1.0;
+    cfg.simulation.manual_clock = manual_clock;
+    cfg.logging.verbose = false;
+    cfg.logging.enable_progress_display = false;
+    cfg.logging.enable_solver_logging = env_or("CARBONSHIFT_ENABLE_SOLVER_LOGGING", "0") == "1";
+    cfg.logging.enable_infeasibility_debug_logging = false;
     let cfg = Arc::new(cfg);
 
     match &executor_url {
@@ -128,10 +128,10 @@ async fn main() {
     let shared_carbon_forecast = Arc::new(RwLock::new(carbon_forecast));
 
     let metrics_logger = Arc::new(MetricsLogger::new(
-        cfg.enable_solver_logging,
-        cfg.solver_runs_file.clone(),
-        cfg.solver_assignments_file.clone(),
-        cfg.solver_slot_metrics_file.clone(),
+        cfg.logging.enable_solver_logging,
+        cfg.logging.solver_runs_file.clone(),
+        cfg.logging.solver_assignments_file.clone(),
+        cfg.logging.solver_slot_metrics_file.clone(),
         None,
     ));
 

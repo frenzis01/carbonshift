@@ -143,9 +143,9 @@ impl DpSolver {
             flavours: cfg.flavours.clone(),
             carbon_forecast: vec![0.0; cfg.total_slots as usize],
             window_size: cfg.total_slots,
-            pruning: cfg.dp_pruning_method.clone(),
-            pruning_k: cfg.dp_pruning_k,
-            timeout: cfg.dp_timeout,
+            pruning: cfg.solver.dp_pruning_method.clone(),
+            pruning_k: cfg.solver.dp_pruning_k,
+            timeout: cfg.solver.dp_timeout,
             carbon_cost_scale: cfg.carbon_cost_duration_scale,
         }
     }

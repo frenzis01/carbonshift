@@ -20,12 +20,12 @@ impl Online2System {
         let shared_state = SharedState::new();
 
         let ml = Arc::new(MetricsLogger::new(
-            cfg.enable_solver_logging,
-            cfg.solver_runs_file.clone(),
-            cfg.solver_assignments_file.clone(),
-            cfg.solver_slot_metrics_file.clone(),
-            if cfg.enable_infeasibility_debug_logging {
-                Some(cfg.solver_infeasible_debug_file.clone())
+            cfg.logging.enable_solver_logging,
+            cfg.logging.solver_runs_file.clone(),
+            cfg.logging.solver_assignments_file.clone(),
+            cfg.logging.solver_slot_metrics_file.clone(),
+            if cfg.logging.enable_infeasibility_debug_logging {
+                Some(cfg.logging.solver_infeasible_debug_file.clone())
             } else {
                 None
             },
@@ -83,7 +83,7 @@ impl Online2System {
             }
 
             let stats = self.scheduler.get_statistics();
-            if self.cfg.verbose {
+            if self.cfg.logging.verbose {
                 let elapsed = self.scheduler.shared_state_virtual_elapsed_secs();
                 let current_slot = (elapsed / eff_slot_dur) as i32;
                 println!(
@@ -137,8 +137,8 @@ fn main() {
             });
             let mut c = Config::default();
             c.apply_scenario_metadata(&scenario.metadata);
-            if no_skip { c.skip_empty_slots = false; }
-            c.slot_speed_scale = speed_scale;
+            if no_skip { c.simulation.skip_empty_slots = false; }
+            c.simulation.slot_speed_scale = speed_scale;
             let by_slot = scenario.requests_by_slot();
             println!(
                 "Loaded scenario: {} slots, {} requests ({})",
@@ -150,20 +150,20 @@ fn main() {
         }
         None => {
             let mut c = Config::default();
-            if no_skip { c.skip_empty_slots = false; }
-            c.slot_speed_scale = speed_scale;
+            if no_skip { c.simulation.skip_empty_slots = false; }
+            c.simulation.slot_speed_scale = speed_scale;
             (c, None, None)
         }
     };
 
     // batch_size can still be overridden here if needed; all scenario params
     // are already applied via apply_scenario_metadata above.
-    // cfg.batch_size = 8;  // example override
+    // cfg.solver.batch_size = 8;  // example override
 
-    if cfg.verbose {
+    if cfg.logging.verbose {
         println!(
             "CarbonShift RS — batch_size={}, total_slots={}, flavours={:?}",
-            cfg.batch_size,
+            cfg.solver.batch_size,
             cfg.total_slots,
             cfg.flavours.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
         );

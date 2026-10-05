@@ -7,45 +7,158 @@
 
 use crate::types::{CapacityTier, Flavour};
 
+// ─── Concern-specific configuration ─────────────────────────────────────────
+
+/// Settings for batching, solver selection, and solver execution.
+#[derive(Debug, Clone)]
+pub struct SolverConfig {
+    /// Number of requests to accumulate before running a solver batch.
+    pub batch_size: usize,
+    /// Which solver to use: "dp", "bandit", "ant_colony", or "greedy_singleton".
+    pub solver_strategy: String,
+    /// DP pruning method: "beam", "kbest", or "none".
+    pub dp_pruning_method: String,
+    /// Apply pruning only for batches at least this large (0 = disabled).
+    pub dp_pruning_min_batch_size: usize,
+    /// Number of states to keep during pruning.
+    pub dp_pruning_k: usize,
+    /// Maximum seconds for the DP solver per batch before timeout fallback.
+    pub dp_timeout: f64,
+    /// Whether future assignments are pinned as baseline load.
+    pub dp_lock_future_assignments: bool,
+    /// Maximum consecutive capacity-tier rollbacks for one batch (0 = disabled).
+    pub rollback_max_consecutive: usize,
+    /// Maximum number of batch solver workers.
+    pub max_batch_solver_parallelism: usize,
+    /// Maximum wait for work on the solver queue, in seconds.
+    pub queue_timeout: f64,
+    /// Flush a partial batch after this many virtual seconds (0 = disabled).
+    pub batch_timeout_secs: f64,
+}
+
+/// Settings used to generate and pace synthetic or replayed workloads.
+#[derive(Debug, Clone)]
+pub struct SimulationConfig {
+    /// Expected request arrivals per slot.
+    pub predicted_requests_per_slot: f64,
+    /// Standard-deviation factor for generated request rates.
+    pub request_rate_std_factor: f64,
+    /// Minimum request deadline slack in slots.
+    pub deadline_min_slack: i32,
+    /// Maximum request deadline slack in slots.
+    pub deadline_max_slack: i32,
+    /// Skip empty slots rather than waiting for their wall-clock boundary.
+    pub skip_empty_slots: bool,
+    /// Wall-clock pacing multiplier for each slot (1.0 = real time).
+    pub slot_speed_scale: f64,
+    /// Freeze the virtual clock until an explicit slot-advance operation.
+    pub manual_clock: bool,
+    /// Maximum generated requests per real-time tick.
+    pub generator_realtime_chunk_size: usize,
+    /// Expected request count for progress reporting (0 = unknown).
+    pub total_requests: usize,
+}
+
+/// Settings for synthetic prehistory and recovery from infeasible batches.
+#[derive(Debug, Clone)]
+pub struct InfeasibilityConfig {
+    /// Whether to use virtual past slots when building the error baseline.
+    pub prehistory_use_virtual_past: bool,
+    /// Prehistory error as a ratio of the configured error threshold.
+    pub prehistory_error_ratio_of_threshold: f64,
+    /// Forecast error as a ratio of the configured error threshold.
+    pub forecast_error_ratio_of_threshold: f64,
+    /// Generate stochastic request counts for virtual prehistory.
+    pub prehistory_stochastic_counts: bool,
+    /// Random seed used for virtual prehistory generation.
+    pub prehistory_random_seed: u64,
+    /// Influence of prehistory mock requests on the error baseline.
+    pub prehistory_mock_influence: f64,
+    /// Recovery policy: "min_error_greedy", "carryover", or "forecast".
+    pub recovery_mode: String,
+    /// Influence of infeasibility mock requests.
+    pub mock_influence: f64,
+    /// Optional fixed error for each infeasibility mock request.
+    pub mock_error_per_request: Option<f64>,
+    /// Influence decay applied to infeasibility mocks at each step.
+    pub mock_influence_decay_step: f64,
+}
+
+/// Hyperparameters and concurrency mode for online swarm solvers.
+#[derive(Debug, Clone)]
+pub struct SwarmConfig {
+    /// Concurrency mode: "serialized" or "merge".
+    pub mode: String,
+    /// Exploration probability for the online bandit.
+    pub bandit_epsilon: f64,
+    /// Optimistic initial Q-value for the online bandit.
+    pub bandit_initial_q: f64,
+    /// RNG seed for the online bandit.
+    pub bandit_seed: u64,
+    /// Number of ants per ACO iteration.
+    pub aco_n_ants: usize,
+    /// Number of ACO iterations per batch.
+    pub aco_n_iterations: usize,
+    /// Pheromone influence exponent α.
+    pub aco_alpha: f64,
+    /// Heuristic influence exponent β.
+    pub aco_beta: f64,
+    /// Pheromone evaporation rate ρ.
+    pub aco_rho: f64,
+    /// Pheromone deposit quantity.
+    pub aco_q: f64,
+    /// Initial pheromone level τ₀.
+    pub aco_tau0: f64,
+    /// RNG seed for online ACO.
+    pub aco_seed: u64,
+}
+
+/// Settings for diagnostic output and solver metrics files.
+#[derive(Debug, Clone)]
+pub struct LoggingConfig {
+    /// Enable verbose scheduler diagnostics.
+    pub verbose: bool,
+    /// Print the scheduler progress line to stdout.
+    pub enable_progress_display: bool,
+    /// Write solver metrics to CSV.
+    pub enable_solver_logging: bool,
+    /// Destination for solver run metrics.
+    pub solver_runs_file: String,
+    /// Destination for per-assignment metrics.
+    pub solver_assignments_file: String,
+    /// Destination for per-slot metrics.
+    pub solver_slot_metrics_file: String,
+    /// Write diagnostics for infeasible solver batches.
+    pub enable_infeasibility_debug_logging: bool,
+    /// Destination for infeasibility diagnostics.
+    pub solver_infeasible_debug_file: String,
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
+/// Core scheduling policy and the concern-specific settings used by its runtime.
 #[derive(Debug, Clone)]
 pub struct Config {
-    // ── batch processing ──────────────────────────────────────────────────
-    /// Number of requests to accumulate before running a DP batch.
-    pub batch_size: usize,
-
-    // ── time slot ─────────────────────────────────────────────────────────
+    /// Settings for batch formation and assignment solvers.
+    pub solver: SolverConfig,
+    /// Settings for synthetic and replayed workload execution.
+    pub simulation: SimulationConfig,
+    /// Settings for error-budget prehistory and infeasibility recovery.
+    pub infeasibility: InfeasibilityConfig,
+    /// Settings for online bandit and ant-colony solvers.
+    pub swarm: SwarmConfig,
+    /// Settings for progress and diagnostic output.
+    pub logging: LoggingConfig,
     /// Duration of each time slot in seconds.
     pub slot_duration_seconds: f64,
     /// Total number of time slots in the planning horizon.
     pub total_slots: i32,
-    /// Offset added to the engine's own (uptime-based) `current_slot` to get
-    /// the *provider's* global slot index, i.e.
-    /// `global_slot = current_slot + slot_epoch_offset`.
-    ///
-    /// Why this exists: `current_slot` here is derived from
-    /// `SharedState::virtual_elapsed_ms`, which starts at 0 when the process
-    /// starts — it is an uptime counter, not an absolute slot. An external
-    /// carbon-intensity provider (see `services/provider/`) publishes slots
-    /// derived from wall-clock time (`floor((now - epoch) / slot_duration)`),
-    /// which is a *different* number space entirely (e.g. 118015 vs 0).
-    ///
-    /// Anything that consumes a provider-reported slot (a pushed forecast, or
-    /// an `actual_carbon_intensity` reading) MUST convert through this field
-    /// rather than assuming the two spaces coincide. Default `0` keeps every
-    /// existing caller (offline simulation, tests, the built-in synthetic
-    /// forecast) behaving exactly as before.
+    /// Offset from the engine's uptime-based slot to the provider's global slot.
     pub slot_epoch_offset: i64,
-
-    // ── flavours ──────────────────────────────────────────────────────────
-    /// Available execution flavours (ordered from most accurate to fastest).
+    /// Available execution flavours, ordered from most accurate to fastest.
     pub flavours: Vec<Flavour>,
-    /// Scale factor: carbon_intensity [gCO₂/kWh] × duration_seconds × scale → gCO₂.
-    /// Derivation: 1/3600 converts seconds to hours at 1 kW load per request.
+    /// Scale factor converting carbon intensity and duration to gCO₂.
     pub carbon_cost_duration_scale: f64,
-
-    // ── error budget ──────────────────────────────────────────────────────
     /// Maximum allowed average error (%) in the sliding window.
     pub max_error_threshold: f64,
     /// Number of past slots in the error window.
@@ -54,172 +167,109 @@ pub struct Config {
     pub error_window_future: i32,
     /// Additional past slots included with linearly decayed weight.
     pub error_window_past_decay_slots: i32,
-    /// Requests cannot be placed beyond current_slot + this value.
+    /// Maximum number of slots into the future for an assignment.
     pub assignment_max_future_slots: i32,
-
-    // global error constraint
+    /// Enforce the global error constraint.
     pub global_error_constraint_enabled: bool,
+    /// Reject assignments that violate the global error constraint.
     pub global_error_constraint_hard: bool,
-
-    // virtual prehistory
-    pub prehistory_use_virtual_past: bool,
-    pub prehistory_error_ratio_of_threshold: f64,
-    pub forecast_error_ratio_of_threshold: f64,
-    pub prehistory_stochastic_counts: bool,
-    pub prehistory_random_seed: u64,
-    pub prehistory_mock_influence: f64,
-
-    // ── capacity tiers (rebound effect) ──────────────────────────────────
+    /// Capacity/rebound tiers applied to slot carbon costs.
     pub capacity_tiers: Vec<CapacityTier>,
+}
 
-    // ── DP solver ─────────────────────────────────────────────────────────
-    /// Pruning method: "beam", "kbest", or "none".
-    pub dp_pruning_method: String,
-    /// Apply pruning only for batches with size >= this threshold (0 = disabled).
-    pub dp_pruning_min_batch_size: usize,
-    /// Number of states to keep during pruning.
-    pub dp_pruning_k: usize,
-    /// Maximum seconds for DP solver per batch before timeout fallback.
-    pub dp_timeout: f64,
-    /// If true, future assignments are pinned as baseline load; if false, they
-    /// are re-planned jointly with the current batch (time-shifting).
-    pub dp_lock_future_assignments: bool,
-    /// Governs both how the error-window baseline is diluted *and* what
-    /// happens when the primary DP solve still can't cover all pending
-    /// requests. The error constraint (`max_error_threshold`) is NEVER
-    /// relaxed/removed — infeasibility always resolves via `greedy_fallback`
-    /// (accurate flavour, cheapest feasible slot), never via a second DP
-    /// pass with a loosened threshold.
-    ///
-    /// - "min_error_greedy": no synthetic/mock requests are injected; on
-    ///   infeasibility, go straight to `greedy_fallback`.
-    /// - "carryover": inject mock requests carried over from the slot that
-    ///   just left the error window (with influence decay); on infeasibility
-    ///   (even with mocks), go to `greedy_fallback`.
-    /// - "forecast": inject mock requests sampled from the expected arrival
-    ///   rate for the current slot (with influence decay); same fallback.
-    pub infeasibility_recovery_mode: String,
-    pub infeasibility_mock_influence: f64,
-    /// None → policy-derived; Some(x) → fixed override.
-    pub infeasibility_mock_error_per_request: Option<f64>,
-    pub infeasibility_mock_influence_decay_step: f64,
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 3,
+            solver_strategy: "dp".to_string(),
+            dp_pruning_method: "beam".to_string(),
+            dp_pruning_min_batch_size: 8,
+            dp_pruning_k: 1200,
+            dp_timeout: 30.0,
+            dp_lock_future_assignments: true,
+            rollback_max_consecutive: 3,
+            max_batch_solver_parallelism: 20,
+            queue_timeout: 1.0,
+            batch_timeout_secs: 0.0,
+        }
+    }
+}
 
-    // ── request generation ────────────────────────────────────────────────
-    pub predicted_requests_per_slot: f64,
-    pub request_rate_std_factor: f64,
-    pub deadline_min_slack: i32,
-    pub deadline_max_slack: i32,
+impl Default for SimulationConfig {
+    fn default() -> Self {
+        Self {
+            predicted_requests_per_slot: 60.0,
+            request_rate_std_factor: 0.5,
+            deadline_min_slack: 0,
+            deadline_max_slack: 14,
+            skip_empty_slots: true,
+            slot_speed_scale: 1.0,
+            manual_clock: false,
+            generator_realtime_chunk_size: 10,
+            total_requests: 0,
+        }
+    }
+}
 
-    // ── rollback (concurrent capacity-tier breach detection) ─────────────
-    /// Maximum number of consecutive rollbacks allowed for a single batch
-    /// before the assignment is forced regardless of tier breach.
-    /// 0 = rollback disabled entirely.
-    pub rollback_max_consecutive: usize,
+impl Default for InfeasibilityConfig {
+    fn default() -> Self {
+        Self {
+            prehistory_use_virtual_past: false,
+            prehistory_error_ratio_of_threshold: 1.0,
+            forecast_error_ratio_of_threshold: 1.0,
+            prehistory_stochastic_counts: true,
+            prehistory_random_seed: 4242,
+            prehistory_mock_influence: 0.4,
+            recovery_mode: "carryover".to_string(),
+            mock_influence: 0.8,
+            mock_error_per_request: None,
+            mock_influence_decay_step: 0.15,
+        }
+    }
+}
 
-    // ── threading & concurrency ───────────────────────────────────────────
-    pub max_batch_solver_parallelism: usize,
-    pub queue_timeout: f64,
-    /// Flush a partial batch (< batch_size requests) if its oldest request has
-    /// been waiting more than this many virtual seconds.  0.0 = disabled.
-    pub batch_timeout_secs: f64,
+impl Default for SwarmConfig {
+    fn default() -> Self {
+        Self {
+            mode: "serialized".to_string(),
+            bandit_epsilon: 0.15,
+            bandit_initial_q: 10.0,
+            bandit_seed: 42,
+            aco_n_ants: 10,
+            aco_n_iterations: 3,
+            aco_alpha: 1.0,
+            aco_beta: 2.0,
+            aco_rho: 0.3,
+            aco_q: 1.0,
+            aco_tau0: 1.0,
+            aco_seed: 42,
+        }
+    }
+}
 
-    // ── simulation speed ──────────────────────────────────────────────────
-    /// When true: once a slot has no pending requests and no active workers,
-    /// the virtual clock jumps immediately to the next slot boundary instead
-    /// of waiting in real time.  Useful for offline / batch-replay runs.
-    pub skip_empty_slots: bool,
-    /// Multiplier on `slot_duration_seconds` for wall-clock pacing.
-    /// `1.0` = real-time; `0.1` = 10× faster; `0.0` = essentially instant
-    /// (only meaningful when `skip_empty_slots` is false).
-    pub slot_speed_scale: f64,
-    /// When true, the virtual clock never advances with real wall-clock
-    /// time — it only moves via an explicit `scheduler::advance_to_next_slot`
-    /// call (exposed as `POST /v1/admin/advance-slot` by the REST service).
-    /// Used for deterministic "fake time" end-to-end testing (see
-    /// PLAN_SERVICE.md §"Emulazione a tempo fittizio"); never enable in
-    /// production, since nothing else advances the clock.
-    pub manual_clock: bool,
-    /// Max requests the generator emits per tick while pacing a slot's
-    /// arrivals in real time (only used when `skip_empty_slots` is false,
-    /// i.e. true realtime simulation). Larger K = coarser pacing.
-    pub generator_realtime_chunk_size: usize,
-
-    // ── progress display ──────────────────────────────────────────────────
-    /// Total requests expected for this run (known from scenario upfront).
-    /// Used by the progress display to show `scheduled / total_requests` and
-    /// a stable percentage even before all requests have been received.
-    /// 0 means "unknown" — falls back to total_received.
-    pub total_requests: usize,
-
-    // ── solver strategy ───────────────────────────────────────────────────
-    /// Which solver to use for batch assignment.
-    /// `"dp"` (default): DP solver with error constraints and rollback.
-    /// `"bandit"`: online ε-greedy bandit (state shared across batches).
-    /// `"ant_colony"`: online ACO (pheromone shared across batches).
-    /// `"greedy_singleton"`: online exhaustive greedy scan (no learning, no
-    /// joint multi-request search) — only valid when `batch_size == 1`.
-    pub solver_strategy: String,
-
-    /// Concurrency strategy for online swarm strategies (bandit / ant_colony)
-    /// when `max_batch_solver_parallelism > 1`. Irrelevant for `"dp"`.
-    ///
-    /// `"serialized"` (default, see `online_swarm.rs`): each batch worker
-    /// solves while holding the scheduler mutex, so swarm state updates are
-    /// fully sequential — correct and reproducible, at the cost of limiting
-    /// swarm batches to one in flight at a time (DP batches are unaffected).
-    ///
-    /// `"merge"` (see `online_swarmerge.rs`): batch workers solve lock-free
-    /// against a snapshot, then additively merge their contribution (running-
-    /// mean deltas for bandit, discounted evaporation+deposit for ACO) back
-    /// into the shared state. Preserves full parallelism without discarding
-    /// concurrent updates (unlike the old last-writer-wins overwrite), at the
-    /// cost of workers reading slightly stale state while they solve.
-    pub online_swarm_mode: String,
-
-    // ── swarm / bandit hyper-parameters ──────────────────────────────────
-    /// Exploration probability for the online bandit.
-    pub swarm_bandit_epsilon: f64,
-    /// Optimistic initial Q-value (encourages early exploration).
-    pub swarm_bandit_initial_q: f64,
-    /// RNG seed for the online bandit.
-    pub swarm_bandit_seed: u64,
-
-    // ── swarm / ACO hyper-parameters ─────────────────────────────────────
-    /// Number of ants per batch iteration.
-    pub swarm_aco_n_ants: usize,
-    /// Number of ACO iterations per batch (1 is fine for online use —
-    /// pheromone accumulates across many batches).
-    pub swarm_aco_n_iterations: usize,
-    /// Pheromone influence exponent α.
-    pub swarm_aco_alpha: f64,
-    /// Heuristic influence exponent β.
-    pub swarm_aco_beta: f64,
-    /// Pheromone evaporation rate ρ ∈ (0, 1).
-    pub swarm_aco_rho: f64,
-    /// Pheromone deposit quantity (divided by solution cost).
-    pub swarm_aco_q: f64,
-    /// Initial pheromone level τ₀.
-    pub swarm_aco_tau0: f64,
-    /// RNG seed for the online ACO.
-    pub swarm_aco_seed: u64,
-
-    // ── logging & output ──────────────────────────────────────────────────
-    pub verbose: bool,
-    /// Print the `\r [N=..] Scheduled x/y (..%)` progress line to stdout.
-    /// Meant for CLI benchmark/simulate runs; the REST service disables it.
-    pub enable_progress_display: bool,
-    pub enable_solver_logging: bool,
-    pub solver_runs_file: String,
-    pub solver_assignments_file: String,
-    pub solver_slot_metrics_file: String,
-    pub enable_infeasibility_debug_logging: bool,
-    pub solver_infeasible_debug_file: String,
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            verbose: true,
+            enable_progress_display: true,
+            enable_solver_logging: true,
+            solver_runs_file: "/tmp/online2_solver_runs.csv".to_string(),
+            solver_assignments_file: "/tmp/online2_solver_assignments.csv".to_string(),
+            solver_slot_metrics_file: "/tmp/online2_solver_slot_metrics.csv".to_string(),
+            enable_infeasibility_debug_logging: true,
+            solver_infeasible_debug_file: "/tmp/online2_solver_infeasible_debug.csv".to_string(),
+        }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            batch_size: 3,
+            solver: SolverConfig::default(),
+            simulation: SimulationConfig::default(),
+            infeasibility: InfeasibilityConfig::default(),
+            swarm: SwarmConfig::default(),
+            logging: LoggingConfig::default(),
             slot_duration_seconds: 10.0,
             total_slots: 24,
             slot_epoch_offset: 0,
@@ -236,62 +286,12 @@ impl Default for Config {
             assignment_max_future_slots: 14,
             global_error_constraint_enabled: true,
             global_error_constraint_hard: true,
-            prehistory_use_virtual_past: false,
-            prehistory_error_ratio_of_threshold: 1.0,
-            forecast_error_ratio_of_threshold: 1.0,
-            prehistory_stochastic_counts: true,
-            prehistory_random_seed: 4242,
-            prehistory_mock_influence: 0.4,
             capacity_tiers: vec![
                 CapacityTier { max_requests: Some(30),  multiplier: 1.0 },
                 CapacityTier { max_requests: Some(50),  multiplier: 1.5 },
                 CapacityTier { max_requests: Some(80),  multiplier: 2.0 },
                 CapacityTier { max_requests: None,      multiplier: 5.0 }, // 81+: overload
             ],
-            dp_pruning_method: "beam".to_string(),
-            dp_pruning_min_batch_size: 8,
-            dp_pruning_k: 1200,
-            dp_timeout: 30.0,
-            dp_lock_future_assignments: true,
-            // infeasibility_recovery_mode: "forecast".to_string(),
-            infeasibility_recovery_mode: "carryover".to_string(),
-            infeasibility_mock_influence: 0.8,
-            infeasibility_mock_error_per_request: None,
-            infeasibility_mock_influence_decay_step: 0.15,
-            predicted_requests_per_slot: 60.0,
-            request_rate_std_factor: 0.5,
-            deadline_min_slack: 0,
-            deadline_max_slack: 14,
-            max_batch_solver_parallelism: 20,
-            queue_timeout: 1.0,
-            batch_timeout_secs: 0.0,
-            rollback_max_consecutive: 3,
-            skip_empty_slots: true,
-            slot_speed_scale: 1.0,
-            manual_clock: false,
-            generator_realtime_chunk_size: 10,
-            total_requests: 0,
-            solver_strategy: "dp".to_string(),
-            online_swarm_mode: "serialized".to_string(),
-            swarm_bandit_epsilon: 0.15,
-            swarm_bandit_initial_q: 10.0,
-            swarm_bandit_seed: 42,
-            swarm_aco_n_ants: 10,
-            swarm_aco_n_iterations: 3,
-            swarm_aco_alpha: 1.0,
-            swarm_aco_beta: 2.0,
-            swarm_aco_rho: 0.3,
-            swarm_aco_q: 1.0,
-            swarm_aco_tau0: 1.0,
-            swarm_aco_seed: 42,
-            verbose: true,
-            enable_progress_display: true,
-            enable_solver_logging: true,
-            solver_runs_file: "/tmp/online2_solver_runs.csv".to_string(),
-            solver_assignments_file: "/tmp/online2_solver_assignments.csv".to_string(),
-            solver_slot_metrics_file: "/tmp/online2_solver_slot_metrics.csv".to_string(),
-            enable_infeasibility_debug_logging: true,
-            solver_infeasible_debug_file: "/tmp/online2_solver_infeasible_debug.csv".to_string(),
         }
     }
 }
@@ -305,7 +305,7 @@ impl Config {
     /// Alias for predicted_requests_per_slot (backward-compat with Python
     /// `REQUESTS_PER_SLOT`).
     pub fn requests_per_slot(&self) -> f64 {
-        self.predicted_requests_per_slot
+        self.simulation.predicted_requests_per_slot
     }
 
     /// Wall-clock seconds per slot, accounting for `slot_speed_scale`.
@@ -313,7 +313,7 @@ impl Config {
     /// Used for virtual-clock slot boundaries.  Clamped to ≥ 1 ms so that
     /// `slot_ms()` is never zero.
     pub fn effective_slot_duration_secs(&self) -> f64 {
-        (self.slot_duration_seconds * self.slot_speed_scale).max(0.001)
+        (self.slot_duration_seconds * self.simulation.slot_speed_scale).max(0.001)
     }
 
     /// Override fields that are present in a scenario's metadata.
@@ -324,19 +324,19 @@ impl Config {
     pub fn apply_scenario_metadata(&mut self, meta: &crate::scenario::ScenarioMetadata) {
         self.total_slots = meta.total_slots;
         self.slot_duration_seconds = meta.slot_duration_seconds;
-        self.predicted_requests_per_slot = meta.requests_per_slot;
-        self.request_rate_std_factor = meta.request_rate_std_factor;
-        self.deadline_min_slack = meta.deadline_min_slack;
-        self.deadline_max_slack = meta.deadline_max_slack;
+        self.simulation.predicted_requests_per_slot = meta.requests_per_slot;
+        self.simulation.request_rate_std_factor = meta.request_rate_std_factor;
+        self.simulation.deadline_min_slack = meta.deadline_min_slack;
+        self.simulation.deadline_max_slack = meta.deadline_max_slack;
         self.max_error_threshold = meta.max_error_threshold;
         self.error_window_past = meta.error_window_past;
         self.error_window_future = meta.error_window_future;
         self.error_window_past_decay_slots = meta.error_window_past_decay_slots;
-        self.prehistory_use_virtual_past = meta.prehistory_enabled;
-        self.prehistory_error_ratio_of_threshold = meta.prehistory_error_ratio;
-        self.forecast_error_ratio_of_threshold = meta.prehistory_error_ratio;
-        self.prehistory_mock_influence = meta.prehistory_mock_influence;
-        self.prehistory_random_seed = meta.seed;
+        self.infeasibility.prehistory_use_virtual_past = meta.prehistory_enabled;
+        self.infeasibility.prehistory_error_ratio_of_threshold = meta.prehistory_error_ratio;
+        self.infeasibility.forecast_error_ratio_of_threshold = meta.prehistory_error_ratio;
+        self.infeasibility.prehistory_mock_influence = meta.prehistory_mock_influence;
+        self.infeasibility.prehistory_random_seed = meta.seed;
         if let Some(tiers) = meta.capacity_tiers.as_ref() {
             self.capacity_tiers = tiers.clone();
         }
@@ -354,5 +354,24 @@ mod tests {
         assert_eq!(cfg.flavours[0].error, 0.0);
         assert_eq!(cfg.flavours[2].error, 5.0);
         assert!(cfg.flavours[0].duration > cfg.flavours[2].duration);
+    }
+
+    #[test]
+    fn concern_specific_defaults_preserve_scheduler_defaults() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.solver.batch_size, 3);
+        assert_eq!(cfg.solver.solver_strategy, "dp");
+        assert_eq!(cfg.solver.max_batch_solver_parallelism, 20);
+        assert_eq!(cfg.simulation.predicted_requests_per_slot, 60.0);
+        assert!(cfg.simulation.skip_empty_slots);
+        assert!(!cfg.simulation.manual_clock);
+        assert_eq!(cfg.infeasibility.recovery_mode, "carryover");
+        assert_eq!(cfg.infeasibility.mock_influence, 0.8);
+        assert_eq!(cfg.swarm.mode, "serialized");
+        assert_eq!(cfg.swarm.aco_n_ants, 10);
+        assert!(cfg.logging.enable_solver_logging);
+        assert_eq!(cfg.total_slots, 24);
+        assert_eq!(cfg.max_error_threshold, 4.0);
     }
 }

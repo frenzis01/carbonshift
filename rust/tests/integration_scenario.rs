@@ -11,7 +11,9 @@
 /// - Carbon costs are non-negative.
 
 use std::collections::HashMap;
-use carbonshift_rs::config::Config;
+use carbonshift_rs::config::{
+    Config, InfeasibilityConfig, LoggingConfig, SimulationConfig, SolverConfig,
+};
 use carbonshift_rs::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use carbonshift_rs::shared_state::SharedState;
 use carbonshift_rs::types::{Assignment, Request};
@@ -53,23 +55,35 @@ struct Scenario {
 /// Uses the same flavours and capacity tiers as the Python config defaults.
 fn config_from_meta(meta: &ScenarioMeta) -> Config {
     Config {
+        solver: SolverConfig {
+            batch_size: 3,
+            dp_lock_future_assignments: true,
+            dp_pruning_min_batch_size: 0,
+            dp_pruning_method: "none".to_string(),
+            ..SolverConfig::default()
+        },
+        simulation: SimulationConfig {
+            deadline_min_slack: meta.deadline_min_slack,
+            deadline_max_slack: meta.deadline_max_slack,
+            predicted_requests_per_slot: meta.requests_per_slot,
+            ..SimulationConfig::default()
+        },
+        infeasibility: InfeasibilityConfig {
+            recovery_mode: "min_error_greedy".to_string(),
+            mock_influence: 0.0,
+            ..InfeasibilityConfig::default()
+        },
+        logging: LoggingConfig {
+            verbose: false,
+            enable_solver_logging: false,
+            ..LoggingConfig::default()
+        },
         total_slots: meta.total_slots,
-        batch_size: 3,
         error_window_past: meta.error_window_past,
         error_window_future: meta.error_window_future,
         max_error_threshold: meta.max_error_threshold,
         slot_duration_seconds: meta.slot_duration_seconds,
-        deadline_min_slack: meta.deadline_min_slack,
-        deadline_max_slack: meta.deadline_max_slack,
-        predicted_requests_per_slot: meta.requests_per_slot,
-        dp_lock_future_assignments: true,
-        dp_pruning_min_batch_size: 0,
-        dp_pruning_method: "none".to_string(),
         global_error_constraint_enabled: false,
-        infeasibility_recovery_mode: "min_error_greedy".to_string(),
-        infeasibility_mock_influence: 0.0,
-        verbose: false,
-        enable_solver_logging: false,
         ..Config::default()
     }
 }
@@ -84,7 +98,7 @@ fn drain_pending_with_dp(
     current_slot: i32,
     all_assignments: &mut Vec<Assignment>,
 ) {
-    let batch_size = cfg.batch_size;
+    let batch_size = cfg.solver.batch_size;
     loop {
         let pending_count = ss.get_pending_count();
         if pending_count < batch_size {

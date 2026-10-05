@@ -43,7 +43,7 @@
 //! ```
 //!
 //! **Key runner fields:**
-//! - `infeasibility_recovery_mode` (default: `Config::infeasibility_recovery_mode`, "carryover"):
+//! - `infeasibility_recovery_mode` (default: `Config::infeasibility.recovery_mode`, "carryover"):
 //!   one of "min_error_greedy" | "carryover" | "forecast". The error-window constraint is never
 //!   relaxed/removed; on infeasibility the scheduler always falls back directly to
 //!   `greedy_fallback` (accurate flavour, cheapest feasible slot). This setting only controls
@@ -110,7 +110,7 @@ struct BenchmarkConfig {
     realtime_slots: bool,
     realtime_speed_scale: f64,
     include_greedy_baseline: bool,
-    /// Overrides `Config::infeasibility_recovery_mode` when present; `None`
+    /// Overrides `Config::infeasibility.recovery_mode` when present; `None`
     /// keeps the default. One of "min_error_greedy" | "carryover" | "forecast".
     infeasibility_recovery_mode: Option<String>,
     /// Max consecutive rollbacks before force-committing (0 = rollback disabled).
@@ -129,7 +129,7 @@ struct BenchmarkConfig {
     batch_timeout_secs: f64,
     /// Overrides `Config::max_batch_solver_parallelism` when present; `None` keeps the default.
     max_batch_solver_parallelism: Option<usize>,
-    /// Overrides `Config::online_swarm_mode` when present; `None` keeps the default ("serialized").
+    /// Overrides `Config::swarm.mode` when present; `None` keeps the default ("serialized").
     online_swarm_mode: Option<String>,
     /// Precomputed baseline carbon cost to reuse when `include_greedy_baseline` is false
     /// (e.g. a second nshift invocation for additional/offline strategies that shouldn't
@@ -1389,8 +1389,8 @@ fn run_single_n(
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
     // Build per-run config.
     let mut cfg = base_cfg.clone();
-    cfg.batch_size = batch_size;
-    cfg.verbose    = verbose;
+    cfg.solver.batch_size = batch_size;
+    cfg.logging.verbose    = verbose;
     // For fast simulation: use skip_empty_slots=true with slot_speed_scale=1.0.
     // The skip mechanism advances the virtual clock when a slot is empty, so the
     // scheduler races through the scenario without waiting for real time.
@@ -1398,21 +1398,21 @@ fn run_single_n(
     // than 1 virtual-slot/ms, causing the monitor to exit before all requests are
     // scheduled (the scheduler can't keep up with a 1ms/slot clock).
     if !realtime_slots {
-        cfg.skip_empty_slots = true;
-        cfg.slot_speed_scale = 1.0;
+        cfg.simulation.skip_empty_slots = true;
+        cfg.simulation.slot_speed_scale = 1.0;
     } else {
-        cfg.skip_empty_slots = false;
-        cfg.slot_speed_scale = realtime_speed_scale;
+        cfg.simulation.skip_empty_slots = false;
+        cfg.simulation.slot_speed_scale = realtime_speed_scale;
     }
-    cfg.enable_solver_logging = true;
+    cfg.logging.enable_solver_logging = true;
     let tmp_runs        = run_dir.join("_solver_runs.csv");
     let tmp_assignments = run_dir.join("_solver_assignments.csv");
     let tmp_slot_mets   = run_dir.join("_solver_slot_metrics.csv");
-    cfg.solver_runs_file            = tmp_runs.to_str().unwrap().to_string();
-    cfg.solver_assignments_file     = tmp_assignments.to_str().unwrap().to_string();
-    cfg.solver_slot_metrics_file    = tmp_slot_mets.to_str().unwrap().to_string();
-    cfg.enable_infeasibility_debug_logging = false;
-    cfg.total_requests              = scenario.requests.len();
+    cfg.logging.solver_runs_file            = tmp_runs.to_str().unwrap().to_string();
+    cfg.logging.solver_assignments_file     = tmp_assignments.to_str().unwrap().to_string();
+    cfg.logging.solver_slot_metrics_file    = tmp_slot_mets.to_str().unwrap().to_string();
+    cfg.logging.enable_infeasibility_debug_logging = false;
+    cfg.simulation.total_requests              = scenario.requests.len();
 
     let cfg         = Arc::new(cfg);
 
@@ -1513,10 +1513,10 @@ fn run_single_n(
         base_cfg.carbon_cost_duration_scale,
     );
     let batch_timings = compute_batch_timings(&runs, batch_size);
-    let exec_mode = if cfg.solver_strategy == "dp" || cfg.solver_strategy.is_empty() {
+    let exec_mode = if cfg.solver.solver_strategy == "dp" || cfg.solver.solver_strategy.is_empty() {
         "nshift_dp".to_string()
     } else {
-        format!("nshift_{}", cfg.solver_strategy)
+        format!("nshift_{}", cfg.solver.solver_strategy)
     };
     let summary = compute_summary(
         &exec_mode,
@@ -1544,7 +1544,7 @@ fn run_single_n(
     // Print a definitive final progress line overwriting whatever partial
     // line the main_loop left behind.  This runs after late scheduling so
     // the numbers are always 100%.
-    if !cfg.verbose {
+    if !cfg.logging.verbose {
         let total = scenario.requests.len();
         let scheduled = per_req.len();
         let pct = if total > 0 { scheduled as f64 / total as f64 * 100.0 } else { 0.0 };
@@ -1602,15 +1602,15 @@ fn main() {
     let mut base_cfg = Config::default();
     base_cfg.apply_scenario_metadata(&scenario.metadata);
     if let Some(mode) = &bcfg.infeasibility_recovery_mode {
-        base_cfg.infeasibility_recovery_mode = mode.clone();
+        base_cfg.infeasibility.recovery_mode = mode.clone();
     }
-    base_cfg.rollback_max_consecutive     = bcfg.rollback_max_consecutive;
-    base_cfg.batch_timeout_secs           = bcfg.batch_timeout_secs;
+    base_cfg.solver.rollback_max_consecutive     = bcfg.rollback_max_consecutive;
+    base_cfg.solver.batch_timeout_secs           = bcfg.batch_timeout_secs;
     if let Some(parallelism) = bcfg.max_batch_solver_parallelism {
-        base_cfg.max_batch_solver_parallelism = parallelism;
+        base_cfg.solver.max_batch_solver_parallelism = parallelism;
     }
     if let Some(mode) = &bcfg.online_swarm_mode {
-        base_cfg.online_swarm_mode = mode.clone();
+        base_cfg.swarm.mode = mode.clone();
     }
     if let Some(flavours) = &bcfg.flavours {
         base_cfg.flavours = flavours.clone();
@@ -1633,8 +1633,8 @@ fn main() {
         realtime_slots,
         speed_scale,
         bcfg.rollback_max_consecutive,
-        base_cfg.online_swarm_mode,
-        base_cfg.max_batch_solver_parallelism,
+        base_cfg.swarm.mode,
+        base_cfg.solver.max_batch_solver_parallelism,
         bcfg.output_dir.display(),
     );
 
@@ -1751,7 +1751,7 @@ fn main() {
             let n_t0 = std::time::Instant::now();
 
             let mut online_base_cfg = base_cfg.clone();
-            online_base_cfg.solver_strategy = strategy.clone();
+            online_base_cfg.solver.solver_strategy = strategy.clone();
 
             let (per_req, batch_timings, mut summary) = run_single_n(
                 &scenario,

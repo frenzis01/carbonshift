@@ -1,7 +1,7 @@
 //! Online swarm scheduling strategies for the CarbonShift batch scheduler
 //! (**parallel, additive-merge** concurrency variant — see `online_swarm.rs`
 //! for the simpler serialized variant; select between them via
-//! `Config::online_swarm_mode`).
+//! `Config::swarm.mode`).
 //!
 //! Provides online variants of the bandit and ACO strategies that integrate
 //! with the generator + scheduler pipeline.  Unlike the offline versions in
@@ -552,30 +552,30 @@ pub enum SwarmDelta {
 }
 
 impl OnlineSwarmState {
-    /// Build the appropriate state from `cfg.solver_strategy`.
+    /// Build the appropriate state from `cfg.solver.solver_strategy`.
     /// `carbon_forecast` is required for computing ACO's static heuristic.
     pub fn from_config(cfg: &Config, carbon_forecast: &Arc<RwLock<Vec<f64>>>) -> Self {
         // Clone internally carbon_forecast
         let carbon_forecast = Arc::clone(carbon_forecast);
-        match cfg.solver_strategy.as_str() {
+        match cfg.solver.solver_strategy.as_str() {
             "bandit" => Self::Bandit(OnlineBanditState::new(
                 cfg.total_slots as usize,
-                cfg.swarm_bandit_initial_q,
-                cfg.swarm_bandit_epsilon,
-                cfg.swarm_bandit_seed,
+                cfg.swarm.bandit_initial_q,
+                cfg.swarm.bandit_epsilon,
+                cfg.swarm.bandit_seed,
             )),
             "ant_colony" => Self::Aco(OnlineAcoState::new(
                 cfg.total_slots as usize,
                 carbon_forecast,
                 cfg,
-                cfg.swarm_aco_n_ants,
-                cfg.swarm_aco_n_iterations,
-                cfg.swarm_aco_alpha,
-                cfg.swarm_aco_beta,
-                cfg.swarm_aco_rho,
-                cfg.swarm_aco_q,
-                cfg.swarm_aco_tau0,
-                cfg.swarm_aco_seed,
+                cfg.swarm.aco_n_ants,
+                cfg.swarm.aco_n_iterations,
+                cfg.swarm.aco_alpha,
+                cfg.swarm.aco_beta,
+                cfg.swarm.aco_rho,
+                cfg.swarm.aco_q,
+                cfg.swarm.aco_tau0,
+                cfg.swarm.aco_seed,
             )),
             _ => Self::None, // "dp" (default) or unrecognised
         }
