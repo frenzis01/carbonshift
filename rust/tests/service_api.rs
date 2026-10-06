@@ -297,7 +297,8 @@ async fn get_task_config_returns_registered_override() {
 #[tokio::test]
 async fn qos_profile_defaults_are_stable_and_task_kind_specific() {
     let app = build_router(test_state(test_service_cfg()));
-    let resp = app
+    let inactive = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/v1/profiles")
@@ -307,10 +308,23 @@ async fn qos_profile_defaults_are_stable_and_task_kind_specific() {
         .await
         .unwrap();
 
+    assert_eq!(inactive.status(), StatusCode::OK);
+    assert!(json_body(inactive).await.as_array().unwrap().is_empty());
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/profiles?include_inactive=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let profiles = json_body(resp).await;
     let profiles = profiles.as_array().unwrap();
     assert_eq!(profiles.len(), 3);
+    assert!(profiles.iter().all(|profile| profile["active"] == false));
 
     let by_kind: std::collections::HashMap<_, _> = profiles
         .iter()
@@ -398,6 +412,7 @@ async fn qos_profile_registration_is_reusable_idempotent_and_immutable() {
     assert_eq!(profile["error_window"]["past_decay_slots"], 2);
     assert_eq!(profile["cumulative_error"]["enabled"], true);
     assert_eq!(profile["cumulative_error"]["hard"], false);
+    assert_eq!(profile["active"], false);
 
     let conflicting_body = qos_profile_payload("qa-standard-v1", 19.0);
     let resp = app
@@ -418,6 +433,80 @@ async fn qos_profile_registration_is_reusable_idempotent_and_immutable() {
         .unwrap();
     let unchanged = json_body(resp).await;
     assert_eq!(unchanged["max_error_threshold"], 17.5);
+}
+
+#[tokio::test]
+async fn profile_listing_includes_only_profiles_with_assignments_by_default() {
+    use carbonshift_rs::engine::qos::QosProfileId;
+    use carbonshift_rs::engine::types::Assignment;
+
+    let state = test_state(test_service_cfg());
+    state
+        .shared_state
+        .add_assignments(vec![Assignment::new_for_profile(
+            91,
+            0,
+            "Accurate".to_string(),
+            1.0,
+            10.0,
+            60,
+            Some(0),
+            Some(1),
+            QosProfileId::parse("default-question-answering").unwrap(),
+        )]);
+    let app = build_router(state);
+
+    let active_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/profiles")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(active_only.status(), StatusCode::OK);
+    let active_profiles = json_body(active_only).await;
+    assert_eq!(active_profiles.as_array().unwrap().len(), 1);
+    assert_eq!(
+        active_profiles[0]["profile_id"],
+        "default-question-answering"
+    );
+    assert_eq!(active_profiles[0]["active"], true);
+
+    let all_profiles = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/profiles?include_inactive=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(all_profiles.status(), StatusCode::OK);
+    let all_profiles = json_body(all_profiles).await;
+    assert_eq!(all_profiles.as_array().unwrap().len(), 3);
+    let inactive = all_profiles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|profile| profile["profile_id"] == "default-ner")
+        .unwrap();
+    assert_eq!(inactive["active"], false);
+
+    let inactive_detail = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/profiles/default-ner")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inactive_detail.status(), StatusCode::OK);
+    assert_eq!(json_body(inactive_detail).await["active"], false);
 }
 
 #[tokio::test]

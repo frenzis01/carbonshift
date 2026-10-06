@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import queue_worker
+from app.metrics import metrics_store
 from app.main import app
 
 
@@ -111,6 +112,57 @@ def test_dispatch_adapter_matches_carbonshift_payload(client):
     status = _wait_for_completion(client, "42")
     assert status["status"] == "completed"
     assert status["context"] == {"scheduled_slot": 7, "carbon_cost": 1.23}
+
+
+def test_duplicate_dispatch_does_not_execute_or_record_the_job_twice(client):
+    request_id = 987654321
+    dispatch = {
+        "request_id": request_id,
+        "scheduled_slot": 0,
+        "flavour": "Balanced",
+        "carbon_cost": 1.23,
+        "callback_url": "",
+        "payload": {"task": "question_answering", "input": {"question": "q", "context": "c"}},
+    }
+    first = client.post("/dispatch", json=dispatch)
+    assert first.status_code == 202
+    assert _wait_for_completion(client, str(request_id))["status"] == "completed"
+
+    retry = client.post("/dispatch", json=dispatch)
+
+    assert retry.status_code == 202
+    assert retry.json()["request_id"] == str(request_id)
+    job_records = [
+        record
+        for record in metrics_store.raw(limit=10_000)
+        if record["request_id"] == str(request_id)
+    ]
+    assert len(job_records) == 1
+
+
+def test_dispatch_rejects_same_request_id_with_different_payload(client):
+    request_id = 987654322
+    dispatch = {
+        "request_id": request_id,
+        "scheduled_slot": 0,
+        "flavour": "Balanced",
+        "carbon_cost": 1.23,
+        "callback_url": "",
+        "payload": {"task": "question_answering", "input": {"question": "q", "context": "c"}},
+    }
+    first = client.post("/dispatch", json=dispatch)
+    assert first.status_code == 202
+    assert _wait_for_completion(client, str(request_id))["status"] == "completed"
+
+    conflicting_retry = client.post(
+        "/dispatch",
+        json={
+            **dispatch,
+            "payload": {"task": "question_answering", "input": {"question": "different", "context": "c"}},
+        },
+    )
+
+    assert conflicting_retry.status_code == 409
 
 
 def test_dispatch_rejects_unknown_task(client):

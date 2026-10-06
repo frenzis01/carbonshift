@@ -16,9 +16,10 @@ use crate::engine::qos::{
 use crate::engine::types::{Flavour, Request as EngineRequest, get_capacity_multiplier};
 use crate::service::models::{
     AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse,
-    ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, RegisterQosProfilePayload,
-    RegisterTaskPayload, RequestStatus, RequestStatusResponse, SlotDetailResponse, SlotErrorItem,
-    StatsResponse, SubmitRequestPayload, TaskConfigResponse,
+    ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, QosProfileResponse,
+    QosProfilesQuery, RegisterQosProfilePayload, RegisterTaskPayload, RequestStatus,
+    RequestStatusResponse, SlotDetailResponse, SlotErrorItem, StatsResponse, SubmitRequestPayload,
+    TaskConfigResponse,
 };
 use crate::service::state::{AppState, ProfileRegistration, ProfileRegistryError, TrackedRequest};
 
@@ -149,22 +150,51 @@ pub async fn register_qos_profile(
     }
 }
 
-/// List the active QoS profiles, including Carbonshift's deterministic defaults.
-pub async fn list_qos_profiles(State(state): State<AppState>) -> Json<Vec<QosProfile>> {
-    Json(state.qos_profiles.list())
+/// List profiles that have assignments. Add `?include_inactive=true` to also
+/// retrieve registered policies that no accepted assignment uses yet.
+///
+/// Activity is derived from the scheduler's committed assignments rather
+/// than stored on the immutable profile definition, so failed execution still
+/// counts as active: the scheduler did assign that profile to real work.
+pub async fn list_qos_profiles(
+    State(state): State<AppState>,
+    Query(query): Query<QosProfilesQuery>,
+) -> Json<Vec<QosProfileResponse>> {
+    let assigned_profiles: std::collections::HashSet<_> = state
+        .shared_state
+        .get_current_assignments()
+        .values()
+        .map(|assignment| assignment.qos_profile_id.clone())
+        .collect();
+
+    let profiles = state
+        .qos_profiles
+        .list()
+        .into_iter()
+        .filter_map(|profile| {
+            let active = assigned_profiles.contains(&profile.profile_id);
+            (active || query.include_inactive).then_some(QosProfileResponse { profile, active })
+        })
+        .collect();
+    Json(profiles)
 }
 
-/// Retrieve one active profile by its stable, reusable identifier.
+/// Retrieve one profile by its stable ID and include its current activity state.
 pub async fn get_qos_profile(
     State(state): State<AppState>,
     Path(profile_id): Path<String>,
-) -> Result<Json<QosProfile>, ApiError> {
+) -> Result<Json<QosProfileResponse>, ApiError> {
     let profile = state
         .qos_profiles
         .get_by_str(&profile_id)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))?;
-    Ok(Json(profile))
+    let active = state
+        .shared_state
+        .get_current_assignments()
+        .values()
+        .any(|assignment| assignment.qos_profile_id == profile.profile_id);
+    Ok(Json(QosProfileResponse { profile, active }))
 }
 
 /// What `arrival_slot` would have cost under the "no carbonshift" baseline:

@@ -25,6 +25,10 @@ from .metrics import metrics_store
 logger = logging.getLogger("executor.queue")
 
 
+class DuplicateRequestIdError(ValueError):
+    """An idempotency key was reused for a different executor dispatch."""
+
+
 class Job:
     def __init__(
         self,
@@ -109,13 +113,45 @@ class JobQueue:
         request_id: Optional[str] = None,
         context: Optional[dict[str, Any]] = None,
     ) -> Job:
+        # Carbonshift can retry a dispatch when its HTTP request times out
+        # after the executor has accepted the job. Reusing request_id must be
+        # idempotent or the same model inference can run twice.
+        provided_execute_at = execute_at
         execute_at = execute_at or self._clock.now()
         request_id = request_id or uuid.uuid4().hex
-        job = Job(request_id, task, flavour, task_input, execute_at, callback_url, context,
-                  queued_at=self._clock.now())
-
         slot_key = execute_at.replace(microsecond=0)
+        normalized_context = context or {}
         with self._lock:
+            existing = self._jobs_by_id.get(request_id)
+            if existing is not None:
+                same_dispatch = (
+                    existing.task == task
+                    and existing.flavour == flavour
+                    and existing.input == task_input
+                    and existing.callback_url == callback_url
+                    and existing.context == normalized_context
+                    and (
+                        provided_execute_at is None
+                        or existing.execute_at == provided_execute_at
+                    )
+                )
+                if not same_dispatch:
+                    raise DuplicateRequestIdError(
+                        f"request_id {request_id!r} is already queued with different dispatch data"
+                    )
+                logger.info("ignoring duplicate dispatch for request_id=%s", request_id)
+                return existing
+
+            job = Job(
+                request_id,
+                task,
+                flavour,
+                task_input,
+                execute_at,
+                callback_url,
+                normalized_context,
+                queued_at=self._clock.now(),
+            )
             self._slots.setdefault(slot_key, []).append(job)
             self._jobs_by_id[request_id] = job
         self._wakeup.set()

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::qos::{CumulativeErrorPolicy, ErrorWindowPolicy};
+use crate::engine::qos::{CumulativeErrorPolicy, ErrorWindowPolicy, QosProfile};
 use crate::engine::types::Flavour;
 use crate::types::CapacityTier;
 
@@ -18,6 +18,26 @@ pub struct RegisterQosProfilePayload {
     pub max_error_threshold: f64,
     pub error_window: ErrorWindowPolicy,
     pub cumulative_error: CumulativeErrorPolicy,
+}
+
+/// Optional profile-catalog listing behavior.
+#[derive(Debug, Deserialize, Default)]
+pub struct QosProfilesQuery {
+    /// Include registered profiles that have not been assigned yet.
+    /// Ordinary callers see only active profiles.
+    #[serde(default)]
+    pub include_inactive: bool,
+}
+
+/// Public profile metadata with its runtime activity state.
+#[derive(Debug, Serialize, Clone)]
+pub struct QosProfileResponse {
+    /// Keep the profile's existing fields at the top level of the JSON
+    /// response while adding activity as derived runtime metadata.
+    #[serde(flatten)]
+    pub profile: QosProfile,
+    /// True once Carbonshift has at least one committed assignment for this ID.
+    pub active: bool,
 }
 
 /// Body of `POST /v1/requests`.

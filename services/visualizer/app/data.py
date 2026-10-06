@@ -57,7 +57,14 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
             "could not load active QoS profiles; check Carbonshift connectivity and CARBONSHIFT_API_KEY"
         )
         _cache["profiles_unavailable_logged"] = True
-    active_profiles: List[Dict[str, Any]] = _cache["active_profiles"]
+    # The API already defaults to active-only results. Filter once more here
+    # so a mixed-version service or test fixture cannot expose inactive
+    # policies in the dashboard selector.
+    active_profiles: List[Dict[str, Any]] = [
+        profile
+        for profile in _cache["active_profiles"]
+        if profile.get("active") is True
+    ]
     selected_profile = next(
         (profile for profile in active_profiles if profile.get("profile_id") == qos_profile_id),
         None,

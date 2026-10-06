@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from .config import ALL_TASKS, MODEL_REGISTRY, settings
 from .metrics import metrics_store
 from .models import AdvanceSlotPayload, CarbonshiftDispatchPayload, JobSubmitRequest, JobSubmitResponse
-from .queue_worker import job_queue
+from .queue_worker import DuplicateRequestIdError, job_queue
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("executor.main")
@@ -51,14 +51,17 @@ async def models() -> dict[str, dict[str, str]]:
 
 @app.post("/jobs", status_code=202)
 async def submit_job(body: JobSubmitRequest) -> JobSubmitResponse:
-    job = job_queue.submit(
-        task=body.task,
-        flavour=body.flavour,
-        task_input=body.input,
-        execute_at=body.execute_at,
-        callback_url=body.callback_url,
-        request_id=body.request_id,
-    )
+    try:
+        job = job_queue.submit(
+            task=body.task,
+            flavour=body.flavour,
+            task_input=body.input,
+            execute_at=body.execute_at,
+            callback_url=body.callback_url,
+            request_id=body.request_id,
+        )
+    except DuplicateRequestIdError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return JobSubmitResponse(
         request_id=job.request_id,
         status=job.status,
@@ -79,15 +82,18 @@ async def dispatch_from_carbonshift(body: CarbonshiftDispatchPayload) -> JobSubm
     if raw_execute_at:
         execute_at = datetime.fromisoformat(raw_execute_at)
 
-    job = job_queue.submit(
-        task=task,
-        flavour=body.flavour.lower(),
-        task_input=task_input,
-        execute_at=execute_at,
-        callback_url=body.callback_url,
-        request_id=str(body.request_id),
-        context={"scheduled_slot": body.scheduled_slot, "carbon_cost": body.carbon_cost},
-    )
+    try:
+        job = job_queue.submit(
+            task=task,
+            flavour=body.flavour.lower(),
+            task_input=task_input,
+            execute_at=execute_at,
+            callback_url=body.callback_url,
+            request_id=str(body.request_id),
+            context={"scheduled_slot": body.scheduled_slot, "carbon_cost": body.carbon_cost},
+        )
+    except DuplicateRequestIdError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return JobSubmitResponse(
         request_id=job.request_id,
         status=job.status,

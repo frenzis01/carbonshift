@@ -116,6 +116,10 @@ Stesso schema esatto del payload che il dispatcher Rust di carbonshift invia
 `{request_id, scheduled_slot, flavour, carbon_cost, callback_url, payload}`.
 L'executor legge `task`/`input` (ed eventualmente `execute_at`) da dentro
 `payload` — vedi [Integrazione con carbonshift](#integrazione-con-carbonshift).
+Il `request_id` è anche una chiave d'idempotenza: una ripetizione dello
+stesso dispatch con gli stessi dati restituisce il job già accodato/completato
+senza eseguire un'altra inferenza; riutilizzarlo con dati differenti ritorna
+`409 Conflict`.
 
 ### Altri endpoint
 
@@ -198,6 +202,13 @@ task/flavour e registra profili QoS immutabili su carbonshift — vedi
 `client/README.md` §"Flavour dinamici per task". Se cambia una calibrazione,
 usa una nuova versione del profilo invece di riutilizzare un ID con contenuto
 diverso.
+
+For QA/NER, `actual_error_pct` follows the measured `quality_score` even for
+the Accurate flavour when a ground-truth reference is supplied; it is not
+forced to zero merely because Accurate is the comparison baseline. Without a
+reference, Accurate's quality convention is 1.0, so the derived error is zero.
+Text generation uses relative confidence degradation instead, making
+Accurate's error zero against itself.
 
 ## Emulazione a tempo fittizio
 

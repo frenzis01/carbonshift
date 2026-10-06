@@ -313,13 +313,23 @@ def run_task(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, A
         if quality_score is None:
             quality_score = _compare_outputs(task, task_input, primary["output"], accurate["output"])
 
+    actual_error_pct: float | None = None
     if flavour == Flavour.ACCURATE:
-        # TODO: remove or keep?
-        # For the Accurate flavour, we could consider the error percentage to be zero
-        # since it is considered the reference output.
-        # actual_error_pct = 0.0
+        # Keep the same QA/NER reference-based metric for every flavour.
+        # With no reference, the Accurate quality convention below supplies
+        # a perfect 1.0 score; text-generation Accurate is its own reference.
         if quality_score is None:
             quality_score = 1.0
+        # QA/NER calibration measures Accurate against caller ground truth when
+        # provided, so preserve its real measured error. Without a reference,
+        # Accurate is the convention's perfect baseline. Text generation uses
+        # relative confidence degradation, for which Accurate compares to
+        # itself and therefore has zero error by definition.
+        actual_error_pct = (
+            0.0
+            if task == Task.TEXT_GENERATION
+            else (1.0 - quality_score) * 100.0
+        )
     elif task == Task.TEXT_GENERATION:
         confidence = primary["confidence"]
         actual_error_pct = (
@@ -342,4 +352,3 @@ def run_task(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, A
         "baseline_execution_time_seconds": baseline_execution_time_seconds,
         "baseline_model": baseline_model,
     }
-

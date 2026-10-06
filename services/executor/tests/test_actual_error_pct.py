@@ -48,3 +48,42 @@ def test_qa_uses_quality_score_for_actual_error(monkeypatch):
 
     assert result["quality_score"] == 1.0
     assert result["actual_error_pct"] == 0.0
+
+
+def test_accurate_qa_uses_measured_quality_error_instead_of_leaving_it_unset(monkeypatch):
+    monkeypatch.setattr(inference, "_run_single", lambda task, flavour, task_input: {
+        "output": {"answer": "partially correct answer"},
+        "model": "accurate-qa",
+        "confidence": 0.8,
+        "execution_time_seconds": 0.25,
+    })
+    monkeypatch.setattr(inference, "_reference_quality_score", lambda task, task_input, output: 0.75)
+    monkeypatch.setattr(inference.settings, "compute_quality_baseline", True)
+
+    result = inference.run_task(
+        Task.QUESTION_ANSWERING,
+        Flavour.ACCURATE,
+        {"question": "q", "context": "c", "reference_answer": "reference"},
+    )
+
+    assert result["quality_score"] == 0.75
+    assert result["actual_error_pct"] == pytest.approx(25.0)
+
+
+def test_accurate_qa_without_ground_truth_has_zero_reference_error(monkeypatch):
+    monkeypatch.setattr(inference, "_run_single", lambda task, flavour, task_input: {
+        "output": {"answer": "answer"},
+        "model": "accurate-qa",
+        "confidence": 0.8,
+        "execution_time_seconds": 0.25,
+    })
+    monkeypatch.setattr(inference.settings, "compute_quality_baseline", True)
+
+    result = inference.run_task(
+        Task.QUESTION_ANSWERING,
+        Flavour.ACCURATE,
+        {"question": "q", "context": "c"},
+    )
+
+    assert result["quality_score"] == 1.0
+    assert result["actual_error_pct"] == 0.0

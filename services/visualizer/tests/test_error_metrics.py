@@ -116,6 +116,7 @@ class ErrorMetricsTests(unittest.TestCase):
         profiles = [
             {
                 "profile_id": "qa-calibrated-v1",
+                "active": True,
                 "task_kind": "question_answering",
                 "error_semantics": "word-overlap-f1-v1",
                 "max_error_threshold": 20.0,
@@ -127,6 +128,7 @@ class ErrorMetricsTests(unittest.TestCase):
             },
             {
                 "profile_id": "ner-calibrated-v1",
+                "active": True,
                 "task_kind": "ner",
                 "error_semantics": "entity-set-f1-v1",
                 "max_error_threshold": 30.0,
@@ -134,6 +136,18 @@ class ErrorMetricsTests(unittest.TestCase):
                     "past_slots": 5,
                     "future_slots": 2,
                     "past_decay_slots": 1,
+                },
+            },
+            {
+                "profile_id": "default-text-generation",
+                "active": False,
+                "task_kind": "text_generation",
+                "error_semantics": "relative-confidence-degradation-v1",
+                "max_error_threshold": 4.0,
+                "error_window": {
+                    "past_slots": 12,
+                    "future_slots": 14,
+                    "past_decay_slots": 12,
                 },
             },
         ]
@@ -271,6 +285,10 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(ner["indicators"]["qos_profile_id"], "ner-calibrated-v1")
         self.assertEqual(ner["error_plot"]["displayed_error_avg"], 85.0)
         self.assertEqual(ner["error_plot"]["error_history"], [85.0])
+        self.assertEqual(
+            [profile["profile_id"] for profile in ner["active_profiles"]],
+            ["qa-calibrated-v1", "ner-calibrated-v1"],
+        )
         custom_flavour_index = ner["assignment_plot"]["flavours"].index("LowLatency")
         self.assertEqual(ner["assignment_plot"]["flavour_counts"][custom_flavour_index][2], 1)
         self.assertEqual(ner["error_plot"]["error_by_flavour"][custom_flavour_index][2], 85.0)
