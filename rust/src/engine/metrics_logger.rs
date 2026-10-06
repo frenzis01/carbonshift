@@ -5,7 +5,6 @@
 /// All files are opened for append on each write (no persistent file handles)
 /// and serialised through a single `Mutex`.  This keeps the API Send+Sync
 /// without lifetime complexity.
-
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::BufRead;
@@ -46,6 +45,10 @@ const RUN_FIELDS: &[&str] = &[
     "global_error_before",
     "global_error_count_before",
     "global_error_constraint_active",
+    "qos_profile_id",
+    "profile_error_before",
+    "profile_error_count_before",
+    "profile_error_constraint_active",
 ];
 
 const ASSIGNMENT_FIELDS: &[&str] = &[
@@ -54,6 +57,7 @@ const ASSIGNMENT_FIELDS: &[&str] = &[
     "solver_start_ts",
     "solver_end_ts",
     "request_id",
+    "qos_profile_id",
     "is_pending_request",
     "is_new_assignment_in_run",
     "scheduled_slot",
@@ -170,7 +174,11 @@ impl MetricsLogger {
                 row
             })
             .collect();
-        append_rows(&self.assignments_file, ASSIGNMENT_FIELDS, &augmented_assignments);
+        append_rows(
+            &self.assignments_file,
+            ASSIGNMENT_FIELDS,
+            &augmented_assignments,
+        );
 
         let augmented_slots: Vec<HashMap<String, String>> = slot_metric_rows
             .iter()
@@ -180,7 +188,11 @@ impl MetricsLogger {
                 row
             })
             .collect();
-        append_rows(&self.slot_metrics_file, SLOT_METRIC_FIELDS, &augmented_slots);
+        append_rows(
+            &self.slot_metrics_file,
+            SLOT_METRIC_FIELDS,
+            &augmented_slots,
+        );
         run_id
     }
 

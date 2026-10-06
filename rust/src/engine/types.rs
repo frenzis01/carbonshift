@@ -2,9 +2,11 @@
 ///
 /// These mirror the Python dataclasses in `shared_state.py` and the flavour /
 /// capacity-tier dicts in `config.py`.
-
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::engine::qos::{QosProfile, QosProfileId};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -25,23 +27,24 @@ pub struct Request {
     pub deadline_slot: i32,
     /// Wall-clock arrival time (seconds since UNIX epoch).
     pub arrival_time: f64,
-    /// Identifies which task this request belongs to (e.g. "text_generation"),
-    /// i.e. which entry of the dynamic task registry `flavours` was resolved
-    /// from. `"default"` for requests with no task-specific flavours (CLI/
-    /// simulation tools, or callers that never registered a task).
+    /// Executor operation kind (e.g. "text_generation"), kept separate from
+    /// the QoS profile ID that owns this request's scheduling/error budget.
+    /// Legacy offline callers may still use `"default"`.
     pub task_id: String,
     /// Flavours available for this request's task, resolved once at intake
     /// time. Empty means "no task-specific override" — the solver falls
     /// back to `Config::flavours` (the predefined default task).
     pub flavours: Vec<Flavour>,
-    /// Overrides `Config::max_error_threshold` (%) for this request's local/
-    /// window feasibility check, if its task registered one (see
-    /// `service::handlers::register_task`). `None` = use the global default.
+    /// Legacy per-request threshold for unprofiled callers.
     pub max_error_threshold: Option<f64>,
-    /// Capacity tiers available for this request's task, resolved once at intake
-    /// time. `None` means "no task-specific override" — the solver falls
-    /// back to `Config::capacity_tiers` (the predefined default task).
+    /// Legacy task-level capacity override. New QoS profiles cannot set this:
+    /// capacity tiers are global shared-infrastructure policy.
     pub capacity_tiers: Option<Vec<CapacityTier>>,
+    /// Immutable QoS contract resolved by the service before enqueueing.
+    /// Offline callers can leave this absent and use the scheduler defaults.
+    pub qos_profile: Option<Arc<QosProfile>>,
+    /// Stable budget identity, including deterministic legacy-task aliases.
+    pub qos_profile_id: QosProfileId,
 }
 
 impl Request {
@@ -55,6 +58,8 @@ impl Request {
             flavours: Vec::new(),
             max_error_threshold: None,
             capacity_tiers: None,
+            qos_profile: None,
+            qos_profile_id: QosProfileId::default_profile(),
         }
     }
 
@@ -70,6 +75,7 @@ impl Request {
         max_error_threshold: Option<f64>,
         capacity_tiers: Option<Vec<CapacityTier>>,
     ) -> Self {
+        let qos_profile_id = QosProfileId::legacy_task_alias(&task_id);
         Self {
             id,
             arrival_slot,
@@ -79,7 +85,35 @@ impl Request {
             flavours,
             max_error_threshold,
             capacity_tiers,
+            qos_profile: None,
+            qos_profile_id,
         }
+    }
+
+    /// Builds a request with a resolved immutable QoS profile.
+    pub fn new_for_qos_profile(
+        id: u64,
+        arrival_slot: i32,
+        deadline_slot: i32,
+        profile: Arc<QosProfile>,
+    ) -> Self {
+        Self {
+            id,
+            arrival_slot,
+            deadline_slot,
+            arrival_time: unix_now(),
+            task_id: profile.task_kind.to_string(),
+            flavours: profile.flavours.clone(),
+            max_error_threshold: Some(profile.max_error_threshold),
+            capacity_tiers: None,
+            qos_profile_id: profile.profile_id.clone(),
+            qos_profile: Some(profile),
+        }
+    }
+
+    /// Stable profile identity used to isolate batches and error budgets.
+    pub fn qos_profile_id(&self) -> QosProfileId {
+        self.qos_profile_id.clone()
     }
 }
 
@@ -99,6 +133,7 @@ pub struct Assignment {
     pub arrival_slot: Option<i32>,
     pub deadline_slot: Option<i32>,
     pub assignment_time: f64,
+    pub qos_profile_id: QosProfileId,
 }
 
 impl Assignment {
@@ -112,6 +147,32 @@ impl Assignment {
         arrival_slot: Option<i32>,
         deadline_slot: Option<i32>,
     ) -> Self {
+        Self::new_for_profile(
+            request_id,
+            scheduled_slot,
+            flavour_name,
+            carbon_cost,
+            error,
+            flavour_duration,
+            arrival_slot,
+            deadline_slot,
+            QosProfileId::default_profile(),
+        )
+    }
+
+    /// Creates an assignment with the QoS profile whose budget it contributes to.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_profile(
+        request_id: u64,
+        scheduled_slot: i32,
+        flavour_name: String,
+        carbon_cost: f64,
+        error: f64,
+        flavour_duration: i32,
+        arrival_slot: Option<i32>,
+        deadline_slot: Option<i32>,
+        qos_profile_id: QosProfileId,
+    ) -> Self {
         Self {
             request_id,
             scheduled_slot,
@@ -122,6 +183,7 @@ impl Assignment {
             arrival_slot,
             deadline_slot,
             assignment_time: unix_now(),
+            qos_profile_id,
         }
     }
 }
@@ -145,7 +207,7 @@ pub struct RequestAssignment {
 ///
 /// `duration` is in seconds (integer) and is used as a relative cost weight
 /// in the DP.  Carbon cost is reported in gCO₂ by the scale factor in Config.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Flavour {
     pub name: String,
     /// Approximation error introduced by this flavour (%).

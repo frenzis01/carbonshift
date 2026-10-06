@@ -16,9 +16,12 @@ client (questo)  --POST /v1/requests-->  carbonshift  --POST /dispatch-->  execu
 ```
 
 **Importante**: il client non sceglie il flavour (Accurate/Balanced/Fast) —
-lo decide carbonshift in base alla sua ottimizzazione carbon-aware. Il
-client sceglie solo il *task* (`text_generation`/`ner`/`question_answering`),
-l'input, e la `deadline_seconds` entro cui vuole il risultato.
+lo decide carbonshift in base alla sua ottimizzazione carbon-aware. Il client
+sceglie il *task kind* dell'executor (`text_generation`/`ner`/
+`question_answering`), l'input, la deadline e, opzionalmente, il QoS profile.
+Il profilo è identificato da un ID stabile e condivisibile: due client che
+inviano lo stesso `qos_profile_id` condividono il relativo budget; se il campo
+è omesso, Carbonshift seleziona il profilo predefinito per quel task kind.
 
 ## Setup
 
@@ -69,6 +72,23 @@ curl -X POST localhost:8100/run/send-batch -H 'Content-Type: application/json' -
 }'
 ```
 
+Per selezionare un budget condiviso, aggiungi `qos_profile_id` senza
+sostituire il task kind:
+
+```json
+{
+  "task": "question_answering",
+  "qos_profile_id": "qa-standard-v1",
+  "count": 5,
+  "deadline_seconds": 30
+}
+```
+
+Il profilo deve essere già registrato su Carbonshift con `POST /v1/profiles`.
+L'helper `register_qos_profile` nel client e `scripts/push_flavours.py`
+registrano profili; l'ID e la definizione devono essere identici tra i client
+che vogliono condividere il budget.
+
 oppure con lo script CLI:
 
 ```sh
@@ -100,7 +120,8 @@ di `slot_minutes` (default 30) — es. una `deadline_at` di `19:32` con slot da
 ```sh
 curl -X POST localhost:8100/run/send-plan -H 'Content-Type: application/json' -d '{
   "requests": [
-    {"task": "text_generation", "input": {"prompt": "Hello"},
+    {"task": "text_generation", "qos_profile_id": "text_generation-calibrated-v1",
+     "input": {"prompt": "Hello"},
      "start_at": "2026-08-26T19:00:00Z", "deadline_at": "2026-08-26T19:32:00Z"}
   ],
   "slot_minutes": 30,
@@ -114,19 +135,8 @@ Con `mode: "emulated"` no — vedi sotto.
 ## Emulazione a tempo fittizio
 
 Per testare un piano che copre ore/giorni di traffico senza aspettare il
-tempo reale, usa `mode: "emulated"`: il client raggruppa le richieste per
-timeslot (in base a `start_at`), invia tutte quelle di un timeslot subito,
-poi sincronizza l'avanzamento dell'orologio con **due** chiamate dirette
-(non tramite carbonshift, che farebbe da tramite solo per il traffico dati
-normale):
-
-1. `POST <carbonshift>/v1/admin/advance-slot` — carbonshift fa il flush di
-   eventuali richieste rimaste in coda per il timeslot e aspetta che il suo
-   dispatcher le consegni all'executor prima di rispondere.
-2. `POST <executor>/admin/advance-slot` — l'executor esegue tutto ciò che è
-   ora dovuto e risponde solo a cose fatte.
-
-Solo a quel punto il client invia le richieste del timeslot successivo.
+tempo reale, usa `mode: "emulated"`. Il client registra il piano; è il provider
+che guida i tick in ordine verso client, Carbonshift ed executor.
 Richiede carbonshift avviato con `MANUAL_CLOCK=1` (e idealmente
 `SUBMIT_WAIT_TIMEOUT_SECS` basso, es. `0.3`, altrimenti ogni invio blocca
 fino a 5s di default) e l'executor con `EXECUTOR_MANUAL_CLOCK=1` — vedi
@@ -137,6 +147,17 @@ razionale completo del protocollo.
 python scripts/run_emulation.py --slots 4 --per-slot 3 --slot-minutes 30 \
   --task text_generation --executor-url http://localhost:9000
 ```
+
+Per impostazione predefinita lo script registra il profilo calibrato con ID
+stabile `<task>-calibrated-v1` e lo include in ogni richiesta del piano.
+Se una nuova calibrazione cambia la definizione, usa
+`--profile-version v2` per registrare un profilo nuovo invece di sovrascrivere
+quello esistente.
+Per fare inviare richieste a più client sotto lo stesso profilo, un client
+può registrarlo e gli altri possono usare `--no-register
+--qos-profile-id question_answering-calibrated-v1`. Per usare il profilo
+predefinito del task kind, passa `--no-register`
+senza `--qos-profile-id`: il campo viene omesso.
 
 Genera un piano sintetico (o da dataset con `--source dataset`) su N
 timeslot e lo invia; segui i risultati con `curl localhost:8100/requests` /
@@ -172,8 +193,8 @@ docker compose run --rm emulation --slots 4 --per-slot 3 --slot-minutes 30 --tas
 
 | Endpoint | Scopo |
 |---|---|
-| `POST /run/send-batch` | Avvia (in background) l'invio di `count` richieste a carbonshift per il `task` scelto, con `deadline_seconds` relativo. `source: "synthetic"` (default, nessun download) o `"dataset"` (HuggingFace). |
-| `POST /run/send-plan` | Come sopra ma con `start_at`/`deadline_at` assoluti e raggruppamento per timeslot; supporta `mode: "realtime"` o `"emulated"` (vedi sopra). |
+| `POST /run/send-batch` | Avvia (in background) l'invio di `count` richieste per il task scelto; accetta `qos_profile_id` opzionale e `deadline_seconds` relativo. `source: "synthetic"` (default) o `"dataset"` (HuggingFace). |
+| `POST /run/send-plan` | Piano con `start_at`/`deadline_at` assoluti e raggruppamento per timeslot; ogni richiesta può avere un `qos_profile_id` opzionale. |
 | `POST /callback` | Riceve da carbonshift il risultato finale (`CallerCallbackPayload`); non richiamarlo manualmente, è per carbonshift. |
 | `GET /requests` | Elenco di tutte le richieste tracciate con il loro stato. |
 | `GET /requests/{id}` | Dettaglio di una richiesta (id = quello assegnato da carbonshift). |
@@ -193,6 +214,8 @@ arriva il risultato/timeout):
   (include sia l'attesa dello scheduling sia l'esecuzione).
 - `late`: `true` se `end_to_end_seconds > deadline_seconds` richiesta.
 - `carbon_cost`, `flavour`, `scheduled_slot`, `eta_seconds`: dalla risposta di carbonshift.
+- `qos_profile_id`: ID effettivamente risolto da Carbonshift, incluso il profilo
+  predefinito quando il client non ne ha selezionato uno.
 - `scheduled_at`: timestamp (ISO8601) di quando il DP solver di carbonshift ha
   committato l'assegnazione di questa richiesta — distinto da
   `callback_received_at` (quando arriva il risultato dall'executor). `null`
@@ -238,11 +261,10 @@ aggregazione, ma su **tutte** le richieste indipendentemente dal task/flavour,
 è disponibile in `overall` (utile per "quanto ho risparmiato in totale in
 questo test?"). C'è anche `scheduler`, letto **in diretta da carbonshift** (non
 derivato dalle richieste tracciate, quindi `null` se carbonshift non è
-raggiungibile): `global_error_avg`/`global_error_count` sono la media/il
-conteggio errore realmente accumulati dallo scheduler (unica media, **non**
-per task, per design — vedi PLAN_SERVICE.md); `tasks.<task>.max_error_threshold`
-è la soglia **dichiarata** effettivamente in vigore per quel task (override
-registrato via `push_flavours.py`, o il default globale di carbonshift).
+raggiungibile): `global_error_avg`/`global_error_count` sono telemetria
+descrittiva aggregata, non una garanzia QoS tra semantiche diverse.
+`profiles.<qos_profile_id>` espone task kind, semantica dell'errore, soglia,
+finestra e vincolo cumulativo dei profili effettivamente usati.
 
 `GET /metrics/progress` dà invece una fotografia unica e leggera dell'intero
 test (non per task/flavour): quante richieste sono state inviate, quante
@@ -295,6 +317,12 @@ Ogni run scrive in `tests/battery/results/<battery_id>_<timestamp>/`:
 | `CLIENT_HTTP_TIMEOUT_SECONDS` | `10` | Timeout della chiamata a carbonshift. |
 | `CLIENT_CALLBACK_TIMEOUT_SECONDS` | `120` | Dopo quanto una richiesta senza callback viene marcata `timed_out`. |
 | `CLIENT_METRICS_PATH` | `data/metrics.jsonl` | File di append delle metriche. |
+| `CLIENT_QOS_PROFILE_VERSION` | `v1` | Versione stabile usata per generare gli ID dei profili calibrati; aumentala quando cambia la policy. |
+| `CLIENT_QOS_PROFILE_THRESHOLD_POSITION` | `0.75` | Posizione fra errore minimo e massimo usata per la soglia dei profili calibrati. |
+| `CLIENT_QOS_PROFILE_STATS_PATH` | `model_stats.json` nel servizio client | Snapshot di calibrazione da cui ricostruire i profili calibrati all'avvio. |
+| `CLIENT_QOS_PROFILE_DEFINITIONS_PATH` | *(assente)* | Percorso opzionale a un array JSON di profili QoS completi da ripristinare all'avvio. |
+| `CLIENT_QOS_PROFILE_REGISTRATION_ATTEMPTS` | `10` | Tentativi di registrazione iniziale per profilo, per gestire l'ordine di avvio dei servizi. |
+| `CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS` | `2` | Attesa fra tentativi transitori di registrazione profilo. |
 | `CLIENT_ADMIN_TIMEOUT_SECONDS` | `60` | Timeout per le chiamate `/admin/advance-slot` (modalità emulazione) — più generoso di `CLIENT_HTTP_TIMEOUT_SECONDS` perché comportano un flush + un'inferenza reale. |
 | `EXECUTOR_ADMIN_URL` | `http://localhost:9000` | Base URL dell'executor per `mode: "emulated"` (può essere sovrascritto per richiesta con `executor_url`). |
 
@@ -343,39 +371,100 @@ ciascun task**, invece:
    nome di modello** (non per task/flavour): così puoi cambiare o aggiungere
    modelli in `executor/app/config.py` e ricalibrare solo quelli, senza
    perdere le misurazioni più vecchie di modelli non più configurati.
-2. **Invio a carbonshift**: raggruppa `model_stats.json` per task e registra
-   ciascun set di flavour via `POST /v1/tasks`.
+2. **Registrazione su carbonshift**: raggruppa `model_stats.json` per task e
+   registra un profilo versionato per ogni task kind.
    ```sh
    python scripts/push_flavours.py
    ```
-   Da quel momento, le richieste inviate con quel `task` (il client lo passa
-   già automaticamente come `task_id`, vedi `submit(..., task_id=task)` in
-   `app/runner.py`/`app/plan_runner.py`) vengono pianificate tra i flavour
-   *misurati*, non quelli di default — mentre l'errore medio globale/di
-   finestra dello scheduler resta un'unica media aggregata su tutte le
-   richieste, indipendentemente dal task (per design: riflette la salute
-   complessiva dello scheduler, non quella di un singolo task).
+   I profili usano ID stabili (`<task-kind>-calibrated-v1`), i flavour
+   *misurati*, la soglia interpolata e la semantica d'errore salvata nei dati
+   di calibrazione. La finestra e il vincolo cumulativo sono espliciti nella
+   registrazione: due client che riutilizzano lo stesso ID devono quindi
+   inviare la stessa definizione. Se una nuova calibrazione cambia una policy,
+   usa `--profile-version v2` per creare un ID diverso. Le richieste selezionano il budget con
+   `qos_profile_id`; il task kind continua a descrivere l'operazione
+   dell'executor. `POST /v1/tasks` resta solo un adapter di compatibilità.
+   Profili differenti non condividono il budget e vengono pianificati in
+   batch separati. Le capacity tiers restano globali e contano le richieste
+   di tutti i profili.
 
-   Registra anche una soglia di errore (`max_error_threshold`) specifica per
-   il task, di default al 75% fra l'errore minimo e massimo tra i suoi
-   flavour calibrati (`--threshold-position` per cambiarlo): serve perché il
-   default globale di carbonshift (4%) è pensato per un caso generico e può
-   essere molto più severo di quanto qualunque modello reale di un task
-   riesca a raggiungere (es. text_generation calibrato spesso supera il
-   4% anche per il flavour più accurato) — senza una soglia dedicata quel
-   task sarebbe permanentemente infattibile e finirebbe sempre nel fallback
-   più costoso. Non tocca il vincolo di errore *globale* (sempre il default
-   di carbonshift, per design task-agnostico).
+   La soglia è di default al 75% fra l'errore minimo e massimo dei flavour
+   calibrati (`--threshold-position` per cambiarlo). La soglia e i vincoli
+   cumulativi si applicano al QoS profile, non a una media hard aggregata tra
+   task diversi. L'endpoint `/v1/stats` conserva una media fleet-wide solo
+   come telemetria descrittiva.
 3. **Correzione con l'errore reale** (solo nell'emulazione/prodotto reale, mai
    nelle simulazioni offline che non passano da carbonshift): quando arriva
    il callback dell'executor con `result.quality_score`, carbonshift sostituisce
-   l'errore *previsto* del flavour assegnato con `(1 − quality_score) × 100`
-   nella media globale/di finestra — vedi `carbonshift/rust/PLAN_SERVICE.md`.
+   l'errore *previsto* del flavour assegnato con il valore riportato dal task
+   nella finestra e nei totali del profilo associato — vedi
+   `carbonshift/rust/PLAN_SERVICE.md`.
+
+## Riavvii e migrazione da `task_id`
+
+Carbonshift conserva i profili QoS personalizzati in memoria. All'avvio il
+client ricostruisce i profili calibrati dal proprio `model_stats.json` e
+registra anche gli eventuali profili completi configurati con
+`CLIENT_QOS_PROFILE_DEFINITIONS_PATH`. Le registrazioni identiche sono
+idempotenti; un ID già usato con una definizione diversa è un errore e non
+viene sovrascritto. Il client riprova gli errori di connessione e server con
+limiti configurabili; errori permanenti di definizione impediscono l'avvio.
+Se cambia la calibrazione, aumenta la versione e mantieni allineati
+`CLIENT_QOS_PROFILE_VERSION`, `push_flavours.py --profile-version` e
+`run_emulation.py --profile-version`: i nuovi profili hanno un ID diverso e
+possono essere ripristinati dalla stessa configurazione sui client.
+
+Se Carbonshift viene riavviato mentre il client resta attivo, una richiesta
+con un profilo noto al catalogo locale riceve un solo tentativo di
+registrazione idempotente e viene reinviata una volta. Se il profilo non è
+nel catalogo locale, l'invio fallisce esplicitamente: non viene sostituito
+silenziosamente con un profilo predefinito.
+
+Per un profilo personalizzato, configura il file in tutti i client che
+devono poterlo ripristinare:
+
+```json
+[
+  {
+    "profile_id": "qa-standard-v2",
+    "task_kind": "question_answering",
+    "flavours": [{"name": "Accurate", "error": 4.0, "duration": 120}],
+    "error_semantics": "word-overlap-f1-v1",
+    "max_error_threshold": 10.0,
+    "error_window": {"past_slots": 12, "future_slots": 14, "past_decay_slots": 12},
+    "cumulative_error": {"enabled": true, "hard": true}
+  }
+]
+```
+
+`CLIENT_QOS_PROFILE_DEFINITIONS_PATH` deve puntare a questo file **dentro**
+ogni container client. Un profilo personalizzato registrato soltanto da uno
+script/altro client non può essere ricostruito da un processo che non possiede
+la sua definizione.
+
+Il ripristino riguarda le **definizioni** e gli ID stabili, non la persistenza
+dello stato dello scheduler. Un riavvio Carbonshift azzera code, assegnazioni,
+contatori di errore e cronologia in memoria; non reinterpreta però le
+definizioni del profilo con un ID diverso. I contatori di compatibilità
+`GET /v1/stats` (`legacy_task_id_usage`) sono anch'essi process-locali e si
+azzerano al riavvio.
+
+I client aggiornati inviano `task_kind` e, se scelto, `qos_profile_id`; non
+inviano più `task_id`. Carbonshift mantiene ancora il campo legacy nelle
+richieste, gli endpoint `/v1/tasks` e il filtro query `task_id`.
+Prima di rimuoverli, verifica che i contatori `request_submissions`,
+`task_api_calls` e `monitoring_queries` siano tutti zero per almeno 30 giorni
+di esercizio dopo aver aggiornato ogni client mantenuto. Poiché i contatori
+si azzerano a ogni riavvio, conserva la serie fuori da Carbonshift (ad esempio
+nel monitoraggio operativo). La rimozione avverrà poi in una modifica
+separata e dichiaratamente breaking; questo rilascio non rimuove gli adapter.
 
 ## Semplificazioni note
 
 - Nessun retry sull'invio a carbonshift (se fallisce, quella richiesta viene
-  solo loggata e saltata).
+  solo loggata e saltata), salvo il singolo ripristino idempotente di un
+  profilo noto quando Carbonshift segnala che il suo registro in memoria è
+  stato azzerato.
 - `source: "dataset"` per NER usa `tomaarsen/conll2003`, un mirror Parquet
   senza script di caricamento (il dataset originale `conll2003` non è più
   caricabile con le versioni recenti di `datasets`).

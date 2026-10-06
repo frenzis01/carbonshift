@@ -2,7 +2,23 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::qos::{CumulativeErrorPolicy, ErrorWindowPolicy};
+use crate::engine::types::Flavour;
 use crate::types::CapacityTier;
+
+/// Registration body for a stable, reusable QoS profile.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterQosProfilePayload {
+    pub profile_id: String,
+    pub task_kind: String,
+    pub flavours: Vec<Flavour>,
+    /// Versioned metric label; descriptive metadata, never executable code.
+    pub error_semantics: String,
+    pub max_error_threshold: f64,
+    pub error_window: ErrorWindowPolicy,
+    pub cumulative_error: CumulativeErrorPolicy,
+}
 
 /// Body of `POST /v1/requests`.
 #[derive(Debug, Deserialize)]
@@ -23,6 +39,13 @@ pub struct SubmitRequestPayload {
     /// unregistered ⇒ falls back to the `"default"` task (`Config::flavours`).
     #[serde(default)]
     pub task_id: Option<String>,
+    /// Stable reusable QoS budget. Omitted requests select the profile for
+    /// their task kind, or the task kind's default profile.
+    #[serde(default)]
+    pub qos_profile_id: Option<String>,
+    /// Executor operation. If omitted during migration, `payload.task` is used.
+    #[serde(default)]
+    pub task_kind: Option<String>,
 
     // TODO: i32 or i64?
     #[serde(default)]
@@ -49,6 +72,7 @@ pub enum RequestStatus {
 #[derive(Debug, Serialize)]
 pub struct RequestStatusResponse {
     pub request_id: u64,
+    pub qos_profile_id: String,
     pub status: RequestStatus,
     pub scheduled_slot: Option<i32>,
     /// Estimated seconds from now until the assigned slot executes.
@@ -90,6 +114,12 @@ pub struct ExecutorCallbackPayload {
 pub struct RegisterTaskPayload {
     pub task_id: String,
     pub flavours: Vec<crate::engine::types::Flavour>,
+    /// Open executor-operation ID; defaults to `task_id` for legacy callers.
+    #[serde(default)]
+    pub task_kind: Option<String>,
+    /// Versioned error-measurement ID. Legacy callers may omit it.
+    #[serde(default)]
+    pub error_semantics: Option<String>,
     /// Overrides `Config::max_error_threshold` (%) for this task's own
     /// requests. `None` = keep using the global default — useful since
     /// different tasks' calibrated flavours can have very different error
@@ -136,8 +166,9 @@ pub struct CallerCallbackPayload {
     pub baseline_execution_time_seconds: Option<f64>,
 }
 
-/// Response of `GET /v1/stats` — counts of tracked requests by status, plus
-/// the scheduler's own (task-agnostic, by design) global error average.
+/// Response of `GET /v1/stats` — counts of tracked requests by status plus
+/// descriptive fleet-wide error telemetry. This aggregate is not a QoS limit:
+/// hard error constraints are scoped to each request's QoS profile.
 #[derive(Debug, Serialize, Default)]
 pub struct StatsResponse {
     pub total: usize,
@@ -151,6 +182,21 @@ pub struct StatsResponse {
     /// `null` if nothing has been scheduled yet.
     pub global_error_avg: Option<f64>,
     pub global_error_count: u64,
+    /// Legacy compatibility usage since this Carbonshift process started.
+    /// These counters reset on restart; they are migration telemetry, not
+    /// durable business metrics.
+    pub legacy_task_id_usage: LegacyTaskIdUsage,
+}
+
+/// Counts calls that still depend on the deprecated `task_id` interfaces.
+#[derive(Debug, Serialize, Default)]
+pub struct LegacyTaskIdUsage {
+    /// Accepted request submissions that included the legacy `task_id` field.
+    pub request_submissions: u64,
+    /// Calls to the compatibility `GET` or `POST /v1/tasks` endpoints.
+    pub task_api_calls: u64,
+    /// Monitoring requests using the legacy `task_id` query parameter.
+    pub monitoring_queries: u64,
 }
 
 /// Response of `GET /v1/tasks/{task_id}` — the task's currently effective
@@ -159,6 +205,7 @@ pub struct StatsResponse {
 #[derive(Debug, Serialize)]
 pub struct TaskConfigResponse {
     pub task_id: String,
+    pub qos_profile_id: String,
     pub flavours: Vec<crate::engine::types::Flavour>,
     /// Always a concrete value: the task's own override if registered,
     /// otherwise `Config::max_error_threshold` (the global default).
@@ -185,7 +232,7 @@ pub struct HorizonResponse {
 
 // ─── Fine-grained monitoring DTOs ───────────────────────────────────────────
 
-/// Query parameters for `GET /v1/assignments` and `GET /v1/metrics/error-history`.
+/// Query parameters for assignment listing and error-history endpoints.
 #[derive(Debug, Deserialize, Default)]
 pub struct AssignmentsQuery {
     #[serde(default)]
@@ -196,12 +243,16 @@ pub struct AssignmentsQuery {
     pub flavour: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
+    /// Filter by stable QoS budget ID. Preferred over the legacy task alias.
+    #[serde(default)]
+    pub qos_profile_id: Option<String>,
 }
 
 /// DTO for a single assignment returned in `GET /v1/assignments`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AssignmentItem {
     pub request_id: u64,
+    pub qos_profile_id: String,
     pub scheduled_slot: i32,
     pub flavour_name: String,
     pub carbon_cost: f64,
@@ -227,12 +278,17 @@ pub struct SlotDetailResponse {
 /// Fine-grained cost breakdown for `GET /v1/metrics/costs`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CostMetricsResponse {
+    /// `None` means totals cover every QoS profile; otherwise all request
+    /// totals are restricted to this profile. Capacity tiers remain global.
+    pub qos_profile_id: Option<String>,
     pub current_actual_carbon_cost: f64,
     pub current_actual_baseline_carbon_cost: f64,
     pub actual_carbon_saving_pct: Option<f64>,
     pub forecasted_pending_carbon_cost: f64,
     pub total_forecasted_carbon_cost: f64,
     pub total_baseline_carbon_cost: f64,
+    /// Shared slot-pricing policy. It is intentionally not profile-scoped.
+    pub capacity_tiers: Vec<crate::types::CapacityTier>,
 }
 
 /// Slot error item for `GET /v1/metrics/error-history`.
@@ -251,7 +307,17 @@ pub struct SlotErrorItem {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ErrorHistoryResponse {
     pub current_slot: i32,
+    /// Selected budget identity; `None` means this is descriptive fleet telemetry.
+    #[serde(default)]
+    pub qos_profile_id: Option<String>,
+    /// Cumulative error for the selected QoS budget, if one was selected.
+    #[serde(default)]
+    pub profile_error_avg: Option<f64>,
+    #[serde(default)]
+    pub error_semantics: Option<String>,
+    /// Fleet-wide descriptive average. Do not compare it against a profile QoS threshold.
     pub global_error_avg: Option<f64>,
+    /// Legacy profile/task threshold lookup by stable profile ID.
     pub max_error_threshold: f64,
     pub task_thresholds: std::collections::HashMap<String, f64>,
     #[serde(default)]
@@ -260,4 +326,3 @@ pub struct ErrorHistoryResponse {
     pub window_future: i32,
     pub slots: Vec<SlotErrorItem>,
 }
-

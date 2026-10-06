@@ -11,11 +11,11 @@
 /// work, and releases it.  Lock granularity is deliberately coarse for
 /// simplicity and correctness; hot-path profiling can guide future
 /// optimisations without changing the public API.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::engine::qos::QosProfileId;
 use crate::online_swarm::SwarmContext;
 use crate::types::{Assignment, CapacityTier, Request};
 
@@ -32,6 +32,7 @@ pub struct SolverSnapshot {
     pub assignments: HashMap<u64, Assignment>,
     pub global_error_sum: f64,
     pub global_assignment_count: u64,
+    pub profile_error_stats: HashMap<QosProfileId, GlobalErrorStats>,
 }
 
 impl SolverSnapshot {
@@ -54,7 +55,7 @@ impl SolverSnapshot {
         exclude: &HashSet<u64>,
     ) -> WindowErrorStats {
         let start = center_slot - window_past;
-        let end   = center_slot + window_future;
+        let end = center_slot + window_future;
         let mut error_sum = 0.0f64;
         let mut count = 0u64;
         for a in self.assignments.values() {
@@ -66,8 +67,16 @@ impl SolverSnapshot {
                 count += 1;
             }
         }
-        let average = if count > 0 { error_sum / count as f64 } else { 0.0 };
-        WindowErrorStats { error_sum, count, average }
+        let average = if count > 0 {
+            error_sum / count as f64
+        } else {
+            0.0
+        };
+        WindowErrorStats {
+            error_sum,
+            count,
+            average,
+        }
     }
 
     /// All assignments in exactly `slot`.
@@ -82,8 +91,77 @@ impl SolverSnapshot {
     pub fn get_global_error_stats(&self) -> GlobalErrorStats {
         let count = self.global_assignment_count;
         let error_sum = self.global_error_sum;
-        let avg = if count > 0 { error_sum / count as f64 } else { 0.0 };
-        GlobalErrorStats { error_sum, count, avg }
+        let avg = if count > 0 {
+            error_sum / count as f64
+        } else {
+            0.0
+        };
+        GlobalErrorStats {
+            error_sum,
+            count,
+            avg,
+        }
+    }
+
+    /// Cumulative error stats for one QoS profile.
+    pub fn get_profile_error_stats(&self, profile_id: &QosProfileId) -> GlobalErrorStats {
+        self.profile_error_stats
+            .get(profile_id)
+            .cloned()
+            .unwrap_or(GlobalErrorStats {
+                error_sum: 0.0,
+                count: 0,
+                avg: 0.0,
+            })
+    }
+
+    /// Weighted window stats for assignments owned by one profile only.
+    pub fn get_profile_window_error_stats(
+        &self,
+        profile_id: &QosProfileId,
+        center_slot: i32,
+        window_past: i32,
+        window_future: i32,
+        exclude: &HashSet<u64>,
+    ) -> WindowErrorStats {
+        let start = center_slot - window_past;
+        let end = center_slot + window_future;
+        let mut error_sum = 0.0;
+        let mut count = 0;
+        for assignment in self.assignments.values() {
+            if assignment.qos_profile_id != *profile_id
+                || exclude.contains(&assignment.request_id)
+                || assignment.scheduled_slot < start
+                || assignment.scheduled_slot > end
+            {
+                continue;
+            }
+            error_sum += assignment.error;
+            count += 1;
+        }
+        WindowErrorStats {
+            error_sum,
+            count,
+            average: if count > 0 {
+                error_sum / count as f64
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// Assignments for profile-specific carryover/prehistory, in one slot.
+    pub fn get_profile_requests_in_slot(
+        &self,
+        profile_id: &QosProfileId,
+        slot: i32,
+    ) -> Vec<&Assignment> {
+        self.assignments
+            .values()
+            .filter(|assignment| {
+                assignment.qos_profile_id == *profile_id && assignment.scheduled_slot == slot
+            })
+            .collect()
     }
 }
 
@@ -95,14 +173,16 @@ struct Inner {
     /// Active assignments (request_id → Assignment).
     assignments: HashMap<u64, Assignment>,
     /// Current time slot (updated by the scheduler loop).
-    current_slot: i32,  // TODO: consider changing to i64 to match other slot representations...
-                        // Probably won't use 64 bit slots in practice...
+    current_slot: i32, // TODO: consider changing to i64 to match other slot representations...
+    // Probably won't use 64 bit slots in practice...
     /// Cumulative statistics (never reset by archiving).
     total_received: u64,
     total_scheduled: u64,
-    /// Running global error totals across all ever-assigned requests.
+    /// Descriptive fleet-wide error totals; never used as a cross-profile QoS limit.
     global_error_sum: f64,
     global_assignment_count: u64,
+    /// Cumulative hard/window QoS totals partitioned by profile.
+    profile_error_stats: HashMap<QosProfileId, GlobalErrorStats>,
     // ── rollback tracking ─────────────────────────────────────────────────
     /// Total number of rollbacks (tier-breach detections) that occurred.
     total_rollbacks: u64,
@@ -110,6 +190,49 @@ struct Inner {
     max_consecutive_rollbacks_seen: u64,
     /// Request IDs that were ultimately committed after ≥1 rollback attempt.
     rolled_back_request_ids: HashSet<u64>,
+}
+
+impl Inner {
+    fn record_assignment(&mut self, assignment: Assignment) {
+        let previous = self.assignments.get(&assignment.request_id).cloned();
+        let mut assignment = assignment;
+        if let Some(previous) = previous {
+            // A request's budget identity is immutable after its first
+            // commitment; replanning changes its live assignment, not which
+            // historical/profile aggregate it belongs to.
+            assignment.qos_profile_id = previous.qos_profile_id;
+        } else {
+            self.total_scheduled += 1;
+            self.global_error_sum += assignment.error;
+            self.global_assignment_count += 1;
+            let stats = self
+                .profile_error_stats
+                .entry(assignment.qos_profile_id.clone())
+                .or_default();
+            stats.error_sum += assignment.error;
+            stats.count += 1;
+        }
+        let stats = self
+            .profile_error_stats
+            .get_mut(&assignment.qos_profile_id)
+            .expect("record_assignment initializes profile error totals");
+        stats.avg = if stats.count > 0 {
+            stats.error_sum / stats.count as f64
+        } else {
+            0.0
+        };
+        self.assignments.insert(assignment.request_id, assignment);
+    }
+}
+
+impl Default for GlobalErrorStats {
+    fn default() -> Self {
+        Self {
+            error_sum: 0.0,
+            count: 0,
+            avg: 0.0,
+        }
+    }
 }
 
 impl Inner {
@@ -122,6 +245,7 @@ impl Inner {
             total_scheduled: 0,
             global_error_sum: 0.0,
             global_assignment_count: 0,
+            profile_error_stats: HashMap::new(),
             total_rollbacks: 0,
             max_consecutive_rollbacks_seen: 0,
             rolled_back_request_ids: HashSet::new(),
@@ -213,6 +337,39 @@ impl SharedState {
         g.pending.drain(..n).collect()
     }
 
+    /// Pending count per stable profile ID, sorted for deterministic fair dispatch.
+    pub fn pending_profile_counts(&self) -> Vec<(QosProfileId, usize)> {
+        let g = self.inner.lock().unwrap();
+        let mut counts: HashMap<QosProfileId, usize> = HashMap::new();
+        for request in &g.pending {
+            *counts.entry(request.qos_profile_id()).or_default() += 1;
+        }
+        let mut counts: Vec<_> = counts.into_iter().collect();
+        counts.sort_by(|left, right| left.0.cmp(&right.0));
+        counts
+    }
+
+    /// Atomically claim at most `count` requests from one profile, preserving
+    /// queue order within that profile and leaving other profiles untouched.
+    pub fn claim_pending_requests_for_profile(
+        &self,
+        profile_id: &QosProfileId,
+        count: usize,
+    ) -> Vec<Request> {
+        let mut g = self.inner.lock().unwrap();
+        let mut claimed = Vec::with_capacity(count.min(g.pending.len()));
+        let mut remaining = Vec::with_capacity(g.pending.len());
+        for request in g.pending.drain(..) {
+            if request.qos_profile_id() == *profile_id && claimed.len() < count {
+                claimed.push(request);
+            } else {
+                remaining.push(request);
+            }
+        }
+        g.pending = remaining;
+        claimed
+    }
+
     /// Return `requests` to the front of the pending queue (preserving order).
     ///
     /// Used when a claimed batch could not be scheduled and must be retried.
@@ -249,8 +406,6 @@ impl SharedState {
         g.pending.drain(..).collect()
     }
 
-
-
     /// Record a batch of scheduling decisions.
     ///
     /// - Overwrites any existing assignment for the same request_id.
@@ -258,14 +413,8 @@ impl SharedState {
     ///   re-planned ones, to avoid double-counting).
     pub fn add_assignments(&self, assignments: Vec<Assignment>) {
         let mut g = self.inner.lock().unwrap();
-        for a in assignments {
-            let is_new = !g.assignments.contains_key(&a.request_id);
-            if is_new {
-                g.total_scheduled += 1;
-                g.global_error_sum += a.error;
-                g.global_assignment_count += 1;
-            }
-            g.assignments.insert(a.request_id, a);
+        for assignment in assignments {
+            g.record_assignment(assignment);
         }
     }
 
@@ -285,6 +434,7 @@ impl SharedState {
             assignments: g.assignments.clone(),
             global_error_sum: g.global_error_sum,
             global_assignment_count: g.global_assignment_count,
+            profile_error_stats: g.profile_error_stats.clone(),
         }
     }
 
@@ -293,18 +443,39 @@ impl SharedState {
     /// Builds per-slot assignment counts and error vectors from the current
     /// committed assignments in a single lock acquisition.
     pub fn swarm_context_snapshot(&self) -> SwarmContext {
+        self.swarm_context_snapshot_for_profile(None)
+    }
+
+    /// Snapshot global capacity occupancy and one profile's error history.
+    pub fn swarm_context_snapshot_for_profile(
+        &self,
+        profile_id: Option<&QosProfileId>,
+    ) -> SwarmContext {
         let g = self.inner.lock().unwrap();
         let mut slot_count: HashMap<i32, i32> = HashMap::new();
         let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
         for a in g.assignments.values() {
             *slot_count.entry(a.scheduled_slot).or_insert(0) += 1;
-            slot_errors.entry(a.scheduled_slot).or_default().push(a.error);
+            if profile_id.map_or(true, |profile_id| a.qos_profile_id == *profile_id) {
+                slot_errors
+                    .entry(a.scheduled_slot)
+                    .or_default()
+                    .push(a.error);
+            }
         }
+        let (global_error_sum, global_count) = if let Some(profile_id) = profile_id {
+            g.profile_error_stats
+                .get(profile_id)
+                .map(|stats| (stats.error_sum, stats.count as usize))
+                .unwrap_or((0.0, 0))
+        } else {
+            (g.global_error_sum, g.global_assignment_count as usize)
+        };
         SwarmContext {
             slot_count,
             slot_errors,
-            global_error_sum: g.global_error_sum,
-            global_count: g.global_assignment_count as usize,
+            global_error_sum,
+            global_count,
         }
     }
 
@@ -348,8 +519,58 @@ impl SharedState {
                 count += 1;
             }
         }
-        let average = if count > 0 { error_sum / count as f64 } else { 0.0 };
-        WindowErrorStats { error_sum, count, average }
+        let average = if count > 0 {
+            error_sum / count as f64
+        } else {
+            0.0
+        };
+        WindowErrorStats {
+            error_sum,
+            count,
+            average,
+        }
+    }
+
+    /// Weighted window statistics restricted to assignments for one profile.
+    pub fn get_profile_window_error_stats(
+        &self,
+        profile_id: &QosProfileId,
+        center_slot: i32,
+        window_past: i32,
+        window_future: i32,
+        exclude: &HashSet<u64>,
+    ) -> WindowErrorStats {
+        self.snapshot_for_solver().get_profile_window_error_stats(
+            profile_id,
+            center_slot,
+            window_past,
+            window_future,
+            exclude,
+        )
+    }
+
+    /// Assignment error stats for one slot and QoS profile.
+    pub fn get_profile_slot_error_stats(
+        &self,
+        profile_id: &QosProfileId,
+        slot: i32,
+    ) -> SlotErrorStats {
+        let g = self.inner.lock().unwrap();
+        let profile_assignments = g.assignments.values().filter(|assignment| {
+            assignment.qos_profile_id == *profile_id && assignment.scheduled_slot == slot
+        });
+        let (count, error_sum) = profile_assignments
+            .fold((0u64, 0.0), |(count, sum), assignment| {
+                (count + 1, sum + assignment.error)
+            });
+        SlotErrorStats {
+            count,
+            average: if count > 0 {
+                error_sum / count as f64
+            } else {
+                0.0
+            },
+        }
     }
 
     /// Cumulative error stats across all ever-assigned requests.
@@ -357,8 +578,31 @@ impl SharedState {
         let g = self.inner.lock().unwrap();
         let count = g.global_assignment_count;
         let error_sum = g.global_error_sum;
-        let avg = if count > 0 { error_sum / count as f64 } else { 0.0 };
-        GlobalErrorStats { error_sum, count, avg }
+        let avg = if count > 0 {
+            error_sum / count as f64
+        } else {
+            0.0
+        };
+        GlobalErrorStats {
+            error_sum,
+            count,
+            avg,
+        }
+    }
+
+    /// Cumulative error statistics restricted to one QoS profile.
+    pub fn get_profile_error_stats(&self, profile_id: &QosProfileId) -> GlobalErrorStats {
+        self.inner
+            .lock()
+            .unwrap()
+            .profile_error_stats
+            .get(profile_id)
+            .cloned()
+            .unwrap_or(GlobalErrorStats {
+                error_sum: 0.0,
+                count: 0,
+                avg: 0.0,
+            })
     }
 
     /// Replaces a committed assignment's *predicted* error with the
@@ -379,10 +623,21 @@ impl SharedState {
     /// scheduled, or was already archived).
     pub fn correct_assignment_error(&self, request_id: u64, actual_error: f64) {
         let mut g = self.inner.lock().unwrap();
-        if let Some(a) = g.assignments.get_mut(&request_id) {
-            let delta = actual_error - a.error;
-            a.error = actual_error;
-            g.global_error_sum += delta;
+        let Some((profile_id, delta)) = g.assignments.get_mut(&request_id).map(|assignment| {
+            let delta = actual_error - assignment.error;
+            assignment.error = actual_error;
+            (assignment.qos_profile_id.clone(), delta)
+        }) else {
+            return;
+        };
+        g.global_error_sum += delta;
+        if let Some(stats) = g.profile_error_stats.get_mut(&profile_id) {
+            stats.error_sum += delta;
+            stats.avg = if stats.count > 0 {
+                stats.error_sum / stats.count as f64
+            } else {
+                0.0
+            };
         }
     }
 
@@ -398,25 +653,38 @@ impl SharedState {
     /// `AppState::carbon_intensity_ratio` / `handlers::executor_callback`).
     /// Returns the new value (so the caller can forward it to the client)
     /// or `None` if there's no committed assignment for `request_id`.
-    pub fn correct_assignment_carbon_cost(&self, request_id: u64, actual_carbon_cost: f64) -> Option<f64> {
+    pub fn correct_assignment_carbon_cost(
+        &self,
+        request_id: u64,
+        actual_carbon_cost: f64,
+    ) -> Option<f64> {
         let mut g = self.inner.lock().unwrap();
         let a = g.assignments.get_mut(&request_id)?;
         a.carbon_cost = actual_carbon_cost;
         Some(actual_carbon_cost)
     }
 
-
     /// Returns the error statistics for a given slot, including the number of assignments and the average error.
     /// TODO: write tests
     pub fn get_slot_error_stats(&self, slot: i32) -> SlotErrorStats {
         let g = self.inner.lock().unwrap();
-        let count = g.assignments.values().filter(|a| a.scheduled_slot == slot).count() as u64;
-        let error_sum = g.assignments.values().filter(|a| a.scheduled_slot == slot).map(|a| a.error).sum::<f64>();
-        let average = if count > 0 { error_sum / count as f64 } else { 0.0 };
-        SlotErrorStats {
-            count,
-            average,
-        }
+        let count = g
+            .assignments
+            .values()
+            .filter(|a| a.scheduled_slot == slot)
+            .count() as u64;
+        let error_sum = g
+            .assignments
+            .values()
+            .filter(|a| a.scheduled_slot == slot)
+            .map(|a| a.error)
+            .sum::<f64>();
+        let average = if count > 0 {
+            error_sum / count as f64
+        } else {
+            0.0
+        };
+        SlotErrorStats { count, average }
     }
 
     // ── slot management ───────────────────────────────────────────────────
@@ -488,17 +756,20 @@ impl SharedState {
 
         if !force_commit {
             for (&slot, &expected) in expected_per_slot {
-                let current_before = g.assignments.values()
+                let current_before = g
+                    .assignments
+                    .values()
                     .filter(|a| a.scheduled_slot == slot)
                     .count() as i32;
-                let batch_adds = assignments.iter()
+                let batch_adds = assignments
+                    .iter()
                     .filter(|a| a.scheduled_slot == slot)
                     .count() as i32;
                 let actual_after = current_before + batch_adds;
 
                 if actual_after > expected {
                     let expected_mult = capacity_multiplier_for_count(expected, tiers);
-                    let actual_mult   = capacity_multiplier_for_count(actual_after, tiers);
+                    let actual_mult = capacity_multiplier_for_count(actual_after, tiers);
                     if actual_mult > expected_mult {
                         g.total_rollbacks += 1;
                         let consec = (consecutive_before + 1) as u64;
@@ -512,14 +783,8 @@ impl SharedState {
         }
 
         // Commit the assignments.
-        for a in assignments {
-            let is_new = !g.assignments.contains_key(&a.request_id);
-            if is_new {
-                g.total_scheduled += 1;
-                g.global_error_sum += a.error;
-                g.global_assignment_count += 1;
-            }
-            g.assignments.insert(a.request_id, a.clone());
+        for assignment in assignments {
+            g.record_assignment(assignment.clone());
         }
         CommitOutcome::Committed
     }
@@ -623,8 +888,10 @@ pub struct Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::qos::{CumulativeErrorPolicy, ErrorWindowPolicy, QosProfile, TaskKindId};
     use crate::types::{Assignment, Request};
     use std::collections::HashSet;
+    use std::sync::Arc;
 
     fn make_request(id: u64, arrival: i32, deadline: i32) -> Request {
         Request {
@@ -636,11 +903,50 @@ mod tests {
             flavours: vec![],
             max_error_threshold: None,
             capacity_tiers: None,
+            qos_profile: None,
+            qos_profile_id: QosProfileId::default_profile(),
         }
     }
 
     fn make_assignment(id: u64, slot: i32, error: f64) -> Assignment {
         Assignment::new(id, slot, "Accurate".to_string(), 1.0, error, 60, None, None)
+    }
+
+    fn make_profiled_assignment(id: u64, slot: i32, error: f64, profile_id: &str) -> Assignment {
+        Assignment::new_for_profile(
+            id,
+            slot,
+            "Accurate".to_string(),
+            1.0,
+            error,
+            60,
+            Some(slot),
+            Some(slot + 1),
+            QosProfileId::parse(profile_id).unwrap(),
+        )
+    }
+
+    fn test_profile(profile_id: &str) -> QosProfile {
+        QosProfile {
+            profile_id: QosProfileId::parse(profile_id).unwrap(),
+            task_kind: TaskKindId::parse("question_answering").unwrap(),
+            flavours: vec![crate::types::Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 10,
+            }],
+            error_semantics: "word-overlap-f1-v1".to_string(),
+            max_error_threshold: 10.0,
+            error_window: ErrorWindowPolicy {
+                past_slots: 2,
+                future_slots: 2,
+                past_decay_slots: 0,
+            },
+            cumulative_error: CumulativeErrorPolicy {
+                enabled: true,
+                hard: true,
+            },
+        }
     }
 
     #[test]
@@ -661,6 +967,58 @@ mod tests {
         state.add_request(make_request(1, 0, 5));
         let claimed = state.claim_pending_requests(10);
         assert_eq!(claimed.len(), 1);
+        assert_eq!(state.get_pending_count(), 0);
+    }
+
+    #[test]
+    fn profile_batch_claims_preserve_each_profile_order_and_leave_others_queued() {
+        let state = SharedState::new();
+        let mut a1 = make_request(1, 0, 2);
+        a1.qos_profile = Some(Arc::new(test_profile("qa-standard-v1")));
+        a1.qos_profile_id = QosProfileId::parse("qa-standard-v1").unwrap();
+        let mut b1 = make_request(2, 0, 2);
+        b1.qos_profile = Some(Arc::new(test_profile("ner-standard-v1")));
+        b1.qos_profile_id = QosProfileId::parse("ner-standard-v1").unwrap();
+        let mut a2 = make_request(3, 0, 2);
+        a2.qos_profile = a1.qos_profile.clone();
+        a2.qos_profile_id = a1.qos_profile_id.clone();
+        state.add_requests(vec![a1, b1, a2]);
+
+        assert_eq!(
+            state.pending_profile_counts(),
+            vec![
+                (QosProfileId::parse("ner-standard-v1").unwrap(), 1),
+                (QosProfileId::parse("qa-standard-v1").unwrap(), 2),
+            ]
+        );
+        let qa = state
+            .claim_pending_requests_for_profile(&QosProfileId::parse("qa-standard-v1").unwrap(), 1);
+        assert_eq!(
+            qa.iter().map(|request| request.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            state
+                .claim_pending_requests_for_profile(
+                    &QosProfileId::parse("ner-standard-v1").unwrap(),
+                    4,
+                )
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            state
+                .claim_pending_requests_for_profile(
+                    &QosProfileId::parse("qa-standard-v1").unwrap(),
+                    4,
+                )
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
         assert_eq!(state.get_pending_count(), 0);
     }
 
@@ -688,14 +1046,129 @@ mod tests {
     }
 
     #[test]
+    fn profile_error_totals_and_windows_exclude_other_profiles() {
+        let state = SharedState::new();
+        let qa = QosProfileId::parse("qa-standard-v1").unwrap();
+        let ner = QosProfileId::parse("ner-standard-v1").unwrap();
+        state.add_assignments(vec![
+            make_profiled_assignment(1, 3, 10.0, "qa-standard-v1"),
+            make_profiled_assignment(2, 3, 90.0, "ner-standard-v1"),
+            make_profiled_assignment(3, 4, 30.0, "qa-standard-v1"),
+        ]);
+
+        let qa_stats = state.get_profile_error_stats(&qa);
+        let ner_stats = state.get_profile_error_stats(&ner);
+        let qa_window = state.get_profile_window_error_stats(&qa, 3, 0, 1, &HashSet::new());
+
+        assert_eq!(qa_stats.count, 2);
+        assert!((qa_stats.avg - 20.0).abs() < 1e-9);
+        assert_eq!(ner_stats.count, 1);
+        assert!((ner_stats.avg - 90.0).abs() < 1e-9);
+        assert_eq!(qa_window.count, 2);
+        assert!((qa_window.average - 20.0).abs() < 1e-9);
+        assert_eq!(state.get_global_error_stats().count, 3);
+    }
+
+    #[test]
+    fn capacity_tier_commit_check_counts_occupancy_from_all_profiles() {
+        let state = SharedState::new();
+        let tiers = vec![
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 2.0,
+            },
+        ];
+        state.add_assignments(vec![make_profiled_assignment(1, 4, 0.0, "qa-standard-v1")]);
+        let second_profile_assignment = make_profiled_assignment(2, 4, 0.0, "ner-standard-v1");
+        let outcome = state.try_add_assignments_checked(
+            &[second_profile_assignment],
+            &HashMap::from([(4, 1)]),
+            &tiers,
+            false,
+            0,
+        );
+
+        assert_eq!(outcome, CommitOutcome::RolledBack);
+        assert!(!state.get_current_assignments().contains_key(&2));
+        assert_eq!(state.get_current_assignments().len(), 1);
+    }
+
+    #[test]
+    fn cross_profile_concurrent_tier_breach_rolls_back_atomically() {
+        let state = SharedState::new();
+        let tiers = vec![
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 3.0,
+            },
+        ];
+        let first_profile = make_profiled_assignment(11, 6, 0.0, "qa-standard-v1");
+        let other_profile = make_profiled_assignment(12, 6, 0.0, "ner-standard-v1");
+        state.add_assignments(vec![first_profile]);
+
+        let outcome = state.try_add_assignments_checked(
+            &[other_profile],
+            &HashMap::from([(6, 1)]),
+            &tiers,
+            false,
+            0,
+        );
+
+        assert_eq!(outcome, CommitOutcome::RolledBack);
+        assert_eq!(state.get_current_assignments().len(), 1);
+        assert_eq!(
+            state
+                .get_profile_error_stats(&QosProfileId::parse("ner-standard-v1").unwrap())
+                .count,
+            0
+        );
+    }
+
+    #[test]
+    fn error_correction_updates_only_the_assignment_profile_aggregate() {
+        let state = SharedState::new();
+        let qa = QosProfileId::parse("qa-standard-v1").unwrap();
+        let ner = QosProfileId::parse("ner-standard-v1").unwrap();
+        state.add_assignments(vec![
+            make_profiled_assignment(1, 3, 10.0, "qa-standard-v1"),
+            make_profiled_assignment(2, 3, 80.0, "ner-standard-v1"),
+        ]);
+
+        state.correct_assignment_error(1, 50.0);
+
+        let qa_stats = state.get_profile_error_stats(&qa);
+        let ner_stats = state.get_profile_error_stats(&ner);
+        assert_eq!(qa_stats.count, 1);
+        assert!((qa_stats.error_sum - 50.0).abs() < 1e-9);
+        assert_eq!(ner_stats.count, 1);
+        assert!((ner_stats.error_sum - 80.0).abs() < 1e-9);
+        assert!((state.get_global_error_stats().error_sum - 130.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn correct_assignment_error_adjusts_global_sum_by_delta() {
         let state = SharedState::new();
         state.add_assignments(vec![make_assignment(1, 0, 3.2), make_assignment(2, 0, 2.0)]);
         // Real measured error (2.1) replaces the predicted one (3.2) for request 1.
         state.correct_assignment_error(1, 2.1);
         let g = state.get_global_error_stats();
-        assert_eq!(g.count, 2, "correction must not change the assignment count");
-        assert!((g.error_sum - 4.1).abs() < 1e-9, "error_sum={}", g.error_sum); // 3.2 - 3.2 + 2.1 + 2.0
+        assert_eq!(
+            g.count, 2,
+            "correction must not change the assignment count"
+        );
+        assert!(
+            (g.error_sum - 4.1).abs() < 1e-9,
+            "error_sum={}",
+            g.error_sum
+        ); // 3.2 - 3.2 + 2.1 + 2.0
         // The window average (recomputed live from Assignment::error) must
         // also reflect the corrected value.
         let window = state.get_window_error_stats(0, 2, 2, &HashSet::new());
@@ -742,7 +1215,10 @@ mod tests {
     fn window_error_stats_excludes_out_of_window() {
         let state = SharedState::new();
         // slot 5 is in window [3,7], slot 10 is outside
-        state.add_assignments(vec![make_assignment(1, 5, 4.0), make_assignment(2, 10, 2.0)]);
+        state.add_assignments(vec![
+            make_assignment(1, 5, 4.0),
+            make_assignment(2, 10, 2.0),
+        ]);
         let stats = state.get_window_error_stats(5, 2, 2, &HashSet::new());
         assert_eq!(stats.count, 1);
         assert!((stats.error_sum - 4.0).abs() < 1e-9);
@@ -779,18 +1255,36 @@ mod tests {
     fn tiers_with_implicit_one() -> Vec<CapacityTier> {
         // [{30,1.0}, {50,1.5}, {null,2.0}] — explicit 1.0 first tier
         vec![
-            CapacityTier { max_requests: Some(30), multiplier: 1.0 },
-            CapacityTier { max_requests: Some(50), multiplier: 1.5 },
-            CapacityTier { max_requests: None,     multiplier: 2.0 },
+            CapacityTier {
+                max_requests: Some(30),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: Some(50),
+                multiplier: 1.5,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 2.0,
+            },
         ]
     }
 
     fn tiers_no_implicit_one() -> Vec<CapacityTier> {
         // [{30,1.5}, {50,2.0}, {null,5.0}] — battery-style (no explicit 1.0)
         vec![
-            CapacityTier { max_requests: Some(30), multiplier: 1.5 },
-            CapacityTier { max_requests: Some(50), multiplier: 2.0 },
-            CapacityTier { max_requests: None,     multiplier: 5.0 },
+            CapacityTier {
+                max_requests: Some(30),
+                multiplier: 1.5,
+            },
+            CapacityTier {
+                max_requests: Some(50),
+                multiplier: 2.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 5.0,
+            },
         ]
     }
 
@@ -927,7 +1421,11 @@ mod tests {
         let mut expected = HashMap::new();
         expected.insert(5i32, 31i32);
         let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
-        assert_eq!(outcome, CommitOutcome::Committed, "same tier should not rollback");
+        assert_eq!(
+            outcome,
+            CommitOutcome::Committed,
+            "same tier should not rollback"
+        );
 
         // Reset: now a breach scenario.
         let state2 = SharedState::new();
@@ -938,7 +1436,11 @@ mod tests {
         expected2.insert(5i32, 30i32); // baseline=27, batch=3
         let batch2: Vec<Assignment> = (3..6u64).map(|i| make_assignment(i, 5, 0.0)).collect();
         let outcome2 = state2.try_add_assignments_checked(&batch2, &expected2, &tiers, false, 0);
-        assert_eq!(outcome2, CommitOutcome::RolledBack, "tier breach should rollback");
+        assert_eq!(
+            outcome2,
+            CommitOutcome::RolledBack,
+            "tier breach should rollback"
+        );
     }
 
     #[test]
@@ -968,13 +1470,13 @@ mod tests {
         // Window error stats match.
         let excl = HashSet::new();
         let direct_ws = state.get_window_error_stats(5, 3, 3, &excl);
-        let snap_ws   = snap.get_window_error_stats(5, 3, 3, &excl);
+        let snap_ws = snap.get_window_error_stats(5, 3, 3, &excl);
         assert!((direct_ws.error_sum - snap_ws.error_sum).abs() < 1e-12);
         assert_eq!(direct_ws.count, snap_ws.count);
 
         // Global stats match.
         let direct_gs = state.get_global_error_stats();
-        let snap_gs   = snap.get_global_error_stats();
+        let snap_gs = snap.get_global_error_stats();
         assert!((direct_gs.error_sum - snap_gs.error_sum).abs() < 1e-12);
         assert_eq!(direct_gs.count, snap_gs.count);
 

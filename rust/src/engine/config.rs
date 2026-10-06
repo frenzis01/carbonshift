@@ -4,7 +4,7 @@
 /// The `Config::default()` implementation reproduces the Python module
 /// defaults exactly so unit tests and production code share one source of
 /// truth.
-
+use crate::engine::qos::QosProfile;
 use crate::types::{CapacityTier, Flavour};
 
 // ─── Concern-specific configuration ─────────────────────────────────────────
@@ -198,9 +198,9 @@ pub struct AssignmentPolicy<'a> {
     pub error_window_past_decay_slots: i32,
     /// Maximum scheduling shift in slots.
     pub assignment_max_future_slots: i32,
-    /// Whether to enforce the task-agnostic global error constraint.
+    /// Whether to enforce this policy's cumulative error constraint.
     pub global_error_constraint_enabled: bool,
-    /// Whether global-constraint violations exclude flavours.
+    /// Whether cumulative-constraint violations exclude flavours.
     pub global_error_constraint_hard: bool,
 }
 
@@ -301,9 +301,21 @@ impl Default for Config {
             total_slots: 24,
             slot_epoch_offset: 0,
             flavours: vec![
-                Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 },
-                Flavour { name: "Balanced".to_string(), error: 2.5, duration: 30 },
-                Flavour { name: "Fast".to_string(), error: 5.0, duration: 10 },
+                Flavour {
+                    name: "Accurate".to_string(),
+                    error: 0.0,
+                    duration: 60,
+                },
+                Flavour {
+                    name: "Balanced".to_string(),
+                    error: 2.5,
+                    duration: 30,
+                },
+                Flavour {
+                    name: "Fast".to_string(),
+                    error: 5.0,
+                    duration: 10,
+                },
             ],
             carbon_cost_duration_scale: 1.0 / 3600.0,
             max_error_threshold: 4.0,
@@ -314,16 +326,49 @@ impl Default for Config {
             global_error_constraint_enabled: true,
             global_error_constraint_hard: true,
             capacity_tiers: vec![
-                CapacityTier { max_requests: Some(30),  multiplier: 1.0 },
-                CapacityTier { max_requests: Some(50),  multiplier: 1.5 },
-                CapacityTier { max_requests: Some(80),  multiplier: 2.0 },
-                CapacityTier { max_requests: None,      multiplier: 5.0 }, // 81+: overload
+                CapacityTier {
+                    max_requests: Some(30),
+                    multiplier: 1.0,
+                },
+                CapacityTier {
+                    max_requests: Some(50),
+                    multiplier: 1.5,
+                },
+                CapacityTier {
+                    max_requests: Some(80),
+                    multiplier: 2.0,
+                },
+                CapacityTier {
+                    max_requests: None,
+                    multiplier: 5.0,
+                }, // 81+: overload
             ],
         }
     }
 }
 
 impl Config {
+    /// Builds assignment policy from a profile while retaining global
+    /// horizon, cost scale, capacity tiers, and assignment-future limits.
+    pub fn assignment_policy_for_profile<'a>(
+        &'a self,
+        profile: &'a QosProfile,
+    ) -> AssignmentPolicy<'a> {
+        AssignmentPolicy {
+            flavours: &profile.flavours,
+            capacity_tiers: &self.capacity_tiers,
+            total_slots: self.total_slots,
+            carbon_cost_duration_scale: self.carbon_cost_duration_scale,
+            max_error_threshold: profile.max_error_threshold,
+            error_window_past: profile.error_window.past_slots,
+            error_window_future: profile.error_window.future_slots,
+            error_window_past_decay_slots: profile.error_window.past_decay_slots,
+            assignment_max_future_slots: self.assignment_max_future_slots,
+            global_error_constraint_enabled: profile.cumulative_error.enabled,
+            global_error_constraint_hard: profile.cumulative_error.hard,
+        }
+    }
+
     /// Creates a borrowed assignment-policy view without exposing unrelated
     /// simulation, logging, recovery, or online-strategy settings.
     pub fn assignment_policy(&self) -> AssignmentPolicy<'_> {
@@ -429,8 +474,14 @@ mod tests {
             duration: 137,
         }];
         cfg.capacity_tiers = vec![
-            CapacityTier { max_requests: Some(7), multiplier: 2.75 },
-            CapacityTier { max_requests: None, multiplier: 8.5 },
+            CapacityTier {
+                max_requests: Some(7),
+                multiplier: 2.75,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 8.5,
+            },
         ];
         cfg.total_slots = 73;
         cfg.carbon_cost_duration_scale = 0.125;

@@ -27,6 +27,7 @@ _counter = itertools.count(1)
 def fake_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
     return {
         "request_id": next(_counter),
+        "qos_profile_id": kwargs.get("qos_profile_id"),
         "status": "scheduled",
         "scheduled_slot": 3,
         "eta_seconds": 5.0,
@@ -61,15 +62,20 @@ def _clean_registry():
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    from app import main as client_main
+
+    monkeypatch.setattr(client_main, "register_configured_qos_profiles", lambda: [])
     with TestClient(app) as c:
         yield c
 
 
-def _register_plan(client, reference: datetime, offsets_minutes: list[float]) -> int:
+def _register_plan(client, reference: datetime, offsets_minutes: list[float],
+                   qos_profile_id: str | None = None) -> int:
     requests = [
         {
             "task": "text_generation",
+            **({"qos_profile_id": qos_profile_id} if qos_profile_id is not None else {}),
             "input": {"prompt": str(i)},
             "start_at": (reference + timedelta(minutes=off)).isoformat(),
             "deadline_at": (reference + timedelta(minutes=off + SLOT_MINUTES)).isoformat(),
@@ -110,6 +116,20 @@ def test_tick_submits_the_slots_requests(client):
     assert body["submitted"] == 3
     assert body["plan_index"] == [[plan_id, 0]]
     assert len(client.get("/requests").json()) == 3
+
+
+def test_tick_preserves_a_plan_request_qos_profile(client):
+    profile_id = "text-generation-calibrated-v1"
+    ref = _boundary(datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc))
+    plan_id = _register_plan(client, ref, [0], qos_profile_id=profile_id)
+    start = state.get_plan(plan_id)["plan_start_slot"]
+
+    response = _tick(client, start)
+
+    assert response.status_code == 200
+    tracked = client.get("/requests").json()[0]
+    assert tracked["task"] == "text_generation"
+    assert tracked["qos_profile_id"] == profile_id
 
 
 def test_tick_only_submits_the_slot_it_names(client):

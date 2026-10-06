@@ -2,18 +2,25 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::Deserialize;
 
-use crate::engine::types::{get_capacity_multiplier, Flavour, Request as EngineRequest};
-use crate::service::models::{
-    AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse, ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, RegisterTaskPayload, RequestStatus, RequestStatusResponse, SlotDetailResponse, SlotErrorItem, StatsResponse, SubmitRequestPayload, TaskConfigResponse,
+use crate::engine::qos::{
+    CumulativeErrorPolicy, ErrorWindowPolicy, QosProfile, QosProfileId, TaskKindId,
 };
-use crate::service::state::{AppState, TrackedRequest};
+use crate::engine::types::{Flavour, Request as EngineRequest, get_capacity_multiplier};
+use crate::service::models::{
+    AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse,
+    ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, RegisterQosProfilePayload,
+    RegisterTaskPayload, RequestStatus, RequestStatusResponse, SlotDetailResponse, SlotErrorItem,
+    StatsResponse, SubmitRequestPayload, TaskConfigResponse,
+};
+use crate::service::state::{AppState, ProfileRegistration, ProfileRegistryError, TrackedRequest};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
@@ -48,7 +55,6 @@ pub struct ObservedPoint {
     pub observed_at_slot: i64,
     pub actual: f64,
 }
-
 
 #[derive(Debug, Deserialize)]
 pub struct CarbonIntensityQuery {
@@ -96,11 +102,9 @@ fn validate_callback_url(raw: &str, allow_private: bool) -> Result<(), String> {
                 IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
             };
             if is_private {
-                return Err(
-                    "callback_url points to a loopback/private address; set \
+                return Err("callback_url points to a loopback/private address; set \
                      CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS=1 to allow this for local testing"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
     }
@@ -109,6 +113,58 @@ fn validate_callback_url(raw: &str, allow_private: bool) -> Result<(), String> {
 
 pub async fn health() -> &'static str {
     "ok"
+}
+
+/// Register a stable, reusable scheduling and error-budget profile.
+///
+/// Identical repeated registrations are safe; changing an existing profile
+/// requires a new ID so already-created requests are never reinterpreted.
+pub async fn register_qos_profile(
+    State(state): State<AppState>,
+    Json(body): Json<RegisterQosProfilePayload>,
+) -> Result<StatusCode, ApiError> {
+    let profile_id = QosProfileId::parse(body.profile_id)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let task_kind = TaskKindId::parse(body.task_kind)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let profile = QosProfile {
+        profile_id,
+        task_kind,
+        flavours: body.flavours,
+        error_semantics: body.error_semantics,
+        max_error_threshold: body.max_error_threshold,
+        error_window: body.error_window,
+        cumulative_error: body.cumulative_error,
+    };
+
+    match state.qos_profiles.register(profile) {
+        Ok(ProfileRegistration::Created | ProfileRegistration::AlreadyRegistered) => {
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(ProfileRegistryError::Invalid(error)) => Err(api_error(StatusCode::BAD_REQUEST, error)),
+        Err(ProfileRegistryError::Conflict(profile_id)) => Err(api_error(
+            StatusCode::CONFLICT,
+            format!("profile_id {profile_id} is already registered with different settings"),
+        )),
+    }
+}
+
+/// List the active QoS profiles, including Carbonshift's deterministic defaults.
+pub async fn list_qos_profiles(State(state): State<AppState>) -> Json<Vec<QosProfile>> {
+    Json(state.qos_profiles.list())
+}
+
+/// Retrieve one active profile by its stable, reusable identifier.
+pub async fn get_qos_profile(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> Result<Json<QosProfile>, ApiError> {
+    let profile = state
+        .qos_profiles
+        .get_by_str(&profile_id)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))?;
+    Ok(Json(profile))
 }
 
 /// What `arrival_slot` would have cost under the "no carbonshift" baseline:
@@ -121,14 +177,19 @@ pub async fn health() -> &'static str {
 /// `flavours` is the request's own resolved flavour set (its task's, or the
 /// default task's) — the same set the DP solver chooses among for it, so
 /// the baseline and the real assignment are always comparable apples-to-apples.
-fn compute_baseline_carbon_cost(state: &AppState, arrival_slot: i32, flavours: &[Flavour]) -> (f64, i32) {
+fn compute_baseline_carbon_cost(
+    state: &AppState,
+    arrival_slot: i32,
+    flavours: &[Flavour],
+) -> (f64, i32) {
     let position = {
         let mut counts = state.baseline_slot_counts.lock().unwrap();
         let c = counts.entry(arrival_slot).or_insert(0);
         *c += 1;
         *c
     };
-    let carbon = state.carbon_forecast
+    let carbon = state
+        .carbon_forecast
         .read()
         .unwrap()
         .get(arrival_slot as usize)
@@ -139,38 +200,230 @@ fn compute_baseline_carbon_cost(state: &AppState, arrival_slot: i32, flavours: &
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("task must have at least one flavour");
-    let cost = carbon * mult * accurate.duration as f64 * state.scheduler.carbon_cost_duration_scale;
+    let cost =
+        carbon * mult * accurate.duration as f64 * state.scheduler.carbon_cost_duration_scale;
     (cost, accurate.duration)
 }
 
-/// `POST /v1/tasks` — announce (or update) a task's available flavours.
-/// Clients call this once per task, before submitting requests that
-/// reference it via `SubmitRequestPayload::task_id`. Overwrites any
-/// previous registration for the same `task_id`; the built-in `"default"`
-/// task (seeded from `Config::flavours`) can be overwritten too.
+fn resolve_request_profile(
+    state: &AppState,
+    body: &SubmitRequestPayload,
+) -> Result<Arc<QosProfile>, ApiError> {
+    let explicit_profile_id = body
+        .qos_profile_id
+        .as_deref()
+        .map(QosProfileId::parse)
+        .transpose()
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let legacy_profile_id = body
+        .task_id
+        .as_deref()
+        .filter(|task_id| *task_id != "default")
+        .and_then(|task_id| state.profile_id_for_task(task_id));
+
+    if let (Some(explicit), Some(legacy)) = (&explicit_profile_id, &legacy_profile_id) {
+        if explicit != legacy {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "qos_profile_id conflicts with the registered legacy task_id profile",
+            ));
+        }
+    }
+
+    let selected_profile_id = explicit_profile_id.or(legacy_profile_id);
+    let selected_profile = selected_profile_id
+        .as_ref()
+        .map(|profile_id| {
+            state
+                .qos_profiles
+                .get(profile_id)
+                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))
+        })
+        .transpose()?;
+
+    let payload_task_kind = body
+        .payload
+        .get("task")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "payload.task must be a string task kind",
+                )
+            })
+        })
+        .transpose()?;
+    if let (Some(explicit), Some(payload)) = (body.task_kind.as_deref(), payload_task_kind) {
+        if explicit != payload {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "task_kind conflicts with payload.task",
+            ));
+        }
+    }
+    let requested_task_kind = body
+        .task_kind
+        .as_deref()
+        .or(payload_task_kind)
+        .map(TaskKindId::parse)
+        .transpose()
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let task_kind = if let Some(task_kind) = requested_task_kind {
+        task_kind
+    } else if let Some(profile) = &selected_profile {
+        profile.task_kind.clone()
+    } else if let Some(task_id) = body.task_id.as_deref() {
+        let candidate = TaskKindId::parse(task_id.to_string()).ok();
+        candidate
+            .filter(|kind| state.qos_profiles.default_for_task_kind(kind).is_some())
+            .unwrap_or_else(|| TaskKindId::parse("text_generation").unwrap())
+    } else {
+        TaskKindId::parse("text_generation").unwrap()
+    };
+
+    let profile = match selected_profile {
+        Some(profile) => profile,
+        None => state
+            .qos_profiles
+            .default_for_task_kind(&task_kind)
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "task kind {task_kind} has no default profile; register and select a QoS profile"
+                    ),
+                )
+            })?,
+    };
+    if profile.task_kind != task_kind {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "QoS profile {} is for task kind {}, not {}",
+                profile.profile_id, profile.task_kind, task_kind
+            ),
+        ));
+    }
+    Ok(Arc::new(profile))
+}
+
+fn resolve_profile_query(
+    state: &AppState,
+    query: &AssignmentsQuery,
+) -> Result<Option<QosProfile>, ApiError> {
+    if query.task_id.is_some() {
+        state.legacy_task_id_usage.record_monitoring_query();
+    }
+    let requested = query
+        .qos_profile_id
+        .as_deref()
+        .map(QosProfileId::parse)
+        .transpose()
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let legacy = query
+        .task_id
+        .as_deref()
+        .and_then(|task_id| state.profile_id_for_task(task_id));
+    if let (Some(requested), Some(legacy)) = (&requested, &legacy) {
+        if requested != legacy {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "qos_profile_id conflicts with the legacy task_id profile",
+            ));
+        }
+    }
+    let Some(profile_id) = requested.or(legacy) else {
+        return Ok(None);
+    };
+    state
+        .qos_profiles
+        .get(&profile_id)
+        .map(Some)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))
+}
+
+/// Legacy adapter that registers task flavours as a stable QoS profile.
+///
+/// New clients should use `POST /v1/profiles`; task_id remains supported as a
+/// profile alias during migration.
 pub async fn register_task(
     State(state): State<AppState>,
     Json(body): Json<RegisterTaskPayload>,
 ) -> Result<StatusCode, ApiError> {
-    if body.flavours.is_empty() {
-        return Err(api_error(StatusCode::BAD_REQUEST, "flavours must not be empty"));
+    state.legacy_task_id_usage.record_task_api_call();
+    if body.task_id == "default" {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "the default QoS profile is task-kind-specific and immutable; register a named /v1/profiles entry instead",
+        ));
     }
-    
+    if body.flavours.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "flavours must not be empty",
+        ));
+    }
+
     let RegisterTaskPayload {
         task_id,
         flavours,
+        task_kind,
+        error_semantics,
         max_error_threshold,
         capacity_tiers,
     } = body;
-    println!("Registered max_error_threshold: {:?}", Some(max_error_threshold));
-    println!("Registered capacity_tiers: {:?}", capacity_tiers);
-    
+    if capacity_tiers.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "capacity tiers are global and cannot be registered per task/profile",
+        ));
+    }
+    let profile_id = QosProfileId::parse(task_id.clone())
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let task_kind = TaskKindId::parse(task_kind.unwrap_or_else(|| task_id.clone()))
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let error_semantics = error_semantics.unwrap_or_else(|| {
+        task_kind
+            .default_error_semantics()
+            .unwrap_or("legacy-unspecified-v1")
+            .to_string()
+    });
+    let profile = QosProfile {
+        profile_id: profile_id.clone(),
+        task_kind,
+        flavours: flavours.clone(),
+        error_semantics,
+        max_error_threshold: max_error_threshold.unwrap_or(state.scheduler.max_error_threshold),
+        error_window: ErrorWindowPolicy {
+            past_slots: state.scheduler.error_window_past,
+            future_slots: state.scheduler.error_window_future,
+            past_decay_slots: state.scheduler.error_window_past_decay_slots,
+        },
+        cumulative_error: CumulativeErrorPolicy {
+            enabled: state.scheduler.cumulative_error_enabled,
+            hard: state.scheduler.cumulative_error_hard,
+        },
+    };
+    match state.qos_profiles.register(profile) {
+        Ok(ProfileRegistration::Created | ProfileRegistration::AlreadyRegistered) => {}
+        Err(ProfileRegistryError::Invalid(error)) => {
+            return Err(api_error(StatusCode::BAD_REQUEST, error));
+        }
+        Err(ProfileRegistryError::Conflict(profile_id)) => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!("task_id {profile_id} is already registered with different settings"),
+            ));
+        }
+    }
+
     state.task_flavours.lock().unwrap().insert(
         task_id,
         crate::service::state::TaskConfig {
+            profile_id,
             flavours,
             max_error_threshold,
-            capacity_tiers,
+            capacity_tiers: None,
         },
     );
     Ok(StatusCode::NO_CONTENT)
@@ -198,7 +451,11 @@ pub async fn horizon(State(state): State<AppState>) -> Json<HorizonResponse> {
 /// roll a replacement instance (see PLAN_SERVICE.md Fase 6).
 pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HorizonResponse>) {
     let h = compute_horizon(&state);
-    let status = if h.near_exhaustion { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
+    let status = if h.near_exhaustion {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
     (status, Json(h))
 }
 
@@ -218,24 +475,29 @@ pub async fn advance_slot(
     Json(body): Json<AdvanceSlotBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !state.scheduler.manual_clock {
-        return Err(api_error(StatusCode::CONFLICT, "MANUAL_CLOCK is not enabled on this instance"));
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "MANUAL_CLOCK is not enabled on this instance",
+        ));
     }
     // TODO: too much slot naming here... evaluate if it's possible to simplify.
-
 
     // Fail loudly if there we cannot set offset
     if body.current_slot.is_none() {
         tracing::error!("Current slot is not provided in the request body");
-        return Err(api_error(StatusCode::CONFLICT, "Current slot is not provided in the request body"));
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "Current slot is not provided in the request body",
+        ));
     }
 
     let body_current_slot = body.current_slot.unwrap();
-    
+
     // Update the slot epoch offset upon the first slot advancement.
     let slot_epoch_offset = update_slot_epoch_offset(&state, body_current_slot).unwrap_or(0);
-    
+
     // let Some(offset) = slot_epoch_offset else { /* 409 */ };
-    let target_engine_slot = (body_current_slot - slot_epoch_offset as i64) as i32;   // i64
+    let target_engine_slot = (body_current_slot - slot_epoch_offset as i64) as i32; // i64
 
     // init here
 
@@ -244,57 +506,81 @@ pub async fn advance_slot(
         // Sync: the engine is already at the target (0). Do NOT advance. We only update the forecast
         // debug_assert_eq!(state.shared_state.get_current_slot() as i64, target_engine_slot);
         if state.shared_state.get_current_slot() != target_engine_slot {
-            tracing::warn!(current_slot = state.shared_state.get_current_slot(), target_engine_slot, "engine slot does not match the target slot on announce");
+            tracing::warn!(
+                current_slot = state.shared_state.get_current_slot(),
+                target_engine_slot,
+                "engine slot does not match the target slot on announce"
+            );
             // fail loudly
-            return Err(api_error(StatusCode::CONFLICT, "engine slot does not match the target slot on announce"));
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "engine slot does not match the target slot on announce",
+            ));
         }
     } else {
-        println!("[Service] Advancing to new slot: {current_slot} -> {target_engine_slot} (global: {body_current_slot})", current_slot = state.shared_state.get_current_slot(), target_engine_slot = target_engine_slot, body_current_slot = body_current_slot);
+        println!(
+            "[Service] Advancing to new slot: {current_slot} -> {target_engine_slot} (global: {body_current_slot})",
+            current_slot = state.shared_state.get_current_slot(),
+            target_engine_slot = target_engine_slot,
+            body_current_slot = body_current_slot
+        );
         let new_slot = crate::engine::scheduler::advance_to_next_slot(
             &state.shared_state,
             state.scheduler.total_slots,
             state.scheduler.effective_slot_duration_secs,
         );
         if new_slot != target_engine_slot {
-            tracing::warn!(new_slot, target_engine_slot, "engine slot disagrees with the announced slot");
+            tracing::warn!(
+                new_slot,
+                target_engine_slot,
+                "engine slot disagrees with the announced slot"
+            );
         }
     }
 
     let curr_slot = state.shared_state.get_current_slot();
-        
+
     if let Some(observed) = &body.observed {
         // Set actual carbon intensity for the current slot, so that we can adjust
         // in executor callbacks the carbon intensity and the carbon cost.
-        
+
         // assert, just for safety that observed.slot is the current slot
         if target_engine_slot != observed.slot as i32 {
             tracing::warn!("Observed slot does not match the current slot");
         }
-        state.actual_carbon_intensity.lock().unwrap().insert(target_engine_slot, observed.actual);
+        state
+            .actual_carbon_intensity
+            .lock()
+            .unwrap()
+            .insert(target_engine_slot, observed.actual);
         // Since we already know the actual carbon intensity for the current slot
         // we use the actual value for such slot for the scheduler to decide
         // However we cannot overwrite here the forecast for the current slot,
         // since it would silently drop the correction we do later on between forecast/actual values,
         // TODO: allow the scheduler to have access to the real value ONLY for the current slot.
     }
-    
+
     if let Some(forecast) = &body.forecast {
         // Update the forecast for the next K(=24) slots in the state.carbon_forecast hashmap.
         let mut carbon_forecast = state.carbon_forecast.write().unwrap();
         for point in forecast {
-            let idx  = point.slot - slot_epoch_offset as i64;
+            let idx = point.slot - slot_epoch_offset as i64;
             // range check for subtraction
-            if idx < 0 { 
-                tracing::warn!(slot = point.slot, offset = slot_epoch_offset, "forecast point precedes the engine horizon; skipping");
-                continue; } // before our horizon
-                let idx = idx as usize;
-                if idx < carbon_forecast.len() {
+            if idx < 0 {
+                tracing::warn!(
+                    slot = point.slot,
+                    offset = slot_epoch_offset,
+                    "forecast point precedes the engine horizon; skipping"
+                );
+                continue;
+            } // before our horizon
+            let idx = idx as usize;
+            if idx < carbon_forecast.len() {
                 carbon_forecast[idx] = point.forecast;
             }
-            
         }
     }
-        
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     // Wait until all pending requests are solved and any request due at or before curr_slot
     // has been dispatched to the executor.
@@ -319,7 +605,6 @@ pub async fn advance_slot(
     Ok(Json(serde_json::json!({ "current_slot": curr_slot })))
 }
 
-
 /// Function invoked upon the first slot advancement to set the slot epoch offset.
 /// Recall that the slot epoch offset is the difference between the provider's global slot numbering and carbonshift's local slot numbering.
 fn update_slot_epoch_offset(state: &AppState, slot_0: i64) -> Option<i32> {
@@ -332,7 +617,6 @@ fn update_slot_epoch_offset(state: &AppState, slot_0: i64) -> Option<i32> {
     return offset.clone();
 }
 
-
 /// `GET /v1/carbon-forecast` — the shared forecast indexed by engine slot.
 /// The provider updates it through the advance-slot request's `forecast` field;
 /// measured values are stored separately through its `observed` field.
@@ -343,7 +627,10 @@ pub async fn carbon_forecast(State(state): State<AppState>) -> Json<serde_json::
 /// `GET /v1/stats` — counts of tracked requests by lifecycle status.
 pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let guard = state.tracked.lock().unwrap();
-    let mut s = StatsResponse { total: guard.len(), ..Default::default() };
+    let mut s = StatsResponse {
+        total: guard.len(),
+        ..Default::default()
+    };
     for t in guard.values() {
         match t.status {
             RequestStatus::Pending => s.pending += 1,
@@ -354,10 +641,11 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         }
     }
     drop(guard);
-    // TODO: Get error stats from state.rs, where there is TaskConfig with the proper error threhshold set 
+    // TODO: Get error stats from state.rs, where there is TaskConfig with the proper error threhshold set
     let g = state.shared_state.get_global_error_stats();
     s.global_error_count = g.count;
     s.global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
+    s.legacy_task_id_usage = state.legacy_task_id_usage.snapshot();
     Json(s)
 }
 
@@ -368,10 +656,19 @@ pub async fn get_task_config(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
 ) -> Json<TaskConfigResponse> {
+    state.legacy_task_id_usage.record_task_api_call();
     Json(TaskConfigResponse {
+        qos_profile_id: state
+            .profile_id_for_task(&task_id)
+            .unwrap_or_else(QosProfileId::default_profile)
+            .to_string(),
         flavours: state.flavours_for_task(&task_id),
-        max_error_threshold: state.threshold_for_task(&task_id).unwrap_or(state.scheduler.max_error_threshold),
-        capacity_tiers: state.capacity_tiers_for_task(&task_id).unwrap_or_else(|| state.scheduler.capacity_tiers.clone()),
+        max_error_threshold: state
+            .threshold_for_task(&task_id)
+            .unwrap_or(state.scheduler.max_error_threshold),
+        capacity_tiers: state
+            .capacity_tiers_for_task(&task_id)
+            .unwrap_or_else(|| state.scheduler.capacity_tiers.clone()),
         task_id,
     })
 }
@@ -393,7 +690,10 @@ pub async fn carbon_intensity(
     State(state): State<AppState>,
     Query(query): Query<CarbonIntensityQuery>,
 ) -> Json<Vec<serde_json::Value>> {
-    let upper = query.slot.or(query.until_slot).unwrap_or_else(|| state.shared_state.get_current_slot());
+    let upper = query
+        .slot
+        .or(query.until_slot)
+        .unwrap_or_else(|| state.shared_state.get_current_slot());
     let upper = upper.max(0);
     let forecast = state.carbon_forecast.as_ref();
     let actual = state.actual_carbon_intensity.lock().unwrap();
@@ -420,34 +720,46 @@ pub async fn carbon_intensity(
 
 // ─── Fine-grained monitoring endpoints ─────────────────────
 
-/// `GET /v1/assignments` — list currently committed assignments across the engine.
+/// `GET /v1/assignments` — list assignments globally or for one QoS profile.
 ///
 /// Supports query filters:
 /// - `from_slot`: minimum scheduled slot (inclusive)
 /// - `to_slot`: maximum scheduled slot (inclusive)
 /// - `flavour`: filter by flavour name (e.g. "Fast", "Balanced", "Accurate")
+/// - `qos_profile_id`: stable profile ID (`task_id` is a migration alias)
 ///
 /// Returns a list of `AssignmentItem` records snapshot from `state.shared_state.get_current_assignments()`.
 pub async fn get_assignments(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<Vec<AssignmentItem>>, ApiError> {
-    
+    let profile = resolve_profile_query(&_state, &_query)?;
     let curr_assignments = _state.shared_state.get_current_assignments();
     let filtered_assignments: Vec<_> = curr_assignments
-    .into_iter()
-    .filter(|(_, assignment)| {
-        (_query.from_slot.map_or(true, |from| assignment.scheduled_slot >= from))
-        && (_query.to_slot.map_or(true, |to| assignment.scheduled_slot <= to))
-        && (_query.flavour.as_ref().map_or(true, |flavour| &assignment.flavour_name == flavour))
-    })
-    .collect();
-    
+        .into_iter()
+        .filter(|(_, assignment)| {
+            (_query
+                .from_slot
+                .map_or(true, |from| assignment.scheduled_slot >= from))
+                && (_query
+                    .to_slot
+                    .map_or(true, |to| assignment.scheduled_slot <= to))
+                && (_query
+                    .flavour
+                    .as_ref()
+                    .map_or(true, |flavour| &assignment.flavour_name == flavour))
+                && profile.as_ref().map_or(true, |profile| {
+                    assignment.qos_profile_id == profile.profile_id
+                })
+        })
+        .collect();
+
     let items = {
         let mut items: Vec<AssignmentItem> = filtered_assignments
             .into_iter()
             .map(|(_req_id, assignment)| AssignmentItem {
                 request_id: assignment.request_id,
+                qos_profile_id: assignment.qos_profile_id.to_string(),
                 scheduled_slot: assignment.scheduled_slot,
                 flavour_name: assignment.flavour_name,
                 carbon_cost: assignment.carbon_cost,
@@ -459,7 +771,7 @@ pub async fn get_assignments(
             })
             // .sort_by_key(|item| (item.scheduled_slot, item.request_id))
             .collect::<Vec<_>>();
-        
+
         items.sort_by_key(|item| (item.scheduled_slot, item.request_id));
         items
     };
@@ -480,7 +792,7 @@ pub async fn get_slot_detail(
     Path(_slot): Path<i32>,
 ) -> Result<Json<SlotDetailResponse>, ApiError> {
     let carbon_forecast = _state.carbon_forecast.read().unwrap().clone();
-    
+
     // horizon is yielded by max(current_slot + assignment_max_future_slots, carbon_forecast length)
     let horizon = std::cmp::max(
         _state.shared_state.get_current_slot() + _state.scheduler.assignment_max_future_slots,
@@ -489,7 +801,10 @@ pub async fn get_slot_detail(
 
     // Status code 400 Bad Request for invalid slot
     if _slot < 0 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Slot cannot be negative"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Slot cannot be negative",
+        ));
     }
     if _slot >= horizon {
         return Err(api_error(StatusCode::BAD_REQUEST, "Slot exceeds horizon"));
@@ -497,20 +812,23 @@ pub async fn get_slot_detail(
 
     let assignments = _state.shared_state.get_requests_in_slot(_slot);
     // compute flavour counts
-    let flavour_counts: HashMap<String, usize> = assignments
-        .iter()
-        .fold(HashMap::new(), |mut acc, assignment| {
-            let flavour = assignment.flavour_name.clone();
-            *acc.entry(flavour).or_insert(0) += 1;
-            acc
-        });
-    
+    let flavour_counts: HashMap<String, usize> =
+        assignments
+            .iter()
+            .fold(HashMap::new(), |mut acc, assignment| {
+                let flavour = assignment.flavour_name.clone();
+                *acc.entry(flavour).or_insert(0) += 1;
+                acc
+            });
+
     let total_carbon_cost: f64 = assignments
         .iter()
         .map(|assignment| assignment.carbon_cost)
         .sum();
 
-    let capacity_multiplier: f64 = _state.scheduler.capacity_tiers
+    let capacity_multiplier: f64 = _state
+        .scheduler
+        .capacity_tiers
         .iter()
         // find highest tier where assignments.len() <= tier.max_requests
         // max_requests being None means infinite
@@ -546,9 +864,14 @@ pub async fn get_slot_detail(
 /// - `forecasted_pending_carbon_cost`: predicted carbon cost of requests still pending or scheduled for future slots
 /// - `total_forecasted_carbon_cost`: total predicted cost of all scheduled requests
 /// - `total_baseline_carbon_cost`: total baseline cost of all requests
+///
+/// An optional `qos_profile_id` restricts request totals to one profile. The
+/// returned `capacity_tiers` are always global because slot occupancy is shared.
 pub async fn get_cost_metrics(
     State(_state): State<AppState>,
+    Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<CostMetricsResponse>, ApiError> {
+    let selected_profile = resolve_profile_query(&_state, &_query)?;
     let assignments = _state.shared_state.get_current_assignments();
     let tracked = _state.tracked.lock().unwrap();
 
@@ -558,6 +881,13 @@ pub async fn get_cost_metrics(
     let mut total_baseline_carbon_cost = 0.0;
 
     for (req_id, t) in tracked.iter() {
+        if selected_profile
+            .as_ref()
+            .is_some_and(|profile| t.qos_profile_id != profile.profile_id)
+        {
+            continue;
+        }
+
         total_baseline_carbon_cost += t.baseline_carbon_cost;
 
         if t.status == RequestStatus::Completed {
@@ -573,27 +903,41 @@ pub async fn get_cost_metrics(
     }
 
     let actual_carbon_saving_pct = if current_actual_baseline_carbon_cost > 0.0 {
-        Some(((current_actual_baseline_carbon_cost - current_actual_carbon_cost) / current_actual_baseline_carbon_cost) * 100.0)
+        Some(
+            ((current_actual_baseline_carbon_cost - current_actual_carbon_cost)
+                / current_actual_baseline_carbon_cost)
+                * 100.0,
+        )
     } else {
         None
     };
 
-    let total_forecasted_carbon_cost: f64 = assignments.values().map(|a| a.carbon_cost).sum();
+    let total_forecasted_carbon_cost: f64 = assignments
+        .values()
+        .filter(|assignment| {
+            selected_profile.as_ref().map_or(true, |profile| {
+                assignment.qos_profile_id == profile.profile_id
+            })
+        })
+        .map(|assignment| assignment.carbon_cost)
+        .sum();
 
     Ok(Json(CostMetricsResponse {
+        qos_profile_id: selected_profile.map(|profile| profile.profile_id.to_string()),
         current_actual_carbon_cost,
         current_actual_baseline_carbon_cost,
         actual_carbon_saving_pct,
         forecasted_pending_carbon_cost,
         total_forecasted_carbon_cost,
         total_baseline_carbon_cost,
+        capacity_tiers: _state.scheduler.capacity_tiers.clone(),
     }))
 }
 
-/// `GET /v1/metrics/error-history` — slot-by-slot average error over time.
-///
-/// Allows external visualizers to plot error trends across time slots against
-/// the configured error threshold.
+/// `GET /v1/metrics/error-history` — fleet telemetry or one profile's error
+/// history, selected using `qos_profile_id` (`task_id` remains a migration
+/// alias). The fleet-wide average is descriptive only, not a cross-profile QoS
+/// measure.
 pub async fn get_error_history(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
@@ -605,54 +949,80 @@ pub async fn get_error_history(
     let to = _query.to_slot.unwrap_or(current_slot);
 
     if from > to {
-        return Err(api_error(StatusCode::BAD_REQUEST, "`from_slot` cannot be greater than `to_slot`"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "`from_slot` cannot be greater than `to_slot`",
+        ));
     }
     if to < 0 || from < 0 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "`from_slot` and `to_slot` must be >= 0"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "`from_slot` and `to_slot` must be >= 0",
+        ));
     }
     if to >= horizon {
-        return Err(api_error(StatusCode::BAD_REQUEST, "`to_slot` exceeds the horizon"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "`to_slot` exceeds the horizon",
+        ));
     }
 
+    let selected_profile = resolve_profile_query(&_state, &_query)?;
+    let selected_profile_id = selected_profile.as_ref().map(|profile| &profile.profile_id);
     let g = _state.shared_state.get_global_error_stats();
     let global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
+    let profile_error_stats = selected_profile_id
+        .map(|profile_id| _state.shared_state.get_profile_error_stats(profile_id));
+    let profile_error_avg = profile_error_stats
+        .as_ref()
+        .and_then(|stats| (stats.count > 0).then_some(stats.avg));
 
     let task_thresholds: HashMap<String, f64> = _state
-        .task_flavours
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|(id, t)| t.max_error_threshold.map(|th| (id.clone(), th)))
+        .qos_profiles
+        .list()
+        .into_iter()
+        .map(|profile| (profile.profile_id.to_string(), profile.max_error_threshold))
         .collect();
-
-    let max_error_threshold = if let Some(target_task) = &_query.task_id {
-        task_thresholds
-            .get(target_task)
-            .copied()
-            .unwrap_or(_state.scheduler.max_error_threshold)
-    } else {
-        task_thresholds
-            .values()
-            .copied()
-            .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a| a.min(t))))
-            .unwrap_or(_state.scheduler.max_error_threshold)
-    };
-
-    let window_past = _state.scheduler.error_window_past;
-    let window_future = _state.scheduler.error_window_future;
+    let max_error_threshold = selected_profile
+        .as_ref()
+        .map(|profile| profile.max_error_threshold)
+        .unwrap_or(_state.scheduler.max_error_threshold);
+    let error_semantics = selected_profile
+        .as_ref()
+        .map(|profile| profile.error_semantics.clone());
+    let window_past = selected_profile
+        .as_ref()
+        .map(|profile| profile.error_window.past_slots)
+        .unwrap_or(_state.scheduler.error_window_past);
+    let window_future = selected_profile
+        .as_ref()
+        .map(|profile| profile.error_window.future_slots)
+        .unwrap_or(_state.scheduler.error_window_future);
 
     let mut slots = Vec::with_capacity((to - from + 1) as usize);
     let mut running_error_sum = 0.0;
     let mut running_count = 0u64;
 
     for s in 0..from {
-        let stats = _state.shared_state.get_slot_error_stats(s);
+        let stats = if let Some(profile_id) = selected_profile_id {
+            _state
+                .shared_state
+                .get_profile_slot_error_stats(profile_id, s)
+        } else {
+            _state.shared_state.get_slot_error_stats(s)
+        };
         running_error_sum += stats.average * (stats.count as f64);
         running_count += stats.count;
     }
 
     for slot in from..=to {
-        let stats = _state.shared_state.get_slot_error_stats(slot);
+        let stats = if let Some(profile_id) = selected_profile_id {
+            _state
+                .shared_state
+                .get_profile_slot_error_stats(profile_id, slot)
+        } else {
+            _state.shared_state.get_slot_error_stats(slot)
+        };
         running_error_sum += stats.average * (stats.count as f64);
         running_count += stats.count;
 
@@ -662,12 +1032,23 @@ pub async fn get_error_history(
             None
         };
 
-        let win_stats = _state.shared_state.get_window_error_stats(
-            slot,
-            window_past,
-            window_future,
-            &std::collections::HashSet::new(),
-        );
+        let empty_exclusion = std::collections::HashSet::new();
+        let win_stats = if let Some(profile_id) = selected_profile_id {
+            _state.shared_state.get_profile_window_error_stats(
+                profile_id,
+                slot,
+                window_past,
+                window_future,
+                &empty_exclusion,
+            )
+        } else {
+            _state.shared_state.get_window_error_stats(
+                slot,
+                window_past,
+                window_future,
+                &empty_exclusion,
+            )
+        };
         let window_error = if win_stats.count > 0 {
             Some(win_stats.average)
         } else {
@@ -685,6 +1066,9 @@ pub async fn get_error_history(
 
     Ok(Json(ErrorHistoryResponse {
         current_slot,
+        qos_profile_id: selected_profile.map(|profile| profile.profile_id.to_string()),
+        profile_error_avg,
+        error_semantics,
         global_error_avg,
         max_error_threshold,
         task_thresholds,
@@ -707,58 +1091,78 @@ pub async fn submit_request(
     Json(body): Json<SubmitRequestPayload>,
 ) -> Result<(StatusCode, Json<RequestStatusResponse>), ApiError> {
     if body.deadline_seconds < 0.0 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "deadline_seconds must be >= 0"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "deadline_seconds must be >= 0",
+        ));
     }
     if let Some(cb) = &body.callback_url {
         validate_callback_url(cb, state.service_cfg.allow_private_callbacks)
             .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     }
+    let profile = resolve_request_profile(&state, &body)?;
+    let profile_id = profile.profile_id.clone();
 
     let request_id = state.next_request_id();
     let current_slot = state.shared_state.get_current_slot();
-    let arrival_slot = match (body.arrival_slot_global, *state.slot_epoch_offset.lock().unwrap()) {
+    let arrival_slot = match (
+        body.arrival_slot_global,
+        *state.slot_epoch_offset.lock().unwrap(),
+    ) {
         (Some(global), Some(offset)) => {
             let engine = global - offset;
             if engine < 0 || engine >= state.scheduler.total_slots {
-                tracing::warn!(global, offset, engine, "arrival_slot_global out of range; falling back to current_slot");
+                tracing::warn!(
+                    global,
+                    offset,
+                    engine,
+                    "arrival_slot_global out of range; falling back to current_slot"
+                );
                 current_slot
             } else {
                 engine as i32
             }
         }
-        _ => current_slot,   // offset not yet known, or client didn't send it
+        _ => current_slot, // offset not yet known, or client didn't send it
     };
 
     let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
     let slots_ahead = ((body.deadline_seconds / eff_slot_dur).ceil() as i32).max(1);
     let deadline_slot = (current_slot + slots_ahead).min(state.scheduler.total_slots - 1);
-    let task_id = body.task_id.clone().unwrap_or_else(|| "default".to_string());
-    let task_flavours = state.flavours_for_task(&task_id);
-    let task_threshold = state.threshold_for_task(&task_id);
-    let task_capacity_tiers = state.capacity_tiers_for_task(&task_id);
-    let (baseline_carbon_cost, baseline_duration) = compute_baseline_carbon_cost(&state, arrival_slot, &task_flavours);
-
+    let task_flavours = profile.flavours.clone();
+    let (baseline_carbon_cost, baseline_duration) =
+        compute_baseline_carbon_cost(&state, arrival_slot, &task_flavours);
+    let mut executor_payload = body.payload.clone();
+    if !executor_payload
+        .as_object()
+        .is_some_and(|payload| payload.contains_key("task"))
+    {
+        executor_payload["task"] = serde_json::Value::String(profile.task_kind.to_string());
+    }
 
     state.tracked.lock().unwrap().insert(
         request_id,
         TrackedRequest::new(
             body.callback_url.clone(),
-            body.payload.clone(),
+            executor_payload,
             baseline_carbon_cost,
             baseline_duration,
             arrival_slot,
+            profile_id.clone(),
         ),
     );
+    if body.task_id.is_some() {
+        state.legacy_task_id_usage.record_request_submission();
+    }
 
-    state.shared_state.add_request(EngineRequest::new_for_task(
-        request_id,
-        arrival_slot,
-        deadline_slot,
-        task_id,
-        task_flavours,
-        task_threshold,
-        task_capacity_tiers,
-    ));
+    state
+        .shared_state
+        .add_request(EngineRequest::new_for_qos_profile(
+            request_id,
+            arrival_slot,
+            deadline_slot,
+            profile,
+        ));
 
     // TODO: remove this debug print
     println!("[Service] Submitted request ID: {}", request_id);
@@ -768,18 +1172,29 @@ pub async fn submit_request(
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs_f64(state.service_cfg.submit_wait_timeout_secs);
     loop {
-        if let Some(assignment) = state.shared_state.get_current_assignments().get(&request_id) {
-            let eta = ((assignment.scheduled_slot - state.shared_state.get_current_slot()).max(0)) as f64
+        if let Some(assignment) = state
+            .shared_state
+            .get_current_assignments()
+            .get(&request_id)
+        {
+            let eta = ((assignment.scheduled_slot - state.shared_state.get_current_slot()).max(0))
+                as f64
                 * eff_slot_dur;
             if let Some(t) = state.tracked.lock().unwrap().get_mut(&request_id) {
                 t.status = RequestStatus::Scheduled;
             }
             // TODO: remove this debug print
-            println!("[Service] Request ID {} scheduled at slot {} / {current_slot}", request_id, assignment.scheduled_slot, current_slot = state.shared_state.get_current_slot());
+            println!(
+                "[Service] Request ID {} scheduled at slot {} / {current_slot}",
+                request_id,
+                assignment.scheduled_slot,
+                current_slot = state.shared_state.get_current_slot()
+            );
             return Ok((
                 StatusCode::OK,
                 Json(RequestStatusResponse {
                     request_id,
+                    qos_profile_id: profile_id.to_string(),
                     status: RequestStatus::Scheduled,
                     scheduled_slot: Some(assignment.scheduled_slot),
                     eta_seconds: Some(eta),
@@ -796,6 +1211,7 @@ pub async fn submit_request(
                 StatusCode::ACCEPTED,
                 Json(RequestStatusResponse {
                     request_id,
+                    qos_profile_id: profile_id.to_string(),
                     status: RequestStatus::Pending,
                     scheduled_slot: None,
                     eta_seconds: None,
@@ -821,9 +1237,14 @@ pub async fn get_request_status(
         let t = guard
             .get(&request_id)
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
-        (t.status, t.error.clone(), t.baseline_carbon_cost)
+        (
+            t.status,
+            t.error.clone(),
+            t.baseline_carbon_cost,
+            t.qos_profile_id.clone(),
+        )
     };
-    let (status, error, baseline_carbon_cost) = tracked_status;
+    let (status, error, baseline_carbon_cost, qos_profile_id) = tracked_status;
 
     let assignments = state.shared_state.get_current_assignments();
     let assignment = assignments.get(&request_id);
@@ -834,6 +1255,7 @@ pub async fn get_request_status(
 
     Ok(Json(RequestStatusResponse {
         request_id,
+        qos_profile_id: qos_profile_id.to_string(),
         status,
         scheduled_slot: assignment.map(|a| a.scheduled_slot),
         eta_seconds: eta,
@@ -888,10 +1310,15 @@ pub async fn executor_callback(
         );
 
         // Correct the assignment error with the actual error reported by the executor.
-        state.shared_state.correct_assignment_error(request_id, actual_error);
+        state
+            .shared_state
+            .correct_assignment_error(request_id, actual_error);
     }
 
-    let actual_execution_time = body.result.get("execution_time_seconds").and_then(|v| v.as_f64());
+    let actual_execution_time = body
+        .result
+        .get("execution_time_seconds")
+        .and_then(|v| v.as_f64());
     let baseline_execution_time = body
         .result
         .get("baseline_execution_time_seconds")
@@ -909,17 +1336,20 @@ pub async fn executor_callback(
                 })
         });
 
-    
     // The logic behind the formula of actual carbon cost is as follows:
     // actual_carbon_cost = forecast_carbon_cost * (actual_ci / forecast_ci) * (actual_exec_time / forecast_exec_time)
     // being the forecast_carbon_cost = forecast_ci * forecast_exec_time * cap_level_multiplier * hourly_scale
     // we get that the actual carbon cost ultimately is:
     // actual_carbon_cost = actual_ci * actual_exec_time * cap_level_multiplier * hourly_scale
-    // 
+    //
     // The formula is less readable than the direct one, but avoids having here explicit cap_level_multiplier and hourly_scale values.
-     
+
     let mut actual_carbon_cost = None;
-    if let Some(assignment) = state.shared_state.get_current_assignments().get(&request_id) {
+    if let Some(assignment) = state
+        .shared_state
+        .get_current_assignments()
+        .get(&request_id)
+    {
         let ci_ratio = state.carbon_intensity_ratio(assignment.scheduled_slot);
         let time_ratio = match (actual_execution_time, assignment.flavour_duration) {
             (Some(t_exec), dur) if dur > 0 => Some(t_exec / dur as f64),
@@ -927,9 +1357,7 @@ pub async fn executor_callback(
         };
 
         if ci_ratio.is_some() || time_ratio.is_some() {
-            let cost = assignment.carbon_cost
-                * ci_ratio.unwrap_or(1.0)
-                * time_ratio.unwrap_or(1.0);
+            let cost = assignment.carbon_cost * ci_ratio.unwrap_or(1.0) * time_ratio.unwrap_or(1.0);
             actual_carbon_cost = state
                 .shared_state
                 .correct_assignment_carbon_cost(request_id, cost);
@@ -941,7 +1369,11 @@ pub async fn executor_callback(
         let t = guard
             .get_mut(&request_id)
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
-        t.status = if body.success { RequestStatus::Completed } else { RequestStatus::Failed };
+        t.status = if body.success {
+            RequestStatus::Completed
+        } else {
+            RequestStatus::Failed
+        };
         t.error = body.error.clone();
 
         let ci_ratio = state.carbon_intensity_ratio(t.arrival_slot);
@@ -951,9 +1383,7 @@ pub async fn executor_callback(
         };
 
         let actual_baseline = if ci_ratio.is_some() || time_ratio.is_some() {
-            let cost = t.baseline_carbon_cost
-                * ci_ratio.unwrap_or(1.0)
-                * time_ratio.unwrap_or(1.0);
+            let cost = t.baseline_carbon_cost * ci_ratio.unwrap_or(1.0) * time_ratio.unwrap_or(1.0);
             t.baseline_carbon_cost = cost;
             Some(cost)
         } else {
@@ -1031,8 +1461,16 @@ mod tests {
         // regardless of its name — mirrors the DP/online solvers' own
         // "reference flavour" lookups (see `Config::flavours` doc).
         cfg.flavours = vec![
-            Flavour { name: "Cheap".to_string(), error: 5.0, duration: 60 },
-            Flavour { name: "Precise".to_string(), error: 0.0, duration: 10 },
+            Flavour {
+                name: "Cheap".to_string(),
+                error: 5.0,
+                duration: 60,
+            },
+            Flavour {
+                name: "Precise".to_string(),
+                error: 0.0,
+                duration: 10,
+            },
         ];
         let cfg = Arc::new(cfg);
         let forecast = Arc::new(RwLock::new(generate_carbon_intensity_forecast(
@@ -1067,7 +1505,10 @@ mod tests {
         let (baseline, duration) = compute_baseline_carbon_cost(&state, 0, &cfg.flavours);
         let carbon = state.carbon_forecast.read().unwrap()[0];
         let expected = carbon * 10.0 * cfg.carbon_cost_duration_scale; // "Precise"'s duration (lowest error), position 1 => multiplier 1.0
-        assert!((baseline - expected).abs() < 1e-9, "baseline={baseline}, expected={expected}");
+        assert!(
+            (baseline - expected).abs() < 1e-9,
+            "baseline={baseline}, expected={expected}"
+        );
         assert_eq!(duration, 10);
     }
 
@@ -1094,12 +1535,23 @@ mod tests {
             dispatcher_poll_interval_ms: 20,
         };
         let state = AppState::new(SharedState::new(), cfg, service_cfg, forecast);
-        state.actual_carbon_intensity.lock().unwrap().insert(1, 115.0);
-        state.actual_carbon_intensity.lock().unwrap().insert(3, 128.0);
+        state
+            .actual_carbon_intensity
+            .lock()
+            .unwrap()
+            .insert(1, 115.0);
+        state
+            .actual_carbon_intensity
+            .lock()
+            .unwrap()
+            .insert(3, 128.0);
 
         let response = carbon_intensity(
             State(state),
-            Query(CarbonIntensityQuery { slot: Some(3), until_slot: None }),
+            Query(CarbonIntensityQuery {
+                slot: Some(3),
+                until_slot: None,
+            }),
         )
         .await;
 

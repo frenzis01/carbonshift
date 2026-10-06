@@ -47,6 +47,7 @@ full examples:
     scenarios              : list  – each entry:
         id           : str  – unique label (subfolder + CSV row name)
         task         : "text_generation" | "ner" | "question_answering"
+        qos_profile_id: optional stable QoS profile shared by requests/clients
         count        : int  – total number of requests to send (5-10 for a
                                quick "does the architecture work" microtest,
                                much larger for a real performance evaluation)
@@ -81,7 +82,7 @@ DEFAULT_CONFIG = CLIENT_ROOT / "tests" / "battery" / "battery_config.json"
 _RESOLVED_STATUSES = {"completed", "failed", "timed_out"}
 
 SCENARIO_CSV_COLUMNS = [
-    "scenario_id", "task", "mode", "source", "count",
+    "scenario_id", "task", "qos_profile_id", "mode", "source", "count",
     "requests_sent", "requests_scheduled", "requests_completed", "requests_failed", "requests_timed_out",
     "avg_quality_score", "avg_confidence", "avg_execution_time_seconds",
     "avg_ack_latency_seconds", "avg_carbon_saving_pct", "elapsed_seconds",
@@ -192,12 +193,22 @@ def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: st
     seed = int(scenario.get("seed", 42))
     mode = scenario.get("mode", "emulated")
     pattern = scenario.get("pattern", "flat")
+    qos_profile_id = scenario.get("qos_profile_id")
 
     print(f"[{scenario['id']}] task={task} count={count} source={source} mode={mode}")
 
     total_slots = max(1, count // per_slot) if per_slot > 0 else 1
     before_ids = {str(i["request_id"]) for i in _get_requests(client_url)}
-    plan = build_requests(task, total_slots, per_slot, slot_minutes, source, seed, pattern=pattern)
+    plan = build_requests(
+        task,
+        total_slots,
+        per_slot,
+        slot_minutes,
+        source,
+        seed,
+        pattern=pattern,
+        qos_profile_id=qos_profile_id,
+    )
 
     t0 = time.monotonic()
     resp = requests.post(f"{client_url}/run/send-plan", json={
@@ -222,7 +233,14 @@ def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: st
     print(f"  -> {metrics['requests_completed']}/{metrics['requests_sent']} completed, "
           f"avg_carbon_saving_pct={metrics['avg_carbon_saving_pct']}, elapsed={elapsed:.1f}s")
 
-    row = {"scenario_id": scenario["id"], "task": task, "mode": mode, "source": source, "count": len(plan)}
+    row = {
+        "scenario_id": scenario["id"],
+        "task": task,
+        "qos_profile_id": qos_profile_id,
+        "mode": mode,
+        "source": source,
+        "count": len(plan),
+    }
     row.update(metrics)
     return row
 
@@ -245,13 +263,13 @@ def _write_battery_readme(run_dir: Path, battery_id: str, start_dt: datetime, ro
         "",
         "## Results",
         "",
-        "| scenario | task | mode | sent | completed | failed | timed_out | "
+        "| scenario | task | QoS profile | mode | sent | completed | failed | timed_out | "
         "avg quality | avg confidence | avg exec time (s) | avg ack latency (s) | avg carbon saving (%) |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
-            f"| {r['scenario_id']} | {r['task']} | {r['mode']} | {r['requests_sent']} | "
+            f"| {r['scenario_id']} | {r['task']} | {r['qos_profile_id'] or '-'} | {r['mode']} | {r['requests_sent']} | "
             f"{r['requests_completed']} | {r['requests_failed']} | {r['requests_timed_out']} | "
             f"{_fmt(r['avg_quality_score'])} | {_fmt(r['avg_confidence'])} | "
             f"{_fmt(r['avg_execution_time_seconds'])} | {_fmt(r['avg_ack_latency_seconds'])} | "

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .config import settings
@@ -19,8 +19,8 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/api/data")
-def api_data() -> JSONResponse:
-    data = get_dashboard_data()
+def api_data(qos_profile_id: str | None = Query(default=None)) -> JSONResponse:
+    data = get_dashboard_data(qos_profile_id=qos_profile_id)
     return JSONResponse(data)
 
 
@@ -260,6 +260,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div class="controls">
+      <label for="profile-select" style="font-size:0.85rem; color:var(--text-muted);">QoS profile:</label>
+      <select id="profile-select" onchange="selectProfile(this.value)">
+        <option value="">All profiles (fleet telemetry)</option>
+      </select>
+
       <span style="font-size:0.85rem; color:var(--text-muted);">Slots:</span>
       <button class="btn time-filter" data-range="24" onclick="setTimeRange(24)">Last 24</button>
       <button class="btn time-filter" data-range="48" onclick="setTimeRange(48)">Last 48</button>
@@ -312,7 +317,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chart-header">
       <div>
         <div class="chart-title">Assignment Timeline & Carbon Intensity</div>
-        <div class="chart-desc">Stacked requests by flavour with capacity tier thresholds and carbon intensity overlay (identical to notebook display)</div>
+        <div class="chart-desc">Selected-profile assignments, with global slot occupancy, capacity tiers, and carbon intensity shown separately.</div>
       </div>
     </div>
     <div id="assignment-plot" class="plot-wrapper"></div>
@@ -323,10 +328,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chart-header">
       <div>
         <div class="chart-title">Error Tracking by Scheduled Slot</div>
-        <div class="chart-desc">Stacked per-slot error contributions; average traces show the last scheduler snapshot measured in each slot.</div>
+        <div class="chart-desc">Selected-profile error contributions; the unfiltered fleet average is descriptive only and has no QoS threshold.</div>
       </div>
       <div class="chart-current-metrics">
-        <span>Current global error avg: <strong id="plot-global-error-avg">-</strong></span>
+        <span id="plot-error-avg-label">Current fleet descriptive avg: <strong id="plot-global-error-avg">-</strong></span>
         <span>Current window error avg: <strong id="plot-window-error-avg">-</strong></span>
       </div>
     </div>
@@ -366,8 +371,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="card-label">Scheduler & Horizon Details</div>
       <table>
         <tbody>
-          <tr><td>Global Error Avg</td><td id="info-global-error">-</td></tr>
-          <tr><td>Error Threshold</td><td id="info-error-threshold">-</td></tr>
+          <tr><td>Selected QoS Profile</td><td id="info-profile">All profiles</td></tr>
+          <tr><td>Error Semantics</td><td id="info-error-semantics">-</td></tr>
+          <tr><td>Error Window (past/future/decay)</td><td id="info-error-window">-</td></tr>
+          <tr><td>Profile / Fleet Error Avg</td><td id="info-global-error">-</td></tr>
+          <tr><td>Selected Profile Threshold</td><td id="info-error-threshold">Not applicable</td></tr>
           <tr><td>Horizon Total Slots</td><td id="info-total-slots">-</td></tr>
           <tr><td>Completed Requests</td><td id="info-completed-reqs">-</td></tr>
           <tr><td>Pending Requests</td><td id="info-pending-reqs">-</td></tr>
@@ -379,6 +387,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <script>
     let rawData = null;
     let selectedRange = 'all';
+    let selectedProfileId = '';
     let resampleBin = 1;
     let autoRefresh = true;
     let refreshTimer = null;
@@ -388,16 +397,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       'Balanced': '#2ca02c',
       'Accurate': '#ff7f0e'
     };
+    const CUSTOM_FLAVOUR_COLORS = [
+      '#14b8a6', '#a855f7', '#eab308', '#ec4899', '#64748b', '#84cc16'
+    ];
+
+    function flavourColor(name, index) {
+      return FLAVOUR_COLORS[name] || CUSTOM_FLAVOUR_COLORS[index % CUSTOM_FLAVOUR_COLORS.length];
+    }
 
     async function fetchData() {
       try {
-        const resp = await fetch('/api/data');
+        const url = new URL('/api/data', window.location.origin);
+        if (selectedProfileId) url.searchParams.set('qos_profile_id', selectedProfileId);
+        const resp = await fetch(url);
         if (!resp.ok) return;
         rawData = await resp.json();
+        selectedProfileId = rawData.indicators.qos_profile_id || '';
+        renderProfileSelector(rawData.active_profiles || []);
         renderAll();
       } catch (e) {
         console.error("Fetch error:", e);
       }
+    }
+
+    function renderProfileSelector(profiles) {
+      const selector = document.getElementById('profile-select');
+      const effectiveProfileId = rawData.indicators.qos_profile_id || '';
+      selector.replaceChildren();
+
+      const allOption = document.createElement('option');
+      allOption.value = '';
+      allOption.textContent = 'All profiles (fleet telemetry)';
+      selector.appendChild(allOption);
+
+      for (const profile of profiles) {
+        const option = document.createElement('option');
+        option.value = profile.profile_id;
+        option.textContent = `${profile.profile_id} · ${profile.task_kind}`;
+        selector.appendChild(option);
+      }
+      selector.value = effectiveProfileId;
+    }
+
+    function selectProfile(profileId) {
+      selectedProfileId = profileId;
+      fetchData();
     }
 
     function toggleAutoRefresh() {
@@ -497,7 +541,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const globalSlot = ind.global_slot !== null && ind.global_slot !== undefined ? displaySlotValue(ind.global_slot) : null;
       document.getElementById('kpi-global-slot').textContent = globalSlot !== null ? `Global Epoch Slot: ${globalSlot}` : `Local Horizon: ${ind.total_slots}`;
       document.getElementById('kpi-assigned-count').textContent = ind.scheduled_requests;
-      document.getElementById('kpi-assigned-breakdown').textContent = `${ind.completed_requests} completed, ${ind.pending_requests} pending`;
+      document.getElementById('kpi-assigned-breakdown').textContent =
+        `${ind.completed_requests} completed, ${ind.pending_requests} pending · ${ind.total_requests} total`;
       
       document.getElementById('kpi-actual-costs').textContent = `${ind.actual_carbon_cost} vs ${ind.actual_baseline_carbon_cost} gCO₂`;
       const savingEl = document.getElementById('kpi-actual-saving');
@@ -517,8 +562,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       // Table & Side info
       const tbody = document.getElementById('flavour-table-body');
       tbody.innerHTML = '';
-      for (const [flv, st] of Object.entries(ind.by_flavour || {})) {
-        const dotColor = FLAVOUR_COLORS[flv] || '#7f7f7f';
+      for (const [index, [flv, st]] of Object.entries(ind.by_flavour || {}).entries()) {
+        const dotColor = flavourColor(flv, index);
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td><span class="flavour-dot" style="background:${dotColor};"></span>${flv}</td>
@@ -529,44 +574,56 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         tbody.appendChild(tr);
       }
 
-      document.getElementById('info-global-error').textContent = ind.global_error_avg !== null ? `${ind.global_error_avg}%` : '-';
-      document.getElementById('info-error-threshold').textContent = `${ind.max_error_threshold}%`;
+      const displayedError = ind.qos_profile_id ? ind.profile_error_avg : ind.global_error_avg;
+      document.getElementById('info-profile').textContent = ind.qos_profile_id || 'All profiles';
+      document.getElementById('info-error-semantics').textContent = ind.error_semantics || '-';
+      const window = ind.error_window;
+      document.getElementById('info-error-window').textContent = window
+        ? `${window.past_slots} / ${window.future_slots} / ${window.past_decay_slots}`
+        : '-';
+      document.getElementById('info-global-error').textContent =
+        displayedError !== null && displayedError !== undefined ? `${displayedError}%` : '-';
+      document.getElementById('info-error-threshold').textContent =
+        ind.max_error_threshold !== null && ind.max_error_threshold !== undefined
+          ? `${ind.max_error_threshold}%`
+          : 'Not applicable';
       document.getElementById('info-total-slots').textContent = ind.total_slots;
       document.getElementById('info-completed-reqs').textContent = ind.completed_requests;
       document.getElementById('info-pending-reqs').textContent = ind.pending_requests;
     }
 
     function renderAssignmentPlot(plot, ind) {
+      const flavourCount = plot.flavours.length;
       const filtered = filterAndResample(
         plot.slots,
-        [plot.fast, plot.balanced, plot.accurate, plot.carbon_intensity_forecast, plot.carbon_intensity_actual],
+        [
+          ...plot.flavour_counts,
+          plot.global_slot_occupancy,
+          plot.carbon_intensity_forecast,
+          plot.carbon_intensity_actual,
+        ],
         resampleBin
       );
 
       const slots = filtered.slots;
-      const [fast, balanced, accurate, ciForecast, ciActual] = filtered.arrays;
-
-      const traces = [
+      const flavourSeries = filtered.arrays.slice(0, flavourCount);
+      const [globalOccupancy, ciForecast, ciActual] = filtered.arrays.slice(flavourCount);
+      const traces = plot.flavours.map((name, index) => ({
+        x: slots,
+        y: flavourSeries[index],
+        name,
+        type: 'bar',
+        marker: { color: flavourColor(name, index) },
+      }));
+      traces.push(
         {
           x: slots,
-          y: fast,
-          name: 'Fast',
-          type: 'bar',
-          marker: { color: FLAVOUR_COLORS['Fast'] },
-        },
-        {
-          x: slots,
-          y: balanced,
-          name: 'Balanced',
-          type: 'bar',
-          marker: { color: FLAVOUR_COLORS['Balanced'] },
-        },
-        {
-          x: slots,
-          y: accurate,
-          name: 'Accurate',
-          type: 'bar',
-          marker: { color: FLAVOUR_COLORS['Accurate'] },
+          y: globalOccupancy,
+          name: 'Global Slot Occupancy',
+          type: 'scatter',
+          mode: 'lines+markers',
+          marker: { size: 4, color: '#cbd5e1' },
+          line: { color: '#cbd5e1', width: 1.5, dash: 'dash' },
         },
         {
           x: slots,
@@ -587,7 +644,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           line: { color: '#ef4444', width: 2.2 },
           yaxis: 'y2'
         }
-      ];
+      );
 
       // Capacity tier shape lines: omit the implicit baseline x1 band and
       // label each subsequent tier by the request count where the next multiplier
@@ -665,9 +722,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderErrorPlot(plot) {
+      document.getElementById('plot-error-avg-label').firstChild.textContent =
+        `Current ${plot.error_avg_label.toLowerCase()}: `;
       document.getElementById('plot-global-error-avg').textContent =
-        plot.global_error_avg !== null && plot.global_error_avg !== undefined
-          ? `${plot.global_error_avg}%`
+        plot.displayed_error_avg !== null && plot.displayed_error_avg !== undefined
+          ? `${plot.displayed_error_avg}%`
           : '-';
       document.getElementById('plot-window-error-avg').textContent =
         plot.window_error_avg !== null && plot.window_error_avg !== undefined
@@ -676,11 +735,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       const filtered = filterAndResample(
         plot.slots,
-        [plot.fast_error, plot.balanced_error, plot.accurate_error],
+        plot.error_by_flavour,
         resampleBin
       );
       const slots = filtered.slots;
-      const [fastErr, balErr, accErr] = filtered.arrays;
 
       let historyStartIdx = 0;
       if (selectedRange !== 'all') {
@@ -692,32 +750,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .map((slot, index) => ({ slot, index }))
         .filter(({ slot }) => slot >= historyStartSlot && slot <= historyEndSlot);
       const historySlots = displaySlotAxis(historyIndexes.map(({ slot }) => slot));
-      const globalHistory = historyIndexes.map(({ index }) => plot.global_error_history[index]);
+      const errorHistory = historyIndexes.map(({ index }) => plot.error_history[index]);
       const windowHistory = historyIndexes.map(({ index }) => plot.window_error_history[index]);
 
-      const traces = [
-        {
-          x: slots,
-          y: fastErr,
-          name: 'Fast Error (Slot Contrib)',
-          type: 'bar',
-          marker: { color: FLAVOUR_COLORS['Fast'] },
-        },
-        {
-          x: slots,
-          y: balErr,
-          name: 'Balanced Error (Slot Contrib)',
-          type: 'bar',
-          marker: { color: FLAVOUR_COLORS['Balanced'] },
-        },
-        {
-          x: slots,
-          y: accErr,
-          name: 'Accurate Error (Slot Contrib)',
-          type: 'bar',
-          marker: { color: FLAVOUR_COLORS['Accurate'] },
-        },
-      ];
+      const traces = plot.flavours.map((name, index) => ({
+        x: slots,
+        y: filtered.arrays[index],
+        name: `${name} Error (Slot Contrib)`,
+        type: 'bar',
+        marker: { color: flavourColor(name, index) },
+      }));
       if (historySlots.length > 0) {
         traces.push(
           {
@@ -733,14 +775,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           },
           {
             x: historySlots,
-            y: globalHistory,
-            name: 'Global Error Avg (last per slot)',
+            y: errorHistory,
+            name: `${plot.error_avg_label} (last per slot)`,
             type: 'scatter',
             mode: 'lines+markers',
             connectgaps: false,
             marker: { size: 5, color: '#a855f7' },
             line: { color: '#a855f7', width: 2.5 },
-            hovertemplate: 'Slot %{x}<br>Global Error Avg: %{y:.2f}%<extra></extra>',
+            hovertemplate: `Slot %{x}<br>${plot.error_avg_label}: %{y:.2f}%<extra></extra>`,
           }
         );
       }
@@ -748,7 +790,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const shapes = [];
       const annotations = [];
 
-      if (plot.max_error_threshold) {
+      if (plot.max_error_threshold !== null && plot.max_error_threshold !== undefined) {
         shapes.push({
           type: 'line',
           xref: 'paper',

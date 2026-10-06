@@ -33,6 +33,20 @@ def test_on_callback_marks_completed_and_computes_latency(tmp_path):
     assert record["late"] is False
 
 
+def test_to_dict_keeps_the_resolved_qos_profile_id(tmp_path):
+    tracker = make_tracker(tmp_path)
+    ack = make_ack(qos_profile_id="default-question-answering")
+    tracker.add(TrackedRequest(
+        "profiled",
+        "question_answering",
+        30.0,
+        datetime.now(timezone.utc),
+        ack,
+    ))
+
+    assert tracker.get("profiled").to_dict()["qos_profile_id"] == "default-question-answering"
+
+
 def test_on_callback_marks_late_when_past_deadline(tmp_path):
     tracker = make_tracker(tmp_path)
     submitted_at = datetime.now(timezone.utc) - timedelta(seconds=5)

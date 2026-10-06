@@ -66,8 +66,17 @@ def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
         deadline_end = ceil_to_slot_end(r["deadline_at"], slot_minutes)
         deadline_seconds = max((deadline_end - submitted_at).total_seconds(), 1.0)
         payload = {"task": r["task"], "input": r["input"]}
+        qos_profile_id = r.get("qos_profile_id")
         try:
-            ack = submit(deadline_seconds, callback_url, payload, task_id=r["task"], arrival_slot_global=slot)
+            ack = submit(
+                deadline_seconds,
+                callback_url,
+                payload,
+                task_id=None,
+                arrival_slot_global=slot,
+                qos_profile_id=qos_profile_id,
+                task_kind=r["task"],
+            )
         except CarbonshiftError:
             logger.exception("batch %s: submit failed for task=%s", batch_id, r["task"])
             continue
@@ -75,7 +84,13 @@ def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
         # `request_id` comes from carbonshift's ack, so the TrackedRequest can
         # only be built *after* a successful submit.
         tracker.add(TrackedRequest(
-            str(ack.get("request_id")), r["task"], deadline_seconds, submitted_at, ack, arrival_slot=slot
+            str(ack.get("request_id")),
+            r["task"],
+            deadline_seconds,
+            submitted_at,
+            ack,
+            arrival_slot=slot,
+            qos_profile_id=qos_profile_id,
         ))
         submitted += 1
         logger.info("batch %s: submitted task=%s deadline_seconds=%.2f",

@@ -23,6 +23,7 @@ def build_requests(
     pattern: str = "flat",
     cycle_slots: Optional[int] = None,
     reference: Optional[datetime] = None,
+    qos_profile_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Builds timeslot requests for total_slots with an average of per_slot_avg
     requests per slot using the requested distribution pattern ("flat", "sinusoidal", "random").
@@ -68,12 +69,15 @@ def build_requests(
             ex_idx += 1
             jitter = jitter_rng.uniform(0, subslot_size)
             start_at = slot_start + timedelta(minutes=subslot_index * subslot_size + jitter)
-            out.append({
+            request = {
                 "task": task,
                 "input": ex["input"],
                 "start_at": start_at.isoformat(),
                 "deadline_at": deadline_at.isoformat(),
-            })
+            }
+            if qos_profile_id is not None:
+                request["qos_profile_id"] = qos_profile_id
+            out.append(request)
 
     return out
 

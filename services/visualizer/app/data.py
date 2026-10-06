@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 import requests
+from urllib.parse import quote
 
 from .config import settings
 
@@ -13,15 +14,19 @@ _cache: Dict[str, Any] = {
     "client_requests": [],
     "client_summary": {},
     "capacity_tiers": [],
-    "max_error_threshold": 20.26,
+    "active_profiles": [],
+    "profiles_unavailable_logged": False,
     "carbon_ci_list": [],
-    "error_metrics_by_slot": {},
+    "error_metrics_by_profile": {},
 }
 
 
 def fetch_json(url: str, timeout: float = settings.request_timeout_seconds) -> Optional[Any]:
     try:
-        resp = requests.get(url, timeout=timeout)
+        headers = {}
+        if settings.carbonshift_api_key and url.startswith(f"{settings.carbonshift_url}/"):
+            headers["X-API-Key"] = settings.carbonshift_api_key
+        resp = requests.get(url, headers=headers, timeout=timeout)
         if resp.status_code == 200:
             return resp.json()
     except Exception as exc:
@@ -29,10 +34,10 @@ def fetch_json(url: str, timeout: float = settings.request_timeout_seconds) -> O
     return None
 
 
-def get_dashboard_data() -> Dict[str, Any]:
+def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     # 1. Fetch raw data from microservices in parallel / sequence
     raw_client_requests: Optional[List[Dict[str, Any]]] = fetch_json(f"{settings.client_url}/requests")
-    if raw_client_requests:
+    if raw_client_requests is not None:
         _cache["client_requests"] = raw_client_requests
     client_requests: List[Dict[str, Any]] = _cache["client_requests"]
 
@@ -40,6 +45,31 @@ def get_dashboard_data() -> Dict[str, Any]:
     if raw_client_summary:
         _cache["client_summary"] = raw_client_summary
     client_summary: Dict[str, Any] = _cache["client_summary"]
+
+    raw_profiles: Optional[List[Dict[str, Any]]] = fetch_json(
+        f"{settings.carbonshift_url}/v1/profiles"
+    )
+    if raw_profiles is not None:
+        _cache["active_profiles"] = raw_profiles
+        _cache["profiles_unavailable_logged"] = False
+    elif not _cache.get("profiles_unavailable_logged", False):
+        logger.warning(
+            "could not load active QoS profiles; check Carbonshift connectivity and CARBONSHIFT_API_KEY"
+        )
+        _cache["profiles_unavailable_logged"] = True
+    active_profiles: List[Dict[str, Any]] = _cache["active_profiles"]
+    selected_profile = next(
+        (profile for profile in active_profiles if profile.get("profile_id") == qos_profile_id),
+        None,
+    )
+    if qos_profile_id is not None and selected_profile is None:
+        logger.warning("requested QoS profile %s is not active; showing all profiles", qos_profile_id)
+    selected_profile_id = selected_profile.get("profile_id") if selected_profile else None
+    profile_query = (
+        f"?qos_profile_id={quote(selected_profile_id, safe='')}"
+        if selected_profile_id is not None
+        else ""
+    )
 
     horizon_info: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/horizon") or {}
     stats_info: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/stats") or {}
@@ -59,43 +89,59 @@ def get_dashboard_data() -> Dict[str, Any]:
     carbon_ci_list: List[Dict[str, Any]] = _cache["carbon_ci_list"]
 
     # Fetch fine-grained Carbonshift endpoints
-    cost_metrics: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/costs") or {}
-    error_history: Dict[str, Any] = fetch_json(f"{settings.carbonshift_url}/v1/metrics/error-history") or {}
-    engine_assignments: Optional[List[Dict[str, Any]]] = fetch_json(f"{settings.carbonshift_url}/v1/assignments")
+    cost_metrics: Dict[str, Any] = (
+        fetch_json(f"{settings.carbonshift_url}/v1/metrics/costs{profile_query}") or {}
+    )
+    error_history: Dict[str, Any] = (
+        fetch_json(f"{settings.carbonshift_url}/v1/metrics/error-history{profile_query}") or {}
+    )
+    global_assignments: Optional[List[Dict[str, Any]]] = fetch_json(
+        f"{settings.carbonshift_url}/v1/assignments"
+    )
+    if selected_profile_id is None:
+        engine_assignments = global_assignments
+    else:
+        engine_assignments = fetch_json(
+            f"{settings.carbonshift_url}/v1/assignments{profile_query}"
+        )
 
-    # 2. Extract Task Configurations (Capacity tiers & error threshold)
-    scheduler_snapshot = client_summary.get("scheduler", {})
-    tasks_cfg = scheduler_snapshot.get("tasks", {})
-    if error_history.get("max_error_threshold"):
-        _cache["max_error_threshold"] = float(error_history["max_error_threshold"])
-    max_error_threshold = _cache["max_error_threshold"]
-
-    capacity_tiers = []
-    for t_name, t_info in tasks_cfg.items():
-        if t_info.get("capacity_tiers"):
-            capacity_tiers = t_info["capacity_tiers"]
-            _cache["capacity_tiers"] = capacity_tiers
-            break
-
-    if not capacity_tiers:
-        # Fallback to direct query on carbonshift
-        for task_candidate in ("question_answering", "default", "text_generation", "ner"):
-            task_resp = fetch_json(f"{settings.carbonshift_url}/v1/tasks/{task_candidate}")
-            if task_resp and task_resp.get("capacity_tiers"):
-                capacity_tiers = task_resp["capacity_tiers"]
-                _cache["capacity_tiers"] = capacity_tiers
-                break
-
-    if not capacity_tiers and _cache["capacity_tiers"]:
+    # Capacity tiers are one shared pricing policy, even when the visible
+    # request/error data is restricted to one QoS profile.
+    capacity_tiers = cost_metrics.get("capacity_tiers")
+    if isinstance(capacity_tiers, list):
+        _cache["capacity_tiers"] = capacity_tiers
+    else:
         capacity_tiers = _cache["capacity_tiers"]
+
+    max_error_threshold = (
+        error_history.get("max_error_threshold")
+        if selected_profile_id is not None
+        else None
+    )
+    if max_error_threshold is None and selected_profile is not None:
+        max_error_threshold = selected_profile.get("max_error_threshold")
 
     # 3. Combine client_requests and engine_assignments
     seen_req_ids = set()
     all_req_items = []
+    selected_assignment_ids = {
+        str(assignment.get("request_id"))
+        for assignment in (engine_assignments or [])
+    }
     for r in client_requests:
         r_id = str(r.get("request_id"))
+        request_profile_id = r.get("qos_profile_id")
+        if selected_profile_id is not None and request_profile_id != selected_profile_id:
+            # Older clients did not persist the profile returned by
+            # Carbonshift. Their request can still be attributed safely when
+            # the selected-profile assignment endpoint confirms its identity.
+            if request_profile_id is not None or r_id not in selected_assignment_ids:
+                continue
         seen_req_ids.add(r_id)
-        all_req_items.append(r)
+        all_req_items.append({
+            **r,
+            **({"qos_profile_id": selected_profile_id} if request_profile_id is None else {}),
+        })
     for a in (engine_assignments or []):
         a_id = str(a.get("request_id"))
         if a_id not in seen_req_ids:
@@ -106,19 +152,28 @@ def get_dashboard_data() -> Dict[str, Any]:
                 "flavour": a.get("flavour_name"),
                 "carbon_cost": a.get("carbon_cost"),
                 "actual_error_pct": a.get("error"),
+                "qos_profile_id": a.get("qos_profile_id"),
             })
 
     completed_requests = [r for r in all_req_items if r.get("status") == "completed"]
     scheduled_requests = [r for r in all_req_items if r.get("scheduled_slot") is not None]
 
     # Calculate KPI Indicators
-    total_req_count = len(all_req_items) if all_req_items else stats_info.get("total", 0)
-    scheduled_req_count = len(scheduled_requests) if scheduled_requests else (stats_info.get("scheduled", 0) + stats_info.get("completed", 0))
-    completed_req_count = len(completed_requests) if completed_requests else stats_info.get("completed", 0)
-    pending_req_count = max(0, total_req_count - scheduled_req_count)
+    if selected_profile_id is not None:
+        total_req_count = len(all_req_items)
+        scheduled_req_count = len(scheduled_requests)
+        completed_req_count = len(completed_requests)
+        pending_req_count = max(0, total_req_count - scheduled_req_count)
+    else:
+        total_req_count = len(all_req_items) if all_req_items else stats_info.get("total", 0)
+        scheduled_req_count = len(scheduled_requests) if scheduled_requests else (
+            stats_info.get("scheduled", 0) + stats_info.get("completed", 0)
+        )
+        completed_req_count = len(completed_requests) if completed_requests else stats_info.get("completed", 0)
+        pending_req_count = max(0, total_req_count - scheduled_req_count)
 
     # Cost calculations (prefer fine-grained engine metrics, fallback to client tracking)
-    if "current_actual_carbon_cost" in cost_metrics and cost_metrics.get("current_actual_baseline_carbon_cost", 0) > 0:
+    if "current_actual_carbon_cost" in cost_metrics:
         actual_cost_sum = cost_metrics["current_actual_carbon_cost"]
         actual_baseline_cost_sum = cost_metrics["current_actual_baseline_carbon_cost"]
         actual_carbon_saving_pct = cost_metrics.get("actual_carbon_saving_pct")
@@ -156,7 +211,22 @@ def get_dashboard_data() -> Dict[str, Any]:
     overall_avg_exec_sec = (sum(exec_times_all) / len(exec_times_all)) if exec_times_all else None
     overall_baseline_exec_sec = (sum(baseline_exec_times_all) / len(baseline_exec_times_all)) if baseline_exec_times_all else None
 
-    flavours = ["Accurate", "Balanced", "Fast"]
+    canonical_flavours = ["Accurate", "Balanced", "Fast"]
+    observed_flavours = {
+        str(request.get("flavour")).strip()
+        for request in all_req_items
+        if request.get("flavour")
+    }
+    canonical_by_name = {name.lower(): name for name in canonical_flavours}
+    custom_flavours = sorted(
+        (
+            name
+            for name in observed_flavours
+            if name.lower() not in canonical_by_name
+        ),
+        key=str.casefold,
+    )
+    flavours = canonical_flavours + custom_flavours
     by_flavour_stats: Dict[str, Dict[str, Any]] = {}
     for flv in flavours:
         flv_reqs = [r for r in completed_requests if (r.get("flavour") or "").lower() == flv.lower()]
@@ -184,40 +254,44 @@ def get_dashboard_data() -> Dict[str, Any]:
     # Determine slot range for visualization: ALWAYS extend at least 12 slots into the future!
     assigned_slots = [r["scheduled_slot"] for r in scheduled_requests if r.get("scheduled_slot") is not None]
     max_assigned = max(assigned_slots) if assigned_slots else current_slot
+    global_assigned_slots = [
+        assignment["scheduled_slot"]
+        for assignment in (global_assignments or [])
+        if assignment.get("scheduled_slot") is not None
+    ]
+    if global_assigned_slots:
+        max_assigned = max(max_assigned, max(global_assigned_slots))
     min_vis_slot = 0
     max_vis_slot = max(max_assigned, current_slot + 12, max_known_slot)
 
     slot_axis = list(range(min_vis_slot, max_vis_slot + 1))
     
-    # Counts by flavour per slot
-    fast_counts = [0] * len(slot_axis)
-    balanced_counts = [0] * len(slot_axis)
-    accurate_counts = [0] * len(slot_axis)
+    # Dynamic flavour arrays preserve custom profiles whose strategies are
+    # not named Accurate/Balanced/Fast.
+    flavour_counts = {flavour: [0] * len(slot_axis) for flavour in flavours}
+    flavour_error_sums = {flavour: [0.0] * len(slot_axis) for flavour in flavours}
     slot_carbon_cost = [0.0] * len(slot_axis)
-    slot_total_reqs = [0] * len(slot_axis)
-
-    # Error sums per flavour per slot
-    fast_error_sum = [0.0] * len(slot_axis)
-    balanced_error_sum = [0.0] * len(slot_axis)
-    accurate_error_sum = [0.0] * len(slot_axis)
+    global_slot_occupancy = [0] * len(slot_axis)
+    profile_slot_counts = [0] * len(slot_axis)
 
     assign_map = {
         str(a.get("request_id")): a
         for a in (engine_assignments or [])
     }
+    for assignment in (global_assignments or []):
+        slot = assignment.get("scheduled_slot")
+        if slot is not None and min_vis_slot <= slot <= max_vis_slot:
+            global_slot_occupancy[slot - min_vis_slot] += 1
 
     for r in all_req_items:
         s = r.get("scheduled_slot")
         if s is not None and min_vis_slot <= s <= max_vis_slot:
             idx = s - min_vis_slot
-            flv = (r.get("flavour") or "").lower()
-            if flv == "fast":
-                fast_counts[idx] += 1
-            elif flv == "balanced":
-                balanced_counts[idx] += 1
-            elif flv == "accurate":
-                accurate_counts[idx] += 1
-            slot_total_reqs[idx] += 1
+            raw_flavour = (r.get("flavour") or "").strip()
+            flavour = canonical_by_name.get(raw_flavour.lower(), raw_flavour)
+            if flavour in flavour_counts:
+                flavour_counts[flavour][idx] += 1
+            profile_slot_counts[idx] += 1
             
             c_cost = r.get("actual_carbon_cost") if r.get("actual_carbon_cost") is not None else r.get("carbon_cost")
             if c_cost:
@@ -231,37 +305,40 @@ def get_dashboard_data() -> Dict[str, Any]:
                     err = a_info.get("error")
             if err is not None:
                 err_val = float(err)
-                if flv == "fast":
-                    fast_error_sum[idx] += err_val
-                elif flv == "balanced":
-                    balanced_error_sum[idx] += err_val
-                elif flv == "accurate":
-                    accurate_error_sum[idx] += err_val
+                if flavour in flavour_error_sums:
+                    flavour_error_sums[flavour][idx] += err_val
 
     ci_forecast_series = [ci_by_slot.get(s, {}).get("forecast") for s in slot_axis]
     ci_actual_series = [ci_by_slot.get(s, {}).get("actual") for s in slot_axis]
 
-    # Stacked fractional error contributions (sum == slot average error %)
-    fast_error_contrib = []
-    balanced_error_contrib = []
-    accurate_error_contrib = []
+    # Each strategy's portion of the slot average; the arrays stay in the same
+    # order as `flavours` for the visualizer to render without hard-coded names.
+    flavour_error_contribs = {
+        flavour: [] for flavour in flavours
+    }
     slot_error_avg = []
 
     for i in range(len(slot_axis)):
-        n = slot_total_reqs[i]
+        n = profile_slot_counts[i]
         if n > 0:
-            f_c = round(fast_error_sum[i] / n, 2)
-            b_c = round(balanced_error_sum[i] / n, 2)
-            a_c = round(accurate_error_sum[i] / n, 2)
-            fast_error_contrib.append(f_c)
-            balanced_error_contrib.append(b_c)
-            accurate_error_contrib.append(a_c)
-            slot_error_avg.append(round(f_c + b_c + a_c, 2))
+            for flavour in flavours:
+                contribution = round(flavour_error_sums[flavour][i] / n, 2)
+                flavour_error_contribs[flavour].append(contribution)
+            slot_error_avg.append(round(
+                sum(flavour_error_contribs[flavour][-1] for flavour in flavours),
+                2,
+            ))
         else:
-            fast_error_contrib.append(0.0)
-            balanced_error_contrib.append(0.0)
-            accurate_error_contrib.append(0.0)
+            for flavour in flavours:
+                flavour_error_contribs[flavour].append(0.0)
             slot_error_avg.append(None)
+
+    fast_counts = flavour_counts["Fast"]
+    balanced_counts = flavour_counts["Balanced"]
+    accurate_counts = flavour_counts["Accurate"]
+    fast_error_contrib = flavour_error_contribs["Fast"]
+    balanced_error_contrib = flavour_error_contribs["Balanced"]
+    accurate_error_contrib = flavour_error_contribs["Accurate"]
 
     # These are live scheduler snapshots, not values to project across slots.
     error_current_slot = error_history.get("current_slot", current_slot)
@@ -276,21 +353,32 @@ def get_dashboard_data() -> Dict[str, Any]:
     global_error_avg = error_history.get("global_error_avg")
     if global_error_avg is not None:
         global_error_avg = round(float(global_error_avg), 2)
+    profile_error_avg = error_history.get("profile_error_avg")
+    if profile_error_avg is not None:
+        profile_error_avg = round(float(profile_error_avg), 2)
+    displayed_error_avg = (
+        profile_error_avg if selected_profile_id is not None else global_error_avg
+    )
     window_error_avg = current_slot_error.get("window_error")
     if window_error_avg is not None:
         window_error_avg = round(float(window_error_avg), 2)
 
-    error_metrics_by_slot = _cache["error_metrics_by_slot"]
+    # Each view gets its own time series. A cached fleet point must never be
+    # reused as a profile QoS point (or vice versa) after selector changes.
+    cache_profile_key = selected_profile_id or "__all_profiles__"
+    error_metrics_by_slot = _cache["error_metrics_by_profile"].setdefault(
+        cache_profile_key, {}
+    )
     if "current_slot" in error_history:
         if error_metrics_by_slot and error_current_slot < max(error_metrics_by_slot):
             error_metrics_by_slot.clear()
         error_metrics_by_slot[error_current_slot] = {
-            "global_error_avg": global_error_avg,
+            "error_avg": displayed_error_avg,
             "window_error_avg": window_error_avg,
         }
     error_history_slots = sorted(error_metrics_by_slot)
-    global_error_history = [
-        error_metrics_by_slot[slot]["global_error_avg"]
+    error_history_values = [
+        error_metrics_by_slot[slot]["error_avg"]
         for slot in error_history_slots
     ]
     window_error_history = [
@@ -324,6 +412,7 @@ def get_dashboard_data() -> Dict[str, Any]:
             input_arrival_counts[local_arr - min_vis_slot] += 1
 
     return {
+        "active_profiles": active_profiles,
         "indicators": {
             "total_requests": total_req_count,
             "completed_requests": completed_req_count,
@@ -340,16 +429,25 @@ def get_dashboard_data() -> Dict[str, Any]:
             "overall_baseline_exec_sec": round(overall_baseline_exec_sec, 4) if overall_baseline_exec_sec is not None else None,
             "by_flavour": by_flavour_stats,
             "global_error_avg": global_error_avg,
+            "profile_error_avg": profile_error_avg,
             "max_error_threshold": max_error_threshold,
+            "qos_profile_id": selected_profile_id,
+            "selected_profile": selected_profile,
+            "error_semantics": selected_profile.get("error_semantics") if selected_profile else None,
+            "error_window": selected_profile.get("error_window") if selected_profile else None,
         },
         "assignment_plot": {
             "slots": slot_axis,
+            "flavours": flavours,
+            "flavour_counts": [flavour_counts[flavour] for flavour in flavours],
             "fast": fast_counts,
             "balanced": balanced_counts,
             "accurate": accurate_counts,
             "carbon_cost": [round(c, 3) for c in slot_carbon_cost],
             "carbon_intensity_forecast": ci_forecast_series,
             "carbon_intensity_actual": ci_actual_series,
+            "global_slot_occupancy": global_slot_occupancy,
+            "qos_profile_id": selected_profile_id,
             "capacity_tiers": capacity_tiers,
             "flavour_colors": {
                 "Fast": "#1f77b4",
@@ -359,15 +457,27 @@ def get_dashboard_data() -> Dict[str, Any]:
         },
         "error_plot": {
             "slots": slot_axis,
+            "flavours": flavours,
+            "error_by_flavour": [
+                flavour_error_contribs[flavour] for flavour in flavours
+            ],
             "fast_error": fast_error_contrib,
             "balanced_error": balanced_error_contrib,
             "accurate_error": accurate_error_contrib,
             "slot_error_avg": slot_error_avg,
             "window_error_avg": window_error_avg,
             "global_error_avg": global_error_avg,
+            "profile_error_avg": profile_error_avg,
+            "displayed_error_avg": displayed_error_avg,
+            "error_avg_label": (
+                "Profile cumulative error"
+                if selected_profile_id is not None
+                else "Fleet descriptive average"
+            ),
+            "qos_profile_id": selected_profile_id,
             "error_history_slots": error_history_slots,
             "window_error_history": window_error_history,
-            "global_error_history": global_error_history,
+            "error_history": error_history_values,
             "max_error_threshold": max_error_threshold,
         },
         "input_plot": {

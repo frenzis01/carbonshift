@@ -4,6 +4,7 @@
 
 Usage:
     python scripts/send_batch.py --task text_generation --count 5 --deadline-seconds 30
+    python scripts/send_batch.py --task question_answering --qos-profile-id qa-standard-v1
 """
 from __future__ import annotations
 
@@ -18,19 +19,25 @@ def main() -> None:
     parser.add_argument("--client-url", default="http://localhost:8100")
     parser.add_argument("--task", default="text_generation",
                          choices=["text_generation", "ner", "question_answering"])
+    parser.add_argument("--qos-profile-id", default=None,
+                         help="Stable profile ID to share; omitted to use the task-kind default.")
     parser.add_argument("--count", type=int, default=5)
     parser.add_argument("--deadline-seconds", type=float, default=30.0)
     parser.add_argument("--source", default="synthetic", choices=["synthetic", "dataset"])
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    resp = requests.post(f"{args.client_url}/run/send-batch", json={
+    body = {
         "task": args.task,
         "count": args.count,
         "deadline_seconds": args.deadline_seconds,
         "source": args.source,
         "seed": args.seed,
-    })
+    }
+    if args.qos_profile_id is not None:
+        body["qos_profile_id"] = args.qos_profile_id
+
+    resp = requests.post(f"{args.client_url}/run/send-batch", json=body)
     resp.raise_for_status()
     print(json.dumps(resp.json(), indent=2))
 

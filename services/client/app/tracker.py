@@ -42,13 +42,17 @@ class TrackedRequest:
 
     def __init__(self, request_id: str, task: str, deadline_seconds: float,
                  submitted_at: datetime, ack: dict[str, Any],
-                 arrival_slot: Optional[int] = None):
+                 arrival_slot: Optional[int] = None,
+                 qos_profile_id: Optional[str] = None):
         self.request_id = request_id
         self.task = task
         self.deadline_seconds = deadline_seconds
         self.submitted_at = submitted_at
         self.ack = ack
         self.arrival_slot = arrival_slot
+        # The response also includes the resolved default profile when the
+        # client omitted one, so dashboard filtering remains accurate either way.
+        self.qos_profile_id = qos_profile_id or ack.get("qos_profile_id")
         self.ack_received_at = datetime.now(timezone.utc)
         self.callback_received_at: Optional[datetime] = None
         self.status = "submitted"  # submitted -> completed | failed | timed_out
@@ -93,6 +97,7 @@ class TrackedRequest:
         return {
             "request_id": self.request_id,
             "task": self.task,
+            "qos_profile_id": self.qos_profile_id,
             "status": self.status,
             "arrival_slot": self.arrival_slot,
             "deadline_seconds": self.deadline_seconds,
@@ -171,6 +176,8 @@ class RequestTracker:
                 fresh_ack = get_status(request_id)
                 with self._lock:
                     t.ack = fresh_ack
+                    if t.qos_profile_id is None:
+                        t.qos_profile_id = fresh_ack.get("qos_profile_id")
             except CarbonshiftError:
                 logger.warning("failed to refresh stale ack for request_id=%s", request_id, exc_info=True)
 

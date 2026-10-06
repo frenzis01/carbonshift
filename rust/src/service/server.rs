@@ -1,11 +1,11 @@
 //! Axum router wiring for the REST service.
 
+use axum::Router;
 use axum::middleware;
 use axum::routing::{get, post};
-use axum::Router;
 
-use crate::service::{auth, handlers};
 use crate::service::state::AppState;
+use crate::service::{auth, handlers};
 
 pub fn build_router(state: AppState) -> Router {
     // `/v1/requests*` requires the caller's API key (if configured);
@@ -14,13 +14,24 @@ pub fn build_router(state: AppState) -> Router {
     let caller_routes = Router::new()
         .route("/v1/requests", post(handlers::submit_request))
         .route("/v1/requests/:id", get(handlers::get_request_status))
+        .route(
+            "/v1/profiles",
+            post(handlers::register_qos_profile).get(handlers::list_qos_profiles),
+        )
+        .route("/v1/profiles/:profile_id", get(handlers::get_qos_profile))
         .route("/v1/tasks", post(handlers::register_task))
         .route("/v1/tasks/:task_id", get(handlers::get_task_config))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_api_key));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_api_key,
+        ));
 
     let executor_routes = Router::new()
         .route("/v1/callback/:id", post(handlers::executor_callback))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_executor_token));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_executor_token,
+        ));
 
     let public_routes = Router::new()
         .route("/health", get(handlers::health))
@@ -32,8 +43,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/assignments", get(handlers::get_assignments))
         .route("/v1/slots/:slot", get(handlers::get_slot_detail))
         .route("/v1/metrics/costs", get(handlers::get_cost_metrics))
-        .route("/v1/metrics/error-history", get(handlers::get_error_history))
+        .route(
+            "/v1/metrics/error-history",
+            get(handlers::get_error_history),
+        )
         .route("/v1/admin/advance-slot", post(handlers::advance_slot));
 
-    public_routes.merge(caller_routes).merge(executor_routes).with_state(state)
+    public_routes
+        .merge(caller_routes)
+        .merge(executor_routes)
+        .with_state(state)
 }

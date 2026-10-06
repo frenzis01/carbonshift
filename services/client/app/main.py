@@ -21,8 +21,9 @@ from .state import (
 
 from fastapi import FastAPI, HTTPException
 
-from .carbonshift_client import CarbonshiftError, get_stats, get_task_config
+from .carbonshift_client import CarbonshiftError, get_qos_profile, get_stats
 from .config import settings
+from .qos_profile_bootstrap import register_configured_qos_profiles
 from . import provider_client
 from .provider_client import ProviderError
 from .models import (
@@ -56,6 +57,9 @@ def _sweeper_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _sweeper_thread
+    # Fail startup on permanent profile-definition errors. Transient startup
+    # ordering is handled with bounded retries in the registration helper.
+    register_configured_qos_profiles()
     _stop_sweeper.clear()
     _sweeper_thread = threading.Thread(target=_sweeper_loop, daemon=True, name="client-sweeper")
     _sweeper_thread.start()
@@ -118,7 +122,15 @@ def tick(body: TickRequest) -> TickResponse:
 
 @app.post("/run/send-batch", status_code=202)
 def run_send_batch(body: SendBatchRequest) -> SendBatchResponse:
-    batch_id = send_batch(tracker, body.task, body.count, body.deadline_seconds, body.source, body.seed)
+    batch_id = send_batch(
+        tracker,
+        body.task,
+        body.count,
+        body.deadline_seconds,
+        body.source,
+        body.seed,
+        body.qos_profile_id,
+    )
     return SendBatchResponse(batch_id=batch_id, count=body.count)
 
 
@@ -164,11 +176,11 @@ def metrics_summary() -> dict[str, Any]:
 
 def _scheduler_snapshot() -> dict[str, Any]:
     """Live state fetched from carbonshift (not derived from tracked
-    requests): the scheduler's own global error average (task-agnostic by
-    design — see PLAN_SERVICE.md) and each seen task's *declared*
-    `max_error_threshold`, so it's clear whether the run stayed within
-    budget. Degrades to `null`s if carbonshift is unreachable, rather than
-    failing the whole `/metrics/summary` response.
+    requests): descriptive fleet-wide error telemetry, the selected profiles'
+    declared QoS policies, and legacy `task_id` usage counters. Profile
+    policies are reported by profile ID because two profiles for one executor
+    task may have different thresholds or error semantics. Degrades to
+    `null`s if Carbonshift is unreachable rather than failing `/metrics/summary`.
 
     Carbon intensity now comes from the **provider**, not carbonshift: the
     provider owns the clock and the readings (see provider/ARCHITECTURE.md
@@ -176,12 +188,18 @@ def _scheduler_snapshot() -> dict[str, Any]:
     `null` until that slot has been reached — a measurement of a future slot
     does not exist.
     """
-    snapshot: dict[str, Any] = {"global_error_avg": None, "global_error_count": None, "tasks": {}}
+    snapshot: dict[str, Any] = {
+        "global_error_avg": None,
+        "global_error_count": None,
+        "profiles": {},
+        "legacy_task_id_usage": None,
+    }
     try:
         stats = get_stats()
         global_error_avg = stats.get("global_error_avg")
         snapshot["global_error_avg"] = round(global_error_avg, 2) if global_error_avg is not None else None
         snapshot["global_error_count"] = stats.get("global_error_count")
+        snapshot["legacy_task_id_usage"] = stats.get("legacy_task_id_usage")
     except CarbonshiftError:
         logger.warning("failed to fetch carbonshift /v1/stats for metrics/summary", exc_info=True)
 
@@ -191,17 +209,28 @@ def _scheduler_snapshot() -> dict[str, Any]:
         logger.warning("failed to fetch provider /v1/observed for metrics/summary", exc_info=True)
         snapshot["carbon_intensity"] = None
 
-    for task in sorted({item["task"] for item in tracker.all()}):
+    profile_ids = sorted({
+        item["qos_profile_id"]
+        for item in tracker.all()
+        if item.get("qos_profile_id")
+    })
+    for profile_id in profile_ids:
         try:
-            cfg = get_task_config(task)
-            threshold = cfg.get("max_error_threshold")
-            capacity_tiers = cfg.get("capacity_tiers")
-            snapshot["tasks"][task] = {"max_error_threshold": round(threshold, 2) if threshold is not None else None,
-                                        "capacity_tiers": capacity_tiers}
+            profile = get_qos_profile(profile_id)
+            snapshot["profiles"][profile_id] = {
+                "task_kind": profile["task_kind"],
+                "error_semantics": profile["error_semantics"],
+                "max_error_threshold": profile["max_error_threshold"],
+                "error_window": profile["error_window"],
+                "cumulative_error": profile["cumulative_error"],
+            }
         except CarbonshiftError:
-            logger.warning("failed to fetch carbonshift task config for task=%s", task, exc_info=True)
-            snapshot["tasks"][task] = {"max_error_threshold": None,
-                                        "capacity_tiers": None}
+            logger.warning(
+                "failed to fetch carbonshift QoS profile=%s for metrics/summary",
+                profile_id,
+                exc_info=True,
+            )
+            snapshot["profiles"][profile_id] = None
     return snapshot
 
 

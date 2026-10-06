@@ -257,6 +257,7 @@ def peers_from_settings(settings) -> list[Peer]:
     peers = [
         Peer(
             name="client",
+            # TODO: what if we have multiple clients... ?
             base_url=settings.client_url,
             advance_path="/v1/tick",
             order=10,

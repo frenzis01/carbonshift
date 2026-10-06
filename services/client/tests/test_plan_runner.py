@@ -22,23 +22,34 @@ def make_fake_submit():
 
     def fake_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
         rid = next(counter)
-        calls.append({"deadline_seconds": deadline_seconds, "payload": payload, "task_id": task_id})
+        calls.append({
+            "deadline_seconds": deadline_seconds,
+            "payload": payload,
+            "task_id": task_id,
+            "task_kind": kwargs.get("task_kind"),
+            "qos_profile_id": kwargs.get("qos_profile_id"),
+        })
         return {"request_id": rid, "status": "scheduled", "scheduled_slot": 1,
-                "eta_seconds": 1.0, "flavour": "Balanced", "carbon_cost": 1.0, "error": None}
+                "eta_seconds": 1.0, "flavour": "Balanced", "carbon_cost": 1.0,
+                "qos_profile_id": kwargs.get("qos_profile_id"), "error": None}
 
     return fake_submit, calls
 
 
-def _specs(reference: datetime, offsets_minutes: list[float], slot_minutes: float = 30.0):
-    return [
-        {
+def _specs(reference: datetime, offsets_minutes: list[float], slot_minutes: float = 30.0,
+           qos_profile_id: str | None = None):
+    specs = []
+    for i, off in enumerate(offsets_minutes):
+        spec = {
             "task": "text_generation",
             "input": {"prompt": str(i)},
             "start_at": reference + timedelta(minutes=off),
             "deadline_at": reference + timedelta(minutes=off) + timedelta(minutes=slot_minutes),
         }
-        for i, off in enumerate(offsets_minutes)
-    ]
+        if qos_profile_id is not None:
+            spec["qos_profile_id"] = qos_profile_id
+        specs.append(spec)
+    return specs
 
 
 # ─── grouping ────────────────────────────────────────────────────────────────
@@ -91,6 +102,26 @@ def test_send_slot_batch_submits_every_request_and_tracks_them(monkeypatch, tmp_
     assert submitted == 2
     assert len(calls) == 2
     assert len(tracker.all()) == 2
+    assert all(call["task_id"] is None for call in calls)
+    assert all(call["task_kind"] == "text_generation" for call in calls)
+
+
+def test_send_slot_batch_keeps_profile_separate_from_executor_task(monkeypatch, tmp_path):
+    fake_submit, calls = make_fake_submit()
+    monkeypatch.setattr(plan_runner, "submit", fake_submit)
+
+    tracker = RequestTracker(str(tmp_path / "metrics.jsonl"), timeout_seconds=60)
+    batch = _specs(
+        datetime.now(timezone.utc),
+        [0],
+        qos_profile_id="text-generation-calibrated-v1",
+    )
+    assert plan_runner.send_slot_batch(tracker, batch, slot_minutes=30.0) == 1
+
+    assert calls[0]["task_kind"] == "text_generation"
+    assert calls[0]["qos_profile_id"] == "text-generation-calibrated-v1"
+    assert calls[0]["task_id"] is None
+    assert tracker.all()[0]["qos_profile_id"] == "text-generation-calibrated-v1"
 
 
 def test_send_slot_batch_returns_zero_for_an_empty_batch(monkeypatch, tmp_path):
@@ -137,4 +168,3 @@ def test_send_slot_batch_derives_a_positive_deadline(monkeypatch, tmp_path):
     plan_runner.send_slot_batch(tracker, _specs(past, [0]), slot_minutes=30.0)
 
     assert calls[0]["deadline_seconds"] >= 1.0
-

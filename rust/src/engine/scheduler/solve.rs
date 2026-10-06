@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::{AssignmentPolicy, InfeasibilityConfig, SimulationConfig, SolverConfig};
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
+use crate::engine::qos::QosProfileId;
 use crate::shared_state::{GlobalErrorStats, SharedState};
 use crate::types::{
     Assignment, CapacityTier, Flavour, Request, RequestAssignment, get_capacity_multiplier,
@@ -23,9 +24,12 @@ pub struct SolveContext {
     pub mode: String,
     pub new_assignments: usize,
     pub total_assignments: usize,
+    /// Descriptive fleet-wide telemetry; never used as a QoS limit.
     pub global_error_before: f64,
     pub global_error_count_before: u64,
-    pub global_error_constraint_active: bool,
+    pub profile_error_before: f64,
+    pub profile_error_count_before: u64,
+    pub profile_error_constraint_active: bool,
     pub modeled_window_avg_after: f64,
     pub window_start_slot: i32,
     pub window_end_slot: i32,
@@ -110,6 +114,7 @@ pub(super) fn select_batch_solver(name: &str) -> Box<dyn BatchSolverStrategy> {
 /// time-shifting, error-baseline, and global-error-constraint logic is not
 /// duplicated between solver strategies.
 struct PreparedSolve {
+    profile_id: QosProfileId,
     pending_ids: HashSet<u64>,
     window_start: i32,
     window_end: i32,
@@ -124,9 +129,10 @@ struct PreparedSolve {
     baseline_slot_counts: HashMap<i32, i32>,
     error_baseline: ErrorBaseline,
     mock_pool_input: MockPool,
-    global_stats: GlobalErrorStats,
-    global_constraint_active: bool,
-    /// Flavours allowed by the (possibly active) global error constraint.
+    global_error_stats: GlobalErrorStats,
+    profile_error_stats: GlobalErrorStats,
+    profile_constraint_active: bool,
+    /// Flavours allowed by this profile's cumulative error constraint.
     solver_flavours: Vec<Flavour>,
     /// Per-request (per-task) flavour overrides — see `prepare_solve`.
     request_flavours: HashMap<u64, Vec<Flavour>>,
@@ -150,6 +156,10 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     let recovery_state = input.recovery_state;
 
     let pending_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
+    let profile_id = pending
+        .first()
+        .map(Request::qos_profile_id)
+        .unwrap_or_else(QosProfileId::default_profile);
 
     // Deadline cap = end of error window.
     let window_start = (current_slot - assignment.error_window_past).max(0);
@@ -172,6 +182,9 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     // If DP_LOCK_FUTURE_ASSIGNMENTS=True, future assignments are pinned as
     // baseline load.  If False, they join the pool for joint re-planning.
     let future_assignments = snapshot.get_future_assignments(current_slot);
+    let (same_profile_future, other_profile_future): (Vec<_>, Vec<_>) = future_assignments
+        .into_iter()
+        .partition(|assignment| assignment.qos_profile_id == profile_id);
 
     let mut solve_requests: Vec<(u64, i32)> = pending
         .iter()
@@ -184,14 +197,14 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         .map(|r| (r.id, (r.arrival_slot, r.deadline_slot)))
         .collect();
 
-    let mut fixed_future: Vec<Assignment> = Vec::new();
+    let mut fixed_future: Vec<Assignment> = other_profile_future;
     let mut movable_future_ids: HashSet<u64> = HashSet::new();
 
     if solver.dp_lock_future_assignments {
-        fixed_future = future_assignments.clone();
+        fixed_future.extend(same_profile_future);
     } else {
-        movable_future_ids = future_assignments.iter().map(|a| a.request_id).collect();
-        for a in &future_assignments {
+        movable_future_ids = same_profile_future.iter().map(|a| a.request_id).collect();
+        for a in &same_profile_future {
             let deadline = a
                 .deadline_slot
                 .unwrap_or_else(|| a.scheduled_slot.max(current_slot));
@@ -209,7 +222,8 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
 
     // ── Step 3: error baseline ──────────────────────────────────────────────
     // 3a. Real window error from snapshot.
-    let ws = snapshot.get_window_error_stats(
+    let ws = snapshot.get_profile_window_error_stats(
+        &profile_id,
         current_slot,
         assignment.error_window_past,
         assignment.error_window_future,
@@ -221,6 +235,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     error_baseline = augment_with_decayed_past(
         current_slot,
         error_baseline,
+        &profile_id,
         assignment,
         &snapshot,
         &movable_future_ids,
@@ -239,6 +254,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     let (augmented_baseline, mock_pool_input) = apply_infeasibility_recovery(
         current_slot,
         error_baseline.clone(),
+        &profile_id,
         assignment,
         simulation,
         recovery,
@@ -247,16 +263,17 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     );
     let error_baseline = augmented_baseline;
 
-    // ── Step 4: global error constraint ────────────────────────────────────
-    let global_stats = snapshot.get_global_error_stats();
+    // ── Step 4: profile cumulative-error constraint ──────────────────────────
+    let global_error_stats = snapshot.get_global_error_stats();
+    let profile_error_stats = snapshot.get_profile_error_stats(&profile_id);
     let mut solver_flavours = assignment.flavours.to_vec();
-    let global_constraint_active;
+    let profile_constraint_active;
 
     if assignment.global_error_constraint_enabled
-        && global_stats.count > 0
-        && global_stats.avg > assignment.max_error_threshold
+        && profile_error_stats.count > 0
+        && profile_error_stats.avg > assignment.max_error_threshold
     {
-        global_constraint_active = true;
+        profile_constraint_active = true;
         if assignment.global_error_constraint_hard {
             let before = solver_flavours.len();
             solver_flavours.retain(|f| f.error <= assignment.max_error_threshold);
@@ -265,32 +282,28 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
                 solver_flavours = assignment.flavours.to_vec();
             } else if verbose && solver_flavours.len() < before {
                 println!(
-                    "[Scheduler] ⚠ Global error constraint (HARD): \
+                    "[Scheduler] ⚠ Profile error constraint (HARD): \
                      global_avg={:.4}% > {:.2}% → {} flavours remaining",
-                    global_stats.avg,
+                    profile_error_stats.avg,
                     assignment.max_error_threshold,
                     solver_flavours.len()
                 );
             }
         }
     } else {
-        global_constraint_active = false;
+        profile_constraint_active = false;
     }
 
-    // Per-request (per-task) flavour overrides: requests whose task was
-    // dynamically registered (see `service::handlers::register_task`) carry
-    // their own `flavours` list, resolved once at intake. Requests with no
-    // override (empty `flavours`, e.g. CLI/simulation tools) fall back to
-    // `solver_flavours`/`assignment.flavours` inside the solver, unaffected by this
-    // map. The global error constraint above is task-agnostic by design
-    // (it reflects overall scheduler error, not any one task) but must still
-    // be honoured by these overrides too, so apply the same hard filter.
+    // Profile-backed requests carry the profile's immutable flavour snapshot.
+    // The filter below enforces only this profile's cumulative error policy;
+    // offline legacy requests without a profile retain their historical
+    // scheduler-default behavior.
     let mut request_flavours: HashMap<u64, Vec<Flavour>> = pending
         .iter()
         .filter(|r| !r.flavours.is_empty())
         .map(|r| (r.id, r.flavours.clone()))
         .collect();
-    if global_constraint_active && assignment.global_error_constraint_hard {
+    if profile_constraint_active && assignment.global_error_constraint_hard {
         for flavours in request_flavours.values_mut() {
             let filtered: Vec<Flavour> = flavours
                 .iter()
@@ -303,31 +316,27 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         }
     }
 
-    // Per-task local/window feasibility threshold: if any request in this
-    // batch registered its own `max_error_threshold` (see
-    // `service::handlers::register_task`), use the *strictest* (minimum) of
-    // them for the whole batch solve — different tasks' calibrated flavours
-    // can have very different error ranges (e.g. text_generation's may all
-    // be 20%+, so the global 4% default would make it permanently
-    // infeasible); this only affects the local/window check below, never
-    // the (task-agnostic by design) global error constraint above, which
-    // always uses `assignment.max_error_threshold`.
-    let effective_error_threshold = pending
-        .iter()
-        .filter_map(|r| r.max_error_threshold)
-        .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a: f64| a.min(t))))
-        .unwrap_or(assignment.max_error_threshold);
+    // Homogeneous profile batches have exactly one window threshold. Keep the
+    // minimum-overrides compatibility path only for older offline callers
+    // constructing requests directly without a resolved profile.
+    let effective_error_threshold = if pending.iter().all(|request| request.qos_profile.is_some()) {
+        assignment.max_error_threshold
+    } else {
+        pending
+            .iter()
+            .filter_map(|request| request.max_error_threshold)
+            .fold(None::<f64>, |acc, threshold| {
+                Some(acc.map_or(threshold, |current: f64| current.min(threshold)))
+            })
+            .unwrap_or(assignment.max_error_threshold)
+    };
 
-    // Per-task capacity tiers: if any request in this batch registered its own
-    // `capacity_tiers`, use them; otherwise fall back to the default from the
-    // config. We keep an owned Vec here so the solver receives a slice with a
-    // stable lifetime, instead of borrowing from `pending`.
-    let effective_capacity_tiers = pending
-        .iter()
-        .find_map(|r| r.capacity_tiers.clone())
-        .unwrap_or_else(|| assignment.capacity_tiers.to_vec());
+    // Rebound tiers describe shared infrastructure, so all profiles use the
+    // same curve and account for occupancy committed by every profile.
+    let effective_capacity_tiers = assignment.capacity_tiers.to_vec();
 
     PreparedSolve {
+        profile_id,
         pending_ids,
         window_start,
         window_end,
@@ -337,8 +346,9 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         baseline_slot_counts,
         error_baseline,
         mock_pool_input,
-        global_stats,
-        global_constraint_active,
+        global_error_stats,
+        profile_error_stats,
+        profile_constraint_active,
         solver_flavours,
         request_flavours,
         effective_error_threshold,
@@ -350,6 +360,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
 
 fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
     let PreparedSolve {
+        profile_id,
         pending_ids,
         window_start,
         window_end,
@@ -359,8 +370,9 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         baseline_slot_counts,
         error_baseline,
         mock_pool_input,
-        global_stats,
-        global_constraint_active,
+        global_error_stats,
+        profile_error_stats,
+        profile_constraint_active,
         solver_flavours,
         request_flavours,
         effective_error_threshold,
@@ -518,7 +530,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .and_then(|flavours| flavours.iter().find(|f| f.name == dp_a.flavour_name))
                 .map(|f| f.duration)
                 .unwrap_or_else(|| fdb.get(&dp_a.flavour_name).copied().unwrap_or(0));
-            Assignment::new(
+            Assignment::new_for_profile(
                 dp_a.request_id,
                 dp_a.slot,
                 dp_a.flavour_name.clone(),
@@ -527,6 +539,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 dur,
                 Some(arrival),
                 Some(deadline),
+                profile_id.clone(),
             )
         })
         .collect();
@@ -553,6 +566,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         current_slot,
         &solve_mode,
         mock_consumed,
+        &profile_id,
         &recovery_config.recovery_mode,
         recovery_state,
     );
@@ -562,9 +576,11 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         mode: solve_mode,
         new_assignments: pending_ids.len(),
         total_assignments: assignments.len(),
-        global_error_before: global_stats.avg,
-        global_error_count_before: global_stats.count,
-        global_error_constraint_active: global_constraint_active,
+        global_error_before: global_error_stats.avg,
+        global_error_count_before: global_error_stats.count,
+        profile_error_before: profile_error_stats.avg,
+        profile_error_count_before: profile_error_stats.count,
+        profile_error_constraint_active: profile_constraint_active,
         modeled_window_avg_after: if modeled_count > 0.0 {
             modeled_error_sum / modeled_count
         } else {
@@ -590,7 +606,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
 ///
 /// For its one pending request, exhaustively scans every `(slot, flavour)`
 /// pair in `[current_slot, deadline]` and commits the cheapest one that
-/// satisfies the local error window and global error constraint — the same
+/// satisfies the local error window and profile cumulative error constraint — the same
 /// logic as the offline `greedy_cheapest` strategy (see
 /// `bin/nshift/main.rs::run_greedy_cheapest`), but driven through the live
 /// scheduler/`SharedState` instead of a single in-memory pass over a whole
@@ -643,14 +659,14 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("no flavours");
 
-    let global_avg = if prep.global_stats.count > 0 {
-        prep.global_stats.avg
+    let profile_avg = if prep.profile_error_stats.count > 0 {
+        prep.profile_error_stats.avg
     } else {
         0.0
     };
-    let global_constraint_active = prep.global_constraint_active
+    let profile_constraint_active = prep.profile_constraint_active
         && assignment.global_error_constraint_hard
-        && global_avg > assignment.max_error_threshold;
+        && profile_avg > assignment.max_error_threshold;
 
     // Local mutable slot counts, seeded from the baseline (pinned future
     // assignments) and updated as each request in `solve_requests` is
@@ -673,10 +689,10 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
             let mult = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
 
             for flav in &sorted_flavours {
-                // Global error constraint: retrospective (average error
+                // Profile cumulative constraint: retrospective (average error
                 // *before* this request), matching solve_dp's step-function
                 // behaviour rather than a per-candidate forward projection.
-                if global_constraint_active && flav.error > assignment.max_error_threshold {
+                if profile_constraint_active && flav.error > assignment.max_error_threshold {
                     continue;
                 }
 
@@ -751,7 +767,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .and_then(|flavours| flavours.iter().find(|f| f.name == ra.flavour_name))
                 .map(|f| f.duration)
                 .unwrap_or_else(|| fdb.get(&ra.flavour_name).copied().unwrap_or(0));
-            Assignment::new(
+            Assignment::new_for_profile(
                 ra.request_id,
                 ra.slot,
                 ra.flavour_name.clone(),
@@ -760,6 +776,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 dur,
                 Some(arrival),
                 Some(deadline),
+                prep.profile_id.clone(),
             )
         })
         .collect();
@@ -786,6 +803,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
         current_slot,
         &solve_mode,
         mock_consumed,
+        &prep.profile_id,
         &recovery_config.recovery_mode,
         recovery_state,
     );
@@ -795,9 +813,11 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
         mode: solve_mode,
         new_assignments: prep.pending_ids.len(),
         total_assignments: assignments.len(),
-        global_error_before: prep.global_stats.avg,
-        global_error_count_before: prep.global_stats.count,
-        global_error_constraint_active: prep.global_constraint_active,
+        global_error_before: prep.global_error_stats.avg,
+        global_error_count_before: prep.global_error_stats.count,
+        profile_error_before: prep.profile_error_stats.avg,
+        profile_error_count_before: prep.profile_error_stats.count,
+        profile_error_constraint_active: prep.profile_constraint_active,
         modeled_window_avg_after: if modeled_count > 0.0 {
             modeled_error_sum / modeled_count
         } else {

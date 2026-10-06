@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Pushes the calibrated cold data (`model_stats.json`, produced by
-`executor/scripts/calibrate_models.py`) to carbonshift as per-task flavour
-registrations (`POST /v1/tasks`), so the DP solver schedules each task's
-requests among its own real measured (error %, cost) flavours instead of
-carbonshift's built-in default.
+"""Registers calibrated QoS profiles from `model_stats.json`.
+
+Each task receives a stable, versioned profile ID (for example,
+`question_answering-calibrated-v1`). Requests use that profile ID explicitly;
+the executor task kind remains a separate field.
 
 `duration` is sent in *milliseconds* (rounded, minimum 1): real model
 execution times are almost always well under carbonshift's built-in
@@ -13,15 +13,15 @@ directly comparable to the default task's) — `carbon_saving_pct` stays
 correct because a task's own baseline and actual cost always use the same
 flavour set (and therefore the same duration unit).
 
-Also registers a per-task `max_error_threshold`: carbonshift's own global
+Each profile also receives a `max_error_threshold`: Carbonshift's built-in
 default (4%) is tuned for a generic case and can be far stricter than what
 any of a task's real calibrated flavours can achieve (e.g. text_generation's
 cheapest flavour may sit at 20-40% error), which would make that task's
 cheaper flavours permanently infeasible. Default: `--threshold-position`
 (0-1, default 0.75) of the way between the task's min and max calibrated
 error — e.g. accurate=10%, fast=20% -> threshold=17.5%. Pass
-`--threshold-position` to move it, or edit the registered value directly
-via another `POST /v1/tasks` call if you need something not on that line.
+`--threshold-position` to move it. Profiles are immutable: use a new profile
+version if you change their policy.
 
 Usage:
     python scripts/push_flavours.py
@@ -32,61 +32,31 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
-from pathlib import Path
 import logging
+from pathlib import Path
 
 logger = logging.getLogger("client.push_flavours")
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.carbonshift_client import CarbonshiftError, register_task  # noqa: E402
+from app.carbonshift_client import CarbonshiftError, register_qos_profile  # noqa: E402
 from app.config import settings  # noqa: E402
-
-DEFAULT_MODEL_STATS = Path(__file__).resolve().parent.parent / "model_stats.json"
-
-
-def build_task_flavours(stats: dict) -> dict[str, list[dict]]:
-    """Groups `model_stats.json` entries by task and converts each into a
-    carbonshift `Flavour` dict (`name`, `error`, `duration`).
-
-    If a task/flavour was calibrated for more than one model (e.g. the
-    configured model was swapped after an earlier calibration run — old
-    entries stay in `model_stats.json`, keyed by model id, by design), only
-    the most recently measured entry for that (task, flavour) is used, so a
-    stale model's numbers never get pushed alongside its replacement's."""
-    by_task: dict[str, dict[str, dict]] = defaultdict(dict)
-    for entry in stats.values():
-        existing = by_task[entry["task"]].get(entry["flavour"])
-        if existing is None or entry["measured_at"] > existing["measured_at"]:
-            by_task[entry["task"]][entry["flavour"]] = entry
-
-    return {
-        task_id: [
-            {
-                "name": e["flavour"].capitalize(),
-                "error": e["error_pct"],
-                "duration": max(round(e["avg_execution_time_seconds"] * 1000), 1),
-            }
-            for e in entries_by_flavour.values()
-        ]
-        for task_id, entries_by_flavour in by_task.items()
-    }
-
-
-def default_error_threshold(flavours: list[dict], position: float) -> float:
-    """`position` (0-1) of the way between a task's min and max calibrated
-    flavour error — e.g. position=0.75, errors [10%, 20%] -> 17.5%."""
-    errors = [f["error"] for f in flavours]
-    return min(errors) + position * (max(errors) - min(errors))
+from app.qos_profiles import (  # noqa: E402
+    DEFAULT_MODEL_STATS,
+    build_task_flavours,
+    build_task_profiles,
+    default_error_threshold,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model-stats", default=str(DEFAULT_MODEL_STATS))
-    parser.add_argument("--threshold-position", type=float, default=0.75,
+    parser.add_argument("--model-stats", default=str(settings.qos_profile_stats_path))
+    parser.add_argument("--threshold-position", type=float, default=settings.qos_profile_threshold_position,
                          help="0-1 fraction between each task's min and max calibrated error (default: 0.75).")
+    parser.add_argument("--profile-version", default=settings.qos_profile_version,
+                         help="Stable version suffix; bump it when calibration changes an immutable profile.")
     args = parser.parse_args()
 
     stats_path = Path(args.model_stats)
@@ -96,18 +66,33 @@ def main() -> None:
     if not stats:
         raise SystemExit(f"{stats_path} is empty — run executor/scripts/calibrate_models.py first")
 
-    for task_id, flavours in build_task_flavours(stats).items():
-        threshold = default_error_threshold(flavours, args.threshold_position)
+    failures: list[str] = []
+    for task_id, profile in build_task_profiles(
+        stats,
+        args.threshold_position,
+        args.profile_version,
+    ).items():
         try:
-            register_task(task_id, flavours, max_error_threshold=threshold)
+            register_qos_profile(profile)
         except CarbonshiftError as exc:
-            print(f"task={task_id}: FAILED ({exc})")
+            print(f"profile={profile['profile_id']}: FAILED ({exc})")
+            failures.append(profile["profile_id"])
             continue
-        # print(f"task={task_id}: registered {len(flavours)} flavours (max_error_threshold={threshold:.2f}%) "
-        #f"on {settings.carbonshift_url}")
-        logger.info(f"task={task_id}: registered {len(flavours)} flavours (max_error_threshold={threshold:.2f}%)")
-        for f in flavours:
+        logger.info(
+            "registered QoS profile=%s task_kind=%s max_error_threshold=%.2f%%",
+            profile["profile_id"],
+            task_id,
+            profile["max_error_threshold"],
+        )
+        print(
+            f"profile={profile['profile_id']} task_kind={task_id} "
+            f"max_error_threshold={profile['max_error_threshold']:.2f}%"
+        )
+        for f in profile["flavours"]:
             print(f"  {f['name']}: error={f['error']:.2f}% duration={f['duration']}ms")
+
+    if failures:
+        raise SystemExit(f"failed to register {len(failures)} QoS profile(s): {', '.join(failures)}")
 
 
 if __name__ == "__main__":

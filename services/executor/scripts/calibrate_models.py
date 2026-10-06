@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 CLIENT_DIR = Path(__file__).resolve().parent.parent.parent / "client"
 DEFAULT_OUTPUT = CLIENT_DIR / "model_stats.json"
 
-from app.config import ALL_FLAVOURS, ALL_TASKS, Flavour, Task, resolve_model  # noqa: E402
+from app.config import ALL_FLAVOURS, ALL_TASKS, ERROR_SEMANTICS, Flavour, Task, resolve_model  # noqa: E402
 from app.inference import run_task  # noqa: E402
 
 
@@ -97,6 +97,7 @@ def calibrate_one(task: str, flavour: str, count: int, seed: int, source: str) -
     return {
         "model": model_id,
         "task": task,
+        "error_semantics": ERROR_SEMANTICS[task],
         "flavour": flavour,
         # No ground truth/shadow comparison ever applies to "accurate" itself
         # (it *is* the reference) -> `errors` stays empty -> 0.0, matching

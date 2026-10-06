@@ -18,7 +18,7 @@ logger = logging.getLogger("client.runner")
 
 
 def send_batch(tracker: RequestTracker, task: str, count: int, deadline_seconds: float,
-               source: str, seed: int) -> str:
+               source: str, seed: int, qos_profile_id: str | None = None) -> str:
     batch_id = uuid.uuid4().hex
 
     def _worker() -> None:
@@ -33,13 +33,29 @@ def send_batch(tracker: RequestTracker, task: str, count: int, deadline_seconds:
             submitted_at = datetime.now(timezone.utc)
             payload = {"task": task, "input": example["input"]}
             try:
-                ack = submit(deadline_seconds, callback_url, payload, task_id=task)
+                # Task kind selects the built-in default when no profile was
+                # requested. New clients therefore never need legacy task_id.
+                ack = submit(
+                    deadline_seconds,
+                    callback_url,
+                    payload,
+                    task_id=None,
+                    qos_profile_id=qos_profile_id,
+                    task_kind=task,
+                )
             except CarbonshiftError:
                 logger.exception("batch %s: submit failed", batch_id)
                 continue
 
             request_id = str(ack.get("request_id"))
-            tracker.add(TrackedRequest(request_id, task, deadline_seconds, submitted_at, ack))
+            tracker.add(TrackedRequest(
+                request_id,
+                task,
+                deadline_seconds,
+                submitted_at,
+                ack,
+                qos_profile_id=qos_profile_id,
+            ))
             logger.info("batch %s: submitted request_id=%s status=%s", batch_id, request_id, ack.get("status"))
 
     threading.Thread(target=_worker, daemon=True, name=f"send-batch-{batch_id}").start()

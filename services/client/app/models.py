@@ -24,6 +24,9 @@ class CallerCallbackPayload(BaseModel):
 
 class SendBatchRequest(BaseModel):
     task: Literal["text_generation", "ner", "question_answering"] = "text_generation"
+    # The scheduler budget is separate from the executor task. Omission asks
+    # Carbonshift to resolve the default profile for `task`.
+    qos_profile_id: Optional[str] = None
     count: int = 5
     deadline_seconds: float = 30.0
     # "synthetic": a handful of hardcoded examples, no download needed.
@@ -39,9 +42,11 @@ class SendBatchResponse(BaseModel):
 
 class PlanRequestSpec(BaseModel):
     """One request in a timeslot-aware plan: absolute (dated) start/deadline
-    instants, discretized into timeslots by `SendPlanRequest.slot_minutes`."""
+    instants, discretized into timeslots by `SendPlanRequest.slot_minutes`.
+    Each request may select a reusable QoS budget independently."""
 
     task: Literal["text_generation", "ner", "question_answering"]
+    qos_profile_id: Optional[str] = None
     input: dict[str, Any]
     start_at: datetime
     deadline_at: datetime

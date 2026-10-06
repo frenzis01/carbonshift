@@ -1,14 +1,19 @@
 //! Shared application state for the REST service.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::engine::config::Config;
+use crate::engine::qos::{
+    CumulativeErrorPolicy, DEFAULT_TASK_ERROR_SEMANTICS, ErrorWindowPolicy, QosProfile,
+    QosProfileId, TaskKindId,
+};
 use crate::engine::shared_state::SharedState;
 use crate::engine::types::Flavour;
-use crate::service::models::RequestStatus;
+use crate::service::models::{LegacyTaskIdUsage, RequestStatus};
 use crate::types::CapacityTier;
 
 /// Per-request bookkeeping that lives outside the scheduling engine: the
@@ -37,6 +42,8 @@ pub struct TrackedRequest {
     /// `baseline_carbon_cost` the same way `Assignment::carbon_cost` gets
     /// corrected (see `executor_callback`).
     pub arrival_slot: i32,
+    /// QoS budget identity selected when the request was accepted.
+    pub qos_profile_id: QosProfileId,
 }
 
 impl TrackedRequest {
@@ -46,6 +53,7 @@ impl TrackedRequest {
         baseline_carbon_cost: f64,
         baseline_duration: i32,
         arrival_slot: i32,
+        qos_profile_id: QosProfileId,
     ) -> Self {
         Self {
             callback_url,
@@ -57,6 +65,7 @@ impl TrackedRequest {
             baseline_carbon_cost,
             baseline_duration,
             arrival_slot,
+            qos_profile_id,
         }
     }
 }
@@ -101,17 +110,20 @@ pub struct ServiceConfig {
     pub dispatcher_poll_interval_ms: u64,
 }
 
-/// A dynamically-registered task's scheduling parameters (see `POST /v1/tasks`).
+/// Legacy `/v1/tasks` lookup adapter; `profile_id` owns the QoS policy.
 #[derive(Clone)]
 pub struct TaskConfig {
+    /// Profile alias used by callers still using the legacy `task_id` field.
+    pub profile_id: QosProfileId,
     pub flavours: Vec<Flavour>,
     // TODO: why is max_error_threshold inside TaskConfig if it is applied globally to all tasks?
     /// Overrides `Config::max_error_threshold` (%) for this task's own
     /// requests' local/window feasibility check. `None` = use the global
-    /// default. Never affects the (task-agnostic by design) global error
-    /// constraint, which always uses `Config::max_error_threshold`.
+    /// default. Legacy compatibility only: resolved QoS profiles now own
+    /// both window and cumulative thresholds.
     pub max_error_threshold: Option<f64>,
-    /// Override for cap levels (`Config::cap_levels`) for this task. `None` = use the global default.
+    /// Deprecated compatibility field. New profiles use scheduler-global
+    /// capacity tiers, so the legacy registration adapter rejects overrides.
     pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
 
@@ -136,8 +148,158 @@ pub struct ServiceSchedulerConfig {
     pub error_window_past: i32,
     /// Number of following slots included in the error window.
     pub error_window_future: i32,
+    /// Additional preceding slots included with linear decay.
+    pub error_window_past_decay_slots: i32,
+    /// Whether to enforce a per-profile cumulative error constraint.
+    pub cumulative_error_enabled: bool,
+    /// Whether the per-profile cumulative error constraint is hard.
+    pub cumulative_error_hard: bool,
     /// Maximum number of slots into the future for an assignment.
     pub assignment_max_future_slots: i32,
+}
+
+/// Process-local counters used to decide when the legacy `task_id` contract
+/// can be removed. They deliberately reset with the in-memory service state.
+#[derive(Clone, Default)]
+pub struct LegacyTaskIdUsageCounters {
+    request_submissions: Arc<AtomicU64>,
+    task_api_calls: Arc<AtomicU64>,
+    monitoring_queries: Arc<AtomicU64>,
+}
+
+impl LegacyTaskIdUsageCounters {
+    pub fn record_request_submission(&self) {
+        self.request_submissions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_task_api_call(&self) {
+        self.task_api_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_monitoring_query(&self) {
+        self.monitoring_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> LegacyTaskIdUsage {
+        LegacyTaskIdUsage {
+            request_submissions: self.request_submissions.load(Ordering::Relaxed),
+            task_api_calls: self.task_api_calls.load(Ordering::Relaxed),
+            monitoring_queries: self.monitoring_queries.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Outcome of registering a profile under a stable shared ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileRegistration {
+    Created,
+    AlreadyRegistered,
+}
+
+/// Invalid profile data or conflicting reuse of an existing profile ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileRegistryError {
+    Invalid(String),
+    Conflict(QosProfileId),
+}
+
+impl fmt::Display for ProfileRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::Conflict(profile_id) => {
+                write!(
+                    f,
+                    "profile_id {profile_id} is already registered with different settings"
+                )
+            }
+        }
+    }
+}
+
+/// In-memory registry for reusable QoS profiles.
+///
+/// Registration is idempotent for identical definitions and immutable for a
+/// given ID, preventing one client from silently changing another client's
+/// budget or the interpretation of existing assignments.
+#[derive(Clone)]
+pub struct QosProfileRegistry {
+    profiles: Arc<RwLock<HashMap<QosProfileId, QosProfile>>>,
+}
+
+impl QosProfileRegistry {
+    fn from_config(cfg: &Config) -> Self {
+        let profiles = DEFAULT_TASK_ERROR_SEMANTICS
+            .iter()
+            .map(|(task_kind_name, error_semantics)| {
+                let task_kind =
+                    TaskKindId::parse(*task_kind_name).expect("valid default task kind");
+                let task_suffix = task_kind.as_str().replace('_', "-");
+                let profile_id = QosProfileId::parse(format!("default-{task_suffix}"))
+                    .expect("valid default profile ID");
+                let profile = QosProfile {
+                    profile_id: profile_id.clone(),
+                    task_kind,
+                    flavours: cfg.flavours.clone(),
+                    error_semantics: (*error_semantics).to_string(),
+                    max_error_threshold: cfg.max_error_threshold,
+                    error_window: ErrorWindowPolicy {
+                        past_slots: cfg.error_window_past,
+                        future_slots: cfg.error_window_future,
+                        past_decay_slots: cfg.error_window_past_decay_slots,
+                    },
+                    cumulative_error: CumulativeErrorPolicy {
+                        enabled: cfg.global_error_constraint_enabled,
+                        hard: cfg.global_error_constraint_hard,
+                    },
+                };
+                (profile_id, profile)
+            })
+            .collect();
+        Self {
+            profiles: Arc::new(RwLock::new(profiles)),
+        }
+    }
+
+    pub fn register(
+        &self,
+        profile: QosProfile,
+    ) -> Result<ProfileRegistration, ProfileRegistryError> {
+        QosProfileId::parse(profile.profile_id.as_str().to_string())
+            .map_err(ProfileRegistryError::Invalid)?;
+        profile.validate().map_err(ProfileRegistryError::Invalid)?;
+
+        let mut profiles = self.profiles.write().unwrap();
+        match profiles.get(&profile.profile_id) {
+            Some(existing) if existing == &profile => Ok(ProfileRegistration::AlreadyRegistered),
+            Some(_) => Err(ProfileRegistryError::Conflict(profile.profile_id)),
+            None => {
+                profiles.insert(profile.profile_id.clone(), profile);
+                Ok(ProfileRegistration::Created)
+            }
+        }
+    }
+
+    pub fn get(&self, profile_id: &QosProfileId) -> Option<QosProfile> {
+        self.profiles.read().unwrap().get(profile_id).cloned()
+    }
+
+    pub fn get_by_str(&self, profile_id: &str) -> Result<Option<QosProfile>, String> {
+        let profile_id = QosProfileId::parse(profile_id.to_string())?;
+        Ok(self.get(&profile_id))
+    }
+
+    pub fn default_for_task_kind(&self, task_kind: &TaskKindId) -> Option<QosProfile> {
+        let suffix = task_kind.as_str().replace('_', "-");
+        let profile_id = QosProfileId::parse(format!("default-{suffix}")).ok()?;
+        self.get(&profile_id)
+    }
+
+    pub fn list(&self) -> Vec<QosProfile> {
+        let mut profiles: Vec<_> = self.profiles.read().unwrap().values().cloned().collect();
+        profiles.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+        profiles
+    }
 }
 
 impl ServiceSchedulerConfig {
@@ -152,6 +314,9 @@ impl ServiceSchedulerConfig {
             max_error_threshold: cfg.max_error_threshold,
             error_window_past: cfg.error_window_past,
             error_window_future: cfg.error_window_future,
+            error_window_past_decay_slots: cfg.error_window_past_decay_slots,
+            cumulative_error_enabled: cfg.global_error_constraint_enabled,
+            cumulative_error_hard: cfg.global_error_constraint_hard,
             assignment_max_future_slots: cfg.assignment_max_future_slots,
         }
     }
@@ -161,6 +326,9 @@ impl ServiceSchedulerConfig {
 pub struct AppState {
     pub shared_state: SharedState,
     pub scheduler: ServiceSchedulerConfig,
+    pub qos_profiles: QosProfileRegistry,
+    /// Usage telemetry for the deprecated task-ID compatibility surfaces.
+    pub legacy_task_id_usage: LegacyTaskIdUsageCounters,
     pub http: reqwest::Client,
     pub service_cfg: Arc<ServiceConfig>,
     pub tracked: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
@@ -189,7 +357,7 @@ pub struct AppState {
 
     /// This is the offset between the provider's global slot numbering (based on the fixed epoch)
     /// and carbonshift's local slot numbering.
-    /// We cannot use it inside cfg because cfg is shared and immutable, while this 
+    /// We cannot use it inside cfg because cfg is shared and immutable, while this
     /// offset is discovered at runtime
     /// carbonshift's `current_slot` starts at **0** and counts up from process start
     /// (`virtual_elapsed_ms` is an uptime counter). The provider publishes **global**
@@ -209,11 +377,22 @@ impl AppState {
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
         let mut task_flavours = HashMap::new();
-        task_flavours.insert("default".to_string(), TaskConfig { flavours: cfg.flavours.clone(), max_error_threshold: None, capacity_tiers: None });
+        task_flavours.insert(
+            "default".to_string(),
+            TaskConfig {
+                profile_id: QosProfileId::parse("default-text-generation").unwrap(),
+                flavours: cfg.flavours.clone(),
+                max_error_threshold: None,
+                capacity_tiers: None,
+            },
+        );
+        let qos_profiles = QosProfileRegistry::from_config(&cfg);
         Self {
             slot_epoch_offset: Arc::new(Mutex::new(None)),
             shared_state,
             scheduler: ServiceSchedulerConfig::from_config(&cfg),
+            qos_profiles,
+            legacy_task_id_usage: LegacyTaskIdUsageCounters::default(),
             http: reqwest::Client::new(),
             service_cfg: Arc::new(service_cfg),
             tracked: Arc::new(Mutex::new(HashMap::new())),
@@ -235,7 +414,11 @@ impl AppState {
     pub fn carbon_intensity_ratio(&self, slot: i32) -> Option<f64> {
         let actual = *self.actual_carbon_intensity.lock().unwrap().get(&slot)?;
         let forecast = *self.carbon_forecast.read().unwrap().get(slot as usize)?;
-        if forecast <= 0.0 { None } else { Some(actual / forecast) }
+        if forecast <= 0.0 {
+            None
+        } else {
+            Some(actual / forecast)
+        }
     }
 
     /// Flavours registered for `task_id`, or the `"default"` task's
@@ -249,14 +432,46 @@ impl AppState {
             .unwrap_or_else(|| self.scheduler.flavours.clone())
     }
 
+    /// Stable profile alias used by a registered legacy task ID.
+    pub fn profile_id_for_task(&self, task_id: &str) -> Option<QosProfileId> {
+        let registered = self
+            .task_flavours
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .map(|task| task.profile_id.clone());
+        registered.or_else(|| {
+            // Some older clients used the profile ID itself as `task_id`.
+            // That remains resolvable after a restart when the profile has
+            // been restored, even though the transient alias map is empty.
+            let profile_id = QosProfileId::parse(task_id.to_string()).ok()?;
+            if self.qos_profiles.get(&profile_id).is_some() {
+                return Some(profile_id);
+            }
+
+            let task_kind = TaskKindId::parse(task_id.to_string()).ok()?;
+            self.qos_profiles
+                .default_for_task_kind(&task_kind)
+                .map(|profile| profile.profile_id)
+        })
+    }
+
     /// `task_id`'s registered `max_error_threshold` override (%), if any.
     pub fn threshold_for_task(&self, task_id: &str) -> Option<f64> {
-        self.task_flavours.lock().unwrap().get(task_id).and_then(|t| t.max_error_threshold)
+        self.task_flavours
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .and_then(|t| t.max_error_threshold)
     }
 
     /// `task_id`'s registered `capacity_tiers` override, if any.
     pub fn capacity_tiers_for_task(&self, task_id: &str) -> Option<Vec<CapacityTier>> {
-        self.task_flavours.lock().unwrap().get(task_id).and_then(|t| t.capacity_tiers.clone())
+        self.task_flavours
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .and_then(|t| t.capacity_tiers.clone())
     }
 }
 
@@ -278,8 +493,14 @@ mod tests {
             duration: 91,
         }];
         cfg.capacity_tiers = vec![
-            CapacityTier { max_requests: Some(9), multiplier: 2.25 },
-            CapacityTier { max_requests: None, multiplier: 7.0 },
+            CapacityTier {
+                max_requests: Some(9),
+                multiplier: 2.25,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 7.0,
+            },
         ];
         cfg.carbon_cost_duration_scale = 0.375;
         cfg.max_error_threshold = 8.25;
@@ -305,6 +526,18 @@ mod tests {
         assert_eq!(service.max_error_threshold, 8.25);
         assert_eq!(service.error_window_past, 5);
         assert_eq!(service.error_window_future, 7);
+        assert_eq!(
+            service.error_window_past_decay_slots,
+            cfg.error_window_past_decay_slots
+        );
+        assert_eq!(
+            service.cumulative_error_enabled,
+            cfg.global_error_constraint_enabled
+        );
+        assert_eq!(
+            service.cumulative_error_hard,
+            cfg.global_error_constraint_hard
+        );
         assert_eq!(service.assignment_max_future_slots, 11);
     }
 }

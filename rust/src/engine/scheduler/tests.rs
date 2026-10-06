@@ -1,6 +1,9 @@
 //! Regression tests for scheduler batching, scheduling, and clock behavior.
 
 use super::*;
+use crate::engine::qos::{
+    CumulativeErrorPolicy, ErrorWindowPolicy, QosProfile, QosProfileId, TaskKindId,
+};
 use crate::shared_state::SharedState;
 use crate::types::{Assignment, Flavour, Request};
 
@@ -37,7 +40,8 @@ fn make_config(overrides: impl FnOnce(&mut Config)) -> Config {
 }
 
 fn make_recovery_state(cfg: &Config) -> RecoveryState {
-    RecoveryState::new(cfg.infeasibility.mock_influence.clamp(0.0, 1.0))
+    let _ = cfg;
+    RecoveryState::new()
 }
 
 fn flat_forecast(slots: i32, value: f64) -> Vec<f64> {
@@ -54,7 +58,33 @@ fn req(id: u64, arrival: i32, deadline: i32) -> Request {
         flavours: vec![],
         max_error_threshold: None,
         capacity_tiers: None,
+        qos_profile: None,
+        qos_profile_id: crate::engine::qos::QosProfileId::default_profile(),
     }
+}
+
+fn profile(
+    profile_id: &str,
+    task_kind: &str,
+    flavours: Vec<Flavour>,
+    max_error_threshold: f64,
+) -> Arc<QosProfile> {
+    Arc::new(QosProfile {
+        profile_id: QosProfileId::parse(profile_id).unwrap(),
+        task_kind: TaskKindId::parse(task_kind).unwrap(),
+        flavours,
+        error_semantics: format!("{task_kind}-error-v1"),
+        max_error_threshold,
+        error_window: ErrorWindowPolicy {
+            past_slots: 0,
+            future_slots: 0,
+            past_decay_slots: 0,
+        },
+        cumulative_error: CumulativeErrorPolicy {
+            enabled: false,
+            hard: false,
+        },
+    })
 }
 
 fn run_batch_strategy(
@@ -71,7 +101,13 @@ fn run_batch_strategy(
         .iter()
         .map(|f| (f.name.clone(), f.duration))
         .collect();
-    let assignment = cfg.assignment_policy();
+    let qos_profile = pending
+        .first()
+        .and_then(|request| request.qos_profile.clone());
+    let assignment = qos_profile
+        .as_deref()
+        .map(|profile| cfg.assignment_policy_for_profile(profile))
+        .unwrap_or_else(|| cfg.assignment_policy());
     let recovery_state = make_recovery_state(cfg);
     let strategy = select_batch_solver(strategy_name);
     let result = strategy.solve(BatchSolveContext {
@@ -477,6 +513,195 @@ fn batch_solver_registry_preserves_dp_fallback_for_unknown_names() {
     );
 }
 
+#[test]
+fn profile_batches_ignore_other_profiles_window_errors() {
+    let cfg = make_config(|c| {
+        c.global_error_constraint_enabled = false;
+        c.flavours = vec![
+            Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 100,
+            },
+            Flavour {
+                name: "Fast".to_string(),
+                error: 15.0,
+                duration: 1,
+            },
+        ];
+    });
+    let qa_profile = profile(
+        "qa-standard-v1",
+        "question_answering",
+        cfg.flavours.clone(),
+        20.0,
+    );
+    let ner_profile = profile(
+        "ner-standard-v1",
+        "ner",
+        vec![Flavour {
+            name: "NerFast".to_string(),
+            error: 90.0,
+            duration: 1,
+        }],
+        90.0,
+    );
+    let shared_state = SharedState::new();
+    shared_state.add_assignments(vec![Assignment::new_for_profile(
+        900,
+        0,
+        "NerFast".to_string(),
+        1.0,
+        90.0,
+        1,
+        Some(0),
+        Some(1),
+        ner_profile.profile_id.clone(),
+    )]);
+    let mut request = Request::new_for_qos_profile(1, 0, 0, qa_profile.clone());
+    request.arrival_time = 0.0;
+    let forecast = flat_forecast(cfg.total_slots, 100.0);
+
+    let (assignments, context) =
+        run_batch_strategy("dp", 0, &[request], &cfg, &shared_state, &forecast);
+
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(
+        assignments[0].flavour_name, "Fast",
+        "the unrelated NER window error must not make QA's fast flavour infeasible"
+    );
+    assert_eq!(assignments[0].qos_profile_id, qa_profile.profile_id);
+    assert!(!context.profile_error_constraint_active);
+}
+
+#[test]
+fn cumulative_error_constraint_uses_only_the_selected_profile() {
+    let mut cfg = make_config(|c| c.global_error_constraint_enabled = true);
+    cfg.global_error_constraint_hard = true;
+    let mut qa = (*profile(
+        "qa-cumulative-v1",
+        "question_answering",
+        vec![
+            Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 100,
+            },
+            Flavour {
+                name: "Fast".to_string(),
+                error: 15.0,
+                duration: 1,
+            },
+        ],
+        20.0,
+    ))
+    .clone();
+    qa.cumulative_error = CumulativeErrorPolicy {
+        enabled: true,
+        hard: true,
+    };
+    let qa = Arc::new(qa);
+    let shared_state = SharedState::new();
+    shared_state.add_assignments(vec![Assignment::new_for_profile(
+        902,
+        0,
+        "Fast".to_string(),
+        1.0,
+        90.0,
+        1,
+        Some(0),
+        Some(1),
+        qa.profile_id.clone(),
+    )]);
+    let request = Request::new_for_qos_profile(3, 1, 1, qa);
+    let forecast = flat_forecast(cfg.total_slots, 100.0);
+
+    let (_, context) = run_batch_strategy("dp", 1, &[request], &cfg, &shared_state, &forecast);
+
+    assert!(
+        context.profile_error_constraint_active,
+        "the selected profile's own cumulative overage must activate its constraint"
+    );
+    assert_eq!(context.profile_error_count_before, 1);
+    assert!((context.profile_error_before - 90.0).abs() < 1e-9);
+}
+
+#[test]
+fn profile_solve_prices_capacity_using_global_cross_profile_occupancy() {
+    let cfg = make_config(|c| {
+        c.global_error_constraint_enabled = false;
+        c.capacity_tiers = vec![
+            crate::types::CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            crate::types::CapacityTier {
+                max_requests: None,
+                multiplier: 2.0,
+            },
+        ];
+    });
+    let qa_profile = profile(
+        "qa-cost-v1",
+        "question_answering",
+        vec![Flavour {
+            name: "Only".to_string(),
+            error: 0.0,
+            duration: 60,
+        }],
+        1.0,
+    );
+    let shared_state = SharedState::new();
+    shared_state.add_assignments(vec![Assignment::new_for_profile(
+        901,
+        0,
+        "Ner".to_string(),
+        1.0,
+        0.0,
+        60,
+        Some(0),
+        Some(0),
+        QosProfileId::parse("ner-cost-v1").unwrap(),
+    )]);
+    let request = Request::new_for_qos_profile(2, 0, 0, qa_profile.clone());
+    let forecast = flat_forecast(cfg.total_slots, 100.0);
+
+    let (assignments, _) = run_batch_strategy("dp", 0, &[request], &cfg, &shared_state, &forecast);
+
+    assert_eq!(assignments.len(), 1);
+    assert!(
+        (assignments[0].carbon_cost - 100.0 * 2.0 * 60.0 / 3600.0).abs() < 1e-9,
+        "profile isolation must not isolate global rebound-tier occupancy"
+    );
+}
+
+#[test]
+fn profile_dispatch_round_robins_without_starving_eligible_profiles() {
+    let qa = QosProfileId::parse("qa-standard-v1").unwrap();
+    let ner = QosProfileId::parse("ner-standard-v1").unwrap();
+    let pending = vec![(qa.clone(), 5), (ner.clone(), 5)];
+    let active = HashSet::new();
+    let infeasible = HashMap::new();
+
+    assert_eq!(
+        next_profile_to_dispatch(&pending, None, &active, &infeasible, 3, 2),
+        Some((ner.clone(), 5))
+    );
+    assert_eq!(
+        next_profile_to_dispatch(&pending, Some(&ner), &active, &infeasible, 3, 2),
+        Some((qa.clone(), 5))
+    );
+    assert_eq!(
+        next_profile_to_dispatch(&pending, Some(&qa), &active, &infeasible, 3, 2),
+        Some((ner.clone(), 5))
+    );
+    let active = HashSet::from([qa.clone()]);
+    assert_eq!(
+        next_profile_to_dispatch(&pending, None, &active, &infeasible, 3, 2),
+        Some((ner, 5))
+    );
+}
+
 /// A single request must be scheduled at/after current_slot, tagged with
 /// the "greedy_singleton" solver mode.
 #[test]
@@ -622,5 +847,5 @@ fn test_greedy_singleton_global_error_constraint_is_retrospective() {
         1,
         "request must still be scheduled under a hard constraint"
     );
-    assert!(ctx.global_error_constraint_active);
+    assert!(ctx.profile_error_constraint_active);
 }

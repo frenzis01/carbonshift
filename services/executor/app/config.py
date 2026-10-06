@@ -18,6 +18,15 @@ class Task:
 
 ALL_TASKS = [Task.TEXT_GENERATION, Task.NER, Task.QUESTION_ANSWERING]
 
+# These identifiers describe how a measured percentage is produced. They are
+# persisted with calibration data so the client can register a compatible QoS
+# profile without guessing from the flavour or the client that submits it.
+ERROR_SEMANTICS = {
+    Task.TEXT_GENERATION: "relative-confidence-degradation-v1",
+    Task.NER: "entity-set-f1-v1",
+    Task.QUESTION_ANSWERING: "word-overlap-f1-v1",
+}
+
 
 class Flavour:
     ACCURATE = "accurate"

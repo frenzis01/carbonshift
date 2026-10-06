@@ -1,3 +1,9 @@
+use carbonshift_rs::config::{
+    AssignmentPolicy, Config, InfeasibilityConfig, LoggingConfig, SimulationConfig, SolverConfig,
+};
+use carbonshift_rs::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
+use carbonshift_rs::shared_state::SharedState;
+use carbonshift_rs::types::{Assignment, Request};
 /// Integration test: full slot-by-slot scheduling of the canonical scenario.
 ///
 /// Loads `tests/battery/scenarios/scenario_seed_2026.json` from the Python test
@@ -9,14 +15,7 @@
 /// - No request is assigned to a slot before it arrived (`scheduled_slot >= arrival_slot`).
 /// - No request is assigned after its deadline (`scheduled_slot <= deadline_slot`).
 /// - Carbon costs are non-negative.
-
 use std::collections::HashMap;
-use carbonshift_rs::config::{
-    AssignmentPolicy, Config, InfeasibilityConfig, LoggingConfig, SimulationConfig, SolverConfig,
-};
-use carbonshift_rs::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
-use carbonshift_rs::shared_state::SharedState;
-use carbonshift_rs::types::{Assignment, Request};
 
 // ─── scenario JSON de-serialisation ──────────────────────────────────────────
 
@@ -117,7 +116,10 @@ fn drain_pending_with_dp(
         let requests: Vec<(u64, i32)> = batch
             .iter()
             .map(|r| {
-                let capped = r.deadline_slot.max(current_slot).min(assignment.total_slots - 1);
+                let capped = r
+                    .deadline_slot
+                    .max(current_slot)
+                    .min(assignment.total_slots - 1);
                 (r.id, capped)
             })
             .collect();
@@ -162,10 +164,9 @@ fn drain_pending_with_dp(
         if dp_result.is_empty() {
             // Infeasible batch: greedy fallback.
             let deadlines: Vec<i32> = requests.iter().map(|(_, d)| *d).collect();
-            let base_counts_arr: Vec<i32> =
-                (0..assignment.total_slots)
-                    .map(|s| base_counts.get(&s).copied().unwrap_or(0))
-                    .collect();
+            let base_counts_arr: Vec<i32> = (0..assignment.total_slots)
+                .map(|s| base_counts.get(&s).copied().unwrap_or(0))
+                .collect();
 
             let greedy = solver.greedy_fallback(
                 &requests,
@@ -179,29 +180,36 @@ fn drain_pending_with_dp(
             let assignments: Vec<Assignment> = greedy
                 .iter()
                 .zip(batch.iter())
-                .map(|(ra, req)| Assignment::new(
-                    ra.request_id,
-                    ra.slot,
-                    ra.flavour_name.clone(),
-                    ra.carbon_cost,
-                    ra.error,
-                    assignment
-                        .flavours
-                        .iter()
-                        .find(|f| f.name == ra.flavour_name)
-                        .map(|f| f.duration)
-                        .unwrap_or(0),
-                    Some(req.arrival_slot),
-                    Some(req.deadline_slot),
-                ))
+                .map(|(ra, req)| {
+                    Assignment::new(
+                        ra.request_id,
+                        ra.slot,
+                        ra.flavour_name.clone(),
+                        ra.carbon_cost,
+                        ra.error,
+                        assignment
+                            .flavours
+                            .iter()
+                            .find(|f| f.name == ra.flavour_name)
+                            .map(|f| f.duration)
+                            .unwrap_or(0),
+                        Some(req.arrival_slot),
+                        Some(req.deadline_slot),
+                    )
+                })
                 .collect();
             ss.add_assignments(assignments.clone());
             all_assignments.extend(assignments);
         } else {
-            let req_meta: HashMap<u64, (i32, i32)> =
-                batch.iter().map(|r| (r.id, (r.arrival_slot, r.deadline_slot))).collect();
-            let dur_by_name: HashMap<String, i32> =
-                assignment.flavours.iter().map(|f| (f.name.clone(), f.duration)).collect();
+            let req_meta: HashMap<u64, (i32, i32)> = batch
+                .iter()
+                .map(|r| (r.id, (r.arrival_slot, r.deadline_slot)))
+                .collect();
+            let dur_by_name: HashMap<String, i32> = assignment
+                .flavours
+                .iter()
+                .map(|f| (f.name.clone(), f.duration))
+                .collect();
 
             let assignments: Vec<Assignment> = dp_result
                 .iter()
@@ -244,8 +252,8 @@ fn scenario_seed_2026_all_requests_scheduled_correctly() {
     let content = std::fs::read_to_string(&scenario_path)
         .unwrap_or_else(|e| panic!("Cannot read scenario file at {scenario_path}: {e}"));
 
-    let scenario: Scenario = serde_json::from_str(&content)
-        .expect("Failed to deserialise scenario JSON");
+    let scenario: Scenario =
+        serde_json::from_str(&content).expect("Failed to deserialise scenario JSON");
 
     let meta = &scenario.metadata;
     let cfg = config_from_meta(meta);
@@ -286,6 +294,8 @@ fn scenario_seed_2026_all_requests_scheduled_correctly() {
                     flavours: vec![],
                     max_error_threshold: None,
                     capacity_tiers: None,
+                    qos_profile: None,
+                    qos_profile_id: carbonshift_rs::engine::qos::QosProfileId::default_profile(),
                 });
             }
         }
@@ -340,6 +350,12 @@ fn scenario_seed_2026_all_requests_scheduled_correctly() {
         }
     }
 
-    assert_eq!(slot_violations, 0, "{slot_violations} assignments scheduled before arrival");
-    assert_eq!(deadline_violations, 0, "{deadline_violations} assignments scheduled after deadline");
+    assert_eq!(
+        slot_violations, 0,
+        "{slot_violations} assignments scheduled before arrival"
+    );
+    assert_eq!(
+        deadline_violations, 0,
+        "{deadline_violations} assignments scheduled after deadline"
+    );
 }

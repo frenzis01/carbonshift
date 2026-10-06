@@ -192,8 +192,12 @@ oscillare la media su un campione piccolo), misura l'errore reale (da
 `quality_score`) e il tempo di esecuzione medio, e aggiorna
 `../client/model_stats.json` (indicizzato per nome di modello, così
 cambiare/aggiungere modelli non perde le misurazioni più vecchie). Da lì,
-`client/scripts/push_flavours.py` registra questi dati su carbonshift come
-flavour dinamici per task — vedi `client/README.md` §"Flavour dinamici per task".
+ogni record include anche l'ID versionato della semantica usata per misurare
+l'errore. `client/scripts/push_flavours.py` combina i record più recenti per
+task/flavour e registra profili QoS immutabili su carbonshift — vedi
+`client/README.md` §"Flavour dinamici per task". Se cambia una calibrazione,
+usa una nuova versione del profilo invece di riutilizzare un ID con contenuto
+diverso.
 
 ## Emulazione a tempo fittizio
 

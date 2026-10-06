@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 
@@ -24,6 +25,27 @@ class Settings:
     # A request with no callback after this long is marked "timed_out".
     callback_timeout_seconds: float = float(os.environ.get("CLIENT_CALLBACK_TIMEOUT_SECONDS", "300"))
     metrics_path: str = os.environ.get("CLIENT_METRICS_PATH", "data/metrics.jsonl")
+    # This calibration snapshot is the local source of truth from which the
+    # client reconstructs the same immutable profile definitions on startup.
+    qos_profile_stats_path: str = os.environ.get(
+        "CLIENT_QOS_PROFILE_STATS_PATH",
+        str(Path(__file__).resolve().parent.parent / "model_stats.json"),
+    )
+    # Additional fully specified profiles let a client restore caller-owned
+    # profiles which cannot be reconstructed from this executor's calibrations.
+    qos_profile_definitions_path: Optional[str] = (
+        os.environ.get("CLIENT_QOS_PROFILE_DEFINITIONS_PATH") or None
+    )
+    qos_profile_version: str = os.environ.get("CLIENT_QOS_PROFILE_VERSION", "v1")
+    qos_profile_threshold_position: float = float(
+        os.environ.get("CLIENT_QOS_PROFILE_THRESHOLD_POSITION", "0.75")
+    )
+    qos_profile_registration_attempts: int = int(
+        os.environ.get("CLIENT_QOS_PROFILE_REGISTRATION_ATTEMPTS", "10")
+    )
+    qos_profile_registration_retry_seconds: float = float(
+        os.environ.get("CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS", "2.0")
+    )
     # Default executor admin base URL for the "emulated" plan mode (only
     # used to call POST /admin/advance-slot directly — normal task traffic
     # always goes through carbonshift, never straight to the executor).

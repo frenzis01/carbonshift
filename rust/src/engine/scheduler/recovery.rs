@@ -1,6 +1,6 @@
 //! Error-budget recovery and its persistent mock-pool state.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use rand::SeedableRng;
@@ -8,6 +8,7 @@ use rand_distr::{Distribution, Normal};
 
 use crate::config::{AssignmentPolicy, InfeasibilityConfig, SimulationConfig};
 use crate::dp_solver::MockPool;
+use crate::engine::qos::QosProfileId;
 use crate::shared_state::SolverSnapshot;
 
 /// Persistent mock-pool for infeasibility recovery.
@@ -33,24 +34,40 @@ struct RecoveryData {
     mock_influence: MockInfluenceState,
 }
 
+impl RecoveryData {
+    fn new(base_influence: f64) -> Self {
+        Self {
+            mock_pool: PersistentMockPool::default(),
+            mock_influence: MockInfluenceState {
+                base: base_influence,
+                effective: base_influence,
+                above_threshold_streak: 0,
+                last_eval_slot: None,
+            },
+        }
+    }
+}
+
 /// Stateful data owned by infeasibility recovery, separate from worker counters and swarm state.
 pub(super) struct RecoveryState {
-    data: Mutex<RecoveryData>,
+    profiles: Mutex<HashMap<QosProfileId, RecoveryData>>,
 }
 
 impl RecoveryState {
-    pub(super) fn new(base_influence: f64) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            data: Mutex::new(RecoveryData {
-                mock_pool: PersistentMockPool::default(),
-                mock_influence: MockInfluenceState {
-                    base: base_influence,
-                    effective: base_influence,
-                    above_threshold_streak: 0,
-                    last_eval_slot: None,
-                },
-            }),
+            profiles: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn profile_state<'a>(
+        profiles: &'a mut HashMap<QosProfileId, RecoveryData>,
+        profile_id: &QosProfileId,
+        base_influence: f64,
+    ) -> &'a mut RecoveryData {
+        profiles
+            .entry(profile_id.clone())
+            .or_insert_with(|| RecoveryData::new(base_influence))
     }
 }
 
@@ -86,6 +103,7 @@ impl ErrorBaseline {
 pub(super) fn augment_with_decayed_past(
     current_slot: i32,
     baseline: ErrorBaseline,
+    profile_id: &QosProfileId,
     assignment: &AssignmentPolicy<'_>,
     snapshot: &SolverSnapshot,
     exclude: &HashSet<u64>,
@@ -102,7 +120,7 @@ pub(super) fn augment_with_decayed_past(
     for idx in 1..=decay_slots {
         let slot = current_slot - assignment.error_window_past - idx as i32;
         let slot_assignments: Vec<_> = snapshot
-            .get_requests_in_slot(slot)
+            .get_profile_requests_in_slot(profile_id, slot)
             .into_iter()
             .filter(|a| !exclude.contains(&a.request_id))
             .collect();
@@ -177,6 +195,7 @@ pub(super) fn augment_with_virtual_prehistory(
 pub(super) fn apply_infeasibility_recovery(
     current_slot: i32,
     baseline: ErrorBaseline,
+    profile_id: &QosProfileId,
     assignment: &AssignmentPolicy<'_>,
     simulation: &SimulationConfig,
     recovery: &InfeasibilityConfig,
@@ -190,19 +209,21 @@ pub(super) fn apply_infeasibility_recovery(
         current_slot,
         baseline.average_error,
         assignment.max_error_threshold,
+        profile_id,
         recovery,
         recovery_state,
     );
 
     if mode == "min_error_greedy" {
         // No mock injection; reset any persistent pool.
-        reset_mock_pool(recovery_state);
+        reset_mock_pool(profile_id, recovery_state);
         return (baseline, MockPool::default());
     }
 
     // Retrieve (or seed) the persistent mock pool for this slot/mode.
     let (mock_count, mock_error, _source) = get_or_seed_mock_pool(
         current_slot,
+        profile_id,
         &mode,
         assignment,
         simulation,
@@ -232,25 +253,31 @@ fn update_mock_influence(
     slot: i32,
     baseline_avg: f64,
     max_error_threshold: f64,
+    profile_id: &QosProfileId,
     recovery: &InfeasibilityConfig,
     recovery_state: &RecoveryState,
 ) {
-    let mut g = recovery_state.data.lock().unwrap();
-    if g.mock_influence.last_eval_slot == Some(slot) {
+    let mut profiles = recovery_state.profiles.lock().unwrap();
+    let state = RecoveryState::profile_state(
+        &mut profiles,
+        profile_id,
+        recovery.mock_influence.clamp(0.0, 1.0),
+    );
+    if state.mock_influence.last_eval_slot == Some(slot) {
         return;
     }
     let base = recovery.mock_influence.clamp(0.0, 1.0);
     let decay = recovery.mock_influence_decay_step.max(0.0);
-    g.mock_influence.base = base;
+    state.mock_influence.base = base;
     if baseline_avg > max_error_threshold {
-        g.mock_influence.above_threshold_streak += 1;
-        g.mock_influence.effective =
-            (base - g.mock_influence.above_threshold_streak as f64 * decay).max(0.0);
+        state.mock_influence.above_threshold_streak += 1;
+        state.mock_influence.effective =
+            (base - state.mock_influence.above_threshold_streak as f64 * decay).max(0.0);
     } else {
-        g.mock_influence.above_threshold_streak = 0;
-        g.mock_influence.effective = base;
+        state.mock_influence.above_threshold_streak = 0;
+        state.mock_influence.effective = base;
     }
-    g.mock_influence.last_eval_slot = Some(slot);
+    state.mock_influence.last_eval_slot = Some(slot);
 }
 
 /// Retrieve the persistent mock pool for `(slot, mode)`, seeding it if needed.
@@ -259,6 +286,7 @@ fn update_mock_influence(
 /// lock to avoid holding it during I/O.
 fn get_or_seed_mock_pool(
     slot: i32,
+    profile_id: &QosProfileId,
     mode: &str,
     assignment: &AssignmentPolicy<'_>,
     simulation: &SimulationConfig,
@@ -268,9 +296,15 @@ fn get_or_seed_mock_pool(
 ) -> (i32, f64, &'static str) {
     // First lock: check if we already have this slot/mode cached.
     let (has_pool, remaining, error) = {
-        let g = recovery_state.data.lock().unwrap();
-        let same = g.mock_pool.slot == Some(slot) && g.mock_pool.mode.as_deref() == Some(mode);
-        (same, g.mock_pool.remaining, g.mock_pool.error)
+        let mut profiles = recovery_state.profiles.lock().unwrap();
+        let state = RecoveryState::profile_state(
+            &mut profiles,
+            profile_id,
+            recovery.mock_influence.clamp(0.0, 1.0),
+        );
+        let same =
+            state.mock_pool.slot == Some(slot) && state.mock_pool.mode.as_deref() == Some(mode);
+        (same, state.mock_pool.remaining, state.mock_pool.error)
     };
     if has_pool {
         return (remaining, error, "persistent_remaining");
@@ -278,24 +312,40 @@ fn get_or_seed_mock_pool(
 
     // Compute outside the lock (reads snapshot for carryover mode).
     let influence = {
-        let g = recovery_state.data.lock().unwrap();
-        g.mock_influence.effective
+        let mut profiles = recovery_state.profiles.lock().unwrap();
+        RecoveryState::profile_state(
+            &mut profiles,
+            profile_id,
+            recovery.mock_influence.clamp(0.0, 1.0),
+        )
+        .mock_influence
+        .effective
     };
     let (new_count, new_error) = compute_mock_seed(
-        slot, mode, assignment, simulation, recovery, influence, snapshot,
+        slot, profile_id, mode, assignment, simulation, recovery, influence, snapshot,
     );
 
     // Second lock: store the new values.
-    let mut g = recovery_state.data.lock().unwrap();
-    g.mock_pool.slot = Some(slot);
-    g.mock_pool.mode = Some(mode.to_string());
-    g.mock_pool.remaining = new_count.max(0);
-    g.mock_pool.error = new_error.max(0.0);
-    (g.mock_pool.remaining, g.mock_pool.error, "new_window_seed")
+    let mut profiles = recovery_state.profiles.lock().unwrap();
+    let state = RecoveryState::profile_state(
+        &mut profiles,
+        profile_id,
+        recovery.mock_influence.clamp(0.0, 1.0),
+    );
+    state.mock_pool.slot = Some(slot);
+    state.mock_pool.mode = Some(mode.to_string());
+    state.mock_pool.remaining = new_count.max(0);
+    state.mock_pool.error = new_error.max(0.0);
+    (
+        state.mock_pool.remaining,
+        state.mock_pool.error,
+        "new_window_seed",
+    )
 }
 
 fn compute_mock_seed(
     slot: i32,
+    profile_id: &QosProfileId,
     mode: &str,
     assignment: &AssignmentPolicy<'_>,
     simulation: &SimulationConfig,
@@ -310,7 +360,7 @@ fn compute_mock_seed(
             if dropped_slot < 0 {
                 return (0, 0.0);
             }
-            let dropped = snapshot.get_requests_in_slot(dropped_slot);
+            let dropped = snapshot.get_profile_requests_in_slot(profile_id, dropped_slot);
             let n = dropped.len() as i32;
             if n == 0 {
                 return (0, 0.0);
@@ -350,24 +400,28 @@ pub(super) fn consume_mock_pool(
     slot: i32,
     mode: &str,
     consumed: i32,
+    profile_id: &QosProfileId,
     recovery_mode: &str,
     recovery_state: &RecoveryState,
 ) {
     if recovery_mode.trim().to_lowercase() == "min_error_greedy" {
         return;
     }
-    let mut g = recovery_state.data.lock().unwrap();
-    if g.mock_pool.slot == Some(slot) && g.mock_pool.mode.as_deref() == Some(mode) {
-        g.mock_pool.remaining = (g.mock_pool.remaining - consumed.max(0)).max(0);
+    let mut profiles = recovery_state.profiles.lock().unwrap();
+    if let Some(state) = profiles.get_mut(profile_id) {
+        if state.mock_pool.slot == Some(slot) && state.mock_pool.mode.as_deref() == Some(mode) {
+            state.mock_pool.remaining = (state.mock_pool.remaining - consumed.max(0)).max(0);
+        }
     }
 }
 
-fn reset_mock_pool(recovery_state: &RecoveryState) {
-    let mut g = recovery_state.data.lock().unwrap();
-    g.mock_pool.slot = None;
-    g.mock_pool.mode = None;
-    g.mock_pool.remaining = 0;
-    g.mock_pool.error = 0.0;
+fn reset_mock_pool(profile_id: &QosProfileId, recovery_state: &RecoveryState) {
+    if let Some(state) = recovery_state.profiles.lock().unwrap().get_mut(profile_id) {
+        state.mock_pool.slot = None;
+        state.mock_pool.mode = None;
+        state.mock_pool.remaining = 0;
+        state.mock_pool.error = 0.0;
+    }
 }
 
 #[cfg(test)]
@@ -376,7 +430,7 @@ mod tests {
     use crate::config::Config;
 
     #[test]
-    fn mock_pool_persists_per_recovery_state_without_cross_instance_leaks() {
+    fn mock_pool_is_persistent_but_isolated_by_profile() {
         let mut config = Config::default();
         config.simulation.predicted_requests_per_slot = 1000.0;
         config.simulation.request_rate_std_factor = 0.0;
@@ -386,12 +440,14 @@ mod tests {
 
         let assignment = config.assignment_policy();
         let snapshot = crate::shared_state::SharedState::new().snapshot_for_solver();
-        let recovery_state = RecoveryState::new(1.0);
-        let independent_recovery_state = RecoveryState::new(1.0);
+        let recovery_state = RecoveryState::new();
+        let profile_a = QosProfileId::parse("qa-standard-v1").unwrap();
+        let profile_b = QosProfileId::parse("ner-standard-v1").unwrap();
 
         let (_, seeded_pool) = apply_infeasibility_recovery(
             0,
             ErrorBaseline::new(0.0, 1.0),
+            &profile_a,
             &assignment,
             &config.simulation,
             &config.infeasibility,
@@ -404,12 +460,14 @@ mod tests {
             0,
             "forecast",
             1,
+            &profile_a,
             &config.infeasibility.recovery_mode,
             &recovery_state,
         );
         let (_, remaining_pool) = apply_infeasibility_recovery(
             0,
             ErrorBaseline::new(0.0, 1.0),
+            &profile_a,
             &assignment,
             &config.simulation,
             &config.infeasibility,
@@ -419,11 +477,12 @@ mod tests {
         let (_, independent_pool) = apply_infeasibility_recovery(
             0,
             ErrorBaseline::new(0.0, 1.0),
+            &profile_b,
             &assignment,
             &config.simulation,
             &config.infeasibility,
             &snapshot,
-            &independent_recovery_state,
+            &recovery_state,
         );
 
         assert_eq!(remaining_pool.initial_count, seeded_pool.initial_count - 1);
