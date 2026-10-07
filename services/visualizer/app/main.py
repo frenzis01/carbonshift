@@ -790,27 +790,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const shapes = [];
       const annotations = [];
 
-      if (plot.max_error_threshold !== null && plot.max_error_threshold !== undefined) {
+      const thresholds = plot.qos_profile_id
+        ? [{
+            profile_id: plot.qos_profile_id,
+            threshold: plot.max_error_threshold,
+          }]
+        : (plot.profile_thresholds || []);
+      const thresholdColors = ['#f87171', '#38bdf8', '#facc15', '#c084fc', '#4ade80'];
+      thresholds.forEach((profile, index) => {
+        if (profile.threshold === null || profile.threshold === undefined) return;
+        const color = thresholdColors[index % thresholdColors.length];
+        const label = plot.qos_profile_id
+          ? `Threshold: ${profile.threshold}%`
+          : `${profile.profile_id}: ${profile.threshold}%`;
         shapes.push({
           type: 'line',
           xref: 'paper',
           x0: 0,
           x1: 1,
-          y0: plot.max_error_threshold,
-          y1: plot.max_error_threshold,
-          line: { color: '#f87171', width: 1.5, dash: 'dash' }
+          y0: profile.threshold,
+          y1: profile.threshold,
+          line: { color, width: 1.5, dash: 'dash' }
         });
         annotations.push({
           xref: 'paper',
           x: 0.99,
-          y: plot.max_error_threshold,
+          y: profile.threshold,
           xanchor: 'right',
           yanchor: 'bottom',
-          text: `Threshold: ${plot.max_error_threshold}%`,
+          text: label,
           showarrow: false,
-          font: { size: 10, color: '#f87171' }
+          font: { size: 10, color }
         });
-      }
+      });
 
       const layout = {
         barmode: 'stack',

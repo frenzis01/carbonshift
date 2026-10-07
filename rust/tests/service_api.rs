@@ -510,6 +510,116 @@ async fn profile_listing_includes_only_profiles_with_assignments_by_default() {
 }
 
 #[tokio::test]
+async fn global_capacity_tier_setter_is_authenticated_atomic_and_readable() {
+    let mut service_cfg = test_service_cfg();
+    service_cfg.api_key = Some("caller-secret".to_string());
+    let state = test_state(service_cfg);
+    let shared_state = state.shared_state.clone();
+    let app = build_router(state);
+    let tiers = serde_json::json!([
+        {"max_requests": 4, "multiplier": 1.0},
+        {"max_requests": 6, "multiplier": 1.5},
+        {"max_requests": null, "multiplier": 5.0}
+    ]);
+    let body = serde_json::json!({
+        "capacity_tiers": tiers
+    })
+    .to_string();
+
+    let unauthorized = app
+        .clone()
+        .oneshot(json_request("PUT", "/v1/admin/capacity-tiers", &body))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let mut authorized = json_request("PUT", "/v1/admin/capacity-tiers", &body);
+    authorized
+        .headers_mut()
+        .insert("x-api-key", "caller-secret".parse().unwrap());
+    let response = app.clone().oneshot(authorized).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        serde_json::to_value(shared_state.capacity_tiers_snapshot()).unwrap(),
+        tiers
+    );
+
+    let invalid_ladder = serde_json::json!({
+        "capacity_tiers": [
+            {"max_requests": 4, "multiplier": 1.0},
+            {"max_requests": 4, "multiplier": 1.5},
+            {"max_requests": null, "multiplier": 5.0}
+        ]
+    })
+    .to_string();
+    let mut invalid = json_request("PUT", "/v1/admin/capacity-tiers", &invalid_ladder);
+    invalid
+        .headers_mut()
+        .insert("x-api-key", "caller-secret".parse().unwrap());
+    let response = app.clone().oneshot(invalid).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::to_value(shared_state.capacity_tiers_snapshot()).unwrap(),
+        tiers
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics/costs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["capacity_tiers"], tiers);
+}
+
+#[tokio::test]
+async fn new_baselines_use_the_replaced_global_tier_ladder() {
+    let cfg = Arc::new(test_engine_config());
+    let shared_state = SharedState::new();
+    let forecast = Arc::new(RwLock::new(vec![100.0; cfg.total_slots as usize]));
+    let app_state = AppState::new(shared_state.clone(), cfg, test_service_cfg(), forecast);
+    let app = build_router(app_state);
+    let tiers = serde_json::json!([
+        {"max_requests": 1, "multiplier": 1.0},
+        {"max_requests": null, "multiplier": 5.0}
+    ]);
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PUT",
+            "/v1/admin/capacity-tiers",
+            &serde_json::json!({"capacity_tiers": tiers}).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let submit = r#"{"deadline_seconds":5,"task_kind":"text_generation","payload":{"task":"text_generation","input":{"prompt":"p"}}}"#;
+    let first = app
+        .clone()
+        .oneshot(json_request("POST", "/v1/requests", submit))
+        .await
+        .unwrap();
+    let second = app
+        .oneshot(json_request("POST", "/v1/requests", submit))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    let first_baseline = json_body(first).await["baseline_carbon_cost"]
+        .as_f64()
+        .unwrap();
+    let second_baseline = json_body(second).await["baseline_carbon_cost"]
+        .as_f64()
+        .unwrap();
+    assert_eq!(second_baseline, first_baseline * 5.0);
+}
+
+#[tokio::test]
 async fn qos_profile_registration_rejects_invalid_ids_and_policy_values() {
     let app = build_router(test_state(test_service_cfg()));
     let invalid_id = qos_profile_payload("QA standard v1", 17.5);

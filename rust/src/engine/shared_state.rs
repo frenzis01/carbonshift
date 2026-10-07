@@ -2,18 +2,17 @@
 ///
 /// Mirrors `shared_state.py::SharedSchedulerState`.
 ///
-/// All public methods acquire an internal `Mutex` and perform the operation
-/// atomically.  Callers never need to manage locks themselves.
+/// Domain methods acquire the internal `Mutex`; global capacity-tier
+/// reads/writes use a separate `RwLock`. Callers never manage either lock.
 ///
 /// # Concurrency model
-/// A single `Mutex<SharedStateInner>` wraps all mutable fields.  This matches
-/// the Python `RLock` pattern: every public method takes the lock, does its
-/// work, and releases it.  Lock granularity is deliberately coarse for
-/// simplicity and correctness; hot-path profiling can guide future
-/// optimisations without changing the public API.
+/// A coarse `Mutex<SharedStateInner>` protects assignments and request queues.
+/// Batch workers hold the capacity-tier read lock through solve and commit;
+/// the administrative setter takes the write lock. This prevents changing
+/// the pricing curve halfway through a batch transaction.
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use crate::engine::qos::QosProfileId;
 use crate::online_swarm::SwarmContext;
@@ -267,6 +266,13 @@ impl Inner {
 #[derive(Clone)]
 pub struct SharedState {
     inner: Arc<Mutex<Inner>>,
+    /// One live, global capacity-tier ladder shared by the service and every
+    /// batch worker. `None` only exists before a scheduler/service constructor
+    /// installs the Config defaults.
+    capacity_tiers: Arc<RwLock<Option<Vec<CapacityTier>>>>,
+    /// Monotonic marker used to invalidate cost-learned online solver state
+    /// after an administrative tier replacement.
+    capacity_tier_revision: Arc<AtomicU64>,
     /// Virtual elapsed time in milliseconds since the run started.
     /// Written only by the scheduler loop; read by generator and monitor.
     pub virtual_elapsed_ms: Arc<AtomicU64>,
@@ -280,9 +286,58 @@ impl SharedState {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::new())),
+            capacity_tiers: Arc::new(RwLock::new(None)),
+            capacity_tier_revision: Arc::new(AtomicU64::new(0)),
             virtual_elapsed_ms: Arc::new(AtomicU64::new(0)),
             generator_processed_slot: Arc::new(AtomicI32::new(-1)),
         }
+    }
+
+    /// Install Config's initial global ladder unless another constructor
+    /// already initialized it. Scheduler and service setup both call this;
+    /// the second call must not overwrite a runtime replacement.
+    pub fn initialize_capacity_tiers(&self, tiers: Vec<CapacityTier>) {
+        let mut current = self.capacity_tiers.write().unwrap();
+        if current.is_none() {
+            *current = Some(tiers);
+        }
+    }
+
+    /// Replace the global ladder for future baselines and scheduling work.
+    ///
+    /// Active batch workers hold a read guard through solve and commit, so this
+    /// write waits for them to finish; a batch cannot be solved with one ladder
+    /// and checked/committed with another. Existing committed assignment costs
+    /// are stored values and are intentionally not repriced here.
+    pub fn replace_capacity_tiers(&self, tiers: Vec<CapacityTier>) {
+        let mut current = self.capacity_tiers.write().unwrap();
+        *current = Some(tiers);
+        self.capacity_tier_revision.fetch_add(1, Ordering::Release);
+    }
+
+    /// Borrow the runtime ladder. A solver keeps this guard until its commit
+    /// finishes so an administrative replacement cannot split its pricing
+    /// snapshot from the global capacity rollback check.
+    pub fn capacity_tiers_guard(&self) -> RwLockReadGuard<'_, Option<Vec<CapacityTier>>> {
+        self.capacity_tiers.read().unwrap()
+    }
+
+    /// Return an owned point-in-time copy for short service calculations and
+    /// API responses that must not hold the runtime lock while serializing.
+    pub fn capacity_tiers_snapshot(&self) -> Vec<CapacityTier> {
+        self.capacity_tiers
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Version of the global tier policy used to discard online solver
+    /// estimates learned under a previous carbon-cost curve.
+    #[inline]
+    pub fn capacity_tier_revision(&self) -> u64 {
+        self.capacity_tier_revision.load(Ordering::Acquire)
     }
 
     // ── virtual clock ────────────────────────────────────────────────────
@@ -892,6 +947,8 @@ mod tests {
     use crate::types::{Assignment, Request};
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn make_request(id: u64, arrival: i32, deadline: i32) -> Request {
         Request {
@@ -924,6 +981,61 @@ mod tests {
             Some(slot + 1),
             QosProfileId::parse(profile_id).unwrap(),
         )
+    }
+
+    #[test]
+    fn replacing_tiers_waits_for_solver_read_snapshot_and_keeps_initialization_idempotent() {
+        let state = SharedState::new();
+        let initial = vec![
+            CapacityTier {
+                max_requests: Some(10),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 2.0,
+            },
+        ];
+        let replacement = vec![
+            CapacityTier {
+                max_requests: Some(3),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 5.0,
+            },
+        ];
+        state.initialize_capacity_tiers(initial.clone());
+
+        let read_snapshot = state.capacity_tiers_guard();
+        let setter_state = state.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let replacement_for_thread = replacement.clone();
+        let setter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            setter_state.replace_capacity_tiers(replacement_for_thread);
+            finished_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "the setter must wait until the active solver releases its tier snapshot"
+        );
+        assert_eq!(
+            read_snapshot.as_ref().as_ref().unwrap()[0].max_requests,
+            Some(10)
+        );
+        drop(read_snapshot);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        setter.join().unwrap();
+
+        // Constructor initialization must not reset a ladder later installed
+        // by the admin endpoint.
+        state.initialize_capacity_tiers(initial);
+        assert_eq!(state.capacity_tiers_snapshot()[0].max_requests, Some(3));
     }
 
     fn test_profile(profile_id: &str) -> QosProfile {

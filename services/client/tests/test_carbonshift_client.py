@@ -135,3 +135,25 @@ def test_profile_helpers_use_the_protected_profile_endpoints(monkeypatch):
         f"{settings.carbonshift_url}/v1/profiles/qa-calibrated-v1",
     ]
     assert all(call[2]["headers"] == {"X-API-Key": "caller-key"} for call in calls)
+
+
+def test_force_set_capacity_tiers_uses_protected_global_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_put(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return FakeResponse(204)
+
+    monkeypatch.setattr(carbonshift_client.requests, "put", fake_put)
+    monkeypatch.setattr(settings, "carbonshift_api_key", "caller-key")
+    tiers = [
+        {"max_requests": 4, "multiplier": 1.0},
+        {"max_requests": 6, "multiplier": 1.5},
+        {"max_requests": None, "multiplier": 5.0},
+    ]
+
+    carbonshift_client.force_set_global_capacity_tiers(tiers)
+
+    assert captured["url"] == f"{settings.carbonshift_url}/v1/admin/capacity-tiers"
+    assert captured["json"] == {"capacity_tiers": tiers}
+    assert captured["headers"] == {"X-API-Key": "caller-key"}

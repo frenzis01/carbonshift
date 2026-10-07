@@ -349,7 +349,9 @@ impl Default for Config {
 
 impl Config {
     /// Builds assignment policy from a profile while retaining global
-    /// horizon, cost scale, capacity tiers, and assignment-future limits.
+    /// horizon, cost scale, default capacity tiers, and assignment-future
+    /// limits. The live batch scheduler replaces the borrowed tier slice with
+    /// its locked runtime snapshot before solving.
     pub fn assignment_policy_for_profile<'a>(
         &'a self,
         profile: &'a QosProfile,

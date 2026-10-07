@@ -376,7 +376,25 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     error_metrics_by_slot = _cache["error_metrics_by_profile"].setdefault(
         cache_profile_key, {}
     )
-    if "current_slot" in error_history:
+    history_rows = error_history.get("slots", [])
+    if history_rows:
+        if error_metrics_by_slot and error_current_slot < max(error_metrics_by_slot):
+            error_metrics_by_slot.clear()
+        # Carbonshift returns the selected profile's complete slot history.
+        # Backfill it when the user switches profiles instead of plotting only
+        # the single current-slot snapshot cached by the previous dashboard.
+        for item in history_rows:
+            slot = item.get("slot")
+            if slot is None or slot > error_current_slot:
+                continue
+            cumulative_error = item.get("cumulative_error")
+            if cumulative_error is None and slot == error_current_slot:
+                cumulative_error = displayed_error_avg
+            error_metrics_by_slot[slot] = {
+                "error_avg": cumulative_error,
+                "window_error_avg": item.get("window_error"),
+            }
+    elif "current_slot" in error_history:
         if error_metrics_by_slot and error_current_slot < max(error_metrics_by_slot):
             error_metrics_by_slot.clear()
         error_metrics_by_slot[error_current_slot] = {
@@ -486,6 +504,15 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
             "window_error_history": window_error_history,
             "error_history": error_history_values,
             "max_error_threshold": max_error_threshold,
+            "profile_thresholds": [
+                {
+                    "profile_id": profile["profile_id"],
+                    "task_kind": profile["task_kind"],
+                    "threshold": profile["max_error_threshold"],
+                }
+                for profile in active_profiles
+                if isinstance(profile.get("max_error_threshold"), (int, float))
+            ],
         },
         "input_plot": {
             "slots": slot_axis,

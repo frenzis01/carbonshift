@@ -159,6 +159,26 @@ può registrarlo e gli altri possono usare `--no-register
 predefinito del task kind, passa `--no-register`
 senza `--qos-profile-id`: il campo viene omesso.
 
+La capacity-tier ladder è globale e non appartiene al profilo. Se vuoi
+impostarla esplicitamente per un'emulazione, aggiungi:
+
+```sh
+python scripts/run_emulation.py --slots 4 --per-slot 3 \
+  --set-global-capacity-tiers
+```
+
+Questo ricostruisce la ladder usata prima della migrazione ai QoS profile
+(`per-slot` a moltiplicatore 1.0, fino a `1.5 × per-slot` a moltiplicatore
+1.5, poi overflow a 5.0) e la invia **una volta prima del piano**. È un
+override globale: influenza le richieste di tutti i profili e di tutti i
+client su quell'istanza Carbonshift. Senza il flag il client non cambia le
+tiers configurate nel server. L'endpoint
+`PUT /v1/admin/capacity-tiers` è protetto dalla API key e restituisce `204`
+quando la ladder globale è stata sostituita. Un aggiornamento attende che i
+batch attivi finiscano solve e commit; le assegnazioni e baseline già
+memorizzate restano ai costi precedenti, mentre i calcoli successivi usano la
+nuova ladder. Per questo è consigliato impostarla prima di inviare il piano.
+
 Genera un piano sintetico (o da dataset con `--source dataset`) su N
 timeslot e lo invia; segui i risultati con `curl localhost:8100/requests` /
 `/metrics/summary` — un piano di ore/giorni simulati completa in pochi

@@ -18,8 +18,8 @@ use crate::service::models::{
     AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse,
     ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, QosProfileResponse,
     QosProfilesQuery, RegisterQosProfilePayload, RegisterTaskPayload, RequestStatus,
-    RequestStatusResponse, SlotDetailResponse, SlotErrorItem, StatsResponse, SubmitRequestPayload,
-    TaskConfigResponse,
+    RequestStatusResponse, SetCapacityTiersPayload, SlotDetailResponse, SlotErrorItem,
+    StatsResponse, SubmitRequestPayload, TaskConfigResponse,
 };
 use crate::service::state::{AppState, ProfileRegistration, ProfileRegistryError, TrackedRequest};
 
@@ -197,6 +197,111 @@ pub async fn get_qos_profile(
     Ok(Json(QosProfileResponse { profile, active }))
 }
 
+/// Replace the shared capacity-tier ladder for all profiles.
+///
+/// The change affects pricing calculations that start after the replacement.
+/// Carbon costs already stored on assignments and submit-time baselines remain
+/// unchanged, as do their historical meanings.
+pub async fn force_set_capacity_tiers(
+    State(_state): State<AppState>,
+    Json(_body): Json<SetCapacityTiersPayload>,
+) -> Result<StatusCode, ApiError> {
+
+    // Capacity tiers should be of the shape
+    // [
+    //     { "max_requests": 100, "multiplier": 1.0 },
+    //     { "max_requests": 200, "multiplier": 1.5 },
+    //     { "max_requests": null, "multiplier": 5.0 }
+    // ]
+
+    // Each finite max_requests is an inclusive 1-indexed request position.
+    // For example, bounds 100 and 200 price positions 1..=100 with tier 1,
+    // 101..=200 with tier 2, and 201+ with the final overflow tier. Tier
+    // multipliers are applied per request position, not to every request in
+    // a slot using the slot's final count.
+    if _body.capacity_tiers.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "capacity_tiers must not be empty",
+        ));
+    }
+
+    let last_index = _body.capacity_tiers.len() - 1;
+    let mut previous_max_requests = None;
+    let mut previous_multiplier = None;
+
+    for (index, tier) in _body.capacity_tiers.iter().enumerate() {
+        if !tier.multiplier.is_finite() || tier.multiplier <= 0.0 {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "tier multipliers must be finite and greater than zero",
+            ));
+        }
+        if index == 0 && tier.multiplier != 1.0 {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "the first capacity tier must use the baseline multiplier 1.0",
+            ));
+        }
+        if previous_multiplier.is_some_and(|previous| tier.multiplier < previous) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "tier multipliers must not decrease as request positions increase",
+            ));
+        }
+        previous_multiplier = Some(tier.multiplier);
+
+        match tier.max_requests {
+            Some(max_requests) => {
+                if max_requests <= 0 {
+                    return Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "finite max_requests bounds must be greater than zero",
+                    ));
+                }
+                if index == last_index {
+                    return Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "the final capacity tier must be the null overflow tier",
+                    ));
+                }
+                if previous_max_requests.is_some_and(|previous| max_requests <= previous) {
+                    return Err(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "finite max_requests bounds must be strictly increasing",
+                    ));
+                }
+                previous_max_requests = Some(max_requests);
+            }
+            None if index != last_index => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "only the final capacity tier may have max_requests: null",
+                ));
+            }
+            None => {}
+        }
+    }
+
+    // CapacityTier state is shared with the engine through SharedState. The
+    // write lock waits for every active worker holding a read snapshot through
+    // solve and commit. That makes the update effective between batches while
+    // preserving already-committed assignments and their old stored costs.
+    // spawn_blocking keeps the wait off the async runtime thread.
+    let shared_state = _state.shared_state.clone();
+    let tiers = _body.capacity_tiers;
+    tokio::task::spawn_blocking(move || shared_state.replace_capacity_tiers(tiers))
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("capacity tier update worker failed: {error}"),
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// What `arrival_slot` would have cost under the "no carbonshift" baseline:
 /// the most-accurate (lowest-error) flavour, executed immediately at
 /// arrival with no batching/carbon optimisation. `position` (1-indexed,
@@ -225,7 +330,8 @@ fn compute_baseline_carbon_cost(
         .get(arrival_slot as usize)
         .copied()
         .unwrap_or(0.0);
-    let mult = get_capacity_multiplier(&state.scheduler.capacity_tiers, position);
+    let capacity_tiers = state.shared_state.capacity_tiers_snapshot();
+    let mult = get_capacity_multiplier(&capacity_tiers, position);
     let accurate = flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
@@ -698,7 +804,7 @@ pub async fn get_task_config(
             .unwrap_or(state.scheduler.max_error_threshold),
         capacity_tiers: state
             .capacity_tiers_for_task(&task_id)
-            .unwrap_or_else(|| state.scheduler.capacity_tiers.clone()),
+            .unwrap_or_else(|| state.shared_state.capacity_tiers_snapshot()),
         task_id,
     })
 }
@@ -856,9 +962,8 @@ pub async fn get_slot_detail(
         .map(|assignment| assignment.carbon_cost)
         .sum();
 
-    let capacity_multiplier: f64 = _state
-        .scheduler
-        .capacity_tiers
+    let capacity_tiers = _state.shared_state.capacity_tiers_snapshot();
+    let capacity_multiplier: f64 = capacity_tiers
         .iter()
         // find highest tier where assignments.len() <= tier.max_requests
         // max_requests being None means infinite
@@ -960,7 +1065,7 @@ pub async fn get_cost_metrics(
         forecasted_pending_carbon_cost,
         total_forecasted_carbon_cost,
         total_baseline_carbon_cost,
-        capacity_tiers: _state.scheduler.capacity_tiers.clone(),
+        capacity_tiers: _state.shared_state.capacity_tiers_snapshot(),
     }))
 }
 

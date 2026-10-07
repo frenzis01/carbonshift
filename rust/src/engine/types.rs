@@ -223,7 +223,9 @@ pub struct Flavour {
 /// A slot with `count` requests uses the multiplier of the first tier whose
 /// `max_requests >= count`.  A tier with `max_requests = null` (JSON) / `None`
 /// (Rust) is the overflow tier and matches all counts above the previous tier.
-/// The implicit baseline multiplier 1.0 applies for counts up to the first tier.
+/// The lookup does not synthesize a baseline tier: the first entry's
+/// multiplier applies to positions up to its bound. Use a first multiplier
+/// of 1.0 when low-load requests should retain the unmodified carbon cost.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CapacityTier {
     pub max_requests: Option<i64>,

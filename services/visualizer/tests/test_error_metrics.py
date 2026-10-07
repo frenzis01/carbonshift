@@ -239,7 +239,11 @@ class ErrorMetricsTests(unittest.TestCase):
                 "profile_error_avg": 14.0,
                 "global_error_avg": 49.5,
                 "max_error_threshold": 20.0,
-                "slots": [{"slot": 2, "window_error": 13.0}],
+                "slots": [
+                    {"slot": 0, "cumulative_error": 10.0, "window_error": 9.0},
+                    {"slot": 1, "cumulative_error": 12.0, "window_error": 11.0},
+                    {"slot": 2, "cumulative_error": 14.0, "window_error": 13.0},
+                ],
             },
             "http://carbonshift:8080/v1/metrics/error-history?qos_profile_id=ner-calibrated-v1": {
                 "current_slot": 2,
@@ -247,7 +251,11 @@ class ErrorMetricsTests(unittest.TestCase):
                 "profile_error_avg": 85.0,
                 "global_error_avg": 49.5,
                 "max_error_threshold": 30.0,
-                "slots": [{"slot": 2, "window_error": 80.0}],
+                "slots": [
+                    {"slot": 0, "cumulative_error": 70.0, "window_error": 65.0},
+                    {"slot": 1, "cumulative_error": 80.0, "window_error": 75.0},
+                    {"slot": 2, "cumulative_error": 85.0, "window_error": 80.0},
+                ],
             },
         }
         cache = {
@@ -270,21 +278,40 @@ class ErrorMetricsTests(unittest.TestCase):
         ):
             qa = data.get_dashboard_data("qa-calibrated-v1")
             ner = data.get_dashboard_data("ner-calibrated-v1")
+            all_profiles = data.get_dashboard_data()
 
         self.assertEqual(qa["indicators"]["total_requests"], 1)
         self.assertEqual(qa["indicators"]["qos_profile_id"], "qa-calibrated-v1")
         self.assertEqual(qa["indicators"]["error_semantics"], "word-overlap-f1-v1")
         self.assertEqual(qa["indicators"]["max_error_threshold"], 20.0)
         self.assertEqual(qa["error_plot"]["displayed_error_avg"], 14.0)
-        self.assertEqual(qa["error_plot"]["error_history"], [14.0])
+        self.assertEqual(qa["error_plot"]["error_history_slots"], [0, 1, 2])
+        self.assertEqual(qa["error_plot"]["error_history"], [10.0, 12.0, 14.0])
+        self.assertEqual(qa["error_plot"]["window_error_history"], [9.0, 11.0, 13.0])
         self.assertEqual(qa["assignment_plot"]["balanced"][2], 1)
         self.assertEqual(qa["assignment_plot"]["fast"][2], 0)
         self.assertEqual(qa["assignment_plot"]["global_slot_occupancy"][2], 2)
         self.assertEqual(qa["assignment_plot"]["capacity_tiers"], capacity_tiers)
+        self.assertEqual(
+            qa["error_plot"]["profile_thresholds"],
+            [
+                {
+                    "profile_id": "qa-calibrated-v1",
+                    "task_kind": "question_answering",
+                    "threshold": 20.0,
+                },
+                {
+                    "profile_id": "ner-calibrated-v1",
+                    "task_kind": "ner",
+                    "threshold": 30.0,
+                },
+            ],
+        )
 
         self.assertEqual(ner["indicators"]["qos_profile_id"], "ner-calibrated-v1")
         self.assertEqual(ner["error_plot"]["displayed_error_avg"], 85.0)
-        self.assertEqual(ner["error_plot"]["error_history"], [85.0])
+        self.assertEqual(ner["error_plot"]["error_history_slots"], [0, 1, 2])
+        self.assertEqual(ner["error_plot"]["error_history"], [70.0, 80.0, 85.0])
         self.assertEqual(
             [profile["profile_id"] for profile in ner["active_profiles"]],
             ["qa-calibrated-v1", "ner-calibrated-v1"],
@@ -294,6 +321,12 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(ner["error_plot"]["error_by_flavour"][custom_flavour_index][2], 85.0)
         self.assertEqual(cache["error_metrics_by_profile"]["qa-calibrated-v1"][2]["error_avg"], 14.0)
         self.assertEqual(cache["error_metrics_by_profile"]["ner-calibrated-v1"][2]["error_avg"], 85.0)
+
+        self.assertEqual(all_profiles["error_plot"]["qos_profile_id"], None)
+        self.assertEqual(
+            all_profiles["error_plot"]["profile_thresholds"],
+            qa["error_plot"]["profile_thresholds"],
+        )
 
 
 if __name__ == "__main__":

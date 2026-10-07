@@ -20,6 +20,16 @@ pub struct RegisterQosProfilePayload {
     pub cumulative_error: CumulativeErrorPolicy,
 }
 
+/// Body of the administrative global-capacity-tier replacement endpoint.
+///
+/// Capacity tiers intentionally live outside `QosProfile`: one update changes
+/// the shared slot-pricing policy for every profile.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetCapacityTiersPayload {
+    pub capacity_tiers: Vec<CapacityTier>,
+}
+
 /// Optional profile-catalog listing behavior.
 #[derive(Debug, Deserialize, Default)]
 pub struct QosProfilesQuery {

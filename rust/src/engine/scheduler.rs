@@ -101,6 +101,8 @@ impl SwarmBackend {
 /// All mutable scheduler state shared between the main loop and workers.
 struct SchedulerMutableState {
     active_workers: usize,
+    /// Revision of the global tiers used by the cached online-solvers.
+    capacity_tier_revision: u64,
     /// Only one solve may be in flight for a profile so its next batch sees
     /// the previous batch's committed error-budget contribution.
     active_profiles: HashSet<QosProfileId>,
@@ -153,6 +155,10 @@ impl BatchScheduler {
         metrics_logger: Arc<MetricsLogger>,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
+        // Offline schedulers have no REST AppState to initialize the runtime
+        // policy. For the live service this is idempotent with AppState::new.
+        shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
+        let capacity_tier_revision = shared_state.capacity_tier_revision();
         let carbon_forecast = carbon_forecast;
         let flavour_duration_by_name: HashMap<String, i32> = cfg
             .flavours
@@ -167,6 +173,7 @@ impl BatchScheduler {
             running: Arc::new(AtomicBool::new(false)),
             mutable: Arc::new(Mutex::new(SchedulerMutableState {
                 active_workers: 0,
+                capacity_tier_revision,
                 active_profiles: HashSet::new(),
                 last_infeasible: HashMap::new(),
                 last_dispatched_profile: None,
@@ -542,8 +549,9 @@ fn dispatch_batch_workers(
     let mut dispatched = false;
     let min_pending = if flush { 1 } else { cfg.solver.batch_size };
     // Serialized swarm solvers update their persistent state in place. Keep
-    // solve and commit as one-at-a-time so the global capacity snapshot cannot
-    // become stale between their state update and shared-state commit.
+    // those solves one-at-a-time so a rollback cannot occur after their
+    // strategy state has already been mutated. Every worker also holds the
+    // shared capacity-tier read guard through solve and commit.
     let max_workers =
         if is_online_swarm_strategy(&cfg.solver.solver_strategy) && cfg.swarm.mode != "merge" {
             1
@@ -632,6 +640,27 @@ fn batch_worker_entry(
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
 ) -> bool {
+    // Keep a read guard for this whole worker: the capacity setter takes the
+    // corresponding write lock, so a running batch finishes its solve and
+    // commit with the same tier ladder before a replacement becomes visible.
+    let capacity_tiers_guard = shared_state.capacity_tiers_guard();
+    let capacity_tiers = capacity_tiers_guard
+        .as_deref()
+        .unwrap_or(&cfg.capacity_tiers);
+    let capacity_tier_revision = shared_state.capacity_tier_revision();
+    {
+        let mut scheduler_state = mutable.lock().unwrap();
+        if scheduler_state.capacity_tier_revision != capacity_tier_revision {
+            // Online bandit/ACO estimates are measured in carbon cost. They
+            // cannot be compared to new costs after a tier switch, so discard
+            // those learned estimates when this worker first sees the new
+            // ladder. The tier read guard ensures no setter can race this
+            // reset, solve, or the eventual commit.
+            scheduler_state.swarm_states.clear();
+            scheduler_state.capacity_tier_revision = capacity_tier_revision;
+        }
+    }
+
     let profile_id = pending
         .first()
         .map(Request::qos_profile_id)
@@ -639,10 +668,11 @@ fn batch_worker_entry(
     let qos_profile = pending
         .first()
         .and_then(|request| request.qos_profile.clone());
-    let assignment = qos_profile
+    let mut assignment = qos_profile
         .as_deref()
         .map(|profile| cfg.assignment_policy_for_profile(profile))
         .unwrap_or_else(|| cfg.assignment_policy());
+    assignment.capacity_tiers = capacity_tiers;
     debug_assert!(
         pending
             .iter()

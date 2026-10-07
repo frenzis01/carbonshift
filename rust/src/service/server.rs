@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 
 use crate::service::state::AppState;
 use crate::service::{auth, handlers};
@@ -19,6 +19,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::register_qos_profile).get(handlers::list_qos_profiles),
         )
         .route("/v1/profiles/:profile_id", get(handlers::get_qos_profile))
+        .route(
+            "/v1/admin/capacity-tiers",
+            put(handlers::force_set_capacity_tiers),
+        )
         .route("/v1/tasks", post(handlers::register_task))
         .route("/v1/tasks/:task_id", get(handlers::get_task_config))
         .route_layer(middleware::from_fn_with_state(

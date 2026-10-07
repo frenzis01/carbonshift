@@ -161,6 +161,32 @@ def get_qos_profile(profile_id: str) -> dict[str, Any]:
     return resp.json()
 
 
+def force_set_global_capacity_tiers(capacity_tiers: list[dict[str, Any]]) -> None:
+    """Request an administrative replacement of the shared tier ladder.
+
+    This deliberately does not register tiers on a profile. Carbonshift's
+    endpoint is a Rust learning scaffold and currently returns 501 until its
+    runtime configuration projections are implemented.
+    """
+    try:
+        resp = requests.put(
+            f"{settings.carbonshift_url}/v1/admin/capacity-tiers",
+            json={"capacity_tiers": capacity_tiers},
+            headers=_api_headers(),
+            timeout=settings.http_timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        raise CarbonshiftError(
+            f"cannot reach carbonshift at {settings.carbonshift_url}: {exc}"
+        ) from exc
+
+    if resp.status_code != 204:
+        raise CarbonshiftError(
+            f"carbonshift returned {resp.status_code}: {resp.text}",
+            status_code=resp.status_code,
+        )
+
+
 def register_task(task_id: str, flavours: list[dict[str, Any]], max_error_threshold: float | None = None, capacity_tiers: list[dict[str, Any]] | None = None) -> None:
     """`POST /v1/tasks` — announces (or updates) a task's available
     flavours (`[{"name", "error", "duration"}, ...]`) on carbonshift, so

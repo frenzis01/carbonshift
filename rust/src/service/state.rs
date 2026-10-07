@@ -138,8 +138,6 @@ pub struct ServiceSchedulerConfig {
     pub manual_clock: bool,
     /// Default execution flavours for requests without a task override.
     pub flavours: Vec<Flavour>,
-    /// Default capacity tiers used to price assignments and baseline costs.
-    pub capacity_tiers: Vec<CapacityTier>,
     /// Conversion factor from intensity and duration to carbon cost.
     pub carbon_cost_duration_scale: f64,
     /// Global maximum average error accepted by the scheduler.
@@ -309,7 +307,6 @@ impl ServiceSchedulerConfig {
             effective_slot_duration_secs: cfg.effective_slot_duration_secs(),
             manual_clock: cfg.simulation.manual_clock,
             flavours: cfg.flavours.clone(),
-            capacity_tiers: cfg.capacity_tiers.clone(),
             carbon_cost_duration_scale: cfg.carbon_cost_duration_scale,
             max_error_threshold: cfg.max_error_threshold,
             error_window_past: cfg.error_window_past,
@@ -376,6 +373,10 @@ impl AppState {
         service_cfg: ServiceConfig,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
+        // Tests and integrations can construct AppState without a live
+        // BatchScheduler. Initialize the shared policy here too; in the
+        // service binary the scheduler constructor has already done so.
+        shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
         let mut task_flavours = HashMap::new();
         task_flavours.insert(
             "default".to_string(),
@@ -517,11 +518,6 @@ mod tests {
         assert_eq!(service.flavours[0].name, "ServiceSentinel");
         assert_eq!(service.flavours[0].error, 3.75);
         assert_eq!(service.flavours[0].duration, 91);
-        assert_eq!(service.capacity_tiers.len(), 2);
-        assert_eq!(service.capacity_tiers[0].max_requests, Some(9));
-        assert_eq!(service.capacity_tiers[0].multiplier, 2.25);
-        assert_eq!(service.capacity_tiers[1].max_requests, None);
-        assert_eq!(service.capacity_tiers[1].multiplier, 7.0);
         assert_eq!(service.carbon_cost_duration_scale, 0.375);
         assert_eq!(service.max_error_threshold, 8.25);
         assert_eq!(service.error_window_past, 5);

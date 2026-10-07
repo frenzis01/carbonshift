@@ -26,7 +26,11 @@ logger = logging.getLogger()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.carbonshift_client import CarbonshiftError, register_qos_profile  # noqa: E402
+from app.carbonshift_client import (  # noqa: E402
+    CarbonshiftError,
+    force_set_global_capacity_tiers,
+    register_qos_profile,
+)
 from app.config import settings  # noqa: E402
 from app.plan_builder import build_requests  # noqa: E402
 from app.qos_profiles import build_task_profiles, load_configured_profiles  # noqa: E402
@@ -98,6 +102,22 @@ def _default_profile_id(task: str, profile_version: str) -> str:
     return f"{task}-calibrated-{profile_version}"
 
 
+def build_capacity_tiers(requests_per_slot: int) -> list[dict[str, int | float | None]]:
+    """Build the old emulation pricing ladder from its requests-per-slot setting.
+
+    The ladder is global and affects every client/profile using Carbonshift.
+    The second finite bound is kept strictly above the first even for tiny
+    workloads (for example, `--per-slot 1`).
+    """
+    base = max(1, requests_per_slot)
+    middle = max(base + 1, int(base * 1.5))
+    return [
+        {"max_requests": base, "multiplier": 1.0},
+        {"max_requests": middle, "multiplier": 1.5},
+        {"max_requests": None, "multiplier": 5.0},
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client-url", default="http://localhost:8100")
@@ -121,11 +141,30 @@ def main() -> None:
                          help="0-1 fraction between the task's min and max calibrated error (default: 0.75).")
     parser.add_argument("--no-register", action="store_true",
                          help="Do not register a profile; omit --qos-profile-id to use the task-kind default.")
+    parser.add_argument(
+        "--no-global-capacity-tiers",
+        action="store_true",
+        help=(
+            "AVOID setting Carbonshift's global capacity ladder from --per-slot before submitting. "
+            "Setting them instead affects all profiles."
+        ),
+    )
     parser.add_argument("--poll-interval", type=float, default=1.0,
                          help="Seconds between progress checks while advancing the clock.")
     parser.add_argument("--timeout", type=float, default=600.0,
                          help="Total timeout in seconds for the emulation to finish.")
     args = parser.parse_args()
+
+    if not args.no_global_capacity_tiers:
+        tiers = build_capacity_tiers(args.per_slot)
+        try:
+            force_set_global_capacity_tiers(tiers)
+        except CarbonshiftError as exc:
+            raise SystemExit(
+                "could not set global capacity tiers; the Carbonshift endpoint may still be "
+                f"the documented Rust scaffold: {exc}"
+            ) from exc
+        print(f"set global capacity tiers from --per-slot={args.per_slot}: {tiers}")
 
     qos_profile_id = args.qos_profile_id
     if not args.no_register:
