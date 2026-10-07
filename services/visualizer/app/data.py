@@ -472,6 +472,9 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
             "carbon_intensity_forecast": ci_forecast_series,
             "carbon_intensity_actual": ci_actual_series,
             "global_slot_occupancy": global_slot_occupancy,
+            # The visualizer uses this only as the initial legend state.
+            # Plotly's uirevision preserves a user's later legend choice.
+            "global_slot_occupancy_visible_by_default": len(active_profiles) > 1,
             "qos_profile_id": selected_profile_id,
             "capacity_tiers": capacity_tiers,
             "flavour_colors": {

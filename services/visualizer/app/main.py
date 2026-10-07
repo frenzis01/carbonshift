@@ -405,6 +405,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       return FLAVOUR_COLORS[name] || CUSTOM_FLAVOUR_COLORS[index % CUSTOM_FLAVOUR_COLORS.length];
     }
 
+    function plotUiRevision(chartName, viewMode = '') {
+      // Plotly.react rebuilds each figure every poll. Keep its revision stable
+      // for this chart/profile so Plotly retains user zoom, legend visibility,
+      // and other interactions instead of treating every poll as a new plot.
+      // A different profile is a different view and gets its own revision.
+      const profileKey = selectedProfileId || 'all-profiles';
+      return `carbonshift:${chartName}:${profileKey}:${viewMode}`;
+    }
+
     async function fetchData() {
       try {
         const url = new URL('/api/data', window.location.origin);
@@ -594,6 +603,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     function renderAssignmentPlot(plot, ind) {
       const flavourCount = plot.flavours.length;
+      const occupancyVisibleByDefault = plot.global_slot_occupancy_visible_by_default;
+      const uiRevision = plotUiRevision(
+        'assignments',
+        occupancyVisibleByDefault ? 'multiple-active-profiles' : 'single-active-profile',
+      );
       const filtered = filterAndResample(
         plot.slots,
         [
@@ -622,6 +636,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           name: 'Global Slot Occupancy',
           type: 'scatter',
           mode: 'lines+markers',
+          // Start hidden for one active profile and shown for multiple
+          // profiles. A legend click is remembered by `uirevision` after this.
+          visible: occupancyVisibleByDefault ? true : 'legendonly',
           marker: { size: 4, color: '#cbd5e1' },
           line: { color: '#cbd5e1', width: 1.5, dash: 'dash' },
         },
@@ -690,12 +707,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
 
       const layout = {
+        uirevision: uiRevision,
         barmode: 'stack',
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: { color: '#f8fafc', family: 'inherit' },
         margin: { l: 50, r: 50, t: 30, b: 60 },
-        legend: { orientation: 'h', x: 0, y: 1.15 },
+        legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
           title: 'Scheduled Slot',
           gridcolor: '#334155',
@@ -722,6 +740,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderErrorPlot(plot) {
+      const uiRevision = plotUiRevision('errors');
       document.getElementById('plot-error-avg-label').firstChild.textContent =
         `Current ${plot.error_avg_label.toLowerCase()}: `;
       document.getElementById('plot-global-error-avg').textContent =
@@ -825,12 +844,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
 
       const layout = {
+        uirevision: uiRevision,
         barmode: 'stack',
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: { color: '#f8fafc', family: 'inherit' },
         margin: { l: 50, r: 50, t: 30, b: 60 },
-        legend: { orientation: 'h', x: 0, y: 1.15 },
+        legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
           title: 'Scheduled Slot',
           gridcolor: '#334155',
@@ -850,6 +870,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderInputPlot(plot) {
+      const uiRevision = plotUiRevision('inputs');
       const filtered = filterAndResample(
         plot.slots,
         [plot.arrived_requests, plot.carbon_intensity_forecast, plot.carbon_intensity_actual],
@@ -888,11 +909,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       ];
 
       const layout = {
+        uirevision: uiRevision,
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: { color: '#f8fafc', family: 'inherit' },
         margin: { l: 50, r: 50, t: 30, b: 60 },
-        legend: { orientation: 'h', x: 0, y: 1.15 },
+        legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
           title: 'Arrival Slot',
           gridcolor: '#334155',

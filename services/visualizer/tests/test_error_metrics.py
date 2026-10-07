@@ -21,6 +21,15 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"selected": "qa-calibrated-v1"})
 
+    def test_dashboard_page_uses_plotly_ui_revision_to_preserve_user_view_state(self):
+        with TestClient(main_module.app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("function plotUiRevision(chartName", response.text)
+        self.assertIn("uirevision: uiRevision", response.text)
+        self.assertIn("legend: { uirevision: uiRevision", response.text)
+
     def test_error_plot_uses_current_scheduler_error_snapshots(self):
         responses = {
             "http://client:8100/requests": [
@@ -291,6 +300,7 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(qa["assignment_plot"]["balanced"][2], 1)
         self.assertEqual(qa["assignment_plot"]["fast"][2], 0)
         self.assertEqual(qa["assignment_plot"]["global_slot_occupancy"][2], 2)
+        self.assertTrue(qa["assignment_plot"]["global_slot_occupancy_visible_by_default"])
         self.assertEqual(qa["assignment_plot"]["capacity_tiers"], capacity_tiers)
         self.assertEqual(
             qa["error_plot"]["profile_thresholds"],
@@ -326,6 +336,12 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(
             all_profiles["error_plot"]["profile_thresholds"],
             qa["error_plot"]["profile_thresholds"],
+        )
+
+        responses["http://carbonshift:8080/v1/profiles"] = [profiles[0]]
+        one_profile = data.get_dashboard_data()
+        self.assertFalse(
+            one_profile["assignment_plot"]["global_slot_occupancy_visible_by_default"]
         )
 
 
