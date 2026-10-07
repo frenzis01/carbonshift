@@ -24,7 +24,7 @@ SLOT_MINUTES = 60.0
 _counter = itertools.count(1)
 
 
-def fake_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
+def fake_submit(deadline_seconds, callback_url, payload, **kwargs):
     return {
         "request_id": next(_counter),
         "qos_profile_id": kwargs.get("qos_profile_id"),
@@ -250,9 +250,9 @@ def test_tick_does_not_require_the_client_to_track_its_own_slot(client):
     sent: list[dict] = []
     original = plan_runner.submit
 
-    def recording_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
+    def recording_submit(deadline_seconds, callback_url, payload, **kwargs):
         sent.append(payload)
-        return original(deadline_seconds, callback_url, payload, task_id=task_id, **kwargs)
+        return original(deadline_seconds, callback_url, payload, **kwargs)
 
     plan_runner.submit = recording_submit
     try:

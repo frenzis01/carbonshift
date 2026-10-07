@@ -956,10 +956,6 @@ mod tests {
             arrival_slot: arrival,
             deadline_slot: deadline,
             arrival_time: 0.0,
-            task_id: "default".to_string(),
-            flavours: vec![],
-            max_error_threshold: None,
-            capacity_tiers: None,
             qos_profile: None,
             qos_profile_id: QosProfileId::default_profile(),
         }

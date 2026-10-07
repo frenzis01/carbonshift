@@ -80,15 +80,12 @@ def _api_headers() -> dict[str, str]:
     return {}
 
 
-# arrival_slot_global is optional and only included in the request body if provided
-# it is needed when./run/send-plan is used. It is not included when /run/send-batch
-# TODO: is send-batch dead code...? Is /run/send-batch actually still used?
+# Plan submissions include an absolute arrival slot; ordinary batch submissions
+# omit it and let Carbonshift derive the arrival slot from its current clock.
 def submit(deadline_seconds: float, callback_url: str, payload: dict[str, Any],
-           task_id: str | None = None, arrival_slot_global: int | None = None,
-           qos_profile_id: str | None = None, task_kind: str | None = None) -> dict[str, Any]:
+           arrival_slot_global: int | None = None, qos_profile_id: str | None = None,
+           task_kind: str | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"deadline_seconds": deadline_seconds, "callback_url": callback_url, "payload": payload}
-    if task_id is not None:
-        body["task_id"] = task_id
     if qos_profile_id is not None:
         body["qos_profile_id"] = qos_profile_id
     if task_kind is not None:
@@ -129,22 +126,6 @@ def register_qos_profile(profile: dict[str, Any]) -> None:
             _known_profile_definitions[str(profile_id)] = deepcopy(profile)
 
 
-def list_qos_profiles() -> list[dict[str, Any]]:
-    """Return active built-in and registered profiles for client tooling."""
-    try:
-        resp = requests.get(
-            f"{settings.carbonshift_url}/v1/profiles",
-            headers=_api_headers(),
-            timeout=settings.http_timeout_seconds,
-        )
-    except requests.RequestException as exc:
-        raise CarbonshiftError(f"cannot reach carbonshift at {settings.carbonshift_url}: {exc}") from exc
-
-    if resp.status_code != 200:
-        raise CarbonshiftError(f"carbonshift returned {resp.status_code}: {resp.text}")
-    return resp.json()
-
-
 def get_qos_profile(profile_id: str) -> dict[str, Any]:
     """Fetch one active profile by its stable shared identifier."""
     try:
@@ -164,9 +145,8 @@ def get_qos_profile(profile_id: str) -> dict[str, Any]:
 def force_set_global_capacity_tiers(capacity_tiers: list[dict[str, Any]]) -> None:
     """Request an administrative replacement of the shared tier ladder.
 
-    This deliberately does not register tiers on a profile. Carbonshift's
-    endpoint is a Rust learning scaffold and currently returns 501 until its
-    runtime configuration projections are implemented.
+    Capacity tiers price shared slot occupancy, so the replacement applies
+    globally rather than changing any individual QoS profile.
     """
     try:
         resp = requests.put(
@@ -185,40 +165,6 @@ def force_set_global_capacity_tiers(capacity_tiers: list[dict[str, Any]]) -> Non
             f"carbonshift returned {resp.status_code}: {resp.text}",
             status_code=resp.status_code,
         )
-
-
-def register_task(task_id: str, flavours: list[dict[str, Any]], max_error_threshold: float | None = None, capacity_tiers: list[dict[str, Any]] | None = None) -> None:
-    """`POST /v1/tasks` — announces (or updates) a task's available
-    flavours (`[{"name", "error", "duration"}, ...]`) on carbonshift, so
-    requests submitted with this `task_id` are scheduled among them instead
-    of carbonshift's built-in default flavours. `max_error_threshold` (%),
-    if given, overrides carbonshift's single global default for this task's
-    requests — see `push_flavours.py` for how it's chosen by default."""
-    body: dict[str, Any] = {"task_id": task_id, "flavours": flavours}
-    if max_error_threshold is not None:
-        body["max_error_threshold"] = max_error_threshold
-    '''
-    Capacity tiers correct format for rust to interpret is
-    [{"max_requests": 30, "multiplier": 1.0},
-    {"max_requests": 50, "multiplier": 1.5},
-    {"max_requests": None, "multiplier": 3.0}]
-    '''
-    
-    if capacity_tiers is not None:
-        body["capacity_tiers"] = capacity_tiers
-
-    try:
-        resp = requests.post(
-            f"{settings.carbonshift_url}/v1/tasks",
-            json=body,
-            headers=_api_headers(),
-            timeout=settings.http_timeout_seconds,
-        )
-    except requests.RequestException as exc:
-        raise CarbonshiftError(f"cannot reach carbonshift at {settings.carbonshift_url}: {exc}") from exc
-
-    if resp.status_code != 204:
-        raise CarbonshiftError(f"carbonshift returned {resp.status_code}: {resp.text}")
 
 
 def get_status(request_id: str) -> dict[str, Any]:
@@ -247,23 +193,6 @@ def get_stats() -> dict[str, Any]:
     try:
         resp = requests.get(
             f"{settings.carbonshift_url}/v1/stats",
-            headers=_api_headers(),
-            timeout=settings.http_timeout_seconds,
-        )
-    except requests.RequestException as exc:
-        raise CarbonshiftError(f"cannot reach carbonshift at {settings.carbonshift_url}: {exc}") from exc
-
-    if resp.status_code != 200:
-        raise CarbonshiftError(f"carbonshift returned {resp.status_code}: {resp.text}")
-    return resp.json()
-
-
-def get_task_config(task_id: str) -> dict[str, Any]:
-    """`GET /v1/tasks/{task_id}` — the task's currently effective flavours
-    and `max_error_threshold` (registered override, or the global default)."""
-    try:
-        resp = requests.get(
-            f"{settings.carbonshift_url}/v1/tasks/{task_id}",
             headers=_api_headers(),
             timeout=settings.http_timeout_seconds,
         )

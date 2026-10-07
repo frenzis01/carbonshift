@@ -17,11 +17,6 @@ class Settings:
     host: str = os.environ.get("CLIENT_HOST", "0.0.0.0")
     port: int = int(os.environ.get("CLIENT_PORT", "8100"))
     http_timeout_seconds: float = float(os.environ.get("CLIENT_HTTP_TIMEOUT_SECONDS", "10"))
-    # Admin advance-slot calls (emulated plan mode) can legitimately take
-    # longer than a normal submission: carbonshift flushes a partial batch
-    # and waits for its own dispatcher to hand everything off, and the
-    # executor then runs a real model inference before replying.
-    admin_timeout_seconds: float = float(os.environ.get("CLIENT_ADMIN_TIMEOUT_SECONDS", "60"))
     # A request with no callback after this long is marked "timed_out".
     callback_timeout_seconds: float = float(os.environ.get("CLIENT_CALLBACK_TIMEOUT_SECONDS", "300"))
     metrics_path: str = os.environ.get("CLIENT_METRICS_PATH", "data/metrics.jsonl")
@@ -46,11 +41,6 @@ class Settings:
     qos_profile_registration_retry_seconds: float = float(
         os.environ.get("CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS", "2.0")
     )
-    # Default executor admin base URL for the "emulated" plan mode (only
-    # used to call POST /admin/advance-slot directly — normal task traffic
-    # always goes through carbonshift, never straight to the executor).
-    executor_admin_url: str = os.environ.get("EXECUTOR_ADMIN_URL", "http://localhost:9000")
-
     # ── carbon-intensity provider ─────────────────────────────────────────
     # The provider owns the clock (see provider/ARCHITECTURE.md §2). The
     # client is a *peer* it notifies, not a driver.

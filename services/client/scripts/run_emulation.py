@@ -161,8 +161,7 @@ def main() -> None:
             force_set_global_capacity_tiers(tiers)
         except CarbonshiftError as exc:
             raise SystemExit(
-                "could not set global capacity tiers; the Carbonshift endpoint may still be "
-                f"the documented Rust scaffold: {exc}"
+                f"could not set global capacity tiers on Carbonshift: {exc}"
             ) from exc
         print(f"set global capacity tiers from --per-slot={args.per_slot}: {tiers}")
 

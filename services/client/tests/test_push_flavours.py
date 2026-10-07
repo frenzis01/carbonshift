@@ -1,16 +1,10 @@
-"""`build_task_flavours` groups `model_stats.json` entries by task and
-converts real (fractional-second) measurements into carbonshift's
-integer `duration` field (milliseconds — see push_flavours.py docstring)."""
+"""Calibration rows become stable profile definitions with millisecond costs."""
 from __future__ import annotations
 
-from scripts.push_flavours import (
-    build_task_flavours,
-    build_task_profiles,
-    default_error_threshold,
-)
+from app.qos_profiles import build_task_profiles, default_error_threshold
 
 
-def test_groups_entries_by_task_and_converts_units():
+def test_profile_builder_groups_latest_task_flavours_and_converts_units():
     stats = {
         "distilgpt2": {"task": "text_generation", "flavour": "fast",
                        "error_pct": 5.1, "avg_execution_time_seconds": 0.02},
@@ -19,21 +13,19 @@ def test_groups_entries_by_task_and_converts_units():
         "distilbert-base-cased-distilled-squad": {"task": "question_answering", "flavour": "fast",
                                                     "error_pct": 1.0, "avg_execution_time_seconds": 0.016},
     }
-    result = build_task_flavours(stats)
-    assert set(result.keys()) == {"text_generation", "question_answering"}
-
-    tg = {f["name"]: f for f in result["text_generation"]}
+    result = build_task_profiles(stats)
+    tg = {f["name"]: f for f in result["text_generation"]["flavours"]}
     assert tg["Fast"]["error"] == 5.1
     assert tg["Fast"]["duration"] == 20  # 0.02s -> 20ms
     assert tg["Balanced"]["duration"] == 50
 
-    assert len(result["question_answering"]) == 1
+    assert len(result["question_answering"]["flavours"]) == 1
 
 
 def test_duration_is_never_zero_for_very_fast_models():
     stats = {"m": {"task": "ner", "flavour": "fast", "error_pct": 0.0, "avg_execution_time_seconds": 0.0001}}
-    result = build_task_flavours(stats)
-    assert result["ner"][0]["duration"] == 1
+    result = build_task_profiles(stats)
+    assert result["ner"]["flavours"][0]["duration"] == 1
 
 
 def test_stale_model_for_the_same_task_flavour_is_superseded_by_the_newer_one():
@@ -48,9 +40,9 @@ def test_stale_model_for_the_same_task_flavour_is_superseded_by_the_newer_one():
                       "error_pct": 13.5, "avg_execution_time_seconds": 0.10,
                       "measured_at": "2026-09-07T16:00:00+00:00"},
     }
-    result = build_task_flavours(stats)
-    assert len(result["question_answering"]) == 1
-    assert result["question_answering"][0]["error"] == 13.5
+    result = build_task_profiles(stats)
+    assert len(result["question_answering"]["flavours"]) == 1
+    assert result["question_answering"]["flavours"][0]["error"] == 13.5
 
 
 def test_default_error_threshold_is_75_percent_between_min_and_max():

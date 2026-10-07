@@ -20,12 +20,11 @@ def make_fake_submit():
     calls = []
     counter = iter(range(1, 10_000))
 
-    def fake_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
+    def fake_submit(deadline_seconds, callback_url, payload, **kwargs):
         rid = next(counter)
         calls.append({
             "deadline_seconds": deadline_seconds,
             "payload": payload,
-            "task_id": task_id,
             "task_kind": kwargs.get("task_kind"),
             "qos_profile_id": kwargs.get("qos_profile_id"),
         })
@@ -102,7 +101,6 @@ def test_send_slot_batch_submits_every_request_and_tracks_them(monkeypatch, tmp_
     assert submitted == 2
     assert len(calls) == 2
     assert len(tracker.all()) == 2
-    assert all(call["task_id"] is None for call in calls)
     assert all(call["task_kind"] == "text_generation" for call in calls)
 
 
@@ -120,7 +118,6 @@ def test_send_slot_batch_keeps_profile_separate_from_executor_task(monkeypatch, 
 
     assert calls[0]["task_kind"] == "text_generation"
     assert calls[0]["qos_profile_id"] == "text-generation-calibrated-v1"
-    assert calls[0]["task_id"] is None
     assert tracker.all()[0]["qos_profile_id"] == "text-generation-calibrated-v1"
 
 
@@ -139,8 +136,8 @@ def test_send_slot_batch_skips_a_failed_submit_without_aborting_the_slot(monkeyp
 
     calls = []
 
-    def flaky_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
-        calls.append(task_id)
+    def flaky_submit(deadline_seconds, callback_url, payload, **kwargs):
+        calls.append(payload)
         if len(calls) == 1:
             raise CarbonshiftError("boom")
         return {"request_id": 99, "status": "scheduled", "scheduled_slot": 1,

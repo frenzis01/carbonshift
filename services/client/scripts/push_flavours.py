@@ -43,10 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.carbonshift_client import CarbonshiftError, register_qos_profile  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.qos_profiles import (  # noqa: E402
-    DEFAULT_MODEL_STATS,
-    build_task_flavours,
     build_task_profiles,
-    default_error_threshold,
 )
 
 

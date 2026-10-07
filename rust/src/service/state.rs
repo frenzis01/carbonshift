@@ -14,7 +14,6 @@ use crate::engine::qos::{
 use crate::engine::shared_state::SharedState;
 use crate::engine::types::Flavour;
 use crate::service::models::{LegacyTaskIdUsage, RequestStatus};
-use crate::types::CapacityTier;
 
 /// Per-request bookkeeping that lives outside the scheduling engine: the
 /// caller's callback URL, the opaque payload to forward to the executor, and
@@ -108,23 +107,6 @@ pub struct ServiceConfig {
     /// to send to the executor. Lower this (e.g. to 10-20ms) for snappier
     /// "fake time" emulation tests; the default is fine for real-time use.
     pub dispatcher_poll_interval_ms: u64,
-}
-
-/// Legacy `/v1/tasks` lookup adapter; `profile_id` owns the QoS policy.
-#[derive(Clone)]
-pub struct TaskConfig {
-    /// Profile alias used by callers still using the legacy `task_id` field.
-    pub profile_id: QosProfileId,
-    pub flavours: Vec<Flavour>,
-    // TODO: why is max_error_threshold inside TaskConfig if it is applied globally to all tasks?
-    /// Overrides `Config::max_error_threshold` (%) for this task's own
-    /// requests' local/window feasibility check. `None` = use the global
-    /// default. Legacy compatibility only: resolved QoS profiles now own
-    /// both window and cumulative thresholds.
-    pub max_error_threshold: Option<f64>,
-    /// Deprecated compatibility field. New profiles use scheduler-global
-    /// capacity tiers, so the legacy registration adapter rejects overrides.
-    pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
 
 /// The subset of scheduler configuration needed by the HTTP service.
@@ -337,12 +319,10 @@ pub struct AppState {
     /// hypothetical baseline the same per-slot capacity-tier repricing an
     /// immediate/no-batching execution would have faced.
     pub baseline_slot_counts: Arc<Mutex<HashMap<i32, i64>>>,
-    /// Dynamic task registry: `task_id → TaskConfig` announced by clients via
-    /// `POST /v1/tasks` (see `service::handlers::register_task`). Always
-    /// seeded with `"default" → cfg.flavours` (no threshold override) so
-    /// requests that don't reference a registered task (or CLI/simulation
-    /// tools) keep using the predefined default flavours, unchanged.
-    pub task_flavours: Arc<Mutex<HashMap<String, TaskConfig>>>,
+    /// Deprecated `/v1/tasks` aliases map to a QoS profile ID only. The
+    /// immutable profile registry is the single source for flavours,
+    /// thresholds, semantics, and windows.
+    pub legacy_task_profile_ids: Arc<Mutex<HashMap<String, QosProfileId>>>,
     // TODO: actually now we have the provider...
     /// Real (not forecast) carbon intensity per slot, reported by the client
     /// piggybacked on `POST /v1/admin/advance-slot` (see
@@ -377,15 +357,10 @@ impl AppState {
         // BatchScheduler. Initialize the shared policy here too; in the
         // service binary the scheduler constructor has already done so.
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
-        let mut task_flavours = HashMap::new();
-        task_flavours.insert(
+        let mut legacy_task_profile_ids = HashMap::new();
+        legacy_task_profile_ids.insert(
             "default".to_string(),
-            TaskConfig {
-                profile_id: QosProfileId::parse("default-text-generation").unwrap(),
-                flavours: cfg.flavours.clone(),
-                max_error_threshold: None,
-                capacity_tiers: None,
-            },
+            QosProfileId::parse("default-text-generation").unwrap(),
         );
         let qos_profiles = QosProfileRegistry::from_config(&cfg);
         Self {
@@ -399,7 +374,7 @@ impl AppState {
             tracked: Arc::new(Mutex::new(HashMap::new())),
             carbon_forecast,
             baseline_slot_counts: Arc::new(Mutex::new(HashMap::new())),
-            task_flavours: Arc::new(Mutex::new(task_flavours)),
+            legacy_task_profile_ids: Arc::new(Mutex::new(legacy_task_profile_ids)),
             actual_carbon_intensity: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
         }
@@ -422,25 +397,9 @@ impl AppState {
         }
     }
 
-    /// Flavours registered for `task_id`, or the `"default"` task's
-    /// flavours (== `cfg.flavours`) if it was never announced.
-    pub fn flavours_for_task(&self, task_id: &str) -> Vec<Flavour> {
-        let guard = self.task_flavours.lock().unwrap();
-        guard
-            .get(task_id)
-            .or_else(|| guard.get("default"))
-            .map(|t| t.flavours.clone())
-            .unwrap_or_else(|| self.scheduler.flavours.clone())
-    }
-
     /// Stable profile alias used by a registered legacy task ID.
     pub fn profile_id_for_task(&self, task_id: &str) -> Option<QosProfileId> {
-        let registered = self
-            .task_flavours
-            .lock()
-            .unwrap()
-            .get(task_id)
-            .map(|task| task.profile_id.clone());
+        let registered = self.legacy_task_profile_ids.lock().unwrap().get(task_id).cloned();
         registered.or_else(|| {
             // Some older clients used the profile ID itself as `task_id`.
             // That remains resolvable after a restart when the profile has
@@ -456,30 +415,13 @@ impl AppState {
                 .map(|profile| profile.profile_id)
         })
     }
-
-    /// `task_id`'s registered `max_error_threshold` override (%), if any.
-    pub fn threshold_for_task(&self, task_id: &str) -> Option<f64> {
-        self.task_flavours
-            .lock()
-            .unwrap()
-            .get(task_id)
-            .and_then(|t| t.max_error_threshold)
-    }
-
-    /// `task_id`'s registered `capacity_tiers` override, if any.
-    pub fn capacity_tiers_for_task(&self, task_id: &str) -> Option<Vec<CapacityTier>> {
-        self.task_flavours
-            .lock()
-            .unwrap()
-            .get(task_id)
-            .and_then(|t| t.capacity_tiers.clone())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::config::Config;
+    use crate::types::CapacityTier;
 
     #[test]
     fn service_scheduler_projection_preserves_custom_runtime_settings() {

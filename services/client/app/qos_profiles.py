@@ -14,9 +14,6 @@ from typing import Any
 from .config import settings
 
 
-DEFAULT_MODEL_STATS = Path(__file__).resolve().parent.parent / "model_stats.json"
-
-
 def _latest_entries_by_task_flavour(stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
     """Keep only the most recently measured model for each task/flavour pair."""
     by_task: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
@@ -35,15 +32,6 @@ def _flavour_definition(entry: dict[str, Any]) -> dict[str, Any]:
         "name": entry["flavour"].capitalize(),
         "error": entry["error_pct"],
         "duration": max(round(entry["avg_execution_time_seconds"] * 1000), 1),
-    }
-
-
-def build_task_flavours(stats: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Group calibration rows by task and convert each to a flavour definition."""
-    by_task = _latest_entries_by_task_flavour(stats)
-    return {
-        task_id: [_flavour_definition(entry) for entry in entries.values()]
-        for task_id, entries in by_task.items()
     }
 
 

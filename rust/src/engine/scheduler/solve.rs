@@ -294,14 +294,17 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         profile_constraint_active = false;
     }
 
-    // Profile-backed requests carry the profile's immutable flavour snapshot.
-    // The filter below enforces only this profile's cumulative error policy;
-    // offline legacy requests without a profile retain their historical
-    // scheduler-default behavior.
+    // Profile-backed requests carry the only request-specific flavour policy.
+    // Unprofiled offline requests are absent from this map and use the
+    // scheduler's default flavour list.
     let mut request_flavours: HashMap<u64, Vec<Flavour>> = pending
         .iter()
-        .filter(|r| !r.flavours.is_empty())
-        .map(|r| (r.id, r.flavours.clone()))
+        .filter_map(|request| {
+            request
+                .qos_profile
+                .as_ref()
+                .map(|profile| (request.id, profile.flavours.clone()))
+        })
         .collect();
     if profile_constraint_active && assignment.global_error_constraint_hard {
         for flavours in request_flavours.values_mut() {
@@ -316,20 +319,9 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         }
     }
 
-    // Homogeneous profile batches have exactly one window threshold. Keep the
-    // minimum-overrides compatibility path only for older offline callers
-    // constructing requests directly without a resolved profile.
-    let effective_error_threshold = if pending.iter().all(|request| request.qos_profile.is_some()) {
-        assignment.max_error_threshold
-    } else {
-        pending
-            .iter()
-            .filter_map(|request| request.max_error_threshold)
-            .fold(None::<f64>, |acc, threshold| {
-                Some(acc.map_or(threshold, |current: f64| current.min(threshold)))
-            })
-            .unwrap_or(assignment.max_error_threshold)
-    };
+    // Every batch has one assignment policy: a QoS profile in the service,
+    // or the scheduler default for offline unprofiled requests.
+    let effective_error_threshold = assignment.max_error_threshold;
 
     // Rebound tiers describe shared infrastructure, so all profiles use the
     // same curve and account for occupancy committed by every profile.

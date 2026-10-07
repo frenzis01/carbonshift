@@ -39,7 +39,6 @@ def send_batch(tracker: RequestTracker, task: str, count: int, deadline_seconds:
                     deadline_seconds,
                     callback_url,
                     payload,
-                    task_id=None,
                     qos_profile_id=qos_profile_id,
                     task_kind=task,
                 )

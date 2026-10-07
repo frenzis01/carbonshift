@@ -553,15 +553,11 @@ pub async fn register_task(
         }
     }
 
-    state.task_flavours.lock().unwrap().insert(
-        task_id,
-        crate::service::state::TaskConfig {
-            profile_id,
-            flavours,
-            max_error_threshold,
-            capacity_tiers: None,
-        },
-    );
+    state
+        .legacy_task_profile_ids
+        .lock()
+        .unwrap()
+        .insert(task_id, profile_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -777,7 +773,6 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         }
     }
     drop(guard);
-    // TODO: Get error stats from state.rs, where there is TaskConfig with the proper error threhshold set
     let g = state.shared_state.get_global_error_stats();
     s.global_error_count = g.count;
     s.global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
@@ -793,18 +788,23 @@ pub async fn get_task_config(
     Path(task_id): Path<String>,
 ) -> Json<TaskConfigResponse> {
     state.legacy_task_id_usage.record_task_api_call();
+    let profile_id = state
+        .profile_id_for_task(&task_id)
+        .unwrap_or_else(QosProfileId::default_profile);
+    let profile = state
+        .qos_profiles
+        .get(&profile_id)
+        .unwrap_or_else(|| {
+            state
+                .qos_profiles
+                .get(&QosProfileId::default_profile())
+                .expect("the built-in default QoS profile is always registered")
+        });
     Json(TaskConfigResponse {
-        qos_profile_id: state
-            .profile_id_for_task(&task_id)
-            .unwrap_or_else(QosProfileId::default_profile)
-            .to_string(),
-        flavours: state.flavours_for_task(&task_id),
-        max_error_threshold: state
-            .threshold_for_task(&task_id)
-            .unwrap_or(state.scheduler.max_error_threshold),
-        capacity_tiers: state
-            .capacity_tiers_for_task(&task_id)
-            .unwrap_or_else(|| state.shared_state.capacity_tiers_snapshot()),
+        qos_profile_id: profile_id.to_string(),
+        flavours: profile.flavours,
+        max_error_threshold: profile.max_error_threshold,
+        capacity_tiers: state.shared_state.capacity_tiers_snapshot(),
         task_id,
     })
 }

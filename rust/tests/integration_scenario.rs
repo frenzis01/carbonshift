@@ -290,10 +290,6 @@ fn scenario_seed_2026_all_requests_scheduled_correctly() {
                     arrival_slot: r.arrival_slot,
                     arrival_time: 0.0,
                     deadline_slot: r.deadline_slot,
-                    task_id: "default".to_string(),
-                    flavours: vec![],
-                    max_error_threshold: None,
-                    capacity_tiers: None,
                     qos_profile: None,
                     qos_profile_id: carbonshift_rs::engine::qos::QosProfileId::default_profile(),
                 });

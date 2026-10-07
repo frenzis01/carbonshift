@@ -109,7 +109,7 @@ def test_submit_does_not_guess_a_definition_for_an_unknown_profile(monkeypatch):
     assert len(calls) == 1
 
 
-def test_profile_helpers_use_the_protected_profile_endpoints(monkeypatch):
+def test_profile_registration_and_lookup_use_protected_endpoints(monkeypatch):
     profile = {"profile_id": "qa-calibrated-v1", "task_kind": "question_answering"}
     calls = []
 
@@ -119,18 +119,16 @@ def test_profile_helpers_use_the_protected_profile_endpoints(monkeypatch):
 
     def fake_get(url, **kwargs):
         calls.append(("GET", url, kwargs))
-        return FakeResponse(200, [profile] if url.endswith("/v1/profiles") else profile)
+        return FakeResponse(200, profile)
 
     monkeypatch.setattr(carbonshift_client.requests, "post", fake_post)
     monkeypatch.setattr(carbonshift_client.requests, "get", fake_get)
     monkeypatch.setattr(settings, "carbonshift_api_key", "caller-key")
 
     carbonshift_client.register_qos_profile(profile)
-    assert carbonshift_client.list_qos_profiles() == [profile]
     assert carbonshift_client.get_qos_profile("qa-calibrated-v1") == profile
 
     assert [call[1] for call in calls] == [
-        f"{settings.carbonshift_url}/v1/profiles",
         f"{settings.carbonshift_url}/v1/profiles",
         f"{settings.carbonshift_url}/v1/profiles/qa-calibrated-v1",
     ]

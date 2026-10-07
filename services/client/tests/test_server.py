@@ -18,9 +18,8 @@ _counter = itertools.count(1)
 _submit_calls = []
 
 
-def fake_submit(deadline_seconds, callback_url, payload, task_id=None, **kwargs):
+def fake_submit(deadline_seconds, callback_url, payload, **kwargs):
     _submit_calls.append({
-        "task_id": task_id,
         "task_kind": kwargs.get("task_kind"),
         "qos_profile_id": kwargs.get("qos_profile_id"),
     })
@@ -92,7 +91,6 @@ def test_send_batch_tracks_requests(client):
     assert len(items) >= 3
     assert all(i["carbonshift_status"] == "scheduled" for i in items)
     assert len(_submit_calls[first_call:]) == 3
-    assert all(call["task_id"] is None for call in _submit_calls[first_call:])
     assert all(call["task_kind"] == "text_generation" for call in _submit_calls[first_call:])
 
 
@@ -113,7 +111,6 @@ def test_send_batch_propagates_and_tracks_an_explicit_qos_profile(client):
     sent = _submit_calls[first_call:]
     assert len(sent) == 1
     assert sent[0] == {
-        "task_id": None,
         "task_kind": "question_answering",
         "qos_profile_id": profile_id,
     }

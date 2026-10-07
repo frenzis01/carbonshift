@@ -64,9 +64,9 @@ pub struct SubmitRequestPayload {
     /// Opaque payload forwarded verbatim to the executor at dispatch time.
     #[serde(default)]
     pub payload: serde_json::Value,
-    /// Which registered task (see `POST /v1/tasks`) this request belongs to
-    /// — selects which flavours the solver chooses among for it. Omitted or
-    /// unregistered ⇒ falls back to the `"default"` task (`Config::flavours`).
+    /// Deprecated compatibility alias resolved through the legacy
+    /// `POST /v1/tasks` mapping. New callers should use `qos_profile_id`;
+    /// requests without either field select the default profile for `task_kind`.
     #[serde(default)]
     pub task_id: Option<String>,
     /// Stable reusable QoS budget. Omitted requests select the profile for
@@ -137,9 +137,9 @@ pub struct ExecutorCallbackPayload {
     pub baseline_execution_time_seconds: Option<f64>,
 }
 
-/// Body of `POST /v1/tasks`: announces (or updates) a task's available
-/// flavours. Clients call this once per task before submitting requests
-/// that reference it via `SubmitRequestPayload::task_id`.
+/// Deprecated registration body retained for the documented migration window.
+/// The handler translates each task ID to an immutable QoS profile; new callers
+/// should register profiles with `POST /v1/profiles`.
 #[derive(Debug, Deserialize)]
 pub struct RegisterTaskPayload {
     pub task_id: String,
@@ -150,15 +150,12 @@ pub struct RegisterTaskPayload {
     /// Versioned error-measurement ID. Legacy callers may omit it.
     #[serde(default)]
     pub error_semantics: Option<String>,
-    /// Overrides `Config::max_error_threshold` (%) for this task's own
-    /// requests. `None` = keep using the global default — useful since
-    /// different tasks' calibrated flavours can have very different error
-    /// ranges (see client/scripts/push_flavours.py for how this is chosen).
+    /// Legacy profile threshold in percent. `None` uses the service default
+    /// when the compatibility handler constructs the immutable profile.
     #[serde(default)]
     pub max_error_threshold: Option<f64>,
-    /// Overrides `Config::capacity_tiers` for this task. `None` = use the global default.
-    /// Cap tiers are specified as a list of pairs indicating the capacity threshold and its corresponding multiplier.
-    /// Example: `[[50, 1.0], [100, 1.5]]` means up to 50 requests use a 1.0x multiplier, and up to 100 requests use a 1.5x multiplier.
+    /// Legacy field retained so the compatibility endpoint can explicitly
+    /// reject profile-scoped tiers; capacity tiers are global.
     #[serde(default)]
     pub capacity_tiers: Option<Vec<CapacityTier>>,
 }
@@ -229,16 +226,14 @@ pub struct LegacyTaskIdUsage {
     pub monitoring_queries: u64,
 }
 
-/// Response of `GET /v1/tasks/{task_id}` — the task's currently effective
-/// scheduling parameters (whether registered via `POST /v1/tasks` or
-/// falling back to defaults), so callers can tell what's actually enforced.
+/// Compatibility response for `GET /v1/tasks/{task_id}`. New clients should
+/// inspect the corresponding QoS profile through the profile endpoints.
 #[derive(Debug, Serialize)]
 pub struct TaskConfigResponse {
     pub task_id: String,
     pub qos_profile_id: String,
     pub flavours: Vec<crate::engine::types::Flavour>,
-    /// Always a concrete value: the task's own override if registered,
-    /// otherwise `Config::max_error_threshold` (the global default).
+    /// Effective threshold from the immutable profile resolved for this alias.
     pub max_error_threshold: f64,
     pub capacity_tiers: Vec<CapacityTier>,
 }

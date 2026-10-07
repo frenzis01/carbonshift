@@ -54,10 +54,6 @@ fn req(id: u64, arrival: i32, deadline: i32) -> Request {
         arrival_slot: arrival,
         arrival_time: 0.0,
         deadline_slot: deadline,
-        task_id: "default".to_string(),
-        flavours: vec![],
-        max_error_threshold: None,
-        capacity_tiers: None,
         qos_profile: None,
         qos_profile_id: crate::engine::qos::QosProfileId::default_profile(),
     }
@@ -324,43 +320,11 @@ fn test_all_pending_requests_are_scheduled() {
     }
 }
 
-/// A request carrying its own (per-task) flavour list must be assigned
-/// one of *those* flavours, not one from `cfg.flavours` — this is what
-/// lets a dynamically-registered task's flavours actually reach the DP
-/// solver (see `Request::new_for_task` / `service::handlers::register_task`).
+/// A QoS profile owns both its flavour set and error threshold. This makes
+/// per-request override fields unnecessary: the solver receives one immutable
+/// policy snapshot for each homogeneous profile batch.
 #[test]
-fn test_per_task_flavour_override_reaches_dp_solver() {
-    let cfg = make_config(|_| {});
-    let current_slot = 0;
-    let task_flavour = Flavour {
-        name: "OnlyForThisTask".to_string(),
-        error: 1.23,
-        duration: 45,
-    };
-    let pending = vec![Request::new_for_task(
-        20,
-        0,
-        5,
-        "custom_task".to_string(),
-        vec![task_flavour.clone()],
-        None,
-        None,
-    )];
-    let (assignments, _ctx) = call_solve_dp(current_slot, &pending, &cfg);
-
-    assert_eq!(assignments.len(), 1);
-    assert_eq!(assignments[0].flavour_name, "OnlyForThisTask");
-    assert_eq!(assignments[0].error, 1.23);
-    // cfg.flavours (the default task) must be untouched by this override.
-    assert!(cfg.flavours.iter().all(|f| f.name != "OnlyForThisTask"));
-}
-
-/// A per-task `max_error_threshold` override actually changes the DP's
-/// choice: without it, the global default (4%) rejects a cheap-but-
-/// high-error flavour in favour of the accurate one; with a lenient
-/// override, the cheap flavour becomes feasible and wins on cost.
-#[test]
-fn test_per_task_error_threshold_override_allows_cheaper_flavour() {
+fn qos_profile_flavours_and_threshold_reach_the_dp_solver() {
     let cfg = make_config(|_| {});
     let current_slot = 0;
     let cheap = Flavour {
@@ -374,29 +338,16 @@ fn test_per_task_error_threshold_override_allows_cheaper_flavour() {
         duration: 60,
     };
 
-    let strict = vec![Request::new_for_task(
-        30,
-        0,
-        5,
-        "t".to_string(),
-        vec![cheap.clone(), accurate.clone()],
-        None,
-        None,
-    )];
-    let (assignments_strict, _ctx) = call_solve_dp(current_slot, &strict, &cfg);
-    assert_eq!(assignments_strict[0].flavour_name, "Accurate2");
-
-    let lenient = vec![Request::new_for_task(
-        31,
-        0,
-        5,
-        "t".to_string(),
+    let policy = profile(
+        "custom-task-policy-v1",
+        "custom_task",
         vec![cheap, accurate],
-        Some(50.0),
-        None,
-    )];
-    let (assignments_lenient, _ctx) = call_solve_dp(current_slot, &lenient, &cfg);
-    assert_eq!(assignments_lenient[0].flavour_name, "Cheap");
+        50.0,
+    );
+    let request = Request::new_for_qos_profile(30, 0, 5, policy);
+    let (assignments, _) = call_solve_dp(current_slot, &[request], &cfg);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].flavour_name, "Cheap");
 }
 
 /// `advance_to_next_slot` should bump the virtual clock by exactly one

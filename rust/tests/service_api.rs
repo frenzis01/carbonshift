@@ -1059,7 +1059,10 @@ async fn omitted_profile_uses_the_default_for_payload_task_kind() {
     let pending = shared_state.drain_pending_requests();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].qos_profile_id.as_str(), "default-ner");
-    assert_eq!(pending[0].task_id, "ner");
+    assert_eq!(
+        pending[0].qos_profile.as_ref().unwrap().task_kind.as_str(),
+        "ner"
+    );
 }
 
 #[tokio::test]

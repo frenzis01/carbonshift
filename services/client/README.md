@@ -343,8 +343,6 @@ Ogni run scrive in `tests/battery/results/<battery_id>_<timestamp>/`:
 | `CLIENT_QOS_PROFILE_DEFINITIONS_PATH` | *(assente)* | Percorso opzionale a un array JSON di profili QoS completi da ripristinare all'avvio. |
 | `CLIENT_QOS_PROFILE_REGISTRATION_ATTEMPTS` | `10` | Tentativi di registrazione iniziale per profilo, per gestire l'ordine di avvio dei servizi. |
 | `CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS` | `2` | Attesa fra tentativi transitori di registrazione profilo. |
-| `CLIENT_ADMIN_TIMEOUT_SECONDS` | `60` | Timeout per le chiamate `/admin/advance-slot` (modalità emulazione) — più generoso di `CLIENT_HTTP_TIMEOUT_SECONDS` perché comportano un flush + un'inferenza reale. |
-| `EXECUTOR_ADMIN_URL` | `http://localhost:9000` | Base URL dell'executor per `mode: "emulated"` (può essere sovrascritto per richiesta con `executor_url`). |
 
 ## Test
 

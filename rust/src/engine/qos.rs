@@ -41,15 +41,6 @@ impl QosProfileId {
         Self("default-text-generation".to_string())
     }
 
-    /// Stable internal budget identity for callers still using the legacy
-    /// task-only request constructor.
-    pub fn legacy_task_alias(task_id: &str) -> Self {
-        if task_id == "default" {
-            Self::default_profile()
-        } else {
-            Self(format!("legacy-task-{task_id}"))
-        }
-    }
 }
 
 impl std::fmt::Display for QosProfileId {

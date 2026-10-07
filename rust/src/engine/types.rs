@@ -27,23 +27,10 @@ pub struct Request {
     pub deadline_slot: i32,
     /// Wall-clock arrival time (seconds since UNIX epoch).
     pub arrival_time: f64,
-    /// Executor operation kind (e.g. "text_generation"), kept separate from
-    /// the QoS profile ID that owns this request's scheduling/error budget.
-    /// Legacy offline callers may still use `"default"`.
-    pub task_id: String,
-    /// Flavours available for this request's task, resolved once at intake
-    /// time. Empty means "no task-specific override" — the solver falls
-    /// back to `Config::flavours` (the predefined default task).
-    pub flavours: Vec<Flavour>,
-    /// Legacy per-request threshold for unprofiled callers.
-    pub max_error_threshold: Option<f64>,
-    /// Legacy task-level capacity override. New QoS profiles cannot set this:
-    /// capacity tiers are global shared-infrastructure policy.
-    pub capacity_tiers: Option<Vec<CapacityTier>>,
     /// Immutable QoS contract resolved by the service before enqueueing.
     /// Offline callers can leave this absent and use the scheduler defaults.
     pub qos_profile: Option<Arc<QosProfile>>,
-    /// Stable budget identity, including deterministic legacy-task aliases.
+    /// Stable budget identity used for homogeneous batching and error accounting.
     pub qos_profile_id: QosProfileId,
 }
 
@@ -54,39 +41,8 @@ impl Request {
             arrival_slot,
             deadline_slot,
             arrival_time: unix_now(),
-            task_id: "default".to_string(),
-            flavours: Vec::new(),
-            max_error_threshold: None,
-            capacity_tiers: None,
             qos_profile: None,
             qos_profile_id: QosProfileId::default_profile(),
-        }
-    }
-
-    /// Builds a request tied to a specific (dynamically-registered) task,
-    /// carrying the flavours (and optional error-threshold override) the
-    /// solver must use for it.
-    pub fn new_for_task(
-        id: u64,
-        arrival_slot: i32,
-        deadline_slot: i32,
-        task_id: String,
-        flavours: Vec<Flavour>,
-        max_error_threshold: Option<f64>,
-        capacity_tiers: Option<Vec<CapacityTier>>,
-    ) -> Self {
-        let qos_profile_id = QosProfileId::legacy_task_alias(&task_id);
-        Self {
-            id,
-            arrival_slot,
-            deadline_slot,
-            arrival_time: unix_now(),
-            task_id,
-            flavours,
-            max_error_threshold,
-            capacity_tiers,
-            qos_profile: None,
-            qos_profile_id,
         }
     }
 
@@ -102,10 +58,6 @@ impl Request {
             arrival_slot,
             deadline_slot,
             arrival_time: unix_now(),
-            task_id: profile.task_kind.to_string(),
-            flavours: profile.flavours.clone(),
-            max_error_threshold: Some(profile.max_error_threshold),
-            capacity_tiers: None,
             qos_profile_id: profile.profile_id.clone(),
             qos_profile: Some(profile),
         }
