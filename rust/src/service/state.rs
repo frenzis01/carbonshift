@@ -13,7 +13,7 @@ use crate::engine::qos::{
 };
 use crate::engine::shared_state::SharedState;
 use crate::engine::types::Flavour;
-use crate::service::models::{LegacyTaskIdUsage, RequestStatus};
+use crate::service::models::RequestStatus;
 
 /// Per-request bookkeeping that lives outside the scheduling engine: the
 /// caller's callback URL, the opaque payload to forward to the executor, and
@@ -136,37 +136,6 @@ pub struct ServiceSchedulerConfig {
     pub cumulative_error_hard: bool,
     /// Maximum number of slots into the future for an assignment.
     pub assignment_max_future_slots: i32,
-}
-
-/// Process-local counters used to decide when the legacy `task_id` contract
-/// can be removed. They deliberately reset with the in-memory service state.
-#[derive(Clone, Default)]
-pub struct LegacyTaskIdUsageCounters {
-    request_submissions: Arc<AtomicU64>,
-    task_api_calls: Arc<AtomicU64>,
-    monitoring_queries: Arc<AtomicU64>,
-}
-
-impl LegacyTaskIdUsageCounters {
-    pub fn record_request_submission(&self) {
-        self.request_submissions.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_task_api_call(&self) {
-        self.task_api_calls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_monitoring_query(&self) {
-        self.monitoring_queries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> LegacyTaskIdUsage {
-        LegacyTaskIdUsage {
-            request_submissions: self.request_submissions.load(Ordering::Relaxed),
-            task_api_calls: self.task_api_calls.load(Ordering::Relaxed),
-            monitoring_queries: self.monitoring_queries.load(Ordering::Relaxed),
-        }
-    }
 }
 
 /// Outcome of registering a profile under a stable shared ID.
@@ -306,8 +275,6 @@ pub struct AppState {
     pub shared_state: SharedState,
     pub scheduler: ServiceSchedulerConfig,
     pub qos_profiles: QosProfileRegistry,
-    /// Usage telemetry for the deprecated task-ID compatibility surfaces.
-    pub legacy_task_id_usage: LegacyTaskIdUsageCounters,
     pub http: reqwest::Client,
     pub service_cfg: Arc<ServiceConfig>,
     pub tracked: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
@@ -319,10 +286,6 @@ pub struct AppState {
     /// hypothetical baseline the same per-slot capacity-tier repricing an
     /// immediate/no-batching execution would have faced.
     pub baseline_slot_counts: Arc<Mutex<HashMap<i32, i64>>>,
-    /// Deprecated `/v1/tasks` aliases map to a QoS profile ID only. The
-    /// immutable profile registry is the single source for flavours,
-    /// thresholds, semantics, and windows.
-    pub legacy_task_profile_ids: Arc<Mutex<HashMap<String, QosProfileId>>>,
     // TODO: actually now we have the provider...
     /// Real (not forecast) carbon intensity per slot, reported by the client
     /// piggybacked on `POST /v1/admin/advance-slot` (see
@@ -357,24 +320,17 @@ impl AppState {
         // BatchScheduler. Initialize the shared policy here too; in the
         // service binary the scheduler constructor has already done so.
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
-        let mut legacy_task_profile_ids = HashMap::new();
-        legacy_task_profile_ids.insert(
-            "default".to_string(),
-            QosProfileId::parse("default-text-generation").unwrap(),
-        );
         let qos_profiles = QosProfileRegistry::from_config(&cfg);
         Self {
             slot_epoch_offset: Arc::new(Mutex::new(None)),
             shared_state,
             scheduler: ServiceSchedulerConfig::from_config(&cfg),
             qos_profiles,
-            legacy_task_id_usage: LegacyTaskIdUsageCounters::default(),
             http: reqwest::Client::new(),
             service_cfg: Arc::new(service_cfg),
             tracked: Arc::new(Mutex::new(HashMap::new())),
             carbon_forecast,
             baseline_slot_counts: Arc::new(Mutex::new(HashMap::new())),
-            legacy_task_profile_ids: Arc::new(Mutex::new(legacy_task_profile_ids)),
             actual_carbon_intensity: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
         }
@@ -395,25 +351,6 @@ impl AppState {
         } else {
             Some(actual / forecast)
         }
-    }
-
-    /// Stable profile alias used by a registered legacy task ID.
-    pub fn profile_id_for_task(&self, task_id: &str) -> Option<QosProfileId> {
-        let registered = self.legacy_task_profile_ids.lock().unwrap().get(task_id).cloned();
-        registered.or_else(|| {
-            // Some older clients used the profile ID itself as `task_id`.
-            // That remains resolvable after a restart when the profile has
-            // been restored, even though the transient alias map is empty.
-            let profile_id = QosProfileId::parse(task_id.to_string()).ok()?;
-            if self.qos_profiles.get(&profile_id).is_some() {
-                return Some(profile_id);
-            }
-
-            let task_kind = TaskKindId::parse(task_id.to_string()).ok()?;
-            self.qos_profiles
-                .default_for_task_kind(&task_kind)
-                .map(|profile| profile.profile_id)
-        })
     }
 }
 

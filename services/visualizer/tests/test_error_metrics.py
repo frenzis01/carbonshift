@@ -78,8 +78,6 @@ class ErrorMetricsTests(unittest.TestCase):
         def fetch_json(url: str, timeout: float = 3.0):
             if url.startswith("http://carbonshift:8080/v1/carbon_intensity?"):
                 return []
-            if url.startswith("http://carbonshift:8080/v1/tasks/"):
-                return None
             return responses.get(url)
 
         with (

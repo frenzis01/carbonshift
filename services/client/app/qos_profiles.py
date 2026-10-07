@@ -67,7 +67,7 @@ def build_task_profiles(
         )
 
     profiles: dict[str, dict[str, Any]] = {}
-    for task_id, entries_by_flavour in _latest_entries_by_task_flavour(stats).items():
+    for task_kind, entries_by_flavour in _latest_entries_by_task_flavour(stats).items():
         flavours = [_flavour_definition(entry) for entry in entries_by_flavour.values()]
         semantics = {
             entry["error_semantics"]
@@ -75,7 +75,7 @@ def build_task_profiles(
             if entry.get("error_semantics")
         }
         if len(semantics) > 1:
-            raise ValueError(f"task {task_id!r} has inconsistent calibrated error semantics")
+            raise ValueError(f"task kind {task_kind!r} has inconsistent calibrated error semantics")
 
         if semantics:
             error_semantics = next(iter(semantics))
@@ -86,15 +86,16 @@ def build_task_profiles(
                 "text_generation": "relative-confidence-degradation-v1",
                 "ner": "entity-set-f1-v1",
                 "question_answering": "word-overlap-f1-v1",
-            }.get(task_id)
+            }.get(task_kind)
         if error_semantics is None:
             raise ValueError(
-                f"task {task_id!r} has no error_semantics; recalibrate or add the versioned metric ID"
+                f"task kind {task_kind!r} has no error_semantics; "
+                "recalibrate or add the versioned metric ID"
             )
 
-        profiles[task_id] = {
-            "profile_id": f"{task_id}-calibrated-{profile_version}",
-            "task_kind": task_id,
+        profiles[task_kind] = {
+            "profile_id": f"{task_kind}-calibrated-{profile_version}",
+            "task_kind": task_kind,
             "flavours": flavours,
             "error_semantics": error_semantics,
             "max_error_threshold": default_error_threshold(

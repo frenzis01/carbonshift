@@ -401,7 +401,7 @@ ciascun task**, invece:
    inviare la stessa definizione. Se una nuova calibrazione cambia una policy,
    usa `--profile-version v2` per creare un ID diverso. Le richieste selezionano il budget con
    `qos_profile_id`; il task kind continua a descrivere l'operazione
-   dell'executor. `POST /v1/tasks` resta solo un adapter di compatibilità.
+   dell'executor.
    Profili differenti non condividono il budget e vengono pianificati in
    batch separati. Le capacity tiers restano globali e contano le richieste
    di tutti i profili.
@@ -418,7 +418,7 @@ ciascun task**, invece:
    nella finestra e nei totali del profilo associato — vedi
    `carbonshift/rust/PLAN_SERVICE.md`.
 
-## Riavvii e migrazione da `task_id`
+## Riavvii e ripristino dei profili QoS
 
 Carbonshift conserva i profili QoS personalizzati in memoria. All'avvio il
 client ricostruisce i profili calibrati dal proprio `model_stats.json` e
@@ -463,19 +463,9 @@ la sua definizione.
 Il ripristino riguarda le **definizioni** e gli ID stabili, non la persistenza
 dello stato dello scheduler. Un riavvio Carbonshift azzera code, assegnazioni,
 contatori di errore e cronologia in memoria; non reinterpreta però le
-definizioni del profilo con un ID diverso. I contatori di compatibilità
-`GET /v1/stats` (`legacy_task_id_usage`) sono anch'essi process-locali e si
-azzerano al riavvio.
-
-I client aggiornati inviano `task_kind` e, se scelto, `qos_profile_id`; non
-inviano più `task_id`. Carbonshift mantiene ancora il campo legacy nelle
-richieste, gli endpoint `/v1/tasks` e il filtro query `task_id`.
-Prima di rimuoverli, verifica che i contatori `request_submissions`,
-`task_api_calls` e `monitoring_queries` siano tutti zero per almeno 30 giorni
-di esercizio dopo aver aggiornato ogni client mantenuto. Poiché i contatori
-si azzerano a ogni riavvio, conserva la serie fuori da Carbonshift (ad esempio
-nel monitoraggio operativo). La rimozione avverrà poi in una modifica
-separata e dichiaratamente breaking; questo rilascio non rimuove gli adapter.
+definizioni del profilo con un ID diverso. Le richieste usano `task_kind` per
+identificare l'operazione e `qos_profile_id` per selezionare il budget. I
+filtri di monitoraggio usano lo stesso ID del profilo.
 
 ## Semplificazioni note
 

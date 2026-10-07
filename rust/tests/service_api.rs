@@ -250,51 +250,6 @@ async fn stats_reports_tracked_request_counts() {
 }
 
 #[tokio::test]
-async fn get_task_config_returns_default_when_not_registered() {
-    let app = build_router(test_state(test_service_cfg()));
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/tasks/never_registered")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = json_body(resp).await;
-    assert_eq!(json["task_id"], "never_registered");
-    assert_eq!(
-        json["max_error_threshold"],
-        test_engine_config().max_error_threshold
-    );
-    assert!(json["flavours"].as_array().unwrap().len() >= 1);
-}
-
-#[tokio::test]
-async fn get_task_config_returns_registered_override() {
-    let app = build_router(test_state(test_service_cfg()));
-    let body = r#"{"task_id": "custom", "flavours": [{"name": "Only", "error": 20.0, "duration": 5}], "max_error_threshold": 17.5}"#;
-    app.clone()
-        .oneshot(json_request("POST", "/v1/tasks", body))
-        .await
-        .unwrap();
-
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/tasks/custom")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let json = json_body(resp).await;
-    assert_eq!(json["max_error_threshold"], 17.5);
-    assert_eq!(json["flavours"][0]["name"], "Only");
-}
-
-#[tokio::test]
 async fn qos_profile_defaults_are_stable_and_task_kind_specific() {
     let app = build_router(test_state(test_service_cfg()));
     let inactive = app
@@ -918,59 +873,6 @@ async fn submit_response_includes_positive_baseline_carbon_cost() {
     );
 }
 
-/// A request that references a dynamically-registered task must be
-/// scheduled with one of *that task's* flavours, not `Config::flavours`
-/// (the default task) — this is what lets a client-announced task's
-/// error/cost data actually reach the DP solver.
-#[tokio::test]
-async fn task_flavours_registered_via_v1_tasks_are_used_for_scheduling() {
-    let mut cfg = test_engine_config();
-    cfg.solver.batch_size = 1;
-    let cfg = Arc::new(cfg);
-
-    let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
-    let forecast = test_forecast(cfg.total_slots);
-    let mut scheduler = BatchScheduler::new(
-        shared_state.clone(),
-        cfg.clone(),
-        metrics_logger,
-        forecast.clone(),
-    );
-    scheduler.start();
-
-    let mut svc_cfg = test_service_cfg();
-    svc_cfg.submit_wait_timeout_secs = 5.0;
-    let state = AppState::new(shared_state, cfg, svc_cfg, forecast);
-    let app = build_router(state);
-
-    let register_body = r#"{"task_id": "custom_task", "flavours": [{"name": "OnlyThis", "error": 1.0, "duration": 45}]}"#;
-    let resp = app
-        .clone()
-        .oneshot(json_request("POST", "/v1/tasks", register_body))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    let submit_body = r#"{"deadline_seconds": 5, "task_id": "custom_task"}"#;
-    let resp = app
-        .oneshot(json_request("POST", "/v1/requests", submit_body))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let json = json_body(resp).await;
-    assert_eq!(json["status"], "scheduled");
-    assert_eq!(json["flavour"], "OnlyThis");
-
-    scheduler.stop();
-}
-
 #[tokio::test]
 async fn explicit_qos_profile_is_preserved_through_request_scheduling() {
     let mut cfg = test_engine_config();
@@ -1048,7 +950,7 @@ async fn omitted_profile_uses_the_default_for_payload_task_kind() {
         .oneshot(json_request(
             "POST",
             "/v1/requests",
-            r#"{"deadline_seconds":5,"task_id":"default","payload":{"task":"ner","input":{"text":"Ada Lovelace"}}}"#,
+            r#"{"deadline_seconds":5,"payload":{"task":"ner","input":{"text":"Ada Lovelace"}}}"#,
         ))
         .await
         .unwrap();
@@ -1063,30 +965,6 @@ async fn omitted_profile_uses_the_default_for_payload_task_kind() {
         pending[0].qos_profile.as_ref().unwrap().task_kind.as_str(),
         "ner"
     );
-}
-
-#[tokio::test]
-async fn legacy_task_id_equal_to_restored_profile_id_still_resolves_after_restart() {
-    let app = build_router(test_state(test_service_cfg()));
-    let profile_body = qos_profile_payload("qa-standard-v1", 17.5);
-    let registered = app
-        .clone()
-        .oneshot(json_request("POST", "/v1/profiles", &profile_body))
-        .await
-        .unwrap();
-    assert_eq!(registered.status(), StatusCode::NO_CONTENT);
-
-    let submitted = app
-        .oneshot(json_request(
-            "POST",
-            "/v1/requests",
-            r#"{"deadline_seconds":5,"task_id":"qa-standard-v1","payload":{"task":"question_answering","input":{"question":"q","context":"c"}}}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(submitted.status(), StatusCode::ACCEPTED);
-    let response = json_body(submitted).await;
-    assert_eq!(response["qos_profile_id"], "qa-standard-v1");
 }
 
 #[tokio::test]
@@ -1330,66 +1208,46 @@ async fn cost_metrics_filter_request_totals_but_keep_capacity_tiers_global() {
 }
 
 #[tokio::test]
-async fn stats_expose_process_local_legacy_task_id_usage_for_migration() {
-    let state = test_state(test_service_cfg());
-    let app = build_router(state.clone());
+async fn legacy_task_id_apis_and_aliases_are_removed() {
+    let app = build_router(test_state(test_service_cfg()));
 
-    let legacy_submit = app
+    for (method, uri) in [("GET", "/v1/tasks/text_generation"), ("POST", "/v1/tasks")] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    let old_request_field = app
         .clone()
         .oneshot(json_request(
             "POST",
             "/v1/requests",
-            r#"{"deadline_seconds":5,"task_id":"text_generation","payload":{"task":"text_generation","input":{"prompt":"legacy"}}}"#,
+            r#"{"deadline_seconds":5,"task_id":"text_generation","payload":{"task":"text_generation"}}"#,
         ))
         .await
         .unwrap();
-    assert_eq!(legacy_submit.status(), StatusCode::ACCEPTED);
+    assert_eq!(old_request_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    let current_submit = app
-        .clone()
-        .oneshot(json_request(
-            "POST",
-            "/v1/requests",
-            r#"{"deadline_seconds":5,"task_kind":"text_generation","payload":{"task":"text_generation","input":{"prompt":"current"}}}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(current_submit.status(), StatusCode::ACCEPTED);
-
-    let legacy_query = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/assignments?task_id=text_generation")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(legacy_query.status(), StatusCode::OK);
-
-    let legacy_task_lookup = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/tasks/text_generation")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(legacy_task_lookup.status(), StatusCode::OK);
-
-    let legacy_task_registration = app
-        .clone()
-        .oneshot(json_request(
-            "POST",
-            "/v1/tasks",
-            r#"{"task_id":"legacy-profile-v1","task_kind":"text_generation","flavours":[{"name":"Accurate","error":1.0,"duration":60}]}"#,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(legacy_task_registration.status(), StatusCode::NO_CONTENT);
+    for uri in [
+        "/v1/assignments?task_id=text_generation",
+        "/v1/metrics/error-history?task_id=text_generation",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     let stats = app
         .oneshot(
@@ -1401,10 +1259,7 @@ async fn stats_expose_process_local_legacy_task_id_usage_for_migration() {
         .await
         .unwrap();
     assert_eq!(stats.status(), StatusCode::OK);
-    let stats = json_body(stats).await;
-    assert_eq!(stats["legacy_task_id_usage"]["request_submissions"], 1);
-    assert_eq!(stats["legacy_task_id_usage"]["task_api_calls"], 2);
-    assert_eq!(stats["legacy_task_id_usage"]["monitoring_queries"], 1);
+    assert!(json_body(stats).await.get("legacy_task_id_usage").is_none());
 }
 
 #[tokio::test]

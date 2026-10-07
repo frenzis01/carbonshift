@@ -64,7 +64,7 @@ def main() -> None:
         raise SystemExit(f"{stats_path} is empty — run executor/scripts/calibrate_models.py first")
 
     failures: list[str] = []
-    for task_id, profile in build_task_profiles(
+    for task_kind, profile in build_task_profiles(
         stats,
         args.threshold_position,
         args.profile_version,
@@ -78,11 +78,11 @@ def main() -> None:
         logger.info(
             "registered QoS profile=%s task_kind=%s max_error_threshold=%.2f%%",
             profile["profile_id"],
-            task_id,
+            task_kind,
             profile["max_error_threshold"],
         )
         print(
-            f"profile={profile['profile_id']} task_kind={task_id} "
+            f"profile={profile['profile_id']} task_kind={task_kind} "
             f"max_error_threshold={profile['max_error_threshold']:.2f}%"
         )
         for f in profile["flavours"]:

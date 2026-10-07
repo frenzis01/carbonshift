@@ -34,7 +34,8 @@ def send_batch(tracker: RequestTracker, task: str, count: int, deadline_seconds:
             payload = {"task": task, "input": example["input"]}
             try:
                 # Task kind selects the built-in default when no profile was
-                # requested. New clients therefore never need legacy task_id.
+                # requested. Requests identify the executor operation and
+                # scheduling budget through task_kind and qos_profile_id.
                 ack = submit(
                     deadline_seconds,
                     callback_url,

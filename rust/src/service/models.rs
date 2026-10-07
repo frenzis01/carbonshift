@@ -52,6 +52,7 @@ pub struct QosProfileResponse {
 
 /// Body of `POST /v1/requests`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitRequestPayload {
     /// Seconds from now by which the job must complete. Converted internally
     /// to a deadline slot using the service's own real-time slot clock.
@@ -64,16 +65,11 @@ pub struct SubmitRequestPayload {
     /// Opaque payload forwarded verbatim to the executor at dispatch time.
     #[serde(default)]
     pub payload: serde_json::Value,
-    /// Deprecated compatibility alias resolved through the legacy
-    /// `POST /v1/tasks` mapping. New callers should use `qos_profile_id`;
-    /// requests without either field select the default profile for `task_kind`.
-    #[serde(default)]
-    pub task_id: Option<String>,
     /// Stable reusable QoS budget. Omitted requests select the profile for
     /// their task kind, or the task kind's default profile.
     #[serde(default)]
     pub qos_profile_id: Option<String>,
-    /// Executor operation. If omitted during migration, `payload.task` is used.
+    /// Executor operation. If omitted, `payload.task` is used when present.
     #[serde(default)]
     pub task_kind: Option<String>,
 
@@ -137,29 +133,6 @@ pub struct ExecutorCallbackPayload {
     pub baseline_execution_time_seconds: Option<f64>,
 }
 
-/// Deprecated registration body retained for the documented migration window.
-/// The handler translates each task ID to an immutable QoS profile; new callers
-/// should register profiles with `POST /v1/profiles`.
-#[derive(Debug, Deserialize)]
-pub struct RegisterTaskPayload {
-    pub task_id: String,
-    pub flavours: Vec<crate::engine::types::Flavour>,
-    /// Open executor-operation ID; defaults to `task_id` for legacy callers.
-    #[serde(default)]
-    pub task_kind: Option<String>,
-    /// Versioned error-measurement ID. Legacy callers may omit it.
-    #[serde(default)]
-    pub error_semantics: Option<String>,
-    /// Legacy profile threshold in percent. `None` uses the service default
-    /// when the compatibility handler constructs the immutable profile.
-    #[serde(default)]
-    pub max_error_threshold: Option<f64>,
-    /// Legacy field retained so the compatibility endpoint can explicitly
-    /// reject profile-scoped tiers; capacity tiers are global.
-    #[serde(default)]
-    pub capacity_tiers: Option<Vec<CapacityTier>>,
-}
-
 /// Body POSTed by this service to the executor at dispatch time, and in turn
 /// (wrapped as `result`) forwarded to the original caller's `callback_url`.
 #[derive(Debug, Serialize)]
@@ -209,33 +182,6 @@ pub struct StatsResponse {
     /// `null` if nothing has been scheduled yet.
     pub global_error_avg: Option<f64>,
     pub global_error_count: u64,
-    /// Legacy compatibility usage since this Carbonshift process started.
-    /// These counters reset on restart; they are migration telemetry, not
-    /// durable business metrics.
-    pub legacy_task_id_usage: LegacyTaskIdUsage,
-}
-
-/// Counts calls that still depend on the deprecated `task_id` interfaces.
-#[derive(Debug, Serialize, Default)]
-pub struct LegacyTaskIdUsage {
-    /// Accepted request submissions that included the legacy `task_id` field.
-    pub request_submissions: u64,
-    /// Calls to the compatibility `GET` or `POST /v1/tasks` endpoints.
-    pub task_api_calls: u64,
-    /// Monitoring requests using the legacy `task_id` query parameter.
-    pub monitoring_queries: u64,
-}
-
-/// Compatibility response for `GET /v1/tasks/{task_id}`. New clients should
-/// inspect the corresponding QoS profile through the profile endpoints.
-#[derive(Debug, Serialize)]
-pub struct TaskConfigResponse {
-    pub task_id: String,
-    pub qos_profile_id: String,
-    pub flavours: Vec<crate::engine::types::Flavour>,
-    /// Effective threshold from the immutable profile resolved for this alias.
-    pub max_error_threshold: f64,
-    pub capacity_tiers: Vec<CapacityTier>,
 }
 
 /// Response of `GET /v1/horizon` and (in abbreviated form) `GET /ready`.
@@ -259,6 +205,7 @@ pub struct HorizonResponse {
 
 /// Query parameters for assignment listing and error-history endpoints.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AssignmentsQuery {
     #[serde(default)]
     pub from_slot: Option<i32>,
@@ -266,9 +213,7 @@ pub struct AssignmentsQuery {
     pub to_slot: Option<i32>,
     #[serde(default)]
     pub flavour: Option<String>,
-    #[serde(default)]
-    pub task_id: Option<String>,
-    /// Filter by stable QoS budget ID. Preferred over the legacy task alias.
+    /// Filter by stable QoS budget ID.
     #[serde(default)]
     pub qos_profile_id: Option<String>,
 }

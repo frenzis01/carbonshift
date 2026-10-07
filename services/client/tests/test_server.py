@@ -165,7 +165,6 @@ def test_metrics_summary_scheduler_section_degrades_gracefully_when_carbonshift_
 
     scheduler = client.get("/metrics/summary").json()["scheduler"]
     assert scheduler["global_error_avg"] is None
-    assert scheduler["legacy_task_id_usage"] is None
 
 
 def test_metrics_summary_scheduler_section_surfaces_carbonshift_data(client, monkeypatch):
@@ -173,11 +172,6 @@ def test_metrics_summary_scheduler_section_surfaces_carbonshift_data(client, mon
     monkeypatch.setattr(main_module, "get_stats", lambda: {
         "global_error_avg": 12.3,
         "global_error_count": 7,
-        "legacy_task_id_usage": {
-            "request_submissions": 3,
-            "task_api_calls": 1,
-            "monitoring_queries": 2,
-        },
     })
     monkeypatch.setattr(main_module, "get_qos_profile", lambda profile_id: {
         "task_kind": "question_answering",
@@ -190,7 +184,6 @@ def test_metrics_summary_scheduler_section_surfaces_carbonshift_data(client, mon
     scheduler = client.get("/metrics/summary").json()["scheduler"]
     assert scheduler["global_error_avg"] == 12.3
     assert scheduler["global_error_count"] == 7
-    assert scheduler["legacy_task_id_usage"]["request_submissions"] == 3
     assert scheduler["profiles"]["question-answering-calibrated-v1"]["error_semantics"] == "word-overlap-f1-v1"
 
 

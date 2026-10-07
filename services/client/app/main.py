@@ -177,9 +177,9 @@ def metrics_summary() -> dict[str, Any]:
 def _scheduler_snapshot() -> dict[str, Any]:
     """Live state fetched from carbonshift (not derived from tracked
     requests): descriptive fleet-wide error telemetry, the selected profiles'
-    declared QoS policies, and legacy `task_id` usage counters. Profile
-    policies are reported by profile ID because two profiles for one executor
-    task may have different thresholds or error semantics. Degrades to
+    declared QoS policies. They are reported by profile ID because two
+    profiles for one task may have different thresholds or error semantics.
+    Degrades to
     `null`s if Carbonshift is unreachable rather than failing `/metrics/summary`.
 
     Carbon intensity now comes from the **provider**, not carbonshift: the
@@ -192,14 +192,12 @@ def _scheduler_snapshot() -> dict[str, Any]:
         "global_error_avg": None,
         "global_error_count": None,
         "profiles": {},
-        "legacy_task_id_usage": None,
     }
     try:
         stats = get_stats()
         global_error_avg = stats.get("global_error_avg")
         snapshot["global_error_avg"] = round(global_error_avg, 2) if global_error_avg is not None else None
         snapshot["global_error_count"] = stats.get("global_error_count")
-        snapshot["legacy_task_id_usage"] = stats.get("legacy_task_id_usage")
     except CarbonshiftError:
         logger.warning("failed to fetch carbonshift /v1/stats for metrics/summary", exc_info=True)
 

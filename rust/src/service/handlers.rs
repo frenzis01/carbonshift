@@ -10,16 +10,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 
-use crate::engine::qos::{
-    CumulativeErrorPolicy, ErrorWindowPolicy, QosProfile, QosProfileId, TaskKindId,
-};
+use crate::engine::qos::{QosProfile, QosProfileId, TaskKindId};
 use crate::engine::types::{Flavour, Request as EngineRequest, get_capacity_multiplier};
 use crate::service::models::{
     AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse,
     ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, QosProfileResponse,
-    QosProfilesQuery, RegisterQosProfilePayload, RegisterTaskPayload, RequestStatus,
-    RequestStatusResponse, SetCapacityTiersPayload, SlotDetailResponse, SlotErrorItem,
-    StatsResponse, SubmitRequestPayload, TaskConfigResponse,
+    QosProfilesQuery, RegisterQosProfilePayload, RequestStatus, RequestStatusResponse,
+    SetCapacityTiersPayload, SlotDetailResponse, SlotErrorItem, StatsResponse,
+    SubmitRequestPayload,
 };
 use crate::service::state::{AppState, ProfileRegistration, ProfileRegistryError, TrackedRequest};
 
@@ -206,7 +204,6 @@ pub async fn force_set_capacity_tiers(
     State(_state): State<AppState>,
     Json(_body): Json<SetCapacityTiersPayload>,
 ) -> Result<StatusCode, ApiError> {
-
     // Capacity tiers should be of the shape
     // [
     //     { "max_requests": 100, "multiplier": 1.0 },
@@ -351,23 +348,7 @@ fn resolve_request_profile(
         .map(QosProfileId::parse)
         .transpose()
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    let legacy_profile_id = body
-        .task_id
-        .as_deref()
-        .filter(|task_id| *task_id != "default")
-        .and_then(|task_id| state.profile_id_for_task(task_id));
-
-    if let (Some(explicit), Some(legacy)) = (&explicit_profile_id, &legacy_profile_id) {
-        if explicit != legacy {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "qos_profile_id conflicts with the registered legacy task_id profile",
-            ));
-        }
-    }
-
-    let selected_profile_id = explicit_profile_id.or(legacy_profile_id);
-    let selected_profile = selected_profile_id
+    let selected_profile = explicit_profile_id
         .as_ref()
         .map(|profile_id| {
             state
@@ -408,11 +389,6 @@ fn resolve_request_profile(
         task_kind
     } else if let Some(profile) = &selected_profile {
         profile.task_kind.clone()
-    } else if let Some(task_id) = body.task_id.as_deref() {
-        let candidate = TaskKindId::parse(task_id.to_string()).ok();
-        candidate
-            .filter(|kind| state.qos_profiles.default_for_task_kind(kind).is_some())
-            .unwrap_or_else(|| TaskKindId::parse("text_generation").unwrap())
     } else {
         TaskKindId::parse("text_generation").unwrap()
     };
@@ -447,28 +423,13 @@ fn resolve_profile_query(
     state: &AppState,
     query: &AssignmentsQuery,
 ) -> Result<Option<QosProfile>, ApiError> {
-    if query.task_id.is_some() {
-        state.legacy_task_id_usage.record_monitoring_query();
-    }
-    let requested = query
+    let Some(profile_id) = query
         .qos_profile_id
         .as_deref()
         .map(QosProfileId::parse)
         .transpose()
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    let legacy = query
-        .task_id
-        .as_deref()
-        .and_then(|task_id| state.profile_id_for_task(task_id));
-    if let (Some(requested), Some(legacy)) = (&requested, &legacy) {
-        if requested != legacy {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "qos_profile_id conflicts with the legacy task_id profile",
-            ));
-        }
-    }
-    let Some(profile_id) = requested.or(legacy) else {
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
+    else {
         return Ok(None);
     };
     state
@@ -476,89 +437,6 @@ fn resolve_profile_query(
         .get(&profile_id)
         .map(Some)
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))
-}
-
-/// Legacy adapter that registers task flavours as a stable QoS profile.
-///
-/// New clients should use `POST /v1/profiles`; task_id remains supported as a
-/// profile alias during migration.
-pub async fn register_task(
-    State(state): State<AppState>,
-    Json(body): Json<RegisterTaskPayload>,
-) -> Result<StatusCode, ApiError> {
-    state.legacy_task_id_usage.record_task_api_call();
-    if body.task_id == "default" {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "the default QoS profile is task-kind-specific and immutable; register a named /v1/profiles entry instead",
-        ));
-    }
-    if body.flavours.is_empty() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "flavours must not be empty",
-        ));
-    }
-
-    let RegisterTaskPayload {
-        task_id,
-        flavours,
-        task_kind,
-        error_semantics,
-        max_error_threshold,
-        capacity_tiers,
-    } = body;
-    if capacity_tiers.is_some() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "capacity tiers are global and cannot be registered per task/profile",
-        ));
-    }
-    let profile_id = QosProfileId::parse(task_id.clone())
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    let task_kind = TaskKindId::parse(task_kind.unwrap_or_else(|| task_id.clone()))
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    let error_semantics = error_semantics.unwrap_or_else(|| {
-        task_kind
-            .default_error_semantics()
-            .unwrap_or("legacy-unspecified-v1")
-            .to_string()
-    });
-    let profile = QosProfile {
-        profile_id: profile_id.clone(),
-        task_kind,
-        flavours: flavours.clone(),
-        error_semantics,
-        max_error_threshold: max_error_threshold.unwrap_or(state.scheduler.max_error_threshold),
-        error_window: ErrorWindowPolicy {
-            past_slots: state.scheduler.error_window_past,
-            future_slots: state.scheduler.error_window_future,
-            past_decay_slots: state.scheduler.error_window_past_decay_slots,
-        },
-        cumulative_error: CumulativeErrorPolicy {
-            enabled: state.scheduler.cumulative_error_enabled,
-            hard: state.scheduler.cumulative_error_hard,
-        },
-    };
-    match state.qos_profiles.register(profile) {
-        Ok(ProfileRegistration::Created | ProfileRegistration::AlreadyRegistered) => {}
-        Err(ProfileRegistryError::Invalid(error)) => {
-            return Err(api_error(StatusCode::BAD_REQUEST, error));
-        }
-        Err(ProfileRegistryError::Conflict(profile_id)) => {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                format!("task_id {profile_id} is already registered with different settings"),
-            ));
-        }
-    }
-
-    state
-        .legacy_task_profile_ids
-        .lock()
-        .unwrap()
-        .insert(task_id, profile_id);
-    Ok(StatusCode::NO_CONTENT)
 }
 
 fn compute_horizon(state: &AppState) -> HorizonResponse {
@@ -776,37 +654,7 @@ pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let g = state.shared_state.get_global_error_stats();
     s.global_error_count = g.count;
     s.global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
-    s.legacy_task_id_usage = state.legacy_task_id_usage.snapshot();
     Json(s)
-}
-
-/// `GET /v1/tasks/{task_id}` — the task's currently effective flavours and
-/// error threshold (registered via `POST /v1/tasks`, or the built-in
-/// defaults if it was never announced).
-pub async fn get_task_config(
-    State(state): State<AppState>,
-    Path(task_id): Path<String>,
-) -> Json<TaskConfigResponse> {
-    state.legacy_task_id_usage.record_task_api_call();
-    let profile_id = state
-        .profile_id_for_task(&task_id)
-        .unwrap_or_else(QosProfileId::default_profile);
-    let profile = state
-        .qos_profiles
-        .get(&profile_id)
-        .unwrap_or_else(|| {
-            state
-                .qos_profiles
-                .get(&QosProfileId::default_profile())
-                .expect("the built-in default QoS profile is always registered")
-        });
-    Json(TaskConfigResponse {
-        qos_profile_id: profile_id.to_string(),
-        flavours: profile.flavours,
-        max_error_threshold: profile.max_error_threshold,
-        capacity_tiers: state.shared_state.capacity_tiers_snapshot(),
-        task_id,
-    })
 }
 
 /// `GET /v1/carbon_intensity` — the carbon intensity up to a requested slot,
@@ -862,7 +710,7 @@ pub async fn carbon_intensity(
 /// - `from_slot`: minimum scheduled slot (inclusive)
 /// - `to_slot`: maximum scheduled slot (inclusive)
 /// - `flavour`: filter by flavour name (e.g. "Fast", "Balanced", "Accurate")
-/// - `qos_profile_id`: stable profile ID (`task_id` is a migration alias)
+/// - `qos_profile_id`: stable profile ID
 ///
 /// Returns a list of `AssignmentItem` records snapshot from `state.shared_state.get_current_assignments()`.
 pub async fn get_assignments(
@@ -1070,9 +918,8 @@ pub async fn get_cost_metrics(
 }
 
 /// `GET /v1/metrics/error-history` — fleet telemetry or one profile's error
-/// history, selected using `qos_profile_id` (`task_id` remains a migration
-/// alias). The fleet-wide average is descriptive only, not a cross-profile QoS
-/// measure.
+/// history, selected using `qos_profile_id`. The fleet-wide average is
+/// descriptive only, not a cross-profile QoS measure.
 pub async fn get_error_history(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
@@ -1286,10 +1133,6 @@ pub async fn submit_request(
             profile_id.clone(),
         ),
     );
-    if body.task_id.is_some() {
-        state.legacy_task_id_usage.record_request_submission();
-    }
-
     state
         .shared_state
         .add_request(EngineRequest::new_for_qos_profile(

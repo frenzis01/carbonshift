@@ -23,8 +23,6 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/admin/capacity-tiers",
             put(handlers::force_set_capacity_tiers),
         )
-        .route("/v1/tasks", post(handlers::register_task))
-        .route("/v1/tasks/:task_id", get(handlers::get_task_config))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,
