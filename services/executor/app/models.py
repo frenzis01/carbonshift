@@ -73,6 +73,7 @@ class AdvanceSlotPayload(BaseModel):
     source: str = ""
     kind: str = "rollover"
     current_slot: Optional[int] = None
+    slot_minutes: Optional[float] = None
     slot_start_utc: Optional[str] = None
     observed: Optional[ObservedPoint] = None
     forecast: Optional[list[ForecastPoint]] = None
@@ -83,12 +84,12 @@ class CarbonshiftDispatchPayload(BaseModel):
     can point straight at this executor with no changes on either side.
     `payload` is carbonshift's opaque, caller-supplied field; the executor
     expects it to contain `{"task": ..., "input": {...}}` (and optionally
-    `"execute_at"`, `"reference"`/`"reference_answer"`/`"reference_entities"`
-    for quality scoring).
+    `"reference"`/`"reference_answer"`/`"reference_entities"` for quality scoring).
     """
 
     request_id: int
     scheduled_slot: int
+    execute_at: datetime
     flavour: str
     carbon_cost: float
     callback_url: str

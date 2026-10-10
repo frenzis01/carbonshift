@@ -33,6 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 rand_chacha = "0.3"
+chrono = "0.4"
 
 [dev-dependencies]
 approx = "0.5"

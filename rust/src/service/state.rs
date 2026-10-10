@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::engine::config::Config;
 use crate::engine::qos::{
@@ -14,6 +14,7 @@ use crate::engine::qos::{
 use crate::engine::shared_state::SharedState;
 use crate::engine::types::Flavour;
 use crate::service::models::RequestStatus;
+use chrono::{SecondsFormat, Utc};
 
 /// Per-request bookkeeping that lives outside the scheduling engine: the
 /// caller's callback URL, the opaque payload to forward to the executor, and
@@ -306,6 +307,9 @@ pub struct AppState {
     /// would be read by the scheduler at the wrong index — and because it would land
     /// outside its array it would be **silently ignored**, not obviously broken.
     pub slot_epoch_offset: Arc<Mutex<Option<i32>>>,
+    /// UTC start of engine slot zero. Manual-clock announcements synchronize
+    /// this anchor with the provider; real-time mode derives it from service uptime.
+    pub slot_epoch_start_utc: Arc<Mutex<SystemTime>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -321,8 +325,15 @@ impl AppState {
         // service binary the scheduler constructor has already done so.
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
         let qos_profiles = QosProfileRegistry::from_config(&cfg);
+        let engine_elapsed =
+            Duration::try_from_secs_f64(shared_state.virtual_elapsed_secs().max(0.0))
+                .expect("engine virtual elapsed time must be finite and non-negative");
+        let slot_epoch_start_utc = SystemTime::now()
+            .checked_sub(engine_elapsed)
+            .expect("engine slot-zero UTC anchor is outside the system clock range");
         Self {
             slot_epoch_offset: Arc::new(Mutex::new(None)),
+            slot_epoch_start_utc: Arc::new(Mutex::new(slot_epoch_start_utc)),
             shared_state,
             scheduler: ServiceSchedulerConfig::from_config(&cfg),
             qos_profiles,
@@ -352,13 +363,52 @@ impl AppState {
             Some(actual / forecast)
         }
     }
+
+    /// Re-anchor engine slot zero using a known UTC boundary for `slot`.
+    pub fn set_slot_time_anchor(
+        &self,
+        slot: i32,
+        slot_start_utc: SystemTime,
+    ) -> Result<(), String> {
+        if slot < 0 {
+            return Err(format!("engine slot must be non-negative, got {slot}"));
+        }
+        let offset = Duration::try_from_secs_f64(
+            self.scheduler.effective_slot_duration_secs * f64::from(slot),
+        )
+        .map_err(|error| format!("invalid slot time offset: {error}"))?;
+        let epoch_start = slot_start_utc
+            .checked_sub(offset)
+            .ok_or_else(|| "slot-zero UTC anchor is outside the system clock range".to_string())?;
+        *self.slot_epoch_start_utc.lock().unwrap() = epoch_start;
+        Ok(())
+    }
+
+    /// Return the RFC 3339 UTC boundary for an engine slot.
+    pub fn execute_at_for_slot(&self, slot: i32) -> Result<String, String> {
+        if slot < 0 {
+            return Err(format!("engine slot must be non-negative, got {slot}"));
+        }
+        let offset = Duration::try_from_secs_f64(
+            self.scheduler.effective_slot_duration_secs * f64::from(slot),
+        )
+        .map_err(|error| format!("invalid slot time offset: {error}"))?;
+        let epoch_start = *self.slot_epoch_start_utc.lock().unwrap();
+        let boundary = epoch_start
+            .checked_add(offset)
+            .ok_or_else(|| "slot UTC boundary is outside the system clock range".to_string())?;
+        Ok(chrono::DateTime::<Utc>::from(boundary).to_rfc3339_opts(SecondsFormat::Millis, true))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::config::Config;
+    use crate::engine::shared_state::SharedState;
     use crate::types::CapacityTier;
+    use std::sync::RwLock;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn service_scheduler_projection_preserves_custom_runtime_settings() {
@@ -414,5 +464,37 @@ mod tests {
             cfg.global_error_constraint_hard
         );
         assert_eq!(service.assignment_max_future_slots, 11);
+    }
+
+    #[test]
+    fn executor_time_uses_the_synchronized_utc_slot_boundary() {
+        let mut cfg = Config::default();
+        cfg.total_slots = 10;
+        cfg.slot_duration_seconds = 60.0;
+        let state = AppState::new(
+            SharedState::new(),
+            Arc::new(cfg),
+            ServiceConfig {
+                executor_url: None,
+                self_base_url: "http://localhost:0".to_string(),
+                submit_wait_timeout_secs: 0.2,
+                allow_private_callbacks: false,
+                api_key: None,
+                executor_token: None,
+                executor_max_retries: 3,
+                executor_retry_base_ms: 10,
+                executor_retry_max_ms: 100,
+                horizon_ready_threshold: 0.9,
+                dispatcher_poll_interval_ms: 20,
+            },
+            Arc::new(RwLock::new(vec![100.0; 10])),
+        );
+        let provider_slot_two = UNIX_EPOCH + Duration::from_secs(1_700_000_120);
+        state.set_slot_time_anchor(2, provider_slot_two).unwrap();
+
+        assert_eq!(
+            state.execute_at_for_slot(3).unwrap(),
+            "2023-11-14T22:16:20.000Z"
+        );
     }
 }

@@ -23,12 +23,11 @@
 /// # Carbon cost
 /// `cost [gCO₂] = carbon_intensity [gCO₂/kWh] × duration_seconds × scale`
 /// where `scale = 1/3600`.  The scale factor comes from `Config`.
-
 use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::{AssignmentPolicy, SolverConfig};
-use crate::types::{get_capacity_multiplier, CapacityTier, Flavour, RequestAssignment};
+use crate::types::{CapacityTier, Flavour, RequestAssignment, get_capacity_multiplier};
 
 /// Shared, `'static` empty map used as the default `request_flavours` when a
 /// caller has no per-request (task-specific) flavour overrides — avoids
@@ -65,12 +64,7 @@ struct DpStateKey {
 }
 
 impl DpStateKey {
-    fn new(
-        error_sum_bp: i64,
-        error_count: f64,
-        mock_remaining: i32,
-        inc_counts: Vec<i32>,
-    ) -> Self {
+    fn new(error_sum_bp: i64, error_count: f64, mock_remaining: i32, inc_counts: Vec<i32>) -> Self {
         Self {
             error_sum_bp,
             error_count_milli: (error_count * 1000.0).round() as i64,
@@ -87,10 +81,18 @@ impl DpStateKey {
 
 // ─── solver ───────────────────────────────────────────────────────────────────
 
+/// One request's slot bounds for a batch solve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SolveRequest {
+    pub request_id: u64,
+    pub earliest_slot: i32,
+    pub deadline_slot: i32,
+}
+
 /// Configurable input for a single batch solve call.
 pub struct SolveBatchInput<'a> {
-    /// Requests to schedule: (id, deadline_slot).
-    pub requests: &'a [(u64, i32)],
+    /// Requests to schedule with per-request earliest and latest slots.
+    pub requests: &'a [SolveRequest],
     pub current_slot: i32,
     /// Capacity multiplier fallback (used when capacity_tiers is empty).
     pub capacity_multiplier: f64,
@@ -154,8 +156,15 @@ impl DpSolver {
     /// present in `overrides`, otherwise `self.flavours` (the predefined
     /// default task — used as-is by CLI/simulation tools and by any request
     /// whose task wasn't dynamically registered).
-    fn flavours_for<'b>(&'b self, req_id: u64, overrides: &'b HashMap<u64, Vec<Flavour>>) -> &'b [Flavour] {
-        overrides.get(&req_id).map(|v| v.as_slice()).unwrap_or(&self.flavours)
+    fn flavours_for<'b>(
+        &'b self,
+        req_id: u64,
+        overrides: &'b HashMap<u64, Vec<Flavour>>,
+    ) -> &'b [Flavour] {
+        overrides
+            .get(&req_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&self.flavours)
     }
 
     pub fn with_carbon_forecast(mut self, forecast: Vec<f64>) -> Self {
@@ -186,7 +195,10 @@ impl DpSolver {
 
         // Resolve capacity tiers: fall back to flat multiplier if empty.
         let tiers: Vec<CapacityTier> = if input.capacity_tiers.is_empty() {
-            vec![CapacityTier { max_requests: None, multiplier: input.capacity_multiplier }]
+            vec![CapacityTier {
+                max_requests: None,
+                multiplier: input.capacity_multiplier,
+            }]
         } else {
             input.capacity_tiers.to_vec()
         };
@@ -203,8 +215,22 @@ impl DpSolver {
         let deadlines: Vec<i32> = input
             .requests
             .iter()
-            .map(|(_, d)| (*d).max(input.current_slot).min(assignment_cap).min(self.window_size - 1))
+            .map(|request| {
+                request
+                    .deadline_slot
+                    .max(input.current_slot)
+                    .min(assignment_cap)
+                    .min(self.window_size - 1)
+            })
             .collect();
+        if input
+            .requests
+            .iter()
+            .zip(&deadlines)
+            .any(|(request, deadline)| request.earliest_slot.max(input.current_slot) > *deadline)
+        {
+            return vec![];
+        }
 
         // Build baseline arrays.
         let mut base_counts = vec![0i32; t];
@@ -215,12 +241,10 @@ impl DpSolver {
         }
 
         // Convert baseline to integer representation.
-        let initial_error_sum_bp =
-            (input.error_window_baseline.error_sum * 100.0).round() as i64;
+        let initial_error_sum_bp = (input.error_window_baseline.error_sum * 100.0).round() as i64;
         let initial_error_count = input.error_window_baseline.request_count;
         let initial_mock_count = input.dynamic_mock_pool.initial_count.max(0);
-        let mock_error_bp =
-            (input.dynamic_mock_pool.error_per_request * 100.0).round() as i64;
+        let mock_error_bp = (input.dynamic_mock_pool.error_per_request * 100.0).round() as i64;
 
         // ── warm start: sequential (request-by-request) solution ─────────
         // This is equivalent to calling solve_batch once per request and
@@ -283,18 +307,19 @@ impl DpSolver {
         let start = Instant::now();
 
         // ── DP expansion: one layer per request ──────────────────────────
-        for (req_idx, (req_id, _)) in input.requests.iter().enumerate() {
+        for (req_idx, request) in input.requests.iter().enumerate() {
             let deadline = deadlines[req_idx];
+            let earliest_slot = request.earliest_slot.max(input.current_slot);
             let mut dp_curr: HashMap<DpStateKey, (f64, Vec<RequestAssignment>)> = HashMap::new();
 
             for (state_key, (prev_cost, prev_assignments)) in &dp_prev {
                 let inc_counts = state_key.inc_counts.clone();
 
-                for flavour in self.flavours_for(*req_id, input.request_flavours) {
+                for flavour in self.flavours_for(request.request_id, input.request_flavours) {
                     let f_error_bp = (flavour.error * 100.0).round() as i64;
                     let f_duration = flavour.duration;
 
-                    for slot in input.current_slot..=deadline {
+                    for slot in earliest_slot..=deadline {
                         let s = slot as usize;
 
                         let delta_cost = self.incremental_carbon_cost(
@@ -334,7 +359,7 @@ impl DpSolver {
                         );
 
                         let assignment = RequestAssignment {
-                            request_id: *req_id,
+                            request_id: request.request_id,
                             flavour_name: flavour.name.clone(),
                             slot,
                             carbon_cost: delta_cost,
@@ -357,7 +382,11 @@ impl DpSolver {
                 // actually end up empty here — kept as a defensive guard).
                 // Same rule as everywhere else: only return the warm-start
                 // answer if it satisfies the error threshold.
-                return if warm_is_feasible { warm_assignments } else { vec![] };
+                return if warm_is_feasible {
+                    warm_assignments
+                } else {
+                    vec![]
+                };
             }
 
             // ── pruning with warm-start protection ───────────────────────
@@ -366,7 +395,7 @@ impl DpSolver {
                     dp_curr.into_iter().collect();
 
                 if self.pruning == "beam" {
-                    items.sort_unstable_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap());
+                    items.sort_unstable_by(|a, b| a.1.0.partial_cmp(&b.1.0).unwrap());
                 } else {
                     // kbest: sort by (cost, avg_error)
                     items.sort_unstable_by(|a, b| {
@@ -380,8 +409,8 @@ impl DpSolver {
                         } else {
                             0.0
                         };
-                        a.1 .0
-                            .partial_cmp(&b.1 .0)
+                        a.1.0
+                            .partial_cmp(&b.1.0)
                             .unwrap()
                             .then(a_avg.partial_cmp(&b_avg).unwrap())
                     });
@@ -398,8 +427,7 @@ impl DpSolver {
                     self.pruning_k
                 };
 
-                let mut trimmed: HashMap<_, _> =
-                    items.drain(..take_n.min(items.len())).collect();
+                let mut trimmed: HashMap<_, _> = items.drain(..take_n.min(items.len())).collect();
 
                 // Inject the warm state if it was pruned away.
                 if let Some(wi) = warm_idx {
@@ -415,7 +443,11 @@ impl DpSolver {
 
             // ── timeout: fall back to warm-start solution (if feasible) ──
             if start.elapsed().as_secs_f64() > self.timeout {
-                return if warm_is_feasible { warm_assignments } else { vec![] };
+                return if warm_is_feasible {
+                    warm_assignments
+                } else {
+                    vec![]
+                };
             }
 
             dp_prev = dp_curr;
@@ -447,7 +479,13 @@ impl DpSolver {
             .into_values()
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
             .map(|(_, assignments)| assignments)
-            .unwrap_or_else(|| if warm_is_feasible { warm_assignments } else { vec![] })
+            .unwrap_or_else(|| {
+                if warm_is_feasible {
+                    warm_assignments
+                } else {
+                    vec![]
+                }
+            })
     }
 
     // ── warm-start helper ─────────────────────────────────────────────────
@@ -506,14 +544,15 @@ impl DpSolver {
         let mut keys = vec![key.clone()];
         let mut assignments = Vec::new();
 
-        for (req_idx, (req_id, _)) in input.requests.iter().enumerate() {
+        for (req_idx, request) in input.requests.iter().enumerate() {
             let deadline = deadlines[req_idx];
+            let earliest_slot = request.earliest_slot.max(input.current_slot);
             let mut best: Option<(f64, &Flavour, i32)> = None;
 
             // Most-accurate (min-error) flavour, and its cheapest slot — the
             // last-resort candidate if nothing keeps the window error within
             // threshold (mirrors `solve_greedy_singleton`'s fallback).
-            let candidate_flavours = self.flavours_for(*req_id, input.request_flavours);
+            let candidate_flavours = self.flavours_for(request.request_id, input.request_flavours);
             let min_error_flavour = candidate_flavours
                 .iter()
                 .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
@@ -521,7 +560,7 @@ impl DpSolver {
             let mut fallback: Option<(f64, i32)> = None;
 
             for flavour in candidate_flavours {
-                for slot in input.current_slot..=deadline {
+                for slot in earliest_slot..=deadline {
                     let cost = self.incremental_carbon_cost(
                         slot,
                         flavour.duration,
@@ -570,8 +609,9 @@ impl DpSolver {
             let (cost, flavour, slot) = match best {
                 Some(b) => b,
                 None => {
-                    let (cost, slot) =
-                        fallback.expect("at least one (flavour, slot) candidate must exist");
+                    let Some((cost, slot)) = fallback else {
+                        return (vec![], keys);
+                    };
                     (cost, min_error_flavour, slot)
                 }
             };
@@ -606,7 +646,7 @@ impl DpSolver {
                 keys.push(key.clone());
 
                 assignments.push(RequestAssignment {
-                    request_id: *req_id,
+                    request_id: request.request_id,
                     flavour_name: flavour.name.clone(),
                     slot,
                     carbon_cost: cost,
@@ -622,8 +662,7 @@ impl DpSolver {
     /// the most accurate (longest duration) flavour available to it.
     pub fn greedy_fallback(
         &self,
-        requests: &[(u64, i32)],
-        deadlines: &[i32],
+        requests: &[SolveRequest],
         current_slot: i32,
         capacity_tiers: &[CapacityTier],
         base_counts: &[i32],
@@ -632,19 +671,23 @@ impl DpSolver {
         let mut inc_counts = base_counts.to_vec();
         let mut assignments = Vec::new();
 
-        for (i, (req_id, _)) in requests.iter().enumerate() {
-            let deadline = deadlines[i];
+        for request in requests {
+            let earliest_slot = request.earliest_slot.max(current_slot);
+            let deadline = request
+                .deadline_slot
+                .max(current_slot)
+                .min(self.window_size - 1);
             // Most accurate = longest duration, among this request's own
             // (task-specific, or default) candidate flavours.
             let fallback_flavour = self
-                .flavours_for(*req_id, request_flavours)
+                .flavours_for(request.request_id, request_flavours)
                 .iter()
                 .max_by_key(|f| f.duration)
                 .expect("at least one flavour");
             let mut best: Option<(f64, i32)> = None;
             let empty_base = vec![0i32; self.window_size as usize];
 
-            for slot in current_slot..=deadline {
+            for slot in earliest_slot..=deadline {
                 let cost = self.incremental_carbon_cost(
                     slot,
                     fallback_flavour.duration,
@@ -661,7 +704,7 @@ impl DpSolver {
                 let s = best_slot as usize;
                 inc_counts[s] += 1;
                 assignments.push(RequestAssignment {
-                    request_id: *req_id,
+                    request_id: request.request_id,
                     flavour_name: fallback_flavour.name.clone(),
                     slot: best_slot,
                     carbon_cost: cost,
@@ -717,11 +760,14 @@ mod tests {
     }
 
     fn no_tiers() -> Vec<CapacityTier> {
-        vec![CapacityTier { max_requests: None, multiplier: 1.0 }]
+        vec![CapacityTier {
+            max_requests: None,
+            multiplier: 1.0,
+        }]
     }
 
     fn make_input_with_maps<'a>(
-        requests: &'a [(u64, i32)],
+        requests: &'a [SolveRequest],
         current_slot: i32,
         tiers: &'a [CapacityTier],
         counts: &'a HashMap<i32, i32>,
@@ -743,7 +789,7 @@ mod tests {
     }
 
     fn make_input<'a>(
-        requests: &'a [(u64, i32)],
+        requests: &'a [SolveRequest],
         current_slot: i32,
         tiers: &'a [CapacityTier],
         counts: &'a HashMap<i32, i32>,
@@ -756,7 +802,11 @@ mod tests {
         // Carbon forecast has a valley at slot 2; solver should place there.
         let forecast = vec![100.0, 80.0, 20.0, 80.0, 100.0];
         let solver = DpSolver {
-            flavours: vec![Flavour { name: "A".to_string(), error: 0.0, duration: 60 }],
+            flavours: vec![Flavour {
+                name: "A".to_string(),
+                error: 0.0,
+                duration: 60,
+            }],
             window_size: 5,
             carbon_forecast: forecast,
             pruning: "none".to_string(),
@@ -764,10 +814,72 @@ mod tests {
             timeout: 5.0,
             carbon_cost_scale: 1.0 / 3600.0,
         };
-        let requests = vec![(1u64, 4i32)];
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            earliest_slot: 0,
+            deadline_slot: 4,
+        }];
         let tiers = no_tiers();
         let counts = HashMap::new();
         let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].slot, 2);
+    }
+
+    #[test]
+    fn request_is_never_assigned_before_its_arrival_slot() {
+        let solver = DpSolver {
+            flavours: vec![Flavour {
+                name: "A".to_string(),
+                error: 0.0,
+                duration: 60,
+            }],
+            window_size: 5,
+            carbon_forecast: vec![1.0, 100.0, 10.0, 20.0, 30.0],
+            pruning: "none".to_string(),
+            pruning_k: 100,
+            timeout: 5.0,
+            carbon_cost_scale: 1.0 / 3600.0,
+        };
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            earliest_slot: 2,
+            deadline_slot: 4,
+        }];
+        let tiers = no_tiers();
+        let counts = HashMap::new();
+
+        let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts));
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].slot, 2);
+    }
+
+    #[test]
+    fn greedy_fallback_never_assigns_before_arrival_slot() {
+        let solver = DpSolver {
+            flavours: vec![Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 60,
+            }],
+            window_size: 5,
+            carbon_forecast: vec![1.0, 100.0, 10.0, 20.0, 30.0],
+            pruning: "none".to_string(),
+            pruning_k: 100,
+            timeout: 5.0,
+            carbon_cost_scale: 1.0 / 3600.0,
+        };
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            earliest_slot: 2,
+            deadline_slot: 4,
+        }];
+        let tiers = no_tiers();
+        let base = vec![0; 5];
+
+        let result = solver.greedy_fallback(&requests, 0, &tiers, &base, empty_request_flavours());
+
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].slot, 2);
     }
@@ -777,12 +889,22 @@ mod tests {
         // Tier threshold at 1 request: the 2nd request uses multiplier 2.0
         // but the 1st request keeps multiplier 1.0 (no repricing).
         let tiers = vec![
-            CapacityTier { max_requests: Some(1), multiplier: 1.0 },
-            CapacityTier { max_requests: None,    multiplier: 2.0 },
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 2.0,
+            },
         ];
         let forecast = vec![40.0; 5]; // flat carbon
         let solver = DpSolver {
-            flavours: vec![Flavour { name: "A".to_string(), error: 0.0, duration: 60 }],
+            flavours: vec![Flavour {
+                name: "A".to_string(),
+                error: 0.0,
+                duration: 60,
+            }],
             window_size: 5,
             carbon_forecast: forecast,
             pruning: "none".to_string(),
@@ -791,41 +913,60 @@ mod tests {
             carbon_cost_scale: 1.0 / 3600.0,
         };
         // First request is at position 1 → tier 1 (mult=1.0): cost = 40 * 1.0 * 60/3600
-        let cost_first = solver.incremental_carbon_cost(
-            0, 60, &vec![0; 5], &vec![0; 5], &tiers,
+        let cost_first = solver.incremental_carbon_cost(0, 60, &vec![0; 5], &vec![0; 5], &tiers);
+        assert!(
+            (cost_first - 40.0 * 1.0 * 60.0 / 3600.0).abs() < 1e-9,
+            "cost_first={cost_first}"
         );
-        assert!((cost_first - 40.0 * 1.0 * 60.0 / 3600.0).abs() < 1e-9,
-            "cost_first={cost_first}");
 
         // Second request is at position 2 → tier 2 (mult=2.0): cost = 40 * 2.0 * 60/3600
         // Previous request is NOT repriced — this is the per-request model.
-        let cost_second = solver.incremental_carbon_cost(
-            0, 60, &vec![0; 5], &vec![1; 5], &tiers,
-        );
+        let cost_second = solver.incremental_carbon_cost(0, 60, &vec![0; 5], &vec![1; 5], &tiers);
         let expected_second = 40.0 * 2.0 * 60.0 / 3600.0;
-        assert!((cost_second - expected_second).abs() < 1e-9,
-            "cost_second={cost_second}, expected={expected_second}");
+        assert!(
+            (cost_second - expected_second).abs() < 1e-9,
+            "cost_second={cost_second}, expected={expected_second}"
+        );
 
         // Total cost for 2 requests = cost_first + cost_second (additive, no repricing)
         let total = cost_first + cost_second;
         let expected_total = 40.0 * (1.0 * 60.0 + 2.0 * 60.0) / 3600.0;
-        assert!((total - expected_total).abs() < 1e-9,
-            "total={total}, expected={expected_total}");
+        assert!(
+            (total - expected_total).abs() < 1e-9,
+            "total={total}, expected={expected_total}"
+        );
     }
 
     #[test]
     fn tier_crossing_does_not_reprice_earlier_requests() {
         // 3 tiers: ≤2 mult=1.0, ≤4 mult=2.0, else mult=5.0; duration=30
         let tiers = vec![
-            CapacityTier { max_requests: Some(2), multiplier: 1.0 },
-            CapacityTier { max_requests: Some(4), multiplier: 2.0 },
-            CapacityTier { max_requests: None,    multiplier: 5.0 },
+            CapacityTier {
+                max_requests: Some(2),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: Some(4),
+                multiplier: 2.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 5.0,
+            },
         ];
         let forecast = vec![60.0; 5];
         let solver = DpSolver {
-            flavours: vec![Flavour { name: "F".to_string(), error: 0.0, duration: 30 }],
-            window_size: 5, carbon_forecast: forecast.clone(), pruning: "none".to_string(),
-            pruning_k: 1000, timeout: 5.0, carbon_cost_scale: 1.0 / 3600.0,
+            flavours: vec![Flavour {
+                name: "F".to_string(),
+                error: 0.0,
+                duration: 30,
+            }],
+            window_size: 5,
+            carbon_forecast: forecast.clone(),
+            pruning: "none".to_string(),
+            pruning_k: 1000,
+            timeout: 5.0,
+            carbon_cost_scale: 1.0 / 3600.0,
         };
         let scale = 1.0 / 3600.0;
         // positions 1,2 → mult 1.0; positions 3,4 → mult 2.0; position 5 → mult 5.0
@@ -840,8 +981,11 @@ mod tests {
             let mut inc_counts = vec![0i32; 5];
             inc_counts[0] = i as i32; // i requests already placed at slot 0
             let cost = solver.incremental_carbon_cost(0, 30, &vec![0; 5], &inc_counts, &tiers);
-            assert!((cost - expected).abs() < 1e-9,
-                "position={}: cost={cost}, expected={expected}", i + 1);
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "position={}: cost={cost}, expected={expected}",
+                i + 1
+            );
         }
     }
 
@@ -852,8 +996,16 @@ mod tests {
         let forecast = flat_forecast(5, 40.0);
         let solver = DpSolver {
             flavours: vec![
-                Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 },
-                Flavour { name: "Fast".to_string(), error: 5.0, duration: 10 },
+                Flavour {
+                    name: "Accurate".to_string(),
+                    error: 0.0,
+                    duration: 60,
+                },
+                Flavour {
+                    name: "Fast".to_string(),
+                    error: 5.0,
+                    duration: 10,
+                },
             ],
             window_size: 5,
             carbon_forecast: forecast,
@@ -862,7 +1014,11 @@ mod tests {
             timeout: 5.0,
             carbon_cost_scale: 1.0 / 3600.0,
         };
-        let requests = vec![(1u64, 2i32)]; // deadline=2, window_future=2 → all slots in window
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            earliest_slot: 0,
+            deadline_slot: 2,
+        }];
         let tiers = no_tiers();
         let counts = HashMap::new();
         let mut input = make_input(&requests, 0, &tiers, &counts);
@@ -877,7 +1033,11 @@ mod tests {
     fn per_request_flavour_override_is_used_over_default() {
         // Solver's own (default-task) flavour list only has "Accurate".
         let solver = DpSolver {
-            flavours: vec![Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 }],
+            flavours: vec![Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 60,
+            }],
             window_size: 5,
             carbon_forecast: flat_forecast(5, 40.0),
             pruning: "none".to_string(),
@@ -885,11 +1045,22 @@ mod tests {
             timeout: 5.0,
             carbon_cost_scale: 1.0 / 3600.0,
         };
-        let requests = vec![(1u64, 2i32)];
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            earliest_slot: 0,
+            deadline_slot: 2,
+        }];
         let tiers = no_tiers();
         let counts = HashMap::new();
         let mut overrides: HashMap<u64, Vec<Flavour>> = HashMap::new();
-        overrides.insert(1, vec![Flavour { name: "TaskOnly".to_string(), error: 1.0, duration: 5 }]);
+        overrides.insert(
+            1,
+            vec![Flavour {
+                name: "TaskOnly".to_string(),
+                error: 1.0,
+                duration: 5,
+            }],
+        );
         let result = solver.solve_batch(SolveBatchInput {
             request_flavours: &overrides,
             ..make_input(&requests, 0, &tiers, &counts)
@@ -902,7 +1073,11 @@ mod tests {
     #[test]
     fn greedy_fallback_uses_per_request_flavour_override() {
         let solver = DpSolver {
-            flavours: vec![Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 }],
+            flavours: vec![Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 60,
+            }],
             window_size: 5,
             carbon_forecast: flat_forecast(5, 40.0),
             pruning: "none".to_string(),
@@ -910,13 +1085,23 @@ mod tests {
             timeout: 5.0,
             carbon_cost_scale: 1.0 / 3600.0,
         };
-        let requests = vec![(1u64, 0i32)];
-        let deadlines = vec![0];
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            earliest_slot: 0,
+            deadline_slot: 0,
+        }];
         let tiers = no_tiers();
         let base = vec![0i32; 5];
         let mut overrides: HashMap<u64, Vec<Flavour>> = HashMap::new();
-        overrides.insert(1, vec![Flavour { name: "TaskOnly".to_string(), error: 1.0, duration: 45 }]);
-        let result = solver.greedy_fallback(&requests, &deadlines, 0, &tiers, &base, &overrides);
+        overrides.insert(
+            1,
+            vec![Flavour {
+                name: "TaskOnly".to_string(),
+                error: 1.0,
+                duration: 45,
+            }],
+        );
+        let result = solver.greedy_fallback(&requests, 0, &tiers, &base, &overrides);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].flavour_name, "TaskOnly");
     }
@@ -935,9 +1120,21 @@ mod tests {
         };
         let solver = DpSolver {
             flavours: vec![
-                Flavour { name: "A".to_string(), error: 0.0, duration: 60 },
-                Flavour { name: "B".to_string(), error: 2.5, duration: 30 },
-                Flavour { name: "C".to_string(), error: 5.0, duration: 10 },
+                Flavour {
+                    name: "A".to_string(),
+                    error: 0.0,
+                    duration: 60,
+                },
+                Flavour {
+                    name: "B".to_string(),
+                    error: 2.5,
+                    duration: 30,
+                },
+                Flavour {
+                    name: "C".to_string(),
+                    error: 5.0,
+                    duration: 10,
+                },
             ],
             window_size: 24,
             carbon_forecast: forecast,
@@ -946,14 +1143,23 @@ mod tests {
             timeout: 10.0,
             carbon_cost_scale: 1.0 / 3600.0,
         };
-        let requests: Vec<(u64, i32)> = (1..=5).map(|i| (i, 23)).collect();
+        let requests: Vec<SolveRequest> = (1..=5)
+            .map(|i| SolveRequest {
+                request_id: i,
+                earliest_slot: 0,
+                deadline_slot: 23,
+            })
+            .collect();
         let tiers = no_tiers();
         let counts = HashMap::new();
         let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts));
         assert_eq!(result.len(), 5, "all requests must be scheduled");
         // All assignments should be in cheap slots (outside window).
         for a in &result {
-            assert!(a.slot >= 3, "beam should prefer cheap slots outside error window");
+            assert!(
+                a.slot >= 3,
+                "beam should prefer cheap slots outside error window"
+            );
         }
     }
 
@@ -961,8 +1167,16 @@ mod tests {
     fn greedy_fallback_covers_all_requests() {
         let solver = DpSolver {
             flavours: vec![
-                Flavour { name: "Accurate".to_string(), error: 0.0, duration: 60 },
-                Flavour { name: "Fast".to_string(), error: 5.0, duration: 10 },
+                Flavour {
+                    name: "Accurate".to_string(),
+                    error: 0.0,
+                    duration: 60,
+                },
+                Flavour {
+                    name: "Fast".to_string(),
+                    error: 5.0,
+                    duration: 10,
+                },
             ],
             window_size: 5,
             carbon_forecast: flat_forecast(5, 40.0),
@@ -971,11 +1185,26 @@ mod tests {
             timeout: 5.0,
             carbon_cost_scale: 1.0 / 3600.0,
         };
-        let requests = vec![(1u64, 0i32), (2u64, 1i32), (3u64, 2i32)];
-        let deadlines = vec![0, 1, 2];
+        let requests = vec![
+            SolveRequest {
+                request_id: 1,
+                earliest_slot: 0,
+                deadline_slot: 0,
+            },
+            SolveRequest {
+                request_id: 2,
+                earliest_slot: 0,
+                deadline_slot: 1,
+            },
+            SolveRequest {
+                request_id: 3,
+                earliest_slot: 0,
+                deadline_slot: 2,
+            },
+        ];
         let tiers = no_tiers();
         let base = vec![0i32; 5];
-        let result = solver.greedy_fallback(&requests, &deadlines, 0, &tiers, &base, empty_request_flavours());
+        let result = solver.greedy_fallback(&requests, 0, &tiers, &base, empty_request_flavours());
         assert_eq!(result.len(), 3);
     }
 
@@ -991,7 +1220,11 @@ mod tests {
     #[test]
     fn current_slot_beyond_window_returns_empty() {
         let solver = DpSolver {
-            flavours: vec![Flavour { name: "A".to_string(), error: 0.0, duration: 60 }],
+            flavours: vec![Flavour {
+                name: "A".to_string(),
+                error: 0.0,
+                duration: 60,
+            }],
             window_size: 5,
             carbon_forecast: flat_forecast(5, 100.0),
             pruning: "none".to_string(),
@@ -1000,7 +1233,11 @@ mod tests {
             carbon_cost_scale: 1.0 / 3600.0,
         };
         let tiers = no_tiers();
-        let requests = vec![(1u64, 4i32)];
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            earliest_slot: 0,
+            deadline_slot: 4,
+        }];
         let counts = HashMap::new();
         let result = solver.solve_batch(SolveBatchInput {
             current_slot: 5, // == window_size → early return

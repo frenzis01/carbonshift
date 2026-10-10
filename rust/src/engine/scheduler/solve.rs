@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::{AssignmentPolicy, InfeasibilityConfig, SimulationConfig, SolverConfig};
-use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
+use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput, SolveRequest};
 use crate::engine::qos::QosProfileId;
 use crate::shared_state::{GlobalErrorStats, SharedState};
 use crate::types::{
@@ -119,10 +119,9 @@ struct PreparedSolve {
     window_start: i32,
     window_end: i32,
     assignment_cap: i32,
-    /// (request_id, capped_deadline) pairs to schedule — the batch's pending
-    /// requests plus, when `dp_lock_future_assignments` is false, any movable
-    /// future assignments re-joining the pool for joint re-planning.
-    solve_requests: Vec<(u64, i32)>,
+    /// Slot-bounded requests to schedule — the batch's pending requests plus,
+    /// when `dp_lock_future_assignments` is false, movable future assignments.
+    solve_requests: Vec<SolveRequest>,
     /// request_id → (arrival_slot, capped_deadline), for converting solver
     /// results back into `Assignment`s.
     assignment_metadata: HashMap<u64, (i32, i32)>,
@@ -186,9 +185,13 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         .into_iter()
         .partition(|assignment| assignment.qos_profile_id == profile_id);
 
-    let mut solve_requests: Vec<(u64, i32)> = pending
+    let mut solve_requests: Vec<SolveRequest> = pending
         .iter()
-        .map(|r| (r.id, cap_deadline(r.deadline_slot)))
+        .map(|r| SolveRequest {
+            request_id: r.id,
+            earliest_slot: r.arrival_slot.max(current_slot),
+            deadline_slot: cap_deadline(r.deadline_slot),
+        })
         .collect();
 
     // Metadata for converting RequestAssignment → Assignment later.
@@ -209,7 +212,11 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
                 .deadline_slot
                 .unwrap_or_else(|| a.scheduled_slot.max(current_slot));
             let capped = cap_deadline(deadline);
-            solve_requests.push((a.request_id, capped));
+            solve_requests.push(SolveRequest {
+                request_id: a.request_id,
+                earliest_slot: a.arrival_slot.unwrap_or(current_slot).max(current_slot),
+                deadline_slot: capped,
+            });
             assignment_metadata.insert(a.request_id, (a.arrival_slot.unwrap_or(0), capped));
         }
     }
@@ -444,10 +451,14 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         // assignment instead of being discarded and redone greedily too
         // (a single infeasible request no longer drags the whole batch
         // down to the greedy/most-accurate-flavour path).
-        let unscheduled: Vec<(u64, i32)> = pending
+        let unscheduled: Vec<SolveRequest> = pending
             .iter()
             .filter(|r| !scheduled_pending_ids.contains(&r.id))
-            .map(|r| (r.id, cap_deadline(r.deadline_slot)))
+            .map(|r| SolveRequest {
+                request_id: r.id,
+                earliest_slot: r.arrival_slot.max(current_slot),
+                deadline_slot: cap_deadline(r.deadline_slot),
+            })
             .collect();
         if verbose {
             println!(
@@ -457,8 +468,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 unscheduled.len()
             );
         }
-        let deadlines: Vec<i32> = unscheduled.iter().map(|(_, d)| *d).collect();
-
         // Fallback cost/capacity accounting must include slots the DP
         // already filled in this same batch, not just the pre-batch baseline.
         let mut fallback_base_counts = base_counts_arr.clone();
@@ -477,7 +486,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         );
         let greedy = greedy_solver.greedy_fallback(
             &unscheduled,
-            &deadlines,
             current_slot,
             assignment.capacity_tiers,
             &fallback_base_counts,
@@ -502,7 +510,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
             assignments: vec![],
             context: SolveContext {
                 status: "infeasible".to_string(),
-                mode: solve_mode,
+                mode: "greedy_singleton".to_string(),
                 ..Default::default()
             },
             baseline_slot_counts: HashMap::new(),
@@ -666,13 +674,26 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
     let mut slot_count: HashMap<i32, i32> = prep.baseline_slot_counts.clone();
     let mut solved: Vec<RequestAssignment> = Vec::new();
 
-    for &(request_id, deadline) in &prep.solve_requests {
+    for request in &prep.solve_requests {
+        let request_id = request.request_id;
+        let deadline = request.deadline_slot;
         let (arrival, _) = prep
             .assignment_metadata
             .get(&request_id)
             .copied()
             .unwrap_or((current_slot, deadline));
-        let start_slot = arrival.max(current_slot);
+        let start_slot = request.earliest_slot.max(current_slot);
+        if start_slot > deadline {
+            return BatchSolveResult {
+                assignments: vec![],
+                context: SolveContext {
+                    status: "infeasible".to_string(),
+                    mode: "greedy_singleton".to_string(),
+                    ..Default::default()
+                },
+                baseline_slot_counts: HashMap::new(),
+            };
+        }
 
         let mut best: Option<(f64, i32, &Flavour)> = None;
         for slot in start_slot..=deadline {

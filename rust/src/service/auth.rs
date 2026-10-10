@@ -16,18 +16,37 @@ pub async fn require_api_key(State(state): State<AppState>, req: Request, next: 
 }
 
 /// Guards `/v1/callback/*`: only the configured executor may post results.
-pub async fn require_executor_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    require_header(&state.service_cfg.executor_token, "x-executor-token", req, next).await
+pub async fn require_executor_token(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    require_header(
+        &state.service_cfg.executor_token,
+        "x-executor-token",
+        req,
+        next,
+    )
+    .await
 }
 
-async fn require_header(expected: &Option<String>, header_name: &str, req: Request, next: Next) -> Response {
+async fn require_header(
+    expected: &Option<String>,
+    header_name: &str,
+    req: Request,
+    next: Next,
+) -> Response {
     match expected {
         None => next.run(req).await,
         Some(expected) => {
             let provided = req.headers().get(header_name).and_then(|v| v.to_str().ok());
             match provided {
                 Some(p) if constant_time_eq(p, expected) => next.run(req).await,
-                _ => (StatusCode::UNAUTHORIZED, format!("missing or invalid {header_name}")).into_response(),
+                _ => (
+                    StatusCode::UNAUTHORIZED,
+                    format!("missing or invalid {header_name}"),
+                )
+                    .into_response(),
             }
         }
     }
@@ -39,7 +58,10 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]

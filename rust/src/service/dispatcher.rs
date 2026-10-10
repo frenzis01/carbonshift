@@ -10,13 +10,15 @@
 use std::time::{Duration, Instant};
 
 use crate::engine::types::Assignment;
-use crate::service::models::RequestStatus;
 use crate::service::models::ExecutorDispatchPayload;
+use crate::service::models::RequestStatus;
 use crate::service::state::AppState;
 
 /// Runs forever; spawn with `tokio::spawn(dispatcher::run(state))`.
 pub async fn run(state: AppState) {
-    let mut interval = tokio::time::interval(Duration::from_millis(state.service_cfg.dispatcher_poll_interval_ms));
+    let mut interval = tokio::time::interval(Duration::from_millis(
+        state.service_cfg.dispatcher_poll_interval_ms,
+    ));
     let mut warned_horizon = false;
     loop {
         interval.tick().await;
@@ -42,8 +44,10 @@ pub async fn run(state: AppState) {
                                 // status is still `Pending` even though a real
                                 // assignment now exists. Anything not yet
                                 // dispatched/completed/failed is fair game here.
-                                matches!(t.status, RequestStatus::Pending | RequestStatus::Scheduled)
-                                    && t.next_attempt_at.map(|at| at <= now).unwrap_or(true)
+                                matches!(
+                                    t.status,
+                                    RequestStatus::Pending | RequestStatus::Scheduled
+                                ) && t.next_attempt_at.map(|at| at <= now).unwrap_or(true)
                             })
                             .unwrap_or(false)
                 })
@@ -68,7 +72,8 @@ fn warn_if_near_horizon(state: &AppState, current_slot: i32, warned: &mut bool) 
         return;
     }
     let total = state.scheduler.total_slots;
-    if total > 0 && current_slot as f64 >= total as f64 * state.service_cfg.horizon_ready_threshold {
+    if total > 0 && current_slot as f64 >= total as f64 * state.service_cfg.horizon_ready_threshold
+    {
         tracing::warn!(
             current_slot,
             total_slots = total,
@@ -88,27 +93,47 @@ async fn dispatch_one(state: &AppState, request_id: u64, assignment: &Assignment
         .get(&request_id)
         .map(|t| t.payload.clone())
         .unwrap_or(serde_json::Value::Null);
+    let execute_at = match state.execute_at_for_slot(assignment.scheduled_slot) {
+        Ok(execute_at) => execute_at,
+        Err(error) => {
+            tracing::error!(request_id, %error, "could not derive executor slot boundary");
+            set_status(state, request_id, RequestStatus::Failed, Some(error));
+            return;
+        }
+    };
 
     let dispatch_payload = ExecutorDispatchPayload {
         request_id,
         scheduled_slot: assignment.scheduled_slot,
+        execute_at,
         flavour: assignment.flavour_name.clone(),
         carbon_cost: assignment.carbon_cost,
-        callback_url: format!("{}/v1/callback/{request_id}", state.service_cfg.self_base_url),
+        callback_url: format!(
+            "{}/v1/callback/{request_id}",
+            state.service_cfg.self_base_url
+        ),
         payload,
     };
 
     match &state.service_cfg.executor_url {
         None => {
             // Dry-run / test mode: no downstream executor configured.
-            tracing::info!(request_id, ?dispatch_payload, "dry-run: not dispatching to any executor");
+            tracing::info!(
+                request_id,
+                ?dispatch_payload,
+                "dry-run: not dispatching to any executor"
+            );
             set_status(state, request_id, RequestStatus::Dispatched, None);
         }
         Some(url) => match state.http.post(url).json(&dispatch_payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 set_status(state, request_id, RequestStatus::Dispatched, None);
             }
-            Ok(resp) => record_failure(state, request_id, format!("executor returned {}", resp.status())),
+            Ok(resp) => record_failure(
+                state,
+                request_id,
+                format!("executor returned {}", resp.status()),
+            ),
             Err(e) => record_failure(state, request_id, e.to_string()),
         },
     }
@@ -130,12 +155,17 @@ fn record_failure(state: &AppState, request_id: u64, error: String) {
     let max_ms = state.service_cfg.executor_retry_max_ms;
 
     let mut guard = state.tracked.lock().unwrap();
-    let Some(t) = guard.get_mut(&request_id) else { return };
+    let Some(t) = guard.get_mut(&request_id) else {
+        return;
+    };
     t.dispatch_attempts += 1;
 
     if t.dispatch_attempts >= max_retries {
         t.status = RequestStatus::Failed;
-        t.error = Some(format!("dispatch failed after {} attempt(s): {error}", t.dispatch_attempts));
+        t.error = Some(format!(
+            "dispatch failed after {} attempt(s): {error}",
+            t.dispatch_attempts
+        ));
         tracing::error!(request_id, attempts = t.dispatch_attempts, %error, "giving up dispatching to executor");
     } else {
         let delay = backoff_delay(t.dispatch_attempts, base_ms, max_ms);
@@ -152,7 +182,9 @@ fn record_failure(state: &AppState, request_id: u64, error: String) {
 
 /// Exponential backoff: `base_ms * 2^(attempt - 1)`, capped at `max_ms`.
 pub fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
-    let multiplier = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
+    let multiplier = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX);
     let ms = base_ms.saturating_mul(multiplier).min(max_ms);
     Duration::from_millis(ms)
 }
@@ -166,7 +198,10 @@ mod tests {
         assert_eq!(backoff_delay(1, 100, 10_000), Duration::from_millis(100));
         assert_eq!(backoff_delay(2, 100, 10_000), Duration::from_millis(200));
         assert_eq!(backoff_delay(3, 100, 10_000), Duration::from_millis(400));
-        assert_eq!(backoff_delay(10, 100, 10_000), Duration::from_millis(10_000));
+        assert_eq!(
+            backoff_delay(10, 100, 10_000),
+            Duration::from_millis(10_000)
+        );
     }
 
     #[test]
@@ -175,4 +210,3 @@ mod tests {
         assert_eq!(d, Duration::from_millis(60_000));
     }
 }
-

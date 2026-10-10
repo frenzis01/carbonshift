@@ -32,6 +32,9 @@ pub struct AdvanceSlotBody {
     pub current_slot: Option<i64>,
     #[serde(default)]
     pub slot_start_utc: Option<String>,
+    /// Provider slot length; must match the scheduler's wall-clock slot duration.
+    #[serde(default)]
+    pub slot_minutes: Option<f64>,
     // observed is a dict with "slot", "observed_at_slot", and "actual" keys
     // the latter being the actual observed carbon intensity.
     #[serde(default)]
@@ -502,12 +505,41 @@ pub async fn advance_slot(
     }
 
     let body_current_slot = body.current_slot.unwrap();
+    if let Some(provider_slot_minutes) = body.slot_minutes {
+        let provider_slot_duration_secs = provider_slot_minutes * 60.0;
+        if !provider_slot_duration_secs.is_finite()
+            || (provider_slot_duration_secs - state.scheduler.effective_slot_duration_secs).abs()
+                > 1e-6
+        {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!(
+                    "provider slot length ({provider_slot_minutes} minutes) does not match \
+                     CarbonShift slot duration ({} seconds)",
+                    state.scheduler.effective_slot_duration_secs
+                ),
+            ));
+        }
+    }
 
     // Update the slot epoch offset upon the first slot advancement.
     let slot_epoch_offset = update_slot_epoch_offset(&state, body_current_slot).unwrap_or(0);
 
     // let Some(offset) = slot_epoch_offset else { /* 409 */ };
     let target_engine_slot = (body_current_slot - slot_epoch_offset as i64) as i32; // i64
+    if let Some(slot_start_utc) = &body.slot_start_utc {
+        let boundary = chrono::DateTime::parse_from_rfc3339(slot_start_utc)
+            .map_err(|error| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("slot_start_utc must be an RFC 3339 timestamp: {error}"),
+                )
+            })?
+            .with_timezone(&chrono::Utc);
+        state
+            .set_slot_time_anchor(target_engine_slot, boundary.into())
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, &error))?;
+    }
 
     // init here
 
@@ -1111,6 +1143,12 @@ pub async fn submit_request(
     let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
     let slots_ahead = ((body.deadline_seconds / eff_slot_dur).ceil() as i32).max(1);
     let deadline_slot = (current_slot + slots_ahead).min(state.scheduler.total_slots - 1);
+    if deadline_slot < arrival_slot {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "deadline falls before arrival_slot; the request cannot be scheduled",
+        ));
+    }
     let task_flavours = profile.flavours.clone();
     let (baseline_carbon_cost, baseline_duration) =
         compute_baseline_carbon_cost(&state, arrival_slot, &task_flavours);

@@ -186,6 +186,105 @@ async fn callback_for_unknown_request_id_returns_404() {
 }
 
 #[tokio::test]
+async fn request_with_deadline_before_future_arrival_is_rejected() {
+    let mut cfg = test_engine_config();
+    cfg.simulation.manual_clock = true;
+    let cfg = Arc::new(cfg);
+    let app = build_router(AppState::new(
+        SharedState::new(),
+        cfg.clone(),
+        test_service_cfg(),
+        test_forecast(cfg.total_slots),
+    ));
+
+    let announce = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/v1/admin/advance-slot",
+            r#"{"kind":"announce","current_slot":100,"slot_start_utc":"2024-05-01T12:00:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(announce.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/v1/requests",
+            r#"{"deadline_seconds":0,"payload":{"task":"text_generation"},"arrival_slot_global":103}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/v1/requests",
+            r#"{"deadline_seconds":10,"payload":{"task":"text_generation"},"arrival_slot_global":101}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(json_body(response).await["status"], "pending");
+}
+
+#[tokio::test]
+async fn provider_slot_duration_mismatch_is_rejected_before_sync() {
+    let mut cfg = test_engine_config();
+    cfg.simulation.manual_clock = true;
+    let cfg = Arc::new(cfg);
+    let app = build_router(AppState::new(
+        SharedState::new(),
+        cfg.clone(),
+        test_service_cfg(),
+        test_forecast(cfg.total_slots),
+    ));
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/v1/admin/advance-slot",
+            r#"{"kind":"announce","current_slot":100,"slot_minutes":30,"slot_start_utc":"2024-05-01T12:00:00Z"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn provider_announce_sets_the_utc_slot_time_anchor() {
+    let mut cfg = test_engine_config();
+    cfg.simulation.manual_clock = true;
+    cfg.slot_duration_seconds = 60.0;
+    let cfg = Arc::new(cfg);
+    let state = AppState::new(
+        SharedState::new(),
+        cfg.clone(),
+        test_service_cfg(),
+        test_forecast(cfg.total_slots),
+    );
+    let app = build_router(state.clone());
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/v1/admin/advance-slot",
+            r#"{"kind":"announce","current_slot":100,"slot_minutes":1,"slot_start_utc":"2024-05-01T12:00:00+02:00"}"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        state.execute_at_for_slot(0).unwrap(),
+        "2024-05-01T10:00:00.000Z"
+    );
+}
+
+#[tokio::test]
 async fn api_key_required_when_configured() {
     let mut svc_cfg = test_service_cfg();
     svc_cfg.api_key = Some("secret".to_string());

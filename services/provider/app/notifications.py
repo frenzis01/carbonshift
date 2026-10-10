@@ -157,6 +157,7 @@ def build_rollover_payload(
         "source": source.name,
         "kind": "rollover",
         "current_slot": current,
+        "slot_minutes": clock.slot_minutes,
         "slot_start_utc": clock.slot_start(current).isoformat(),
         "observed": reading.to_dict() if reading is not None else None,
         "forecast": [{"slot": p.slot, "forecast": p.forecast} for p in points],

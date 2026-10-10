@@ -670,6 +670,32 @@ fn test_greedy_singleton_schedules_single_request() {
     assert_eq!(ctx.status, "ok");
 }
 
+#[test]
+fn test_batch_solvers_never_assign_before_arrival_slot() {
+    let cfg = make_config(|_| {});
+    let current_slot = 1;
+    let pending = vec![req(5, 3, 6)];
+    let mut forecast = flat_forecast(cfg.total_slots, 100.0);
+    forecast[1] = 1.0;
+    forecast[3] = 20.0;
+    let shared = SharedState::new();
+
+    let (dp_assignments, _) =
+        call_solve_dp_with_forecast(current_slot, &pending, &cfg, &shared, &forecast);
+    let (greedy_assignments, _) = call_solve_greedy_singleton_with_forecast(
+        current_slot,
+        &pending,
+        &cfg,
+        &SharedState::new(),
+        &forecast,
+    );
+
+    assert_eq!(dp_assignments.len(), 1);
+    assert_eq!(greedy_assignments.len(), 1);
+    assert!(dp_assignments[0].scheduled_slot >= pending[0].arrival_slot);
+    assert!(greedy_assignments[0].scheduled_slot >= pending[0].arrival_slot);
+}
+
 /// For a single request (batch_size=1), the exhaustive greedy scan must
 /// pick the same (slot, flavour, cost) as the DP solver — with only one
 /// request there is no combinatorial ordering effect, so both are

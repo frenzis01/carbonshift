@@ -10,10 +10,11 @@ Two submission entry points:
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 
 from .config import ALL_TASKS, MODEL_REGISTRY, settings
 from .metrics import metrics_store
@@ -22,6 +23,11 @@ from .queue_worker import DuplicateRequestIdError, job_queue
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("executor.main")
+
+def _to_utc_execute_at(value: datetime, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise HTTPException(status_code=422, detail=f"{field} must include a timezone")
+    return value.astimezone(timezone.utc)
 
 
 @asynccontextmanager
@@ -51,12 +57,17 @@ async def models() -> dict[str, dict[str, str]]:
 
 @app.post("/jobs", status_code=202)
 async def submit_job(body: JobSubmitRequest) -> JobSubmitResponse:
+    execute_at = (
+        _to_utc_execute_at(body.execute_at, "execute_at")
+        if body.execute_at is not None
+        else None
+    )
     try:
         job = job_queue.submit(
             task=body.task,
             flavour=body.flavour,
             task_input=body.input,
-            execute_at=body.execute_at,
+            execute_at=execute_at,
             callback_url=body.callback_url,
             request_id=body.request_id,
         )
@@ -77,10 +88,7 @@ async def dispatch_from_carbonshift(body: CarbonshiftDispatchPayload) -> JobSubm
         raise HTTPException(422, f"payload.task must be one of {ALL_TASKS}, got {task!r}")
     task_input = body.payload.get("input", {})
 
-    execute_at = None
-    raw_execute_at = body.payload.get("execute_at")
-    if raw_execute_at:
-        execute_at = datetime.fromisoformat(raw_execute_at)
+    execute_at = _to_utc_execute_at(body.execute_at, "execute_at")
 
     try:
         job = job_queue.submit(
@@ -116,9 +124,23 @@ async def get_queue() -> dict[str, list[str]]:
 
 
 @app.post("/admin/advance-slot")
-async def advance_slot(body: Optional[AdvanceSlotPayload] = None) -> dict:
+async def advance_slot(
+    body: AdvanceSlotPayload = Body(default=AdvanceSlotPayload()),
+) -> dict:
     if not settings.manual_clock:
         raise HTTPException(status_code=409, detail="EXECUTOR_MANUAL_CLOCK is not enabled")
+    if body and body.slot_minutes is not None and (
+        not math.isfinite(body.slot_minutes)
+        or body.slot_minutes <= 0
+        or abs(body.slot_minutes - settings.slot_minutes) > 1e-9
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"provider slot length ({body.slot_minutes} minutes) does not match "
+                f"executor slot length ({settings.slot_minutes} minutes)"
+            ),
+        )
     return job_queue.advance_slot(body)
 
 

@@ -149,6 +149,11 @@ def announce(notify: bool) -> notifications.RolloverReport:
     forecast from the same instant, before any slot has been crossed. Without
     it, the first slot the peers ever hear about is the one *after* the one
     the provider started in, and that starting slot is never described.
+
+    Consumers are synchronized before the client is ticked. That guarantees
+    CarbonShift has installed its global-slot offset before the initial plan
+    batch arrives; unlike a rollover, this announcement does not dispatch new
+    slot work, so producer-first ordering is not needed here.
     """
     current = clock.current_slot()
     reading = source.observe(current)
@@ -158,12 +163,20 @@ def announce(notify: bool) -> notifications.RolloverReport:
         clock, source, horizon_slots=settings.forecast_horizon_slots, reading=reading,
     )
     payload["kind"] = "announce"
-    deliveries = notifications.notify_peers(
-        peers, payload,
-        timeout_seconds=settings.notify_timeout_seconds,
-        max_attempts=settings.notify_max_attempts,
-        backoff_seconds=settings.notify_retry_backoff_seconds,
-    ) if notify and peers else []
+    deliveries = []
+    if notify and peers:
+        consumers = [peer for peer in peers if peer.role is notifications.Role.CONSUMER]
+        producers = [peer for peer in peers if peer.role is notifications.Role.PRODUCER]
+        delivery_options = {
+            "timeout_seconds": settings.notify_timeout_seconds,
+            "max_attempts": settings.notify_max_attempts,
+            "backoff_seconds": settings.notify_retry_backoff_seconds,
+        }
+        deliveries = notifications.notify_peers(consumers, payload, **delivery_options)
+        if all(delivery.ok for delivery in deliveries):
+            deliveries.extend(
+                notifications.notify_peers(producers, payload, **delivery_options)
+            )
     return notifications.RolloverReport(tick=None, deliveries=deliveries)
 
 def rollover(*, notify: bool) -> notifications.RolloverReport:
@@ -323,7 +336,16 @@ def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
 
     # If this is the first local step, announce the current slot to all peers before rolling over.
     if clock.local_step() == 0:
-        announce(notify=request.notify_peers)       # slot G
+        announcement = announce(notify=request.notify_peers)  # slot G
+        if request.notify_peers and announcement.any_failed:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "announcement_failed": True,
+                    "all_ok": False,
+                    "deliveries": [delivery.to_dict() for delivery in announcement.deliveries],
+                },
+            )
     report = rollover(notify=request.notify_peers)  # slot G+1
     tick = report.tick
 

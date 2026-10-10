@@ -57,7 +57,8 @@ fn capacity_mult(tiers: &[CapacityTier], count: i64) -> f64 {
 /// Returns the valid target slot range for a request: [arrival, min(deadline, arrival+window)].
 fn valid_slots(req: &ScenarioRequest, max_future: i32, total_slots: i32) -> Vec<i32> {
     let from = req.arrival_slot;
-    let to = req.deadline_slot
+    let to = req
+        .deadline_slot
         .min(req.arrival_slot + max_future)
         .min(total_slots - 1);
     (from..=to.max(from)).collect()
@@ -81,14 +82,16 @@ fn pick_feasible_flavour<'a>(
     win_future: i32,
     global_constraint_enabled: bool,
 ) -> Option<(&'a Flavour, f64)> {
-    let ci       = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
+    let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
     let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-    let mult     = capacity_mult(tiers, position as i64);
+    let mult = capacity_mult(tiers, position as i64);
 
     for &flav in sorted_flavours {
         if global_constraint_enabled {
             let new_avg = (global_error_sum + flav.error) / (global_count as f64 + 1.0);
-            if new_avg > max_err { continue; }
+            if new_avg > max_err {
+                continue;
+            }
         }
         {
             let mut win_sum = flav.error;
@@ -99,7 +102,9 @@ fn pick_feasible_flavour<'a>(
                     win_cnt += errs.len();
                 }
             }
-            if win_sum / win_cnt as f64 > max_err { continue; }
+            if win_sum / win_cnt as f64 > max_err {
+                continue;
+            }
         }
         let cost = ci * mult * flav.duration as f64 * scale;
         return Some((flav, cost));
@@ -116,9 +121,9 @@ fn slot_cost(
     slot_count: &HashMap<i32, i32>,
     scale: f64,
 ) -> f64 {
-    let ci       = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
+    let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
     let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-    let mult     = capacity_mult(tiers, position as i64);
+    let mult = capacity_mult(tiers, position as i64);
     ci * mult * flav.duration as f64 * scale
 }
 
@@ -136,7 +141,11 @@ pub struct BanditParams {
 
 impl Default for BanditParams {
     fn default() -> Self {
-        Self { epsilon: 0.15, initial_q: 10.0, seed: 42 }
+        Self {
+            epsilon: 0.15,
+            initial_q: 10.0,
+            seed: 42,
+        }
     }
 }
 
@@ -166,7 +175,8 @@ pub fn run_bandit(
     // Flavours sorted cheapest-first; fallback = minimum-error flavour.
     let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
     sorted_flavours.sort_by_key(|f| f.duration);
-    let fallback_flav = assignment.flavours
+    let fallback_flav = assignment
+        .flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("assignment policy must have at least one flavour");
@@ -174,10 +184,10 @@ pub fn run_bandit(
     // Q[s] = running-mean carbon cost achieved at slot s; n[s] = sample count.
     let mut q: Vec<f64> = vec![params.initial_q; total_slots as usize];
     let mut n: Vec<u64> = vec![0; total_slots as usize];
-    let mut slot_count:  HashMap<i32, i32>       = HashMap::new();
-    let mut slot_errors: HashMap<i32, Vec<f64>>  = HashMap::new();
+    let mut slot_count: HashMap<i32, i32> = HashMap::new();
+    let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
     let mut global_error_sum: f64 = 0.0;
-    let mut global_count:  usize  = 0;
+    let mut global_count: usize = 0;
     let mut rng = SmallRng::seed_from_u64(params.seed);
     let mut assignments = Vec::with_capacity(requests.len());
 
@@ -193,17 +203,39 @@ pub fn run_bandit(
         } else {
             *candidates
                 .iter()
-                .min_by(|&&a, &&b| q[a as usize].partial_cmp(&q[b as usize]).unwrap_or(std::cmp::Ordering::Equal))
+                .min_by(|&&a, &&b| {
+                    q[a as usize]
+                        .partial_cmp(&q[b as usize])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .unwrap()
         };
 
         // Within the chosen slot, pick cheapest feasible flavour (error-aware).
         let (chosen_flav, cost) = pick_feasible_flavour(
-            chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
-            global_error_sum, global_count, scale, &sorted_flavours,
-            max_err, win_past, win_future, assignment.global_error_constraint_enabled,
-        ).unwrap_or_else(|| {
-            let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
+            chosen_slot,
+            carbon_forecast,
+            tiers,
+            &slot_count,
+            &slot_errors,
+            global_error_sum,
+            global_count,
+            scale,
+            &sorted_flavours,
+            max_err,
+            win_past,
+            win_future,
+            assignment.global_error_constraint_enabled,
+        )
+        .unwrap_or_else(|| {
+            let c = slot_cost(
+                chosen_slot,
+                fallback_flav,
+                carbon_forecast,
+                tiers,
+                &slot_count,
+                scale,
+            );
             (fallback_flav, c)
         });
 
@@ -213,19 +245,22 @@ pub fn run_bandit(
         q[idx] += (cost - q[idx]) / n[idx] as f64;
 
         *slot_count.entry(chosen_slot).or_insert(0) += 1;
-        slot_errors.entry(chosen_slot).or_default().push(chosen_flav.error);
+        slot_errors
+            .entry(chosen_slot)
+            .or_default()
+            .push(chosen_flav.error);
         global_error_sum += chosen_flav.error;
-        global_count     += 1;
+        global_count += 1;
 
         assignments.push(SwarmAssignment {
-            request_id:       req.request_id,
-            arrival_slot:     req.arrival_slot,
-            deadline_slot:    req.deadline_slot,
-            scheduled_slot:   chosen_slot,
-            flavour_name:     chosen_flav.name.clone(),
+            request_id: req.request_id,
+            arrival_slot: req.arrival_slot,
+            deadline_slot: req.deadline_slot,
+            scheduled_slot: chosen_slot,
+            flavour_name: chosen_flav.name.clone(),
             flavour_duration: chosen_flav.duration,
-            error:            chosen_flav.error,
-            carbon_cost:      cost,
+            error: chosen_flav.error,
+            carbon_cost: cost,
         });
     }
 
@@ -296,7 +331,8 @@ pub fn run_ant_colony(
     // Flavours sorted cheapest-first; fallback = minimum-error flavour.
     let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
     sorted_flavours.sort_by_key(|f| f.duration);
-    let fallback_flav = assignment.flavours
+    let fallback_flav = assignment
+        .flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("assignment policy must have at least one flavour");
@@ -305,7 +341,7 @@ pub fn run_ant_colony(
     let cheapest = sorted_flavours[0];
     let eta: Vec<f64> = (0..total_slots as usize)
         .map(|s| {
-            let ci   = carbon_forecast.get(s).copied().unwrap_or(1.0);
+            let ci = carbon_forecast.get(s).copied().unwrap_or(1.0);
             let base = ci * cheapest.duration as f64 * scale;
             if base > 0.0 { 1.0 / base } else { 1e9 }
         })
@@ -324,10 +360,10 @@ pub fn run_ant_colony(
 
         for _ant in 0..params.n_ants {
             // Each ant tracks its own error state.
-            let mut slot_count:  HashMap<i32, i32>      = HashMap::new();
+            let mut slot_count: HashMap<i32, i32> = HashMap::new();
             let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
             let mut global_error_sum: f64 = 0.0;
-            let mut global_count:  usize  = 0;
+            let mut global_count: usize = 0;
             let mut ant_solution: Vec<SwarmAssignment> = Vec::with_capacity(requests.len());
             let mut ant_cost = 0.0_f64;
 
@@ -365,29 +401,50 @@ pub fn run_ant_colony(
 
                 // Pick cheapest feasible flavour for chosen slot.
                 let (chosen_flav, cost) = pick_feasible_flavour(
-                    chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
-                    global_error_sum, global_count, scale, &sorted_flavours,
-                    max_err, win_past, win_future, assignment.global_error_constraint_enabled,
-                ).unwrap_or_else(|| {
-                    let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
+                    chosen_slot,
+                    carbon_forecast,
+                    tiers,
+                    &slot_count,
+                    &slot_errors,
+                    global_error_sum,
+                    global_count,
+                    scale,
+                    &sorted_flavours,
+                    max_err,
+                    win_past,
+                    win_future,
+                    assignment.global_error_constraint_enabled,
+                )
+                .unwrap_or_else(|| {
+                    let c = slot_cost(
+                        chosen_slot,
+                        fallback_flav,
+                        carbon_forecast,
+                        tiers,
+                        &slot_count,
+                        scale,
+                    );
                     (fallback_flav, c)
                 });
 
                 ant_cost += cost;
                 *slot_count.entry(chosen_slot).or_insert(0) += 1;
-                slot_errors.entry(chosen_slot).or_default().push(chosen_flav.error);
+                slot_errors
+                    .entry(chosen_slot)
+                    .or_default()
+                    .push(chosen_flav.error);
                 global_error_sum += chosen_flav.error;
-                global_count     += 1;
+                global_count += 1;
 
                 ant_solution.push(SwarmAssignment {
-                    request_id:       req.request_id,
-                    arrival_slot:     req.arrival_slot,
-                    deadline_slot:    req.deadline_slot,
-                    scheduled_slot:   chosen_slot,
-                    flavour_name:     chosen_flav.name.clone(),
+                    request_id: req.request_id,
+                    arrival_slot: req.arrival_slot,
+                    deadline_slot: req.deadline_slot,
+                    scheduled_slot: chosen_slot,
+                    flavour_name: chosen_flav.name.clone(),
                     flavour_duration: chosen_flav.duration,
-                    error:            chosen_flav.error,
-                    carbon_cost:      cost,
+                    error: chosen_flav.error,
+                    carbon_cost: cost,
                 });
             }
 

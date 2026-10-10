@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from app import queue_worker
+from app import main, queue_worker
 from app.metrics import metrics_store
 from app.main import app
 
@@ -99,9 +99,11 @@ def test_unknown_job_returns_404(client):
 
 
 def test_dispatch_adapter_matches_carbonshift_payload(client):
+    execute_at = datetime.now(timezone.utc).isoformat()
     resp = client.post("/dispatch", json={
         "request_id": 42,
         "scheduled_slot": 7,
+        "execute_at": execute_at,
         "flavour": "Balanced",
         "carbon_cost": 1.23,
         "callback_url": "http://example.invalid/cb",
@@ -109,9 +111,28 @@ def test_dispatch_adapter_matches_carbonshift_payload(client):
     })
     assert resp.status_code == 202
     assert resp.json()["request_id"] == "42"
+    assert datetime.fromisoformat(resp.json()["execute_at"]).utcoffset() == timedelta(0)
     status = _wait_for_completion(client, "42")
     assert status["status"] == "completed"
     assert status["context"] == {"scheduled_slot": 7, "carbon_cost": 1.23}
+
+
+def test_dispatch_keeps_a_future_utc_job_queued(client):
+    execute_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    response = client.post("/dispatch", json={
+        "request_id": 987654320,
+        "scheduled_slot": 7,
+        "execute_at": execute_at.isoformat(),
+        "flavour": "Balanced",
+        "carbon_cost": 1.23,
+        "callback_url": "",
+        "payload": {"task": "text_generation", "input": {"prompt": "hello"}},
+    })
+
+    assert response.status_code == 202
+    status = client.get("/jobs/987654320").json()
+    assert status["status"] == "queued"
+    assert datetime.fromisoformat(status["execute_at"]) == execute_at
 
 
 def test_duplicate_dispatch_does_not_execute_or_record_the_job_twice(client):
@@ -119,6 +140,7 @@ def test_duplicate_dispatch_does_not_execute_or_record_the_job_twice(client):
     dispatch = {
         "request_id": request_id,
         "scheduled_slot": 0,
+        "execute_at": datetime.now(timezone.utc).isoformat(),
         "flavour": "Balanced",
         "carbon_cost": 1.23,
         "callback_url": "",
@@ -145,6 +167,7 @@ def test_dispatch_rejects_same_request_id_with_different_payload(client):
     dispatch = {
         "request_id": request_id,
         "scheduled_slot": 0,
+        "execute_at": datetime.now(timezone.utc).isoformat(),
         "flavour": "Balanced",
         "carbon_cost": 1.23,
         "callback_url": "",
@@ -165,13 +188,80 @@ def test_dispatch_rejects_same_request_id_with_different_payload(client):
     assert conflicting_retry.status_code == 409
 
 
+def test_dispatch_requires_timezone_aware_execute_at(client):
+    response = client.post("/dispatch", json={
+        "request_id": 987654323,
+        "scheduled_slot": 1,
+        "execute_at": "2030-01-01T00:00:00",
+        "flavour": "Balanced",
+        "carbon_cost": 1.23,
+        "callback_url": "",
+        "payload": {"task": "question_answering", "input": {"question": "q", "context": "c"}},
+    })
+    assert response.status_code == 422
+
+
+def test_native_jobs_reject_naive_execute_at(client):
+    response = client.post("/jobs", json={
+        "task": "text_generation",
+        "flavour": "fast",
+        "input": {"prompt": "hello"},
+        "execute_at": "2030-01-01T00:00:00",
+    })
+    assert response.status_code == 422
+
+
+def test_executor_rejects_provider_slot_length_mismatch(client, monkeypatch):
+    monkeypatch.setattr(main.settings, "manual_clock", True)
+    monkeypatch.setattr(main.settings, "slot_minutes", 30.0)
+
+    response = client.post("/admin/advance-slot", json={"slot_minutes": 60.0})
+
+    assert response.status_code == 409
+    assert "does not match" in response.json()["detail"]
+
+
+def test_executor_announce_uses_provider_utc_slot_boundary(client, monkeypatch):
+    from app.clock import VirtualClock
+    from app.queue_worker import JobQueue
+
+    queue = JobQueue(VirtualClock(manual=True, slot_minutes=30.0))
+    monkeypatch.setattr(main, "job_queue", queue)
+    monkeypatch.setattr(main.settings, "manual_clock", True)
+    monkeypatch.setattr(main.settings, "slot_minutes", 30.0)
+
+    response = client.post("/admin/advance-slot", json={
+        "kind": "announce",
+        "current_slot": 123,
+        "slot_minutes": 30.0,
+        "slot_start_utc": "2024-05-01T12:00:00Z",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["current_time"] == "2024-05-01T12:00:00+00:00"
+
+
 def test_dispatch_rejects_unknown_task(client):
     resp = client.post("/dispatch", json={
-        "request_id": 2, "scheduled_slot": 0, "flavour": "fast",
+        "request_id": 2, "scheduled_slot": 0,
+        "execute_at": datetime.now(timezone.utc).isoformat(),
+        "flavour": "fast",
         "carbon_cost": 0.0, "callback_url": "http://example.invalid/",
         "payload": {"task": "not_a_task", "input": {}},
     })
     assert resp.status_code == 422
+
+
+def test_dispatch_requires_execute_at(client):
+    response = client.post("/dispatch", json={
+        "request_id": 987654324,
+        "scheduled_slot": 1,
+        "flavour": "fast",
+        "carbon_cost": 0.0,
+        "callback_url": "",
+        "payload": {"task": "text_generation", "input": {"prompt": "hello"}},
+    })
+    assert response.status_code == 422
 
 
 def test_metrics_summary_reflects_completed_jobs(client):

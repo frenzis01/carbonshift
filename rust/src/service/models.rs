@@ -139,6 +139,8 @@ pub struct ExecutorCallbackPayload {
 pub struct ExecutorDispatchPayload {
     pub request_id: u64,
     pub scheduled_slot: i32,
+    /// RFC 3339 UTC instant at which this assignment's slot begins.
+    pub execute_at: String,
     pub flavour: String,
     pub carbon_cost: f64,
     /// Where the executor should POST its `ExecutorCallbackPayload` result.

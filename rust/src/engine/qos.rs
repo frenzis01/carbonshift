@@ -40,7 +40,6 @@ impl QosProfileId {
     pub fn default_profile() -> Self {
         Self("default-text-generation".to_string())
     }
-
 }
 
 impl std::fmt::Display for QosProfileId {

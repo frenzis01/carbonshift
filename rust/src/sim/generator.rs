@@ -5,10 +5,9 @@
 /// Generates requests at a configurable rate (Gaussian-distributed per slot)
 /// and adds them to `SharedState`.  Runs in a background thread; call
 /// `start()` / `stop()` to manage the lifecycle.
-
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -185,11 +184,12 @@ fn generator_loop(
                 let mut requests: Vec<Request> = match &scenario_by_slot {
                     Some(by_slot) => by_slot.get(slot as usize).cloned().unwrap_or_default(),
                     None => {
-                        let mut rng = rand::rngs::StdRng::seed_from_u64(
-                            base_seed.wrapping_add(slot as u64),
-                        );
+                        let mut rng =
+                            rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(slot as u64));
                         let num = (dist.sample(&mut rng) as i32).max(1) as usize;
-                        (0..num).map(|_| generate_request(slot, &cfg, &counter)).collect()
+                        (0..num)
+                            .map(|_| generate_request(slot, &cfg, &counter))
+                            .collect()
                     }
                 };
 

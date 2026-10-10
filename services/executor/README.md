@@ -78,7 +78,7 @@ Variabili d'ambiente (tutte opzionali):
 | `EXECUTOR_METRICS_PATH` | `data/metrics.jsonl` | File JSONL di append delle metriche. |
 | `EXECUTOR_CALLBACK_TIMEOUT_SECONDS` | `10` | Timeout HTTP per l'invio del callback. |
 | `EXECUTOR_MANUAL_CLOCK` | `0` | Congela l'orologio della coda eccetto via `POST /admin/advance-slot` (solo test/emulazione). |
-| `EXECUTOR_SLOT_MINUTES` | `30` | Durata di un timeslot in modalit\u00e0 manual clock (dovrebbe combaciare con `SLOT_DURATION_SECONDS` di carbonshift). |
+| `EXECUTOR_SLOT_MINUTES` | `30` | Durata di un timeslot in modalit\u00e0 manual clock; deve combaciare con `PROVIDER_SLOT_MINUTES` e con `SLOT_DURATION_SECONDS / 60` di CarbonShift. |
 | `EXECUTOR_COMPUTE_QUALITY_BASELINE` | `1` | Se attivo, ogni richiesta con flavour diverso da `accurate` esegue anche una passata "ombra" col flavour Accurate sullo stesso input, per ottenere `baseline_execution_time_seconds`/`baseline_model` (misura reale, non stimata) e un `quality_score` per confronto quando non è fornito un `reference*`. Circa raddoppia il calcolo per richiesta — disattivalo (`0`) nei test su larga scala dove non serve il confronto di qualità/tempo. |
 
 ## API
@@ -113,9 +113,11 @@ risposte note.
 
 Stesso schema esatto del payload che il dispatcher Rust di carbonshift invia
 (`ExecutorDispatchPayload`, vedi `carbonshift/rust/src/service/models.rs`):
-`{request_id, scheduled_slot, flavour, carbon_cost, callback_url, payload}`.
-L'executor legge `task`/`input` (ed eventualmente `execute_at`) da dentro
-`payload` — vedi [Integrazione con carbonshift](#integrazione-con-carbonshift).
+`{request_id, scheduled_slot, execute_at, flavour, carbon_cost, callback_url, payload}`.
+`execute_at` è il confine UTC dello slot assegnato, serializzato come timestamp
+RFC 3339 con fuso orario; l'executor mantiene il job in coda fino a quell'istante.
+L'executor legge `task`/`input` da dentro `payload` — vedi
+[Integrazione con carbonshift](#integrazione-con-carbonshift).
 Il `request_id` è anche una chiave d'idempotenza: una ripetizione dello
 stesso dispatch con gli stessi dati restituisce il job già accodato/completato
 senza eseguire un'altra inferenza; riutilizzarlo con dati differenti ritorna
@@ -218,13 +220,16 @@ protocollo completo insieme a carbonshift), imposta `EXECUTOR_MANUAL_CLOCK=1`:
 l'orologio della coda si congela e avanza solo tramite
 `POST /admin/advance-slot`, che sposta il clock al timeslot successivo,
 esegue (bloccando la risposta HTTP) tutti i job ora dovuti, e restituisce lo
-stato finale della coda. Normalmente orchestrato dal client
-(`client/scripts/run_emulation.py`), non va chiamato manualmente se non per
-debug:
+stato finale della coda. Il provider è il time master: al primo tick invia
+prima un `announce` con `slot_start_utc` per sincronizzare l'executor, poi
+invia i successivi rollover dopo CarbonShift. Se la durata comunicata dal
+provider non coincide con `EXECUTOR_SLOT_MINUTES`, l'endpoint risponde `409`.
 
 ```sh
 EXECUTOR_MANUAL_CLOCK=1 EXECUTOR_SLOT_MINUTES=30 uvicorn app.main:app --port 9000
-curl -X POST localhost:9000/admin/advance-slot
+curl -X POST localhost:9000/admin/advance-slot \
+  -H 'Content-Type: application/json' \
+  -d '{"kind":"announce","slot_start_utc":"2026-08-26T18:00:00Z","slot_minutes":30}'
 ```
 
 ## Integrazione con carbonshift e con il client

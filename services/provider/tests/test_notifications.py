@@ -60,6 +60,7 @@ def test_payload_carries_the_whole_window_not_just_the_current_value():
     """Lets a peer that missed a notification recover from the next one."""
     payload = build_rollover_payload(_clock(), _source(), horizon_slots=24)
     assert len(payload["forecast"]) == 24
+    assert payload["slot_minutes"] == 30
     assert [p["slot"] for p in payload["forecast"]] == list(
         range(payload["current_slot"], payload["current_slot"] + 24)
     )

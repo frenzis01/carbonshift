@@ -172,14 +172,62 @@ def test_advance_slot_moves_one_slot_and_reports_deliveries(client, monkeypatch)
     assert body["current_slot"] == before + 1
     assert body["local_step"] == 1
     assert body["all_ok"] is True
-    # Client first (producer), then carbonshift (consumer).
+    # Initial announcement synchronizes consumers before the first client
+    # batch; normal rollover then submits client work before CarbonShift ticks.
     assert calls == [
-        # First advance triggers announce (slot 0)
+        # First advance announces slot 0 to CarbonShift before the client.
+        "http://localhost:8080/v1/admin/advance-slot",
+        "http://localhost:8100/v1/tick",
+        # Followed by rollover into slot 1, with the usual producer-first order.
         "http://localhost:8100/v1/tick",
         "http://localhost:8080/v1/admin/advance-slot",
-        # Followed by rollover (slot 1)
-        "http://localhost:8100/v1/tick",
-        "http://localhost:8080/v1/admin/advance-slot",
+    ]
+
+
+def test_failed_initial_consumer_announcement_does_not_tick_client(client, monkeypatch):
+    calls: list[str] = []
+
+    def fail_announcement(url, json=None, timeout=None):
+        calls.append(url)
+        return _Resp(500)
+
+    monkeypatch.setattr(main.notifications.requests, "post", fail_announcement)
+    before = client.get("/v1/slot").json()["current_slot"]
+
+    response = client.post("/v1/advance-slot", json={})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["announcement_failed"] is True
+    assert calls == ["http://localhost:8080/v1/admin/advance-slot"] * main.settings.notify_max_attempts
+    assert client.get("/v1/slot").json()["current_slot"] == before
+
+
+def test_initial_announcement_synchronizes_all_consumers_before_client(client, monkeypatch):
+    from app.notifications import Peer, Role
+
+    monkeypatch.setattr(main, "peers", [
+        Peer("client", "http://client", "/v1/tick", 10, Role.PRODUCER),
+        Peer("carbonshift", "http://carbonshift", "/v1/admin/advance-slot", 20),
+        Peer("executor", "http://executor", "/admin/advance-slot", 30),
+    ])
+    calls: list[tuple[str, str]] = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json["kind"]))
+        return _Resp(200)
+
+    monkeypatch.setattr(main.notifications.requests, "post", fake_post)
+
+    response = client.post("/v1/advance-slot", json={})
+
+    assert response.status_code == 200
+    assert calls == [
+        ("http://carbonshift/v1/admin/advance-slot", "announce"),
+        ("http://executor/admin/advance-slot", "announce"),
+        ("http://client/v1/tick", "announce"),
+        ("http://client/v1/tick", "rollover"),
+        ("http://carbonshift/v1/admin/advance-slot", "rollover"),
+        ("http://executor/admin/advance-slot", "rollover"),
     ]
 
 
@@ -225,6 +273,8 @@ def test_advance_slot_can_skip_notifying_peers(client):
 def test_advance_slot_fails_hard_when_a_peer_does_not_ack(client, monkeypatch):
     """A partial fan-out must not return 200: the clock moved but not every
     peer followed, so the run is unrecoverable and must be reported as such."""
+    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    assert client.post("/v1/advance-slot", json={}).status_code == 200
     monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
     resp = client.post("/v1/advance-slot", json={})
     assert resp.status_code == 503
@@ -235,6 +285,8 @@ def test_advance_slot_fails_hard_when_a_peer_does_not_ack(client, monkeypatch):
 
 def test_a_desynced_provider_refuses_all_further_advances(client, monkeypatch):
     """The latch is what stops a desynced run from quietly continuing."""
+    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    assert client.post("/v1/advance-slot", json={}).status_code == 200
     monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
     assert client.post("/v1/advance-slot", json={}).status_code == 503
 
@@ -246,6 +298,8 @@ def test_a_desynced_provider_refuses_all_further_advances(client, monkeypatch):
 
 
 def test_health_reports_degraded_once_desynced(client, monkeypatch):
+    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    assert client.post("/v1/advance-slot", json={}).status_code == 200
     monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
     client.post("/v1/advance-slot", json={})
 

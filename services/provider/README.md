@@ -73,10 +73,11 @@ to a real peer.
 
 * The remote adapter is intentionally unimplemented (it returns no data rather
   than raising, so the clock loop survives).
-* The provider is **not yet wired into the running stack** — carbonshift,
-  client and executor still behave exactly as before. See `ARCHITECTURE.md` §8
-  for the migration stages; **the pushed forecast is inert until
-  `Config::slot_epoch_offset` is set** (§7).
+* Manual-clock emulation is wired through the provider: it ticks the client,
+  CarbonShift, and (when configured) the executor. On the first call it
+  synchronizes consumer clocks before the client's initial batch, so
+  CarbonShift has the slot offset and UTC boundary before accepting those
+  requests. See `INTERFACE.md` for the initial announce and rollover order.
 * The upstream GB API is natively half-hourly, so a `remote` role only maps
   1:1 onto slots at `PROVIDER_SLOT_MINUTES=30`.
 * There is **no `actual` for a future slot** and there never will be — a

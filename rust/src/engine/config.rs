@@ -207,15 +207,15 @@ pub struct AssignmentPolicy<'a> {
 impl Default for SolverConfig {
     fn default() -> Self {
         Self {
-            batch_size: 3,
+            batch_size: 4,
             solver_strategy: "dp".to_string(),
             dp_pruning_method: "beam".to_string(),
             dp_pruning_min_batch_size: 8,
             dp_pruning_k: 1200,
             dp_timeout: 30.0,
             dp_lock_future_assignments: true,
-            rollback_max_consecutive: 3,
-            max_batch_solver_parallelism: 20,
+            rollback_max_consecutive: 0,
+            max_batch_solver_parallelism: 12,
             queue_timeout: 1.0,
             batch_timeout_secs: 0.0,
         }

@@ -71,7 +71,12 @@ fn capacity_mult(tiers: &[CapacityTier], count: i64) -> f64 {
 
 /// Return the sorted list of valid target slots for a request:
 /// `[arrival_slot, min(deadline_slot, arrival_slot + max_future, total_slots-1)]`.
-fn valid_slots(arrival_slot: i32, deadline_slot: i32, max_future: i32, total_slots: i32) -> Vec<i32> {
+fn valid_slots(
+    arrival_slot: i32,
+    deadline_slot: i32,
+    max_future: i32,
+    total_slots: i32,
+) -> Vec<i32> {
     let from = arrival_slot;
     let to = deadline_slot
         .min(arrival_slot + max_future)
@@ -103,7 +108,9 @@ fn pick_feasible_flavour<'a>(
     for &flav in sorted_flavours {
         if global_constraint_enabled {
             let new_avg = (global_error_sum + flav.error) / (global_count as f64 + 1.0);
-            if new_avg > max_err { continue; }
+            if new_avg > max_err {
+                continue;
+            }
         }
         let mut win_sum = flav.error;
         let mut win_cnt = 1usize;
@@ -113,7 +120,9 @@ fn pick_feasible_flavour<'a>(
                 win_cnt += errs.len();
             }
         }
-        if win_sum / win_cnt as f64 > max_err { continue; }
+        if win_sum / win_cnt as f64 > max_err {
+            continue;
+        }
         let cost = ci * mult * flav.duration as f64 * scale;
         return Some((flav, cost));
     }
@@ -151,7 +160,8 @@ fn make_assignment(req: &Request, slot: i32, flav: &Flavour, cost: f64) -> Assig
 fn sorted_flavours_and_fallback(flavours: &[Flavour]) -> (Vec<&Flavour>, &Flavour) {
     let mut sorted: Vec<&Flavour> = flavours.iter().collect();
     sorted.sort_by_key(|f| f.duration);
-    let fallback = flavours.iter()
+    let fallback = flavours
+        .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("assignment policy must have at least one flavour");
     (sorted, fallback)
@@ -209,8 +219,7 @@ impl OnlineBanditState {
         ctx: &SwarmContext,
         assignment: &AssignmentPolicy<'_>,
     ) -> (Vec<Assignment>, BanditDelta) {
-        let (sorted_flavours, fallback_flav) =
-            sorted_flavours_and_fallback(assignment.flavours);
+        let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(assignment.flavours);
         let tiers = assignment.capacity_tiers;
         let scale = assignment.carbon_cost_duration_scale;
         let max_future = assignment.assignment_max_future_slots;
@@ -236,14 +245,18 @@ impl OnlineBanditState {
         let mut assignments = Vec::with_capacity(pending.len());
 
         for req in pending {
-            let candidates = valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
-            if candidates.is_empty() { continue; }
+            let candidates =
+                valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
+            if candidates.is_empty() {
+                continue;
+            }
 
             // ε-greedy slot selection.
             let chosen_slot = if rng.r#gen::<f64>() < self.epsilon {
                 candidates[rng.gen_range(0..candidates.len())]
             } else {
-                *candidates.iter()
+                *candidates
+                    .iter()
                     .min_by(|&&a, &&b| {
                         let qa = q.get(a as usize).copied().unwrap_or(f64::MAX);
                         let qb = q.get(b as usize).copied().unwrap_or(f64::MAX);
@@ -254,11 +267,29 @@ impl OnlineBanditState {
 
             // Cheapest feasible flavour; fallback to min-error if none pass.
             let (chosen_flav, cost) = pick_feasible_flavour(
-                chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
-                global_error_sum, global_count, scale, &sorted_flavours,
-                max_err, win_past, win_future_cfg, assignment.global_error_constraint_enabled,
-            ).unwrap_or_else(|| {
-                let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
+                chosen_slot,
+                carbon_forecast,
+                tiers,
+                &slot_count,
+                &slot_errors,
+                global_error_sum,
+                global_count,
+                scale,
+                &sorted_flavours,
+                max_err,
+                win_past,
+                win_future_cfg,
+                assignment.global_error_constraint_enabled,
+            )
+            .unwrap_or_else(|| {
+                let c = slot_cost(
+                    chosen_slot,
+                    fallback_flav,
+                    carbon_forecast,
+                    tiers,
+                    &slot_count,
+                    scale,
+                );
                 (fallback_flav, c)
             });
 
@@ -270,7 +301,10 @@ impl OnlineBanditState {
             }
 
             *slot_count.entry(chosen_slot).or_insert(0) += 1;
-            slot_errors.entry(chosen_slot).or_default().push(chosen_flav.error);
+            slot_errors
+                .entry(chosen_slot)
+                .or_default()
+                .push(chosen_flav.error);
             global_error_sum += chosen_flav.error;
             global_count += 1;
 
@@ -289,7 +323,14 @@ impl OnlineBanditState {
             }
         }
 
-        (assignments, BanditDelta { n_delta, cost_sum_delta, rng_after: rng })
+        (
+            assignments,
+            BanditDelta {
+                n_delta,
+                cost_sum_delta,
+                rng_after: rng,
+            },
+        )
     }
 
     /// Additively merge a worker's delta into the current shared state.
@@ -301,7 +342,9 @@ impl OnlineBanditState {
     pub fn merge_delta(&mut self, delta: BanditDelta) {
         for i in 0..self.q.len() {
             let dn = delta.n_delta[i];
-            if dn == 0 { continue; }
+            if dn == 0 {
+                continue;
+            }
             let new_n = self.n[i] + dn;
             let new_cost_sum = self.q[i] * self.n[i] as f64 + delta.cost_sum_delta[i];
             self.q[i] = new_cost_sum / new_n as f64;
@@ -367,13 +410,19 @@ impl OnlineAcoState {
         tau0: f64,
         seed: u64,
     ) -> Self {
-        let cheapest = flavours.iter()
+        let cheapest = flavours
+            .iter()
             .min_by_key(|f| f.duration)
             .expect("at least one flavour");
         let eta: Vec<f64> = (0..total_slots)
             .map(|s| {
                 // TODO: is it ok to unwrap here? Technically carbon_forecast gets updated as we go on...
-                let ci = carbon_forecast.read().unwrap().get(s).copied().unwrap_or(1.0);
+                let ci = carbon_forecast
+                    .read()
+                    .unwrap()
+                    .get(s)
+                    .copied()
+                    .unwrap_or(1.0);
                 let base = ci * cheapest.duration as f64 * carbon_cost_duration_scale;
                 if base > 0.0 { 1.0 / base } else { 1e9 }
             })
@@ -404,8 +453,7 @@ impl OnlineAcoState {
         ctx: &SwarmContext,
         assignment: &AssignmentPolicy<'_>,
     ) -> (Vec<Assignment>, AcoDelta) {
-        let (sorted_flavours, fallback_flav) =
-            sorted_flavours_and_fallback(assignment.flavours);
+        let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(assignment.flavours);
         let tiers = assignment.capacity_tiers;
         let scale = assignment.carbon_cost_duration_scale;
         let max_future = assignment.assignment_max_future_slots;
@@ -439,14 +487,20 @@ impl OnlineAcoState {
                 let mut ant_cost = 0.0f64;
 
                 for req in pending {
-                    let candidates = valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
-                    if candidates.is_empty() { continue; }
+                    let candidates =
+                        valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
+                    if candidates.is_empty() {
+                        continue;
+                    }
 
-                    let weights: Vec<f64> = candidates.iter().map(|&s| {
-                        let t = tau.get(s as usize).copied().unwrap_or(1e-12).max(1e-12);
-                        let e = self.eta.get(s as usize).copied().unwrap_or(1e-12);
-                        t.powf(self.alpha) * e.powf(self.beta)
-                    }).collect();
+                    let weights: Vec<f64> = candidates
+                        .iter()
+                        .map(|&s| {
+                            let t = tau.get(s as usize).copied().unwrap_or(1e-12).max(1e-12);
+                            let e = self.eta.get(s as usize).copied().unwrap_or(1e-12);
+                            t.powf(self.alpha) * e.powf(self.beta)
+                        })
+                        .collect();
 
                     let total_weight: f64 = weights.iter().sum();
                     let chosen_slot = if total_weight <= 0.0 {
@@ -456,23 +510,47 @@ impl OnlineAcoState {
                         let mut chosen = *candidates.last().unwrap();
                         for (&s, &w) in candidates.iter().zip(weights.iter()) {
                             r -= w;
-                            if r <= 0.0 { chosen = s; break; }
+                            if r <= 0.0 {
+                                chosen = s;
+                                break;
+                            }
                         }
                         chosen
                     };
 
                     let (chosen_flav, cost) = pick_feasible_flavour(
-                        chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
-                        global_error_sum, global_count, scale, &sorted_flavours,
-                        max_err, win_past, win_future_cfg, assignment.global_error_constraint_enabled,
-                    ).unwrap_or_else(|| {
-                        let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
+                        chosen_slot,
+                        carbon_forecast,
+                        tiers,
+                        &slot_count,
+                        &slot_errors,
+                        global_error_sum,
+                        global_count,
+                        scale,
+                        &sorted_flavours,
+                        max_err,
+                        win_past,
+                        win_future_cfg,
+                        assignment.global_error_constraint_enabled,
+                    )
+                    .unwrap_or_else(|| {
+                        let c = slot_cost(
+                            chosen_slot,
+                            fallback_flav,
+                            carbon_forecast,
+                            tiers,
+                            &slot_count,
+                            scale,
+                        );
                         (fallback_flav, c)
                     });
 
                     ant_cost += cost;
                     *slot_count.entry(chosen_slot).or_insert(0) += 1;
-                    slot_errors.entry(chosen_slot).or_default().push(chosen_flav.error);
+                    slot_errors
+                        .entry(chosen_slot)
+                        .or_default()
+                        .push(chosen_flav.error);
                     global_error_sum += chosen_flav.error;
                     global_count += 1;
 
@@ -517,7 +595,14 @@ impl OnlineAcoState {
             }
         }
 
-        (best_solution, AcoDelta { evap_factor, deposit: deposit_acc, rng_after: rng })
+        (
+            best_solution,
+            AcoDelta {
+                evap_factor,
+                deposit: deposit_acc,
+                rng_after: rng,
+            },
+        )
     }
 
     /// Additively merge a worker's delta into the current shared pheromone.
@@ -620,13 +705,11 @@ impl OnlineSwarmState {
         match self {
             Self::None => (vec![], SwarmDelta::None),
             Self::Bandit(b) => {
-                let (assignments, delta) =
-                    b.solve_batch(pending, carbon_forecast, ctx, assignment);
+                let (assignments, delta) = b.solve_batch(pending, carbon_forecast, ctx, assignment);
                 (assignments, SwarmDelta::Bandit(delta))
             }
             Self::Aco(a) => {
-                let (assignments, delta) =
-                    a.solve_batch(pending, carbon_forecast, ctx, assignment);
+                let (assignments, delta) = a.solve_batch(pending, carbon_forecast, ctx, assignment);
                 (assignments, SwarmDelta::Aco(delta))
             }
         }
@@ -698,7 +781,8 @@ mod tests {
 
         let mut sequential = OnlineBanditState::new(6, 10.0, 0.0, 42);
         let all: Vec<Request> = batch_a.into_iter().chain(batch_b).collect();
-        let (assignments, delta) = sequential.solve_batch(&all, &carbon_forecast, &ctx, &assignment);
+        let (assignments, delta) =
+            sequential.solve_batch(&all, &carbon_forecast, &ctx, &assignment);
         assert_eq!(assignments.len(), 4);
         sequential.merge_delta(delta);
 
@@ -706,7 +790,9 @@ mod tests {
             assert_eq!(merged.n[i], sequential.n[i], "slot {i}: n mismatch");
             assert!(
                 (merged.q[i] - sequential.q[i]).abs() < 1e-9,
-                "slot {i}: merged.q={} sequential.q={}", merged.q[i], sequential.q[i]
+                "slot {i}: merged.q={} sequential.q={}",
+                merged.q[i],
+                sequential.q[i]
             );
         }
         let total_n: u64 = merged.n.iter().sum();
@@ -726,8 +812,10 @@ mod tests {
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
         let requests = vec![
-            make_request(1, 0, 5), make_request(2, 1, 4),
-            make_request(3, 0, 2), make_request(4, 2, 5),
+            make_request(1, 0, 5),
+            make_request(2, 1, 4),
+            make_request(3, 0, 2),
+            make_request(4, 2, 5),
         ];
 
         let mut legacy = crate::online_swarm::OnlineBanditState::new(6, 10.0, 0.2, 99);
@@ -742,7 +830,9 @@ mod tests {
             assert_eq!(merged.n[i], legacy.n[i], "slot {i}: n mismatch");
             assert!(
                 (merged.q[i] - legacy.q[i]).abs() < 1e-9,
-                "slot {i}: merged.q={} legacy.q={}", merged.q[i], legacy.q[i]
+                "slot {i}: merged.q={} legacy.q={}",
+                merged.q[i],
+                legacy.q[i]
             );
         }
     }
@@ -757,7 +847,11 @@ mod tests {
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
         let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
-        let requests = vec![make_request(1, 0, 5), make_request(2, 0, 5), make_request(3, 0, 5)];
+        let requests = vec![
+            make_request(1, 0, 5),
+            make_request(2, 0, 5),
+            make_request(3, 0, 5),
+        ];
 
         let mut legacy = crate::online_swarm::OnlineAcoState::new(
             6,
@@ -809,7 +903,9 @@ mod tests {
         for i in 0..6 {
             assert!(
                 (merged.tau[i] - legacy.tau[i]).abs() < 1e-9,
-                "slot {i}: merged.tau={} legacy.tau={}", merged.tau[i], legacy.tau[i]
+                "slot {i}: merged.tau={} legacy.tau={}",
+                merged.tau[i],
+                legacy.tau[i]
             );
         }
     }
@@ -823,7 +919,11 @@ mod tests {
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
         let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
-        let requests = vec![make_request(1, 0, 5), make_request(2, 0, 5), make_request(3, 0, 5)];
+        let requests = vec![
+            make_request(1, 0, 5),
+            make_request(2, 0, 5),
+            make_request(3, 0, 5),
+        ];
 
         let baseline = OnlineAcoState::new(
             6,
@@ -863,7 +963,11 @@ mod tests {
             assert!(t.is_finite() && t > 0.0, "tau[{i}] = {t}");
         }
         assert!(
-            merged.tau.iter().zip(baseline.tau.iter()).any(|(m, b)| (m - b).abs() > 1e-9),
+            merged
+                .tau
+                .iter()
+                .zip(baseline.tau.iter())
+                .any(|(m, b)| (m - b).abs() > 1e-9),
             "merge_delta should have changed the pheromone vector"
         );
     }

@@ -5,7 +5,6 @@
 /// request list, and the metadata that describes the generation parameters.
 /// Loading a scenario lets the Rust runtime reproduce exactly the same
 /// workload as a Python benchmark run.
-
 use std::collections::HashMap;
 
 use serde::Deserialize;

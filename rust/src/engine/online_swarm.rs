@@ -68,7 +68,12 @@ fn capacity_mult(tiers: &[CapacityTier], count: i64) -> f64 {
 
 /// Return the sorted list of valid target slots for a request:
 /// `[arrival_slot, min(deadline_slot, arrival_slot + max_future, total_slots-1)]`.
-fn valid_slots(arrival_slot: i32, deadline_slot: i32, max_future: i32, total_slots: i32) -> Vec<i32> {
+fn valid_slots(
+    arrival_slot: i32,
+    deadline_slot: i32,
+    max_future: i32,
+    total_slots: i32,
+) -> Vec<i32> {
     let from = arrival_slot;
     let to = deadline_slot
         .min(arrival_slot + max_future)
@@ -100,7 +105,9 @@ fn pick_feasible_flavour<'a>(
     for &flav in sorted_flavours {
         if global_constraint_enabled {
             let new_avg = (global_error_sum + flav.error) / (global_count as f64 + 1.0);
-            if new_avg > max_err { continue; }
+            if new_avg > max_err {
+                continue;
+            }
         }
         let mut win_sum = flav.error;
         let mut win_cnt = 1usize;
@@ -110,7 +117,9 @@ fn pick_feasible_flavour<'a>(
                 win_cnt += errs.len();
             }
         }
-        if win_sum / win_cnt as f64 > max_err { continue; }
+        if win_sum / win_cnt as f64 > max_err {
+            continue;
+        }
         let cost = ci * mult * flav.duration as f64 * scale;
         return Some((flav, cost));
     }
@@ -148,7 +157,8 @@ fn make_assignment(req: &Request, slot: i32, flav: &Flavour, cost: f64) -> Assig
 fn sorted_flavours_and_fallback(flavours: &[Flavour]) -> (Vec<&Flavour>, &Flavour) {
     let mut sorted: Vec<&Flavour> = flavours.iter().collect();
     sorted.sort_by_key(|f| f.duration);
-    let fallback = flavours.iter()
+    let fallback = flavours
+        .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("assignment policy must have at least one flavour");
     (sorted, fallback)
@@ -191,8 +201,7 @@ impl OnlineBanditState {
         ctx: &SwarmContext,
         assignment: &AssignmentPolicy<'_>,
     ) -> Vec<Assignment> {
-        let (sorted_flavours, fallback_flav) =
-            sorted_flavours_and_fallback(assignment.flavours);
+        let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(assignment.flavours);
         let tiers = assignment.capacity_tiers;
         let scale = assignment.carbon_cost_duration_scale;
         let max_future = assignment.assignment_max_future_slots;
@@ -210,14 +219,18 @@ impl OnlineBanditState {
         let mut assignments = Vec::with_capacity(pending.len());
 
         for req in pending {
-            let candidates = valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
-            if candidates.is_empty() { continue; }
+            let candidates =
+                valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
+            if candidates.is_empty() {
+                continue;
+            }
 
             // ε-greedy slot selection.
             let chosen_slot = if self.rng.r#gen::<f64>() < self.epsilon {
                 candidates[self.rng.gen_range(0..candidates.len())]
             } else {
-                *candidates.iter()
+                *candidates
+                    .iter()
                     .min_by(|&&a, &&b| {
                         let qa = self.q.get(a as usize).copied().unwrap_or(f64::MAX);
                         let qb = self.q.get(b as usize).copied().unwrap_or(f64::MAX);
@@ -228,11 +241,29 @@ impl OnlineBanditState {
 
             // Cheapest feasible flavour; fallback to min-error if none pass.
             let (chosen_flav, cost) = pick_feasible_flavour(
-                chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
-                global_error_sum, global_count, scale, &sorted_flavours,
-                max_err, win_past, win_future_cfg, assignment.global_error_constraint_enabled,
-            ).unwrap_or_else(|| {
-                let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
+                chosen_slot,
+                carbon_forecast,
+                tiers,
+                &slot_count,
+                &slot_errors,
+                global_error_sum,
+                global_count,
+                scale,
+                &sorted_flavours,
+                max_err,
+                win_past,
+                win_future_cfg,
+                assignment.global_error_constraint_enabled,
+            )
+            .unwrap_or_else(|| {
+                let c = slot_cost(
+                    chosen_slot,
+                    fallback_flav,
+                    carbon_forecast,
+                    tiers,
+                    &slot_count,
+                    scale,
+                );
                 (fallback_flav, c)
             });
 
@@ -244,7 +275,10 @@ impl OnlineBanditState {
             }
 
             *slot_count.entry(chosen_slot).or_insert(0) += 1;
-            slot_errors.entry(chosen_slot).or_default().push(chosen_flav.error);
+            slot_errors
+                .entry(chosen_slot)
+                .or_default()
+                .push(chosen_flav.error);
             global_error_sum += chosen_flav.error;
             global_count += 1;
 
@@ -294,13 +328,19 @@ impl OnlineAcoState {
         tau0: f64,
         seed: u64,
     ) -> Self {
-        let cheapest = flavours.iter()
+        let cheapest = flavours
+            .iter()
             .min_by_key(|f| f.duration)
             .expect("at least one flavour");
         let eta: Vec<f64> = (0..total_slots)
             .map(|s| {
                 // TODO: is it ok to unwrap here? Technically carbon_forecast gets updated as we go on...
-                let ci = carbon_forecast.read().unwrap().get(s).copied().unwrap_or(1.0);
+                let ci = carbon_forecast
+                    .read()
+                    .unwrap()
+                    .get(s)
+                    .copied()
+                    .unwrap_or(1.0);
                 let base = ci * cheapest.duration as f64 * carbon_cost_duration_scale;
                 if base > 0.0 { 1.0 / base } else { 1e9 }
             })
@@ -330,8 +370,7 @@ impl OnlineAcoState {
         ctx: &SwarmContext,
         assignment: &AssignmentPolicy<'_>,
     ) -> Vec<Assignment> {
-        let (sorted_flavours, fallback_flav) =
-            sorted_flavours_and_fallback(assignment.flavours);
+        let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(assignment.flavours);
         let tiers = assignment.capacity_tiers;
         let scale = assignment.carbon_cost_duration_scale;
         let max_future = assignment.assignment_max_future_slots;
@@ -356,14 +395,25 @@ impl OnlineAcoState {
                 let mut ant_cost = 0.0f64;
 
                 for req in pending {
-                    let candidates = valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
-                    if candidates.is_empty() { continue; }
+                    let candidates =
+                        valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
+                    if candidates.is_empty() {
+                        continue;
+                    }
 
-                    let weights: Vec<f64> = candidates.iter().map(|&s| {
-                        let t = self.tau.get(s as usize).copied().unwrap_or(1e-12).max(1e-12);
-                        let e = self.eta.get(s as usize).copied().unwrap_or(1e-12);
-                        t.powf(self.alpha) * e.powf(self.beta)
-                    }).collect();
+                    let weights: Vec<f64> = candidates
+                        .iter()
+                        .map(|&s| {
+                            let t = self
+                                .tau
+                                .get(s as usize)
+                                .copied()
+                                .unwrap_or(1e-12)
+                                .max(1e-12);
+                            let e = self.eta.get(s as usize).copied().unwrap_or(1e-12);
+                            t.powf(self.alpha) * e.powf(self.beta)
+                        })
+                        .collect();
 
                     let total_weight: f64 = weights.iter().sum();
                     let chosen_slot = if total_weight <= 0.0 {
@@ -373,23 +423,47 @@ impl OnlineAcoState {
                         let mut chosen = *candidates.last().unwrap();
                         for (&s, &w) in candidates.iter().zip(weights.iter()) {
                             r -= w;
-                            if r <= 0.0 { chosen = s; break; }
+                            if r <= 0.0 {
+                                chosen = s;
+                                break;
+                            }
                         }
                         chosen
                     };
 
                     let (chosen_flav, cost) = pick_feasible_flavour(
-                        chosen_slot, carbon_forecast, tiers, &slot_count, &slot_errors,
-                        global_error_sum, global_count, scale, &sorted_flavours,
-                        max_err, win_past, win_future_cfg, assignment.global_error_constraint_enabled,
-                    ).unwrap_or_else(|| {
-                        let c = slot_cost(chosen_slot, fallback_flav, carbon_forecast, tiers, &slot_count, scale);
+                        chosen_slot,
+                        carbon_forecast,
+                        tiers,
+                        &slot_count,
+                        &slot_errors,
+                        global_error_sum,
+                        global_count,
+                        scale,
+                        &sorted_flavours,
+                        max_err,
+                        win_past,
+                        win_future_cfg,
+                        assignment.global_error_constraint_enabled,
+                    )
+                    .unwrap_or_else(|| {
+                        let c = slot_cost(
+                            chosen_slot,
+                            fallback_flav,
+                            carbon_forecast,
+                            tiers,
+                            &slot_count,
+                            scale,
+                        );
                         (fallback_flav, c)
                     });
 
                     ant_cost += cost;
                     *slot_count.entry(chosen_slot).or_insert(0) += 1;
-                    slot_errors.entry(chosen_slot).or_default().push(chosen_flav.error);
+                    slot_errors
+                        .entry(chosen_slot)
+                        .or_default()
+                        .push(chosen_flav.error);
                     global_error_sum += chosen_flav.error;
                     global_count += 1;
 

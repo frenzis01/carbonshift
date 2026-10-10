@@ -15,7 +15,11 @@ struct Online2System {
 }
 
 impl Online2System {
-    fn new(cfg: Config, scenario_forecast: Option<Vec<f64>>, scenario_requests: Option<Vec<Vec<carbonshift_rs::types::Request>>>) -> Self {
+    fn new(
+        cfg: Config,
+        scenario_forecast: Option<Vec<f64>>,
+        scenario_requests: Option<Vec<Vec<carbonshift_rs::types::Request>>>,
+    ) -> Self {
         let cfg = Arc::new(cfg);
         let shared_state = SharedState::new();
         let generator_cfg = RequestGeneratorConfig::from_config(&cfg);
@@ -33,11 +37,9 @@ impl Online2System {
         ));
 
         let generator = match scenario_requests {
-            Some(by_slot) => RequestGenerator::new_from_scenario(
-                shared_state.clone(),
-                generator_cfg,
-                by_slot,
-            ),
+            Some(by_slot) => {
+                RequestGenerator::new_from_scenario(shared_state.clone(), generator_cfg, by_slot)
+            }
             None => RequestGenerator::new(shared_state.clone(), generator_cfg),
         };
         let carbon_forecast = scenario_forecast.unwrap_or_else(|| {
@@ -59,7 +61,11 @@ impl Online2System {
         let carbon_forecast = Arc::new(RwLock::new(carbon_forecast));
         let scheduler = BatchScheduler::new(shared_state, cfg.clone(), ml, carbon_forecast);
 
-        Self { generator, scheduler, cfg }
+        Self {
+            generator,
+            scheduler,
+            cfg,
+        }
     }
 
     fn start(&mut self) {
@@ -130,15 +136,23 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--no-skip" => { no_skip = true; }
+            "--no-skip" => {
+                no_skip = true;
+            }
             "--speed-scale" => {
                 i += 1;
-                speed_scale = args.get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| { eprintln!("--speed-scale requires a numeric value"); std::process::exit(1); });
+                speed_scale = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--speed-scale requires a numeric value");
+                    std::process::exit(1);
+                });
             }
-            arg if !arg.starts_with("--") => { scenario_path = Some(arg.to_string()); }
-            other => { eprintln!("Unknown argument: {other}"); std::process::exit(1); }
+            arg if !arg.starts_with("--") => {
+                scenario_path = Some(arg.to_string());
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                std::process::exit(1);
+            }
         }
         i += 1;
     }
@@ -151,7 +165,9 @@ fn main() {
             });
             let mut c = Config::default();
             c.apply_scenario_metadata(&scenario.metadata);
-            if no_skip { c.simulation.skip_empty_slots = false; }
+            if no_skip {
+                c.simulation.skip_empty_slots = false;
+            }
             c.simulation.slot_speed_scale = speed_scale;
             let by_slot = scenario.requests_by_slot();
             println!(
@@ -164,7 +180,9 @@ fn main() {
         }
         None => {
             let mut c = Config::default();
-            if no_skip { c.simulation.skip_empty_slots = false; }
+            if no_skip {
+                c.simulation.skip_empty_slots = false;
+            }
             c.simulation.slot_speed_scale = speed_scale;
             (c, None, None)
         }
@@ -179,7 +197,10 @@ fn main() {
             "CarbonShift RS — batch_size={}, total_slots={}, flavours={:?}",
             cfg.solver.batch_size,
             cfg.total_slots,
-            cfg.flavours.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+            cfg.flavours
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

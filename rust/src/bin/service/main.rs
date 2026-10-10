@@ -92,7 +92,9 @@ async fn main() {
 
     match &executor_url {
         Some(url) => tracing::info!(executor_url = %url, "executor dispatch enabled"),
-        None => tracing::warn!("EXECUTOR_URL not set — running in dry-run mode (no dispatch will be sent)"),
+        None => tracing::warn!(
+            "EXECUTOR_URL not set — running in dry-run mode (no dispatch will be sent)"
+        ),
     }
     if manual_clock {
         tracing::warn!(
@@ -104,7 +106,9 @@ async fn main() {
         tracing::warn!("CARBONSHIFT_API_KEY not set — /v1/requests* is unauthenticated");
     }
     if env_secret("CARBONSHIFT_EXECUTOR_TOKEN").is_none() {
-        tracing::warn!("CARBONSHIFT_EXECUTOR_TOKEN not set — /v1/callback/{{id}} is unauthenticated");
+        tracing::warn!(
+            "CARBONSHIFT_EXECUTOR_TOKEN not set — /v1/callback/{{id}} is unauthenticated"
+        );
     }
 
     let shared_state = SharedState::new();
@@ -151,11 +155,21 @@ async fn main() {
         allow_private_callbacks: env_or("CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS", "0") == "1",
         api_key: env_secret("CARBONSHIFT_API_KEY"),
         executor_token: env_secret("CARBONSHIFT_EXECUTOR_TOKEN"),
-        executor_max_retries: env_or("EXECUTOR_MAX_RETRIES", "5").parse().expect("EXECUTOR_MAX_RETRIES must be an integer"),
-        executor_retry_base_ms: env_or("EXECUTOR_RETRY_BASE_MS", "500").parse().expect("EXECUTOR_RETRY_BASE_MS must be an integer"),
-        executor_retry_max_ms: env_or("EXECUTOR_RETRY_MAX_MS", "30000").parse().expect("EXECUTOR_RETRY_MAX_MS must be an integer"),
-        horizon_ready_threshold: env_or("HORIZON_READY_THRESHOLD", "0.9").parse().expect("HORIZON_READY_THRESHOLD must be a number"),
-        dispatcher_poll_interval_ms: env_or("DISPATCHER_POLL_INTERVAL_MS", "200").parse().expect("DISPATCHER_POLL_INTERVAL_MS must be an integer"),
+        executor_max_retries: env_or("EXECUTOR_MAX_RETRIES", "5")
+            .parse()
+            .expect("EXECUTOR_MAX_RETRIES must be an integer"),
+        executor_retry_base_ms: env_or("EXECUTOR_RETRY_BASE_MS", "500")
+            .parse()
+            .expect("EXECUTOR_RETRY_BASE_MS must be an integer"),
+        executor_retry_max_ms: env_or("EXECUTOR_RETRY_MAX_MS", "30000")
+            .parse()
+            .expect("EXECUTOR_RETRY_MAX_MS must be an integer"),
+        horizon_ready_threshold: env_or("HORIZON_READY_THRESHOLD", "0.9")
+            .parse()
+            .expect("HORIZON_READY_THRESHOLD must be a number"),
+        dispatcher_poll_interval_ms: env_or("DISPATCHER_POLL_INTERVAL_MS", "200")
+            .parse()
+            .expect("DISPATCHER_POLL_INTERVAL_MS must be an integer"),
     };
     let state = AppState::new(shared_state, cfg, service_cfg, shared_carbon_forecast);
     tokio::spawn(dispatcher::run(state.clone()));
@@ -176,7 +190,9 @@ async fn main() {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install Ctrl-C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
     };
 
     #[cfg(unix)]
