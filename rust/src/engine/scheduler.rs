@@ -64,6 +64,8 @@ enum SwarmBackend {
 }
 
 impl SwarmBackend {
+    /// Construct the configured online strategy with the same profile policy
+    /// and forecast used by the scheduler worker that owns it.
     fn from_config(
         solver: &SolverConfig,
         swarm: &SwarmConfig,
@@ -119,17 +121,28 @@ struct SchedulerMutableState {
 
 // ─── public result type ──────────────────────────────────────────────────────
 
+/// A read-only snapshot of scheduler throughput and worker concurrency.
 #[derive(Debug, Clone)]
 pub struct SchedulerStatistics {
+    /// Number of worker batches that completed successfully.
     pub batches_processed: u64,
+    /// Number of newly submitted requests committed by those batches.
     pub total_scheduled: u64,
+    /// Number of solver runs recorded after a batch commits successfully.
     pub solver_runs: u64,
+    /// Duration of the most recent solver invocation, in milliseconds.
     pub last_solver_elapsed_ms: f64,
+    /// Total solver time divided by successful batches.
     pub avg_solver_ms_per_batch: f64,
+    /// Total solver time divided by newly scheduled requests.
     pub avg_solver_ms_per_request: f64,
+    /// Workers currently solving batches.
     pub active_batch_workers: usize,
+    /// Configured upper bound on parallel batch workers.
     pub max_batch_parallelism: usize,
+    /// Highest number of simultaneous workers observed since startup.
     pub peak_concurrent_workers: usize,
+    /// Mean active-worker count at each worker dispatch.
     pub avg_concurrent_workers: f64,
 }
 
@@ -149,6 +162,9 @@ pub struct BatchScheduler {
 }
 
 impl BatchScheduler {
+    /// Create the scheduler and initialize global capacity policy before any
+    /// worker can price assignments. The live service may already have done
+    /// this during app setup, so initialization is intentionally idempotent.
     pub fn new(
         shared_state: SharedState,
         cfg: Arc<Config>,
@@ -232,12 +248,18 @@ impl BatchScheduler {
         }
     }
 
+    /// Return a consistent snapshot of counters and worker concurrency.
+    ///
+    /// Averages are computed from accumulated solver time and batch/request
+    /// totals; they are zero until the corresponding denominator is nonzero.
     pub fn get_statistics(&self) -> SchedulerStatistics {
         let m = self.mutable.lock().unwrap();
         let runs = m.stats.solver_runs;
         let time_ms = m.stats.solver_total_time_ms;
         let reqs = m.stats.solver_total_requests;
         let dispatches = m.stats.solver_runs; // one dispatch per solver run
+        // Derive averages from accumulated totals rather than maintaining
+        // counters on every worker completion; zero-run cases have no average.
         SchedulerStatistics {
             batches_processed: m.stats.batches_processed,
             total_scheduled: m.stats.total_scheduled,
@@ -264,6 +286,13 @@ impl BatchScheduler {
 
 // ─── main loop ───────────────────────────────────────────────────────────────
 
+/// Drive the scheduler until shutdown: synchronize virtual time, launch full
+/// profile batches, flush smaller batches when a slot/timeout requires it,
+/// and optionally skip idle slots in offline simulations.
+///
+/// This runs on the background thread created by [`BatchScheduler::start`].
+/// Batch work itself runs on worker threads so the loop can continue updating
+/// time, observing queue state, and admitting other profile batches.
 fn main_loop(
     running: Arc<AtomicBool>,
     shared_state: SharedState,
@@ -500,6 +529,9 @@ fn next_profile_to_dispatch(
     slot: i32,
     min_pending: usize,
 ) -> Option<(QosProfileId, usize)> {
+    // A profile is eligible only when it has enough work, no solve is already
+    // active for it, and this exact infeasible queue was not just retried.
+    // Sorting before applying the cursor makes round-robin order deterministic.
     let mut eligible: Vec<_> = pending_by_profile
         .iter()
         .filter(|(profile_id, count)| {
@@ -520,9 +552,14 @@ fn next_profile_to_dispatch(
                 .position(|(profile_id, _)| profile_id > cursor)
         })
         .unwrap_or(0);
+    // Start after the last selected profile, wrapping to the first profile
+    // when the cursor is at the end of the sorted eligible list.
     Some(eligible[next_index].clone())
 }
 
+/// Tell the slot-flush logic whether any queued profile can be retried now.
+/// An unchanged infeasible queue is suppressed for this slot to avoid a hot
+/// retry loop; a new slot or changed queue size makes it eligible again.
 fn has_retryable_profile_pending(
     shared_state: &SharedState,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
@@ -535,6 +572,12 @@ fn has_retryable_profile_pending(
     })
 }
 
+/// Claim eligible profile-homogeneous batches and launch one worker per batch.
+///
+/// During a normal pass, a complete configured batch is required. A flush
+/// relaxes that minimum to one so stragglers are not stranded until another
+/// request arrives. The return value tells the main loop whether it launched
+/// any workers during this pass.
 fn dispatch_batch_workers(
     slot: i32,
     shared_state: &SharedState,
@@ -585,10 +628,14 @@ fn dispatch_batch_workers(
                 return dispatched;
             }
             if pending.len() < min_pending {
+                // A queue can shrink between counting and claiming. Put this
+                // undersized claim back before releasing the profile as active.
                 shared_state.requeue_pending_requests_front(pending);
                 return dispatched;
             }
 
+            // Reserve the profile and worker slot before spawning, so another
+            // pass cannot claim a second batch for the same QoS budget.
             g.last_dispatched_profile = Some(profile_id.clone());
             g.active_profiles.insert(profile_id.clone());
             g.active_workers += 1;
@@ -614,6 +661,9 @@ fn dispatch_batch_workers(
         std::thread::spawn(move || {
             let scheduled =
                 batch_worker_entry(slot, pending, &ss, &cfg2, &forecast, &fdb2, &mut2, &ml2);
+            // Release reservations on both success and infeasibility. Remember
+            // an unchanged failed queue so the main loop can retry it later,
+            // rather than spinning immediately on the same input.
             let mut g = mut2.lock().unwrap();
             g.active_workers -= 1;
             g.active_profiles.remove(&profile_id);
@@ -630,6 +680,12 @@ fn dispatch_batch_workers(
 
 // ─── worker entry ─────────────────────────────────────────────────────────────
 
+/// Solve and commit one already-claimed, single-profile batch.
+///
+/// The worker snapshots the capacity-tier policy, builds the profile-specific
+/// assignment policy, invokes the selected solver, then performs an atomic
+/// capacity check. If another worker changed occupancy after this solve's
+/// snapshot, the batch is solved again against fresh state.
 fn batch_worker_entry(
     slot: i32,
     pending: Vec<Request>,
@@ -710,6 +766,9 @@ fn batch_worker_entry(
         let t0 = Instant::now();
         let wall_start = unix_now_f64();
 
+        // Solvers read a consistent snapshot and return proposals; they do not
+        // mutate committed assignments. This separation lets the following
+        // commit check detect races and safely request a fresh solve.
         let solve_result = batch_solver.solve(BatchSolveContext {
             current_slot: slot,
             pending: &pending,
@@ -746,7 +805,9 @@ fn batch_worker_entry(
         // Limit expected_per_slot to only include the slots to which we are assigning requests in this batch.
         expected_per_slot.retain(|slot, _| assignments.iter().any(|a| a.scheduled_slot == *slot));
 
-        // Attempt atomic commit; check for concurrent capacity-tier breach.
+        // The solver priced each request using this expected occupancy.
+        // Commit rechecks it against global state because other profile workers
+        // may have committed into the same slots in the meantime.
         let force_commit = cfg.solver.rollback_max_consecutive == 0
             || consecutive_rollbacks >= cfg.solver.rollback_max_consecutive;
 
@@ -769,11 +830,12 @@ fn batch_worker_entry(
                 }
                 // Wait a bit before retrying to avoid hot loop if the state is very contended
                 // Generate random backoff between 10-90 ms to reduce thundering herd risk if many workers are contending
-                // TODO
+                // TODO:
                 // let backoff_ms = 10 + rand::thread_rng().gen_range(0..80);
                 // std::thread::sleep(Duration::from_millis(backoff_ms));
 
-                // Re-run solve_dp with the same pending batch but fresh shared_state view.
+                // Keep the claimed requests intact and recompute their prices
+                // from a new shared-state snapshot on the next loop iteration.
                 continue;
             }
             CommitOutcome::Committed => {
@@ -968,7 +1030,13 @@ fn batch_worker_entry(
 
 // ─── online swarm batch worker ────────────────────────────────────────────────
 
+/// Whether the configured algorithm needs persistent online learning state.
+///
+/// Used by dispatch to select its concurrency policy and by the worker entry
+/// to route bandit/ACO batches away from the stateless batch-solver registry.
 fn is_online_swarm_strategy(strategy: &str) -> bool {
+    // These algorithms keep learning state between batches; unlike the
+    // stateless DP and greedy strategies, they need the swarm worker path.
     matches!(
         strategy.trim().to_ascii_lowercase().as_str(),
         "bandit" | "ant_colony"
@@ -1160,6 +1228,10 @@ fn batch_worker_entry_swarm_merge(
     )
 }
 
+/// Atomically validate a swarm proposal against global per-slot occupancy.
+///
+/// `baseline_slot_counts` is the occupancy snapshot used during solving; the
+/// checked commit detects other workers that changed those slots meanwhile.
 fn try_commit_swarm_batch(
     assignments: &[Assignment],
     baseline_slot_counts: &HashMap<i32, i32>,
@@ -1168,6 +1240,10 @@ fn try_commit_swarm_batch(
     force_commit: bool,
     consecutive_rollbacks: usize,
 ) -> CommitOutcome {
+    // Reconstruct the occupancy the swarm solver priced against: fixed
+    // baseline requests plus each proposed assignment in this batch. The
+    // shared-state commit checks this expectation atomically against all
+    // profiles, since capacity tiers describe global slot occupancy.
     let mut expected_per_slot = baseline_slot_counts.clone();
     for assignment in assignments {
         *expected_per_slot
@@ -1186,6 +1262,9 @@ fn try_commit_swarm_batch(
 }
 
 /// Shared tail after a profile-aware swarm commit: update stats and log metrics.
+///
+/// The caller invokes this only after assignments are committed; failed or
+/// rolled-back proposals must not appear in success metrics.
 fn finish_swarm_batch(
     slot: i32,
     pending: &[Request],
@@ -1240,7 +1319,9 @@ fn finish_swarm_batch(
     true
 }
 
-/// Build per-assignment CSV rows.
+/// Convert committed assignment records into the row shape expected by the
+/// metrics logger. Sorting makes a run's output stable even though assignments
+/// may have been assembled from different solver paths.
 fn build_assignment_rows(
     assignments: &[Assignment],
     new_ids: &HashSet<u64>,
@@ -1285,7 +1366,11 @@ fn build_assignment_rows(
     rows
 }
 
+/// Return a wall-clock timestamp for solver logs, separate from virtual slot
+/// time used by scheduling and simulation.
 fn unix_now_f64() -> f64 {
+    // Wall-clock timestamps are used for diagnostics only; virtual scheduler
+    // time is maintained separately in SharedState.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

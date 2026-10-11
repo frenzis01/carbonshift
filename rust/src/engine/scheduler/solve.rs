@@ -20,25 +20,43 @@ use super::recovery::RecoveryState;
 /// Shared output metadata produced by one batch scheduling strategy.
 #[derive(Debug, Clone, Default)]
 pub struct SolveContext {
+    /// Outcome label returned to logs and metrics (for example `ok` or `infeasible`).
     pub status: String,
+    /// Algorithm/path used for this batch, including any fallback.
     pub mode: String,
+    /// Number of newly submitted requests represented by the result.
     pub new_assignments: usize,
+    /// Total committed candidates, including any future assignments replanned with this batch.
     pub total_assignments: usize,
     /// Descriptive fleet-wide telemetry; never used as a QoS limit.
     pub global_error_before: f64,
+    /// Fleet request count represented by `global_error_before`.
     pub global_error_count_before: u64,
+    /// This profile's cumulative average before solving.
     pub profile_error_before: f64,
+    /// This profile's request count represented by `profile_error_before`.
     pub profile_error_count_before: u64,
+    /// Whether the profile cumulative-error rule restricted this solve.
     pub profile_error_constraint_active: bool,
+    /// Modeled profile window average after applying the proposed assignments.
     pub modeled_window_avg_after: f64,
+    /// Inclusive first slot used in the local error-window calculation.
     pub window_start_slot: i32,
+    /// Inclusive last slot used in the local error-window calculation.
     pub window_end_slot: i32,
+    /// Number of synthetic recovery requests consumed by this solve.
     pub mock_recovery_consumed: i32,
+    /// Configured recovery policy used to form the baseline.
     pub recovery_mode: String,
+    /// Solver time in milliseconds; the worker fills this after returning.
     pub solver_elapsed_ms: f64,
 }
 
 /// The stable input contract shared by batch-solving strategies.
+///
+/// It deliberately carries narrow policy groups instead of the full `Config`:
+/// a batch solver should depend only on inputs relevant to one profile's
+/// assignment decision.
 pub(super) struct BatchSolveContext<'a> {
     pub(super) current_slot: i32,
     pub(super) pending: &'a [Request],
@@ -63,6 +81,8 @@ pub(super) struct BatchSolveResult {
 /// Solver strategy interface. New stateless batch algorithms can implement
 /// this contract and register a factory without changing worker dispatch.
 pub(super) trait BatchSolverStrategy: Send + Sync {
+    /// Return proposed assignments and diagnostic context for one claimed
+    /// batch. The worker owns commit/rollback after this method returns.
     fn solve(&self, input: BatchSolveContext<'_>) -> BatchSolveResult;
 }
 
@@ -83,10 +103,14 @@ impl BatchSolverStrategy for GreedySingletonBatchSolver {
 
 type BatchSolverFactory = fn() -> Box<dyn BatchSolverStrategy>;
 
+/// Factory used by the registry so strategy creation stays separate from the
+/// worker's shared lifecycle and commit/rollback handling.
 fn build_dp_batch_solver() -> Box<dyn BatchSolverStrategy> {
     Box::new(DpBatchSolver)
 }
 
+/// Factory for the exhaustive singleton strategy; the scheduler applies the
+/// same worker and commit path used by DP after this solver returns.
 fn build_greedy_singleton_batch_solver() -> Box<dyn BatchSolverStrategy> {
     Box::new(GreedySingletonBatchSolver)
 }
@@ -99,6 +123,9 @@ const BATCH_SOLVER_REGISTRY: &[(&str, BatchSolverFactory)] = &[
 /// Resolve the configured strategy once per worker. Unknown names retain the
 /// historical DP fallback; known strategies are looked up in the registry.
 pub(super) fn select_batch_solver(name: &str) -> Box<dyn BatchSolverStrategy> {
+    // Keep the historical DP fallback for an unrecognized name. The config
+    // layer normally validates this value; the fallback also keeps internal
+    // callers from failing to construct a worker.
     BATCH_SOLVER_REGISTRY
         .iter()
         .find(|(registered_name, _)| name.trim().eq_ignore_ascii_case(registered_name))
@@ -143,6 +170,11 @@ struct PreparedSolve {
     effective_capacity_tiers: Vec<CapacityTier>,
 }
 
+/// Capture and derive all shared inputs needed by a single batch solve.
+///
+/// Both `solve_dp` and `solve_greedy_singleton` call this first, ensuring they
+/// use the same state snapshot, profile-specific error history, movable future
+/// assignments, recovery inputs, and global capacity policy.
 fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     let current_slot = input.current_slot;
     let pending = input.pending;
@@ -177,7 +209,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     // The lock is released before the solver runs.
     let snapshot = shared_state.snapshot_for_solver();
 
-    // ── Step 2: time-shifting ────────────────────────────────────────────────
+    // ── Step 2: decide which future work can move with this batch ────────────
     // If DP_LOCK_FUTURE_ASSIGNMENTS=True, future assignments are pinned as
     // baseline load.  If False, they join the pool for joint re-planning.
     let future_assignments = snapshot.get_future_assignments(current_slot);
@@ -204,6 +236,8 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     let mut movable_future_ids: HashSet<u64> = HashSet::new();
 
     if solver.dp_lock_future_assignments {
+        // Other profiles are always fixed because their error/QoS constraints
+        // are independent; this flag controls only this profile's future work.
         fixed_future.extend(same_profile_future);
     } else {
         movable_future_ids = same_profile_future.iter().map(|a| a.request_id).collect();
@@ -227,7 +261,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         *baseline_slot_counts.entry(a.scheduled_slot).or_insert(0) += 1;
     }
 
-    // ── Step 3: error baseline ──────────────────────────────────────────────
+    // ── Step 3: assemble this profile's error baseline ──────────────────────
     // 3a. Real window error from snapshot.
     let ws = snapshot.get_profile_window_error_stats(
         &profile_id,
@@ -270,7 +304,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     );
     let error_baseline = augmented_baseline;
 
-    // ── Step 4: profile cumulative-error constraint ──────────────────────────
+    // ── Step 4: apply this profile's cumulative-error policy ────────────────
     let global_error_stats = snapshot.get_global_error_stats();
     let profile_error_stats = snapshot.get_profile_error_stats(&profile_id);
     let mut solver_flavours = assignment.flavours.to_vec();
@@ -326,8 +360,9 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         }
     }
 
-    // Every batch has one assignment policy: a QoS profile in the service,
-    // or the scheduler default for offline unprofiled requests.
+    // This is the local sliding-window limit. The fleet-wide error value
+    // captured above is telemetry only and never substitutes for this
+    // profile's threshold.
     let effective_error_threshold = assignment.max_error_threshold;
 
     // Rebound tiers describe shared infrastructure, so all profiles use the
@@ -357,6 +392,12 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
 
 // ─── core DP pipeline ─────────────────────────────────────────────────────────
 
+/// Run the rolling-window DP pipeline for one profile batch.
+///
+/// Preparation and recovery are shared with the singleton alternative. Here
+/// the DP proposes a joint placement, unscheduled requests receive the
+/// configured coverage fallback, and the proposals are converted into engine
+/// assignments. The calling worker, not this function, commits them.
 fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
     let PreparedSolve {
         profile_id,
@@ -392,7 +433,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         flavour_duration_by_name: fdb,
     } = input;
 
-    // ── Step 5: DP solve ────────────────────────────────────────────────────
+    // ── Step 5: search for a joint placement ────────────────────────────────
     let effective_pruning = get_effective_pruning_mode(pending.len(), solver_config);
     let solver = build_solver(
         &solver_flavours,
@@ -496,7 +537,8 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         solve_mode = "greedy_after_infeasible".to_string();
     }
 
-    // Safety check: if not all pending are covered, signal infeasibility.
+    // Verify coverage independently of solver status strings: downstream
+    // workers interpret an empty result as "requeue and try in a later pass."
     let final_pending_covered: usize = dp_assignments
         .iter()
         .filter(|a| pending_ids.contains(&a.request_id))
@@ -517,7 +559,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         };
     }
 
-    // ── Step 6: convert RequestAssignment → Assignment ──────────────────────
+    // ── Step 6: attach service/domain metadata to solver decisions ───────────
     let assignments: Vec<Assignment> = dp_assignments
         .iter()
         .map(|dp_a| {
@@ -544,7 +586,8 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         })
         .collect();
 
-    // Compute the modelled window average after this run (mirrors Python logic).
+    // Recompute the modeled post-batch error for diagnostics and consume only
+    // the synthetic requests that actually overlapped this solve's window.
     let mut modeled_error_sum = error_baseline.error_sum;
     let mut modeled_count = error_baseline.request_count;
     let mut mock_remaining = mock_pool_input.initial_count;
@@ -853,6 +896,9 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
 // ─── misc helpers ─────────────────────────────────────────────────────────────
 
 pub(super) fn get_effective_pruning_mode(batch_size: usize, solver: &SolverConfig) -> String {
+    // Small batches have few enough states that pruning adds approximation
+    // without meaningful performance benefit. A zero threshold disables this
+    // size-based switch and uses the configured strategy for every batch.
     let threshold = solver.dp_pruning_min_batch_size;
     if threshold == 0 || batch_size < threshold {
         "none".to_string()
@@ -868,6 +914,9 @@ fn build_solver(
     solver_config: &SolverConfig,
     pruning: &str,
 ) -> DpSolver {
+    // DpSolver owns its inputs, so take snapshots of the profile flavour set
+    // and forecast. This also lets DP and fallback instances use different
+    // candidate lists without mutating shared configuration.
     let mut solver =
         DpSolver::new(solver_config, assignment).with_carbon_forecast(carbon_forecast.to_vec());
     solver.flavours = flavours.to_vec();

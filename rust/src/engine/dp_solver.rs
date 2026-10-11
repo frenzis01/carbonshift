@@ -64,6 +64,9 @@ struct DpStateKey {
 }
 
 impl DpStateKey {
+    /// Build a hashable description of the solver's accumulated error and
+    /// per-slot load. Floating-point request counts are quantized because
+    /// `HashMap` keys must support exact equality and hashing.
     fn new(error_sum_bp: i64, error_count: f64, mock_remaining: i32, inc_counts: Vec<i32>) -> Self {
         Self {
             error_sum_bp,
@@ -73,7 +76,8 @@ impl DpStateKey {
         }
     }
 
-    /// Reconstruct error_count as f64.
+    /// Convert the stored milli-request count back to the weighted count used
+    /// by the error-average calculation.
     fn error_count(&self) -> f64 {
         self.error_count_milli as f64 / 1000.0
     }
@@ -84,8 +88,11 @@ impl DpStateKey {
 /// One request's slot bounds for a batch solve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveRequest {
+    /// Stable request key used to select a per-request flavour override.
     pub request_id: u64,
+    /// Earliest local slot the solver is allowed to use.
     pub earliest_slot: i32,
+    /// Latest local slot the solver is allowed to use.
     pub deadline_slot: i32,
 }
 
@@ -93,6 +100,7 @@ pub struct SolveRequest {
 pub struct SolveBatchInput<'a> {
     /// Requests to schedule with per-request earliest and latest slots.
     pub requests: &'a [SolveRequest],
+    /// Engine slot from which this solve is allowed to make assignments.
     pub current_slot: i32,
     /// Capacity multiplier fallback (used when capacity_tiers is empty).
     pub capacity_multiplier: f64,
@@ -104,7 +112,9 @@ pub struct SolveBatchInput<'a> {
     pub error_window_baseline: ErrorWindowBaseline,
     /// Maximum allowed average window error (None = no constraint).
     pub max_error_threshold: Option<f64>,
+    /// Number of historical slots included before `current_slot`.
     pub error_window_past: i32,
+    /// Number of future slots included after `current_slot`.
     pub error_window_future: i32,
     /// Hard upper bound on scheduled slot (None = window_size − 1).
     pub assignment_max_slot: Option<i32>,
@@ -118,28 +128,47 @@ pub struct SolveBatchInput<'a> {
 
 #[derive(Debug, Clone, Default)]
 pub struct ErrorWindowBaseline {
+    /// Sum of errors already present in the profile's active window.
     pub error_sum: f64,
+    /// Number of real or weighted requests represented by `error_sum`.
     pub request_count: f64,
 }
 
+/// Synthetic requests used only during infeasibility recovery. They model
+/// already-known history for the DP constraint; they are not scheduled jobs.
 #[derive(Debug, Clone, Default)]
 pub struct MockPool {
+    /// Maximum synthetic requests available to consume during this solve.
     pub initial_count: i32,
+    /// Error contribution modeled for each synthetic request.
     pub error_per_request: f64,
 }
 
+/// Stateless rolling-window optimizer. A worker constructs one solver for a
+/// batch, supplies the current forecast, and receives proposed assignments;
+/// the scheduler separately validates and commits those proposals.
 pub struct DpSolver {
+    /// Default candidate strategies when no request-level flavour override exists.
     pub flavours: Vec<Flavour>,
+    /// Carbon-intensity estimate indexed by local planning slot.
     pub carbon_forecast: Vec<f64>,
+    /// Number of local slots in the finite planning horizon.
     pub window_size: i32,
     /// "beam" | "kbest" | "none"
     pub pruning: String,
+    /// Maximum retained DP states when pruning is enabled.
     pub pruning_k: usize,
+    /// Search time limit in seconds before the warm-start result is returned.
     pub timeout: f64,
+    /// Converts flavour duration into the units used by the carbon estimate.
     pub carbon_cost_scale: f64,
 }
 
 impl DpSolver {
+    /// Copy the assignment policy and solver-specific search settings needed
+    /// by this solve. The forecast is initialized to zero and normally
+    /// replaced with [`with_carbon_forecast`](Self::with_carbon_forecast)
+    /// before solving.
     pub fn new(solver: &SolverConfig, assignment: &AssignmentPolicy<'_>) -> Self {
         Self {
             flavours: assignment.flavours.to_vec(),
@@ -152,10 +181,11 @@ impl DpSolver {
         }
     }
 
-    /// Flavours to consider for `req_id`: its task-specific override if
-    /// present in `overrides`, otherwise `self.flavours` (the predefined
-    /// default task — used as-is by CLI/simulation tools and by any request
-    /// whose task wasn't dynamically registered).
+    /// Return the strategy choices for one request.
+    ///
+    /// Service requests carry profile/task-specific flavours in `overrides`;
+    /// CLI and simulation requests, or requests without an override, use the
+    /// solver's configured default list.
     fn flavours_for<'b>(
         &'b self,
         req_id: u64,
@@ -168,6 +198,8 @@ impl DpSolver {
     }
 
     pub fn with_carbon_forecast(mut self, forecast: Vec<f64>) -> Self {
+        // Fail at construction time rather than silently indexing unrelated
+        // slots or treating a short forecast as valid throughout the horizon.
         assert_eq!(
             forecast.len(),
             self.window_size as usize,
@@ -179,11 +211,14 @@ impl DpSolver {
 
     // ── public API ────────────────────────────────────────────────────────
 
-    /// Solve a batch of requests with DP.
+    /// Find a minimum-carbon feasible placement for a batch of requests.
     ///
     /// Returns an empty `Vec` only when *both* the full DP and the warm-start
-    /// sequential solution are provably infeasible.
+    /// sequential solution are provably infeasible. The live scheduler calls
+    /// this through `solve_dp`; after it returns, the scheduler still performs
+    /// an atomic capacity check before committing the assignments.
     pub fn solve_batch(&self, input: SolveBatchInput<'_>) -> Vec<RequestAssignment> {
+        // Empty work and an exhausted finite horizon have no legal DP layers.
         if input.requests.is_empty() {
             return vec![];
         }
@@ -211,7 +246,8 @@ impl DpSolver {
             .min(self.window_size - 1)
             .max(input.current_slot);
 
-        // Clamp every deadline into [current_slot, assignment_cap].
+        // A request may be scheduled no earlier than its arrival and no later
+        // than both its deadline and this solve's bounded planning window.
         let deadlines: Vec<i32> = input
             .requests
             .iter()
@@ -229,10 +265,13 @@ impl DpSolver {
             .zip(&deadlines)
             .any(|(request, deadline)| request.earliest_slot.max(input.current_slot) > *deadline)
         {
+            // At least one request has no legal slot, so expanding a partial
+            // batch would only produce assignments that the caller cannot use.
             return vec![];
         }
 
-        // Build baseline arrays.
+        // Copy fixed assignments into an indexed array; state transitions can
+        // then price each candidate slot without repeatedly looking up a map.
         let mut base_counts = vec![0i32; t];
         for (&slot, &cnt) in input.baseline_slot_counts {
             if slot >= 0 && (slot as usize) < t {
@@ -240,7 +279,8 @@ impl DpSolver {
             }
         }
 
-        // Convert baseline to integer representation.
+        // Store errors in basis points inside DP keys to keep accumulation
+        // deterministic; retain fractional request counts for decayed history.
         let initial_error_sum_bp = (input.error_window_baseline.error_sum * 100.0).round() as i64;
         let initial_error_count = input.error_window_baseline.request_count;
         let initial_mock_count = input.dynamic_mock_pool.initial_count.max(0);
@@ -294,7 +334,8 @@ impl DpSolver {
             })
         });
 
-        // ── initial DP state ─────────────────────────────────────────────
+        // Each map entry is one distinct feasibility/load state paired with
+        // its cheapest path so far. The initial state contains no new work.
         let init_key = DpStateKey::new(
             initial_error_sum_bp,
             initial_error_count,
@@ -306,7 +347,8 @@ impl DpSolver {
 
         let start = Instant::now();
 
-        // ── DP expansion: one layer per request ──────────────────────────
+        // Process requests in order. Each transition tries every flavour and
+        // legal slot, then merges paths that reach the same accounting state.
         for (req_idx, request) in input.requests.iter().enumerate() {
             let deadline = deadlines[req_idx];
             let earliest_slot = request.earliest_slot.max(input.current_slot);
@@ -330,7 +372,9 @@ impl DpSolver {
                             &tiers,
                         );
 
-                        // Update error accumulators.
+                        // Only assignments inside the active window affect
+                        // this QoS check; older/newer placements still count
+                        // toward carbon and capacity, but not this window.
                         let mut new_error_sum_bp = state_key.error_sum_bp;
                         let mut new_error_count = state_key.error_count();
                         let mut new_mock_remaining = state_key.mock_remaining;
@@ -366,6 +410,9 @@ impl DpSolver {
                             error: flavour.error,
                         };
 
+                        // Different paths can end with identical error and
+                        // occupancy state. Keep only the cheaper path because
+                        // every possible future choice is then shared.
                         let entry = dp_curr.entry(new_key).or_insert((f64::INFINITY, vec![]));
                         if new_cost < entry.0 {
                             let mut new_assignments = prev_assignments.clone();
@@ -389,7 +436,9 @@ impl DpSolver {
                 };
             }
 
-            // ── pruning with warm-start protection ───────────────────────
+            // Pruning bounds the number of states for large batches. Preserve
+            // the warm-start path separately so a feasible incumbent is not
+            // lost merely because it falls outside the top-K candidates.
             if matches!(self.pruning.as_str(), "beam" | "kbest") && dp_curr.len() > self.pruning_k {
                 let mut items: Vec<(DpStateKey, (f64, Vec<RequestAssignment>))> =
                     dp_curr.into_iter().collect();
@@ -441,7 +490,9 @@ impl DpSolver {
                 dp_curr = trimmed;
             }
 
-            // ── timeout: fall back to warm-start solution (if feasible) ──
+            // Return a known feasible incumbent on timeout. If that incumbent
+            // violates the threshold, report infeasibility instead of
+            // pretending the QoS constraint was satisfied.
             if start.elapsed().as_secs_f64() > self.timeout {
                 return if warm_is_feasible {
                     warm_assignments
@@ -453,7 +504,9 @@ impl DpSolver {
             dp_prev = dp_curr;
         }
 
-        // ── feasibility filter ───────────────────────────────────────────
+        // Enforce the average-error budget on complete paths only; checking
+        // partial paths can incorrectly reject a currently high average that
+        // later low-error requests would bring back under the limit.
         if let Some(threshold) = input.max_error_threshold {
             dp_prev.retain(|k, _| {
                 let ec = k.error_count();
@@ -658,8 +711,13 @@ impl DpSolver {
         (assignments, keys)
     }
 
-    /// Greedy fallback: assign each request to the cheapest feasible slot using
-    /// the most accurate (longest duration) flavour available to it.
+    /// Last-resort placement when the DP cannot cover every request.
+    ///
+    /// For each remaining request, use its longest-duration flavour (the
+    /// standard calibrated profiles use the longest option as their most
+    /// accurate one) and choose the cheapest legal slot. This prioritizes
+    /// coverage over a global optimum; callers must not treat it as proof that
+    /// the DP error constraint was feasible.
     pub fn greedy_fallback(
         &self,
         requests: &[SolveRequest],
@@ -672,6 +730,8 @@ impl DpSolver {
         let mut assignments = Vec::new();
 
         for request in requests {
+            // Keep the request's arrival as a lower bound, and never extend
+            // beyond the finite horizon even if its supplied deadline does.
             let earliest_slot = request.earliest_slot.max(current_slot);
             let deadline = request
                 .deadline_slot
@@ -702,6 +762,8 @@ impl DpSolver {
 
             if let Some((cost, best_slot)) = best {
                 let s = best_slot as usize;
+                // Later requests in this same fallback batch see the
+                // occupancy created by this placement.
                 inc_counts[s] += 1;
                 assignments.push(RequestAssignment {
                     request_id: request.request_id,

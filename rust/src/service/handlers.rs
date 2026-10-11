@@ -23,6 +23,8 @@ use crate::service::state::{AppState, ProfileRegistration, ProfileRegistryError,
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
+/// Payload sent by the provider to announce a starting slot or advance the
+/// manual emulation clock with that slot's forecast and observation.
 #[derive(Debug, Deserialize)]
 pub struct AdvanceSlotBody {
     #[serde(default)]
@@ -45,12 +47,14 @@ pub struct AdvanceSlotBody {
     pub forecast: Option<Vec<ForecastPoint>>,
 }
 
+/// One provider forecast value expressed in the provider's global slot space.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ForecastPoint {
     pub slot: i64,
     pub forecast: f64,
 }
 
+/// The measured grid intensity associated with an entered provider slot.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ObservedPoint {
     pub slot: i64,
@@ -58,6 +62,7 @@ pub struct ObservedPoint {
     pub actual: f64,
 }
 
+/// Inclusive upper slot bound accepted by the carbon-intensity monitoring API.
 #[derive(Debug, Deserialize)]
 pub struct CarbonIntensityQuery {
     /// Upper bound slot to return. If omitted, use the current virtual slot.
@@ -68,6 +73,8 @@ pub struct CarbonIntensityQuery {
     pub until_slot: Option<i32>,
 }
 
+/// Build the common JSON error response used by handlers when input validation,
+/// lookup, or runtime operations fail.
 fn api_error(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(serde_json::json!({ "error": msg.into() })))
 }
@@ -113,7 +120,10 @@ fn validate_callback_url(raw: &str, allow_private: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `GET /health` liveness probe; it does not report planning-horizon readiness.
 pub async fn health() -> &'static str {
+    // Liveness is intentionally independent of horizon readiness: this says
+    // the process can answer HTTP, not that it should receive new work.
     "ok"
 }
 
@@ -121,10 +131,13 @@ pub async fn health() -> &'static str {
 ///
 /// Identical repeated registrations are safe; changing an existing profile
 /// requires a new ID so already-created requests are never reinterpreted.
+/// This is the `POST /v1/profiles` handler wired in `service::server`.
 pub async fn register_qos_profile(
     State(state): State<AppState>,
     Json(body): Json<RegisterQosProfilePayload>,
 ) -> Result<StatusCode, ApiError> {
+    // Parse identifiers at the API boundary so malformed values never enter
+    // the registry as strings with inconsistent normalization.
     let profile_id = QosProfileId::parse(body.profile_id)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     let task_kind = TaskKindId::parse(body.task_kind)
@@ -139,6 +152,8 @@ pub async fn register_qos_profile(
         cumulative_error: body.cumulative_error,
     };
 
+    // The registry treats profiles as immutable snapshots. An identical
+    // retry is idempotent, while a caller must choose a new ID to change policy.
     match state.qos_profiles.register(profile) {
         Ok(ProfileRegistration::Created | ProfileRegistration::AlreadyRegistered) => {
             Ok(StatusCode::NO_CONTENT)
@@ -153,6 +168,7 @@ pub async fn register_qos_profile(
 
 /// List profiles that have assignments. Add `?include_inactive=true` to also
 /// retrieve registered policies that no accepted assignment uses yet.
+/// Serves `GET /v1/profiles`, as registered by `service::server`.
 ///
 /// Activity is derived from the scheduler's committed assignments rather
 /// than stored on the immutable profile definition, so failed execution still
@@ -161,6 +177,8 @@ pub async fn list_qos_profiles(
     State(state): State<AppState>,
     Query(query): Query<QosProfilesQuery>,
 ) -> Json<Vec<QosProfileResponse>> {
+    // Activity is derived from assignments rather than profile registration:
+    // registering a policy alone does not mean it has served any work.
     let assigned_profiles: std::collections::HashSet<_> = state
         .shared_state
         .get_current_assignments()
@@ -181,6 +199,7 @@ pub async fn list_qos_profiles(
 }
 
 /// Retrieve one profile by its stable ID and include its current activity state.
+/// Serves `GET /v1/profiles/:profile_id`.
 pub async fn get_qos_profile(
     State(state): State<AppState>,
     Path(profile_id): Path<String>,
@@ -190,6 +209,8 @@ pub async fn get_qos_profile(
         .get_by_str(&profile_id)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))?;
+    // A profile stays active when its assigned request later fails execution;
+    // activity records scheduling use, not successful completion.
     let active = state
         .shared_state
         .get_current_assignments()
@@ -203,6 +224,7 @@ pub async fn get_qos_profile(
 /// The change affects pricing calculations that start after the replacement.
 /// Carbon costs already stored on assignments and submit-time baselines remain
 /// unchanged, as do their historical meanings.
+/// Handles `PUT /v1/admin/capacity-tiers`.
 pub async fn force_set_capacity_tiers(
     State(_state): State<AppState>,
     Json(_body): Json<SetCapacityTiersPayload>,
@@ -317,6 +339,9 @@ fn compute_baseline_carbon_cost(
     arrival_slot: i32,
     flavours: &[Flavour],
 ) -> (f64, i32) {
+    // Reserve the next 1-indexed position in the arrival slot. The baseline is
+    // calculated at submission time and its position is kept stable even if
+    // CarbonShift later moves or re-prices the real assignment.
     let position = {
         let mut counts = state.baseline_slot_counts.lock().unwrap();
         let c = counts.entry(arrival_slot).or_insert(0);
@@ -341,10 +366,18 @@ fn compute_baseline_carbon_cost(
     (cost, accurate.duration)
 }
 
+/// Resolve the immutable QoS policy snapshot for an incoming submission.
+///
+/// An explicit profile ID takes precedence; otherwise task kind selects that
+/// task's registered default. The task may be supplied in the top-level field
+/// or inside the executor payload, but conflicting values are rejected before
+/// the request is queued.
 fn resolve_request_profile(
     state: &AppState,
     body: &SubmitRequestPayload,
 ) -> Result<Arc<QosProfile>, ApiError> {
+    // Resolve an explicitly named profile first so its task kind can serve as
+    // the fallback when the caller omits task information.
     let explicit_profile_id = body
         .qos_profile_id
         .as_deref()
@@ -361,6 +394,8 @@ fn resolve_request_profile(
         })
         .transpose()?;
 
+    // Keep scheduler identity consistent with what the executor will run:
+    // payload.task is the executor-facing task selection.
     let payload_task_kind = body
         .payload
         .get("task")
@@ -396,6 +431,8 @@ fn resolve_request_profile(
         TaskKindId::parse("text_generation").unwrap()
     };
 
+    // Without an explicit ID, choose the deterministic default profile for
+    // the resolved task kind.
     let profile = match selected_profile {
         Some(profile) => profile,
         None => state
@@ -422,6 +459,9 @@ fn resolve_request_profile(
     Ok(Arc::new(profile))
 }
 
+/// Resolve the optional profile filter used by assignment and metric endpoints.
+/// `None` means the caller requested fleet-wide data; an unknown ID is an API
+/// error rather than silently returning an empty result.
 fn resolve_profile_query(
     state: &AppState,
     query: &AssignmentsQuery,
@@ -442,6 +482,8 @@ fn resolve_profile_query(
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))
 }
 
+/// Snapshot the finite planning horizon and derive the readiness fraction
+/// shared by `/v1/horizon` and `/ready`.
 fn compute_horizon(state: &AppState) -> HorizonResponse {
     let current_slot = state.shared_state.get_current_slot();
     let total_slots = state.scheduler.total_slots.max(1);
@@ -464,6 +506,8 @@ pub async fn horizon(State(state): State<AppState>) -> Json<HorizonResponse> {
 /// roll a replacement instance (see PLAN_SERVICE.md Fase 6).
 pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HorizonResponse>) {
     let h = compute_horizon(&state);
+    // Readiness turns false before exhaustion so an orchestrator can stop
+    // sending new traffic; liveness remains available during that transition.
     let status = if h.near_exhaustion {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -487,6 +531,9 @@ pub async fn advance_slot(
     // We must have a real body struct carrying slot, observed, forecast and current_slot, all #[serde(default)]
     Json(body): Json<AdvanceSlotBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Only the provider should move the emulated clock. Rejecting this call
+    // outside manual-clock mode prevents a test protocol from altering a live
+    // scheduler whose time is driven by wall clock.
     if !state.scheduler.manual_clock {
         return Err(api_error(
             StatusCode::CONFLICT,
@@ -522,7 +569,9 @@ pub async fn advance_slot(
         }
     }
 
-    // Update the slot epoch offset upon the first slot advancement.
+    // The provider uses global slot numbers while the engine uses a local
+    // horizon beginning at zero. Learn their fixed offset on the first call,
+    // then translate every later provider slot through it.
     let slot_epoch_offset = update_slot_epoch_offset(&state, body_current_slot).unwrap_or(0);
 
     // let Some(offset) = slot_epoch_offset else { /* 409 */ };
@@ -543,7 +592,9 @@ pub async fn advance_slot(
 
     // init here
 
-    // The announce is the first message, before any advance
+    // The first provider message is an announce, not a rollover: it aligns
+    // provider/engine numbering and supplies current readings without moving
+    // the engine clock a second time.
     if body.kind == "announce" {
         // Sync: the engine is already at the target (0). Do NOT advance. We only update the forecast
         // debug_assert_eq!(state.shared_state.get_current_slot() as i64, target_engine_slot);
@@ -582,6 +633,9 @@ pub async fn advance_slot(
 
     let curr_slot = state.shared_state.get_current_slot();
 
+    // Keep measured current-slot intensity separate from forecast values.
+    // Callback correction can then reprice completed work without destroying
+    // the forecast that the optimizer used when it made the assignment.
     if let Some(observed) = &body.observed {
         // Set actual carbon intensity for the current slot, so that we can adjust
         // in executor callbacks the carbon intensity and the carbon cost.
@@ -602,6 +656,8 @@ pub async fn advance_slot(
         // TODO: allow the scheduler to have access to the real value ONLY for the current slot.
     }
 
+    // Convert provider slot indices to local engine indices and update only
+    // points inside the finite planning horizon.
     if let Some(forecast) = &body.forecast {
         // Update the forecast for the next K(=24) slots in the state.carbon_forecast hashmap.
         let mut carbon_forecast = state.carbon_forecast.write().unwrap();
@@ -623,6 +679,9 @@ pub async fn advance_slot(
         }
     }
 
+    // The provider calls peers sequentially, so do not report this transition
+    // before assignment solving and due dispatch have had a chance to finish.
+    // Keep the wait bounded so one slow batch cannot block the provider forever.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     // Wait until all pending requests are solved and any request due at or before curr_slot
     // has been dispatched to the executor.
@@ -647,8 +706,11 @@ pub async fn advance_slot(
     Ok(Json(serde_json::json!({ "current_slot": curr_slot })))
 }
 
-/// Function invoked upon the first slot advancement to set the slot epoch offset.
-/// Recall that the slot epoch offset is the difference between the provider's global slot numbering and carbonshift's local slot numbering.
+/// Establish or return the fixed provider-to-engine slot-number offset.
+///
+/// Called by `advance_slot` before it translates provider indices. The first
+/// message anchors the provider's global slot to CarbonShift's current local
+/// slot; later messages reuse that same mapping instead of recalculating it.
 fn update_slot_epoch_offset(state: &AppState, slot_0: i64) -> Option<i32> {
     let mut offset = state.slot_epoch_offset.lock().unwrap();
     if offset.is_none() {
@@ -706,6 +768,8 @@ pub async fn carbon_intensity(
     State(state): State<AppState>,
     Query(query): Query<CarbonIntensityQuery>,
 ) -> Json<Vec<serde_json::Value>> {
+    // `slot` is the preferred query parameter; `until_slot` remains an alias
+    // for existing dashboards and scripts.
     let upper = query
         .slot
         .or(query.until_slot)
@@ -714,6 +778,8 @@ pub async fn carbon_intensity(
     let forecast = state.carbon_forecast.as_ref();
     let actual = state.actual_carbon_intensity.lock().unwrap();
 
+    // Return a dense series through the requested slot. Missing forecast
+    // points are represented as zero and missing observations as JSON null.
     let rows = (0..=upper)
         .map(|slot| {
             let forecast_ci = forecast
@@ -749,6 +815,8 @@ pub async fn get_assignments(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<Vec<AssignmentItem>>, ApiError> {
+    // Resolve the profile before reading the full assignment snapshot so a
+    // misspelled profile is reported as an API error, not an empty list.
     let profile = resolve_profile_query(&_state, &_query)?;
     let curr_assignments = _state.shared_state.get_current_assignments();
     let filtered_assignments: Vec<_> = curr_assignments
@@ -770,6 +838,8 @@ pub async fn get_assignments(
         })
         .collect();
 
+    // Sort after mapping from the hash-backed state to give API consumers a
+    // stable order across polls and process runs.
     let items = {
         let mut items: Vec<AssignmentItem> = filtered_assignments
             .into_iter()
@@ -809,6 +879,8 @@ pub async fn get_slot_detail(
 ) -> Result<Json<SlotDetailResponse>, ApiError> {
     let carbon_forecast = _state.carbon_forecast.read().unwrap().clone();
 
+    // Accept both configured assignment reach and known forecast length:
+    // a provider may publish farther ahead than the solver's immediate window.
     // horizon is yielded by max(current_slot + assignment_max_future_slots, carbon_forecast length)
     let horizon = std::cmp::max(
         _state.shared_state.get_current_slot() + _state.scheduler.assignment_max_future_slots,
@@ -826,6 +898,9 @@ pub async fn get_slot_detail(
         return Err(api_error(StatusCode::BAD_REQUEST, "Slot exceeds horizon"));
     }
 
+    // Aggregate committed assignments from every profile. Capacity tiers are
+    // global, so slot occupancy is also global even when the error policy is
+    // profile-scoped.
     let assignments = _state.shared_state.get_requests_in_slot(_slot);
     // compute flavour counts
     let flavour_counts: HashMap<String, usize> =
@@ -895,6 +970,9 @@ pub async fn get_cost_metrics(
     let mut forecasted_pending_carbon_cost = 0.0;
     let mut total_baseline_carbon_cost = 0.0;
 
+    // Completed requests contribute measured costs; scheduled but unresolved
+    // work contributes forecast cost. Failed requests remain in the baseline
+    // total but are excluded from both completed actuals and pending forecast.
     for (req_id, t) in tracked.iter() {
         if selected_profile
             .as_ref()
@@ -917,6 +995,7 @@ pub async fn get_cost_metrics(
         }
     }
 
+    // No baseline energy means the percentage is undefined rather than zero.
     let actual_carbon_saving_pct = if current_actual_baseline_carbon_cost > 0.0 {
         Some(
             ((current_actual_baseline_carbon_cost - current_actual_carbon_cost)
@@ -956,6 +1035,8 @@ pub async fn get_error_history(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<ErrorHistoryResponse>, ApiError> {
+    // Validate the requested interval before collecting metrics; all slot
+    // indexes are local engine slots within this finite horizon.
     let current_slot = _state.shared_state.get_current_slot();
     let horizon = _state.scheduler.total_slots;
 
@@ -1017,6 +1098,9 @@ pub async fn get_error_history(
     let mut running_error_sum = 0.0;
     let mut running_count = 0u64;
 
+    // Seed cumulative error with all history before `from`; the returned
+    // series then shows the cumulative average as it evolves through the
+    // selected interval, rather than restarting at its first displayed slot.
     for s in 0..from {
         let stats = if let Some(profile_id) = selected_profile_id {
             _state
@@ -1046,6 +1130,8 @@ pub async fn get_error_history(
             None
         };
 
+        // This is an observational endpoint, so unlike an in-progress solve
+        // it excludes no movable assignments from the current window.
         let empty_exclusion = std::collections::HashSet::new();
         let win_stats = if let Some(profile_id) = selected_profile_id {
             _state.shared_state.get_profile_window_error_stats(
@@ -1104,6 +1190,8 @@ pub async fn submit_request(
     State(state): State<AppState>,
     Json(body): Json<SubmitRequestPayload>,
 ) -> Result<(StatusCode, Json<RequestStatusResponse>), ApiError> {
+    // Reject invalid timing and callback destinations before allocating an ID
+    // or mutating either the API's tracked-request table or engine queue.
     if body.deadline_seconds < 0.0 {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1119,6 +1207,9 @@ pub async fn submit_request(
 
     let request_id = state.next_request_id();
     let current_slot = state.shared_state.get_current_slot();
+    // Convert the provider's global arrival index only after its epoch offset
+    // is known. During the initial announce, or for callers without a global
+    // slot, use the engine's current slot as the safe local fallback.
     let arrival_slot = match (
         body.arrival_slot_global,
         *state.slot_epoch_offset.lock().unwrap(),
@@ -1140,6 +1231,8 @@ pub async fn submit_request(
         _ => current_slot, // offset not yet known, or client didn't send it
     };
 
+    // Deadlines are relative to CarbonShift's current local slot, not the
+    // provider's future arrival slot. The solver later enforces both bounds.
     let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
     let slots_ahead = ((body.deadline_seconds / eff_slot_dur).ceil() as i32).max(1);
     let deadline_slot = (current_slot + slots_ahead).min(state.scheduler.total_slots - 1);
@@ -1149,6 +1242,8 @@ pub async fn submit_request(
             "deadline falls before arrival_slot; the request cannot be scheduled",
         ));
     }
+    // Freeze the no-shifting counterfactual now. It must not change when the
+    // optimizer later moves the real assignment or global tiers are replaced.
     let task_flavours = profile.flavours.clone();
     let (baseline_carbon_cost, baseline_duration) =
         compute_baseline_carbon_cost(&state, arrival_slot, &task_flavours);
@@ -1160,6 +1255,8 @@ pub async fn submit_request(
         executor_payload["task"] = serde_json::Value::String(profile.task_kind.to_string());
     }
 
+    // Install callback and baseline metadata before enqueueing: the scheduler
+    // may solve quickly, and an executor callback must always find its record.
     state.tracked.lock().unwrap().insert(
         request_id,
         TrackedRequest::new(
@@ -1183,8 +1280,9 @@ pub async fn submit_request(
     // TODO: remove this debug print
     println!("[Service] Submitted request ID: {}", request_id);
 
-    // Poll for the solver's assignment; short sleeps so we don't block the
-    // async runtime while waiting for the (std-threaded) engine to catch up.
+    // The engine's solver runs on standard threads. Poll asynchronously so
+    // this handler yields to Tokio while waiting; timeout returns 202 but does
+    // not cancel or remove the request from the engine queue.
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs_f64(state.service_cfg.submit_wait_timeout_secs);
     loop {
@@ -1248,6 +1346,8 @@ pub async fn get_request_status(
     State(state): State<AppState>,
     Path(request_id): Path<u64>,
 ) -> Result<Json<RequestStatusResponse>, ApiError> {
+    // Copy API-owned lifecycle fields while holding its mutex, then release
+    // the lock before reading engine assignments and building the response.
     let tracked_status = {
         let guard = state.tracked.lock().unwrap();
         let t = guard
@@ -1262,6 +1362,8 @@ pub async fn get_request_status(
     };
     let (status, error, baseline_carbon_cost, qos_profile_id) = tracked_status;
 
+    // A request can be accepted before it has an assignment, so scheduled
+    // fields are optional even when the tracked request is known.
     let assignments = state.shared_state.get_current_assignments();
     let assignment = assignments.get(&request_id);
     let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
@@ -1314,6 +1416,8 @@ pub async fn executor_callback(
     Path(request_id): Path<u64>,
     Json(body): Json<ExecutorCallbackPayload>,
 ) -> Result<StatusCode, ApiError> {
+    // Executor feedback corrects predictions in place; absent optional
+    // measurements leave the corresponding forecast estimate unchanged.
     if let Some(actual_error) = body.result.get("actual_error_pct").and_then(|v| v.as_f64()) {
         // TODO: remove
         // For auditing purposes, we log the diff between the predicted and actual error.
@@ -1331,6 +1435,8 @@ pub async fn executor_callback(
             .correct_assignment_error(request_id, actual_error);
     }
 
+    // Older executor responses may omit the explicit baseline duration. If
+    // the Accurate flavour itself ran, its measured time is also the baseline.
     let actual_execution_time = body
         .result
         .get("execution_time_seconds")
@@ -1360,6 +1466,9 @@ pub async fn executor_callback(
     //
     // The formula is less readable than the direct one, but avoids having here explicit cap_level_multiplier and hourly_scale values.
 
+    // Reprice the committed estimate with whichever actual factors are known.
+    // A missing carbon-intensity or runtime measurement contributes a ratio of
+    // one, preserving that part of the original estimate.
     let mut actual_carbon_cost = None;
     if let Some(assignment) = state
         .shared_state
@@ -1380,6 +1489,9 @@ pub async fn executor_callback(
         }
     }
 
+    // Update lifecycle status and the stable arrival-slot baseline together;
+    // copy callback data out so network I/O never happens while the mutex is
+    // held.
     let (callback_url, actual_baseline_carbon_cost) = {
         let mut guard = state.tracked.lock().unwrap();
         let t = guard
@@ -1409,6 +1521,8 @@ pub async fn executor_callback(
         (t.callback_url.clone(), actual_baseline)
     };
 
+    // Forward caller notification in the background. The executor callback
+    // returns promptly even if a client callback is slow or unavailable.
     if let Some(url) = callback_url {
         let http = state.http.clone();
         let payload = CallerCallbackPayload {

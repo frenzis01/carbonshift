@@ -35,6 +35,8 @@ struct RecoveryData {
 }
 
 impl RecoveryData {
+    /// Create the first recovery record for a profile using its configured
+    /// influence as both the starting and current value.
     fn new(base_influence: f64) -> Self {
         Self {
             mock_pool: PersistentMockPool::default(),
@@ -54,17 +56,24 @@ pub(super) struct RecoveryState {
 }
 
 impl RecoveryState {
+    /// Start with no cached recovery state; profile entries are created lazily
+    /// when a solve first needs infeasibility recovery.
     pub(super) fn new() -> Self {
         Self {
             profiles: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Return the state for one profile, inserting a fresh pool on first use.
+    /// Keeping this lookup separate makes every recovery path use the same
+    /// profile-isolation rule.
     fn profile_state<'a>(
         profiles: &'a mut HashMap<QosProfileId, RecoveryData>,
         profile_id: &QosProfileId,
         base_influence: f64,
     ) -> &'a mut RecoveryData {
+        // Each QoS profile owns its own mock pool and influence history, so
+        // one profile's infeasible batches cannot change another's recovery.
         profiles
             .entry(profile_id.clone())
             .or_insert_with(|| RecoveryData::new(base_influence))
@@ -73,6 +82,9 @@ impl RecoveryState {
 
 // ─── Simple error baseline (internal) ────────────────────────────────────────
 
+/// Weighted error history accumulated before the current batch is considered.
+///
+/// Counts may be fractional because decayed history is deliberately weighted.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ErrorBaseline {
     pub(super) error_sum: f64,
@@ -81,6 +93,8 @@ pub(super) struct ErrorBaseline {
 }
 
 impl ErrorBaseline {
+    /// Store both the weighted sum and count so callers can add real,
+    /// decayed, and synthetic history before computing the average.
     pub(super) fn new(error_sum: f64, request_count: f64) -> Self {
         let avg = if request_count > 0.0 {
             error_sum / request_count
@@ -129,6 +143,8 @@ pub(super) fn augment_with_decayed_past(
             continue;
         }
         let slot_avg_err: f64 = slot_assignments.iter().map(|a| a.error).sum::<f64>() / n as f64;
+        // The nearest slot outside the real window receives the largest
+        // weight; each additional slot contributes progressively less.
         let weight = (decay_slots - idx + 1) as f64 / denominator;
         weighted_count += n as f64 * weight;
         weighted_error_sum += slot_avg_err * n as f64 * weight;
@@ -167,6 +183,9 @@ pub(super) fn augment_with_virtual_prehistory(
 
     let mut virtual_requests = 0i32;
     for offset in 0..missing {
+        // Derive a seed from the configured seed and virtual slot so repeated
+        // solves produce the same synthetic history instead of new random
+        // error-budget inputs on every retry.
         let seed = recovery
             .prehistory_random_seed
             .wrapping_add((current_slot as u64).wrapping_sub(missing as u64 + offset as u64));
@@ -191,7 +210,9 @@ pub(super) fn augment_with_virtual_prehistory(
 
 /// Apply the configured infeasibility-recovery policy.
 ///
-/// Returns (augmented_baseline, mock_pool_for_dp).
+/// Returns the error baseline passed to the solver and the matching synthetic
+/// pool used by its DP state transitions. The pool is persistent per profile
+/// and slot so retries consume a stable amount of mock history.
 pub(super) fn apply_infeasibility_recovery(
     current_slot: i32,
     baseline: ErrorBaseline,
@@ -249,6 +270,9 @@ pub(super) fn apply_infeasibility_recovery(
 
 // ─── mock pool helpers ────────────────────────────────────────────────────────
 
+/// Update a profile's effective synthetic-history influence at most once per
+/// slot. Repeated high-error slots reduce it by a configured step; a slot
+/// within the threshold restores the configured base influence.
 fn update_mock_influence(
     slot: i32,
     baseline_avg: f64,
@@ -264,12 +288,16 @@ fn update_mock_influence(
         recovery.mock_influence.clamp(0.0, 1.0),
     );
     if state.mock_influence.last_eval_slot == Some(slot) {
+        // A slot can trigger multiple solver retries; only one decay step is
+        // allowed per slot, otherwise retries would change their own inputs.
         return;
     }
     let base = recovery.mock_influence.clamp(0.0, 1.0);
     let decay = recovery.mock_influence_decay_step.max(0.0);
     state.mock_influence.base = base;
     if baseline_avg > max_error_threshold {
+        // Repeatedly exceeding the profile threshold gradually reduces how
+        // much synthetic history can dilute the real observed error.
         state.mock_influence.above_threshold_streak += 1;
         state.mock_influence.effective =
             (base - state.mock_influence.above_threshold_streak as f64 * decay).max(0.0);
@@ -343,6 +371,11 @@ fn get_or_seed_mock_pool(
     )
 }
 
+/// Build a new slot's mock pool according to the recovery mode.
+///
+/// `carryover` reuses requests that just left the past window; `forecast`
+/// synthesizes a reproducible workload count and error level. Unknown modes
+/// contribute no mocks, leaving the baseline unchanged.
 fn compute_mock_seed(
     slot: i32,
     profile_id: &QosProfileId,
@@ -353,6 +386,9 @@ fn compute_mock_seed(
     influence: f64,
     snapshot: &SolverSnapshot,
 ) -> (i32, f64) {
+    // The selected recovery mode determines where the initial synthetic
+    // requests come from: recently expired real work, or a deterministic
+    // forecast of workload.
     let (mut count, error) = match mode {
         "carryover" => {
             let window_start = (slot - assignment.error_window_past).max(0);
@@ -389,13 +425,22 @@ fn compute_mock_seed(
     (count.max(0), error.max(0.0))
 }
 
+/// Choose the configured synthetic error or the mode-specific estimate,
+/// clamping the result to a non-negative percentage.
 fn resolve_mock_error(fallback: f64, recovery: &InfeasibilityConfig) -> f64 {
+    // An explicit per-request error overrides the mode-specific estimate;
+    // clamp either source so synthetic data cannot contribute negative error.
     match recovery.mock_error_per_request {
         Some(v) => v.max(0.0),
         None => fallback.max(0.0),
     }
 }
 
+/// Persist the number of synthetic requests consumed by a successful solve.
+///
+/// This is called from both solver strategies after they have computed their
+/// post-batch error accounting; it leaves unconsumed requests available to
+/// retries in the same profile and slot.
 pub(super) fn consume_mock_pool(
     slot: i32,
     mode: &str,
@@ -404,19 +449,27 @@ pub(super) fn consume_mock_pool(
     recovery_mode: &str,
     recovery_state: &RecoveryState,
 ) {
+    // Greedy recovery does not feed mock requests into the DP state, so it
+    // must not consume the persistent pool used by a later DP solve.
     if recovery_mode.trim().to_lowercase() == "min_error_greedy" {
         return;
     }
     let mut profiles = recovery_state.profiles.lock().unwrap();
     if let Some(state) = profiles.get_mut(profile_id) {
+        // A retry may have moved to another slot or recovery mode. Consume
+        // only the pool that was actually supplied to this solve.
         if state.mock_pool.slot == Some(slot) && state.mock_pool.mode.as_deref() == Some(mode) {
             state.mock_pool.remaining = (state.mock_pool.remaining - consumed.max(0)).max(0);
         }
     }
 }
 
+/// Clear one profile's cached synthetic pool without discarding its influence
+/// history. Used when recovery switches to a policy that injects no mocks.
 fn reset_mock_pool(profile_id: &QosProfileId, recovery_state: &RecoveryState) {
     if let Some(state) = recovery_state.profiles.lock().unwrap().get_mut(profile_id) {
+        // Keep the profile's influence history, but remove any synthetic
+        // requests left over from the mode that has just been disabled.
         state.mock_pool.slot = None;
         state.mock_pool.mode = None;
         state.mock_pool.remaining = 0;
