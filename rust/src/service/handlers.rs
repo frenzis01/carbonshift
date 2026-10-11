@@ -496,6 +496,25 @@ fn compute_horizon(state: &AppState) -> HorizonResponse {
     }
 }
 
+/// Convert a relative deadline duration into the latest local slot allowed
+/// for a request.
+///
+/// The slack starts at the request's resolved arrival slot, not at the
+/// scheduler's possibly older current slot. This matters during manual-clock
+/// emulation, where CarbonShift receives requests for K+1 before its clock
+/// advances from K. The result is clamped to the finite planning horizon.
+fn deadline_slot_from_slack(
+    arrival_slot: i32,
+    deadline_seconds: f64,
+    slot_duration_secs: f64,
+    total_slots: i32,
+) -> i32 {
+    let slots_ahead = ((deadline_seconds / slot_duration_secs).ceil() as i32).max(1);
+    arrival_slot
+        .saturating_add(slots_ahead)
+        .min(total_slots - 1)
+}
+
 /// `GET /v1/horizon` — how much of the finite planning horizon has elapsed.
 pub async fn horizon(State(state): State<AppState>) -> Json<HorizonResponse> {
     Json(compute_horizon(&state))
@@ -1192,10 +1211,10 @@ pub async fn submit_request(
 ) -> Result<(StatusCode, Json<RequestStatusResponse>), ApiError> {
     // Reject invalid timing and callback destinations before allocating an ID
     // or mutating either the API's tracked-request table or engine queue.
-    if body.deadline_seconds < 0.0 {
+    if !body.deadline_seconds.is_finite() || body.deadline_seconds < 0.0 {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            "deadline_seconds must be >= 0",
+            "deadline_seconds must be finite and >= 0",
         ));
     }
     if let Some(cb) = &body.callback_url {
@@ -1231,11 +1250,16 @@ pub async fn submit_request(
         _ => current_slot, // offset not yet known, or client didn't send it
     };
 
-    // Deadlines are relative to CarbonShift's current local slot, not the
-    // provider's future arrival slot. The solver later enforces both bounds.
+    // Convert the caller's relative time slack to whole slots. Use the
+    // resolved arrival as the anchor: during an ordered manual-clock tick
+    // CarbonShift can still be at K when the submitted request belongs to K+1.
     let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
-    let slots_ahead = ((body.deadline_seconds / eff_slot_dur).ceil() as i32).max(1);
-    let deadline_slot = (current_slot + slots_ahead).min(state.scheduler.total_slots - 1);
+    let deadline_slot = deadline_slot_from_slack(
+        arrival_slot,
+        body.deadline_seconds,
+        eff_slot_dur,
+        state.scheduler.total_slots,
+    );
     if deadline_slot < arrival_slot {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -1549,6 +1573,27 @@ pub async fn executor_callback(
 mod tests {
     use super::*;
     use std::sync::RwLock;
+
+    #[test]
+    fn relative_deadline_uses_future_arrival_slot_as_its_base() {
+        // CarbonShift may still be at K=10 when this request arrives for K+1=11.
+        // Six ten-second slots of slack must end at K+7=17, not K+6=16.
+        assert_eq!(deadline_slot_from_slack(11, 60.0, 10.0, 100), 17);
+    }
+
+    #[test]
+    fn relative_deadline_keeps_current_slot_behavior_without_future_arrival() {
+        // Ordinary requests resolve arrival_slot to current_slot, so their
+        // deadline remains current_slot plus the rounded-up slack.
+        assert_eq!(deadline_slot_from_slack(10, 60.0, 10.0, 100), 16);
+    }
+
+    #[test]
+    fn relative_deadline_rounds_up_minimizes_to_one_slot_and_clamps_to_horizon() {
+        assert_eq!(deadline_slot_from_slack(11, 0.0, 10.0, 100), 12);
+        assert_eq!(deadline_slot_from_slack(11, 61.0, 10.0, 100), 18);
+        assert_eq!(deadline_slot_from_slack(95, 60.0, 10.0, 100), 99);
+    }
 
     #[test]
     fn rejects_non_http_scheme() {

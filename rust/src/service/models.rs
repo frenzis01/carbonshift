@@ -54,8 +54,10 @@ pub struct QosProfileResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitRequestPayload {
-    /// Seconds from now by which the job must complete. Converted internally
-    /// to a deadline slot using the service's own real-time slot clock.
+    /// Relative time slack, in seconds, from request arrival to its deadline.
+    /// CarbonShift rounds this up to whole slots and adds it to the resolved
+    /// `arrival_slot` (the current slot when no provider-aligned arrival is
+    /// supplied), then clamps the result to the planning horizon.
     pub deadline_seconds: f64,
     /// URL the service will POST the final result to once a result callback
     /// is received from the executor. Optional: if omitted, the caller must
@@ -73,7 +75,8 @@ pub struct SubmitRequestPayload {
     #[serde(default)]
     pub task_kind: Option<String>,
 
-    // TODO: i32 or i64?
+    /// Optional provider-global arrival slot, translated to the engine's
+    /// local slot using the offset learned during the provider announce.
     #[serde(default)]
     pub arrival_slot_global: Option<i32>,
 }
