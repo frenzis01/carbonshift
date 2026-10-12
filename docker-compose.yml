@@ -58,6 +58,28 @@ services:
       - carbonshift
       - provider
 
+  client-2:
+    build: ./services/client
+    profiles: ["multi-client"]
+    ports:
+      - "8101:8100"
+    environment:
+      CARBONSHIFT_URL: http://carbonshift:8080
+      CARBONSHIFT_API_KEY: "${CARBONSHIFT_API_KEY:-}"
+      CLIENT_SELF_BASE_URL: http://client-2:8100
+      CLIENT_METRICS_PATH: data/metrics-client-2.jsonl
+      PROVIDER_URL: http://provider:9100
+      PROVIDER_SLOT_MINUTES: "${PROVIDER_SLOT_MINUTES:-60}"
+      CLIENT_CALLBACK_TIMEOUT_SECONDS: 6000
+      CLIENT_QOS_PROFILE_VERSION: "${CLIENT_QOS_PROFILE_VERSION:-v1}"
+      CLIENT_QOS_PROFILE_THRESHOLD_POSITION: "${CLIENT_QOS_PROFILE_THRESHOLD_POSITION:-0.75}"
+      CLIENT_QOS_PROFILE_DEFINITIONS_PATH: "${CLIENT_QOS_PROFILE_DEFINITIONS_PATH:-}"
+      CLIENT_QOS_PROFILE_REGISTRATION_ATTEMPTS: "${CLIENT_QOS_PROFILE_REGISTRATION_ATTEMPTS:-10}"
+      CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS: "${CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS:-2.0}"
+    depends_on:
+      - carbonshift
+      - provider
+
   provider:
     build: ./services/provider
     ports:
@@ -71,6 +93,7 @@ services:
       PROVIDER_NOTIFY_TIMEOUT_SECONDS: "${PROVIDER_NOTIFY_TIMEOUT_SECONDS:-180}"
       CARBONSHIFT_URL: http://carbonshift:8080
       CLIENT_URL: http://client:8100
+      PROVIDER_CLIENT_URLS: "${PROVIDER_CLIENT_URLS:-}"
       EXECUTOR_URL: http://executor:9000
       PROVIDER_SELF_BASE_URL: http://provider:9100
     # depends_on: 
@@ -87,15 +110,15 @@ services:
       VISUALIZER_PORT: 8500
       CARBONSHIFT_URL: http://carbonshift:8080
       CARBONSHIFT_API_KEY: "${CARBONSHIFT_API_KEY:-}"
-      CLIENT_URL: http://client:8100
       PROVIDER_URL: http://provider:9100
     depends_on:
       - carbonshift
       - client
 
-  # One-off runner for the fake-time emulation test (see client/README.md
+  # One-off runners for fake-time emulation (see client/README.md
   # §"Emulazione a tempo fittizio"). Not started by `docker compose up`
-  # (profile-gated); run explicitly once the stack above is up:
+  # (profile-gated); run explicitly once the stack above is up. The
+  # multi-client runner uses the `multi-client` profile and client-2:
   #   MANUAL_CLOCK=1 SUBMIT_WAIT_TIMEOUT_SECS=0.3 docker compose up -d --build
   #   docker compose run --rm emulation --slots 4 --per-slot 3 --slot-minutes 30
   emulation:
@@ -119,6 +142,39 @@ services:
       - scripts/run_emulation.py
       - --client-url
       - http://client:8100
+      - --executor-url
+      - http://executor:9000
+      - --provider-url
+      - http://provider:9100
+
+  emulation-multi:
+    build: ./services/client
+    profiles: ["multi-client"]
+    healthcheck:
+      disable: true
+    depends_on:
+      - client
+      - client-2
+      - provider
+    environment:
+      CARBONSHIFT_URL: http://carbonshift:8080
+      CARBONSHIFT_API_KEY: "${CARBONSHIFT_API_KEY:-}"
+      CLIENT_SELF_BASE_URL: http://client:8100
+      PROVIDER_URL: http://provider:9100
+      CLIENT_QOS_PROFILE_VERSION: "${CLIENT_QOS_PROFILE_VERSION:-v1}"
+      CLIENT_QOS_PROFILE_THRESHOLD_POSITION: "${CLIENT_QOS_PROFILE_THRESHOLD_POSITION:-0.75}"
+      CLIENT_QOS_PROFILE_DEFINITIONS_PATH: "${CLIENT_QOS_PROFILE_DEFINITIONS_PATH:-}"
+    entrypoint:
+      - python3
+      - scripts/run_emulation_multi.py
+      - --client-url
+      - http://client:8100
+      - --client-url
+      - http://client-2:8100
+      - --task
+      - ner
+      - --task
+      - question_answering
       - --executor-url
       - http://executor:9000
       - --provider-url

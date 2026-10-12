@@ -17,7 +17,7 @@ use crate::service::models::{
     ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, QosProfileResponse,
     QosProfilesQuery, RegisterQosProfilePayload, RequestStatus, RequestStatusResponse,
     SetCapacityTiersPayload, SlotDetailResponse, SlotErrorItem, StatsResponse,
-    SubmitRequestPayload,
+    SubmitRequestPayload, TrackedRequestResponse,
 };
 use crate::service::state::{AppState, ProfileRegistration, ProfileRegistryError, TrackedRequest};
 
@@ -1409,6 +1409,80 @@ pub async fn get_request_status(
     }))
 }
 
+/// `GET /v1/requests` — list scheduler-owned state for every tracked request.
+pub async fn list_request_statuses(
+    State(state): State<AppState>,
+) -> Json<Vec<TrackedRequestResponse>> {
+    let tracked: Vec<_> = {
+        let guard = state.tracked.lock().unwrap();
+        guard
+            .iter()
+            .map(|(request_id, request)| {
+                (
+                    *request_id,
+                    request.status,
+                    request.qos_profile_id.to_string(),
+                    request.arrival_slot,
+                    request
+                        .payload
+                        .get("task")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    request.baseline_carbon_cost,
+                    request.actual_baseline_carbon_cost,
+                    request.actual_carbon_cost,
+                    request.actual_error_pct,
+                    request.execution_time_seconds,
+                    request.baseline_execution_time_seconds,
+                    request.error.clone(),
+                )
+            })
+            .collect()
+    };
+    let assignments = state.shared_state.get_current_assignments();
+    let mut responses: Vec<_> = tracked
+        .into_iter()
+        .map(
+            |(
+                request_id,
+                status,
+                qos_profile_id,
+                arrival_slot,
+                task,
+                baseline_carbon_cost,
+                actual_baseline_carbon_cost,
+                actual_carbon_cost,
+                actual_error_pct,
+                execution_time_seconds,
+                baseline_execution_time_seconds,
+                error,
+            )| {
+                let assignment = assignments.get(&request_id);
+                TrackedRequestResponse {
+                    request_id,
+                    task,
+                    qos_profile_id,
+                    status,
+                    arrival_slot,
+                    scheduled_slot: assignment.map(|item| item.scheduled_slot),
+                    flavour: assignment.map(|item| item.flavour_name.clone()),
+                    carbon_cost: assignment.map(|item| item.carbon_cost),
+                    actual_carbon_cost,
+                    baseline_carbon_cost,
+                    actual_baseline_carbon_cost,
+                    actual_error_pct,
+                    execution_time_seconds,
+                    baseline_execution_time_seconds,
+                    scheduled_at: assignment.map(|item| item.assignment_time),
+                    error,
+                }
+            },
+        )
+        .collect();
+    responses.sort_by_key(|request| request.request_id);
+    Json(responses)
+}
+
 /// `POST /v1/callback/{id}` — result callback from the executor.
 ///
 /// Marks the request completed/failed and forwards the result to the
@@ -1527,6 +1601,14 @@ pub async fn executor_callback(
             RequestStatus::Failed
         };
         t.error = body.error.clone();
+        t.actual_carbon_cost = actual_carbon_cost;
+        t.actual_baseline_carbon_cost = None;
+        t.actual_error_pct = body
+            .result
+            .get("actual_error_pct")
+            .and_then(|value| value.as_f64());
+        t.execution_time_seconds = actual_execution_time;
+        t.baseline_execution_time_seconds = baseline_execution_time;
 
         let ci_ratio = state.carbon_intensity_ratio(t.arrival_slot);
         let time_ratio = match (baseline_execution_time, t.baseline_duration) {
@@ -1537,6 +1619,7 @@ pub async fn executor_callback(
         let actual_baseline = if ci_ratio.is_some() || time_ratio.is_some() {
             let cost = t.baseline_carbon_cost * ci_ratio.unwrap_or(1.0) * time_ratio.unwrap_or(1.0);
             t.baseline_carbon_cost = cost;
+            t.actual_baseline_carbon_cost = Some(cost);
             Some(cost)
         } else {
             None

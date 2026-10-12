@@ -253,24 +253,30 @@ def peers_from_settings(settings) -> list[Peer]:
     """Build the peer list (and its policy order) from configuration.
 
     Order rationale is documented in the module docstring; keeping it here
-    makes it a single reviewable place.
+    makes it a single reviewable place. Client producers are an ordered,
+    configuration-driven group so adding another client does not change the
+    fan-out policy.
     """
-    peers = [
+    client_peers = [
         Peer(
-            name="client",
-            # TODO: what if we have multiple clients... ?
-            base_url=settings.client_url,
+            name="client" if index == 1 else f"client-{index}",
+            base_url=base_url,
             advance_path="/v1/tick",
-            order=10,
-            role=Role.PRODUCER
-        ),
+            order=index * 10,
+            role=Role.PRODUCER,
+        )
+        for index, base_url in enumerate(settings.client_urls, start=1)
+    ]
+    first_consumer_order = (len(client_peers) + 1) * 10
+    peers = [
+        *client_peers,
         Peer(
             name="carbonshift",
             base_url=settings.carbonshift_url,
             # carbonshift already exposes exactly this endpoint; the provider
             # assumes the *role* of the clock driver the client plays today.
             advance_path="/v1/admin/advance-slot",
-            order=20,
+            order=first_consumer_order,
             role=Role.CONSUMER,
         )
     ]
@@ -280,7 +286,7 @@ def peers_from_settings(settings) -> list[Peer]:
                 name="executor",
                 base_url=settings.executor_url,
                 advance_path="/admin/advance-slot",
-                order=30,
+                order=first_consumer_order + 10,
                 role=Role.CONSUMER,
             )
         )

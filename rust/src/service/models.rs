@@ -119,6 +119,30 @@ pub struct RequestStatusResponse {
     pub error: Option<String>,
 }
 
+/// Scheduler-owned lifecycle and result metadata for one tracked request.
+///
+/// Unlike the submit response, this summary is intended for monitoring every
+/// request without consulting the caller that originally submitted it.
+#[derive(Debug, Serialize)]
+pub struct TrackedRequestResponse {
+    pub request_id: u64,
+    pub task: Option<String>,
+    pub qos_profile_id: String,
+    pub status: RequestStatus,
+    pub arrival_slot: i32,
+    pub scheduled_slot: Option<i32>,
+    pub flavour: Option<String>,
+    pub carbon_cost: Option<f64>,
+    pub actual_carbon_cost: Option<f64>,
+    pub baseline_carbon_cost: f64,
+    pub actual_baseline_carbon_cost: Option<f64>,
+    pub actual_error_pct: Option<f64>,
+    pub execution_time_seconds: Option<f64>,
+    pub baseline_execution_time_seconds: Option<f64>,
+    pub scheduled_at: Option<f64>,
+    pub error: Option<String>,
+}
+
 /// Body of `POST /v1/callback/{request_id}`, sent by the executor.
 #[derive(Debug, Deserialize)]
 pub struct ExecutorCallbackPayload {

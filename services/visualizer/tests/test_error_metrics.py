@@ -32,7 +32,7 @@ class ErrorMetricsTests(unittest.TestCase):
 
     def test_error_plot_uses_current_scheduler_error_snapshots(self):
         responses = {
-            "http://client:8100/requests": [
+            "http://carbonshift:8080/v1/requests": [
                 {
                     "request_id": 1,
                     "scheduled_slot": 10,
@@ -43,9 +43,6 @@ class ErrorMetricsTests(unittest.TestCase):
                     "carbon_cost": 1.0,
                 }
             ],
-            "http://client:8100/metrics/summary": {
-                "scheduler": {"tasks": {}, "global_error_avg": 88.0}
-            },
             "http://carbonshift:8080/v1/horizon": {
                 "current_slot": 2,
                 "total_slots": 100,
@@ -66,8 +63,7 @@ class ErrorMetricsTests(unittest.TestCase):
         }
 
         cache = {
-            "client_requests": [],
-            "client_summary": {},
+            "scheduler_requests": [],
             "capacity_tiers": [],
             "active_profiles": [],
             "profiles_unavailable_logged": False,
@@ -192,6 +188,18 @@ class ErrorMetricsTests(unittest.TestCase):
                 "baseline_execution_time_seconds": 0.2,
             },
         ]
+        second_client_requests = [
+            {
+                "request_id": 3,
+                "qos_profile_id": "qa-calibrated-v1",
+                "task": "question_answering",
+                "scheduled_slot": 2,
+                "arrival_slot": 1,
+                "flavour": "Fast",
+                "actual_error_pct": None,
+                "status": "submitted",
+            },
+        ]
         assignments = [
             {
                 "request_id": 1,
@@ -211,20 +219,31 @@ class ErrorMetricsTests(unittest.TestCase):
                 "carbon_cost": 9.0,
                 "error": 85.0,
             },
+            {
+                "request_id": 3,
+                "qos_profile_id": "qa-calibrated-v1",
+                "scheduled_slot": 2,
+                "arrival_slot": 1,
+                "flavour_name": "Fast",
+                "carbon_cost": 1.0,
+                "error": 24.0,
+            },
         ]
         capacity_tiers = [
             {"max_requests": 30, "multiplier": 1.0},
             {"max_requests": None, "multiplier": 1.5},
         ]
         responses = {
-            "http://client:8100/requests": requests,
-            "http://client:8100/metrics/summary": {"scheduler": {"tasks": {}}},
+            "http://carbonshift:8080/v1/requests": requests + second_client_requests,
             "http://carbonshift:8080/v1/profiles": profiles,
             "http://carbonshift:8080/v1/horizon": {"current_slot": 2, "total_slots": 100},
             "http://carbonshift:8080/v1/stats": {},
             "http://provider:9100/v1/slot": {"current_slot": 2},
             "http://carbonshift:8080/v1/assignments": assignments,
-            "http://carbonshift:8080/v1/assignments?qos_profile_id=qa-calibrated-v1": [assignments[0]],
+            "http://carbonshift:8080/v1/assignments?qos_profile_id=qa-calibrated-v1": [
+                assignments[0],
+                assignments[2],
+            ],
             "http://carbonshift:8080/v1/assignments?qos_profile_id=ner-calibrated-v1": [assignments[1]],
             "http://carbonshift:8080/v1/metrics/costs?qos_profile_id=qa-calibrated-v1": {
                 "current_actual_carbon_cost": 3.0,
@@ -266,8 +285,7 @@ class ErrorMetricsTests(unittest.TestCase):
             },
         }
         cache = {
-            "client_requests": [],
-            "client_summary": {},
+            "scheduler_requests": [],
             "capacity_tiers": [],
             "active_profiles": [],
             "carbon_ci_list": [],
@@ -287,7 +305,10 @@ class ErrorMetricsTests(unittest.TestCase):
             ner = data.get_dashboard_data("ner-calibrated-v1")
             all_profiles = data.get_dashboard_data()
 
-        self.assertEqual(qa["indicators"]["total_requests"], 1)
+        self.assertEqual(qa["indicators"]["total_requests"], 2)
+        self.assertEqual(qa["indicators"]["completed_requests"], 1)
+        self.assertEqual(qa["indicators"]["scheduled_requests"], 2)
+        self.assertEqual(qa["indicators"]["pending_requests"], 0)
         self.assertEqual(qa["indicators"]["qos_profile_id"], "qa-calibrated-v1")
         self.assertEqual(qa["indicators"]["error_semantics"], "word-overlap-f1-v1")
         self.assertEqual(qa["indicators"]["max_error_threshold"], 20.0)
@@ -296,8 +317,8 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(qa["error_plot"]["error_history"], [10.0, 12.0, 14.0])
         self.assertEqual(qa["error_plot"]["window_error_history"], [9.0, 11.0, 13.0])
         self.assertEqual(qa["assignment_plot"]["balanced"][2], 1)
-        self.assertEqual(qa["assignment_plot"]["fast"][2], 0)
-        self.assertEqual(qa["assignment_plot"]["global_slot_occupancy"][2], 2)
+        self.assertEqual(qa["assignment_plot"]["fast"][2], 1)
+        self.assertEqual(qa["assignment_plot"]["global_slot_occupancy"][2], 3)
         self.assertTrue(qa["assignment_plot"]["global_slot_occupancy_visible_by_default"])
         self.assertEqual(qa["assignment_plot"]["capacity_tiers"], capacity_tiers)
         self.assertEqual(

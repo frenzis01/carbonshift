@@ -11,6 +11,13 @@ import os
 from dataclasses import dataclass
 
 
+def _client_urls_from_environment() -> tuple[str, ...]:
+    configured = os.environ.get("PROVIDER_CLIENT_URLS", "").strip()
+    if not configured:
+        configured = os.environ.get("CLIENT_URL", "http://localhost:8100")
+    return tuple(url.strip() for url in configured.split(",") if url.strip())
+
+
 @dataclass
 class Settings:
     host: str = os.environ.get("PROVIDER_HOST", "0.0.0.0")
@@ -65,12 +72,12 @@ class Settings:
     actual_jitter_std: float = float(os.environ.get("PROVIDER_ACTUAL_JITTER_STD", "0.05"))
 
     # ── notification fan-out ──────────────────────────────────────────────
-    # Comma-separated base URLs of the components to notify on each slot
-    # rollover (carbonshift, and optionally the executor). Emitted in a fixed
-    # order with retries — see ARCHITECTURE.md §"Ordine".
+    # Client URLs form the producer group; CarbonShift and the optional
+    # executor are consumers. The provider emits notifications in role order
+    # with retries — see ARCHITECTURE.md §"Ordine".
     carbonshift_url: str = os.environ.get("CARBONSHIFT_URL", "http://localhost:8080")
     executor_url: str = os.environ.get("EXECUTOR_URL", "")
-    client_url: str = os.environ.get("CLIENT_URL", "http://localhost:8100")
+    client_urls: tuple[str, ...] = _client_urls_from_environment()
     self_base_url: str = os.environ.get("PROVIDER_SELF_BASE_URL", "http://localhost:9100")
     notify_timeout_seconds: float = float(os.environ.get("PROVIDER_NOTIFY_TIMEOUT_SECONDS", "30"))
     notify_max_attempts: int = int(os.environ.get("PROVIDER_NOTIFY_MAX_ATTEMPTS", "3"))

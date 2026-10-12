@@ -44,6 +44,12 @@ pub struct TrackedRequest {
     pub arrival_slot: i32,
     /// QoS budget identity selected when the request was accepted.
     pub qos_profile_id: QosProfileId,
+    /// Executor measurements retained for scheduler-owned monitoring.
+    pub actual_carbon_cost: Option<f64>,
+    pub actual_baseline_carbon_cost: Option<f64>,
+    pub actual_error_pct: Option<f64>,
+    pub execution_time_seconds: Option<f64>,
+    pub baseline_execution_time_seconds: Option<f64>,
 }
 
 impl TrackedRequest {
@@ -66,6 +72,11 @@ impl TrackedRequest {
             baseline_duration,
             arrival_slot,
             qos_profile_id,
+            actual_carbon_cost: None,
+            actual_baseline_carbon_cost: None,
+            actual_error_pct: None,
+            execution_time_seconds: None,
+            baseline_execution_time_seconds: None,
         }
     }
 }

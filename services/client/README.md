@@ -159,6 +159,11 @@ può registrarlo e gli altri possono usare `--no-register
 predefinito del task kind, passa `--no-register`
 senza `--qos-profile-id`: il campo viene omesso.
 
+Il visualizer legge ora stati e callback dei singoli request direttamente da
+CarbonShift (`GET /v1/requests`), quindi non richiede un URL del client e
+mostra `completed`, `in progress`, `failed` e `pending` secondo il ciclo di
+vita mantenuto dallo scheduler.
+
 La capacity-tier ladder è globale e non appartiene al profilo. Se vuoi
 impostarla esplicitamente per un'emulazione, aggiungi:
 
@@ -208,6 +213,28 @@ docker compose down   # se lo stack era già su con altre variabili
 docker compose up -d --build
 docker compose run --rm emulation --slots 4 --per-slot 3 --slot-minutes 30 --task text_generation
 ```
+
+Per l'emulazione multi-client usa il profilo Compose `multi-client`, che
+aggiunge un secondo servizio client con callback e metriche isolati. Il runner
+invia per default un piano NER al client su `8100` e un piano question
+answering al client su `8101`; provider e runner condividono la lista degli
+endpoint client configurata. La lista è estensibile con ulteriori coppie
+`--client-url` / `--task`, mentre il provider mantiene il singolo `CLIENT_URL`
+quando `PROVIDER_CLIENT_URLS` non è impostato.
+
+```sh
+cd ..
+export MANUAL_CLOCK=1 SUBMIT_WAIT_TIMEOUT_SECS=0.3
+export PROVIDER_CLIENT_URLS=http://client:8100,http://client-2:8100
+docker compose --profile multi-client up -d --build carbonshift executor client client-2 provider
+docker compose --profile multi-client run --rm emulation-multi \
+  --slots 4 --per-slot 3 --slot-minutes 30
+```
+
+`--per-slot` è per client; la ladder globale viene dimensionata sul carico
+combinato. Per un solo client è possibile passare una sola coppia `--client-url`
+e `--task`; i profili QoS personalizzati, se presenti, si specificano con un
+`--qos-profile-id` per ogni coppia.
 
 ## API del client
 

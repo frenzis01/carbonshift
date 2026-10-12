@@ -8,7 +8,6 @@ from dataclasses import dataclass
 class Settings:
     carbonshift_url: str = os.environ.get("CARBONSHIFT_URL", "http://carbonshift:8080").rstrip("/")
     carbonshift_api_key: str | None = os.environ.get("CARBONSHIFT_API_KEY") or None
-    client_url: str = os.environ.get("CLIENT_URL", "http://client:8100").rstrip("/")
     provider_url: str = os.environ.get("PROVIDER_URL", "http://provider:9100").rstrip("/")
     host: str = os.environ.get("VISUALIZER_HOST", "0.0.0.0")
     port: int = int(os.environ.get("VISUALIZER_PORT", "8500"))

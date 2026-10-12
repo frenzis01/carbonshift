@@ -11,8 +11,7 @@ logger = logging.getLogger("visualizer.data")
 
 # Persistent cache across polling ticks so transient timeouts never wipe the UI
 _cache: Dict[str, Any] = {
-    "client_requests": [],
-    "client_summary": {},
+    "scheduler_requests": [],
     "capacity_tiers": [],
     "active_profiles": [],
     "profiles_unavailable_logged": False,
@@ -36,15 +35,12 @@ def fetch_json(url: str, timeout: float = settings.request_timeout_seconds) -> O
 
 def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     # 1. Fetch raw data from microservices in parallel / sequence
-    raw_client_requests: Optional[List[Dict[str, Any]]] = fetch_json(f"{settings.client_url}/requests")
-    if raw_client_requests is not None:
-        _cache["client_requests"] = raw_client_requests
-    client_requests: List[Dict[str, Any]] = _cache["client_requests"]
-
-    raw_client_summary: Optional[Dict[str, Any]] = fetch_json(f"{settings.client_url}/metrics/summary")
-    if raw_client_summary:
-        _cache["client_summary"] = raw_client_summary
-    client_summary: Dict[str, Any] = _cache["client_summary"]
+    raw_scheduler_requests: Optional[List[Dict[str, Any]]] = fetch_json(
+        f"{settings.carbonshift_url}/v1/requests"
+    )
+    if raw_scheduler_requests is not None:
+        _cache["scheduler_requests"] = raw_scheduler_requests
+    scheduler_requests: List[Dict[str, Any]] = _cache["scheduler_requests"]
 
     raw_profiles: Optional[List[Dict[str, Any]]] = fetch_json(
         f"{settings.carbonshift_url}/v1/profiles"
@@ -128,14 +124,14 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     if max_error_threshold is None and selected_profile is not None:
         max_error_threshold = selected_profile.get("max_error_threshold")
 
-    # 3. Combine client_requests and engine_assignments
+    # 3. Combine scheduler-owned lifecycle state and engine assignments.
     seen_req_ids = set()
     all_req_items = []
     selected_assignment_ids = {
         str(assignment.get("request_id"))
         for assignment in (engine_assignments or [])
     }
-    for r in client_requests:
+    for r in scheduler_requests:
         r_id = str(r.get("request_id"))
         request_profile_id = r.get("qos_profile_id")
         if selected_profile_id is not None and request_profile_id != selected_profile_id:
@@ -163,6 +159,8 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
             })
 
     completed_requests = [r for r in all_req_items if r.get("status") == "completed"]
+    dispatched_req_count = sum(r.get("status") == "dispatched" for r in all_req_items)
+    failed_req_count = sum(r.get("status") == "failed" for r in all_req_items)
     scheduled_requests = [r for r in all_req_items if r.get("scheduled_slot") is not None]
 
     # Calculate KPI Indicators
@@ -170,14 +168,16 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
         total_req_count = len(all_req_items)
         scheduled_req_count = len(scheduled_requests)
         completed_req_count = len(completed_requests)
-        pending_req_count = max(0, total_req_count - scheduled_req_count)
+        pending_req_count = sum(r.get("status") == "pending" for r in all_req_items)
     else:
         total_req_count = len(all_req_items) if all_req_items else stats_info.get("total", 0)
         scheduled_req_count = len(scheduled_requests) if scheduled_requests else (
             stats_info.get("scheduled", 0) + stats_info.get("completed", 0)
         )
         completed_req_count = len(completed_requests) if completed_requests else stats_info.get("completed", 0)
-        pending_req_count = max(0, total_req_count - scheduled_req_count)
+        pending_req_count = sum(r.get("status") == "pending" for r in all_req_items)
+        if not all_req_items:
+            pending_req_count = stats_info.get("pending", 0)
 
     # Cost calculations (prefer fine-grained engine metrics, fallback to client tracking)
     if "current_actual_carbon_cost" in cost_metrics:
@@ -204,7 +204,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
         pending_forecasted_cost = sum(
             (r.get("carbon_cost") or 0.0)
             for r in all_req_items
-            if r.get("status") in ("submitted", "scheduled", "pending")
+            if r.get("status") in ("submitted", "scheduled", "pending", "dispatched")
             and (r.get("scheduled_slot") is None or r.get("scheduled_slot") >= current_slot)
         )
 
@@ -441,6 +441,8 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
         "indicators": {
             "total_requests": total_req_count,
             "completed_requests": completed_req_count,
+            "dispatched_requests": dispatched_req_count,
+            "failed_requests": failed_req_count,
             "scheduled_requests": scheduled_req_count,
             "pending_requests": pending_req_count,
             "current_slot": current_slot,

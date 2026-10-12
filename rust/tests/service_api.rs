@@ -349,6 +349,63 @@ async fn stats_reports_tracked_request_counts() {
 }
 
 #[tokio::test]
+async fn request_list_reports_scheduler_status_and_executor_completion() {
+    let app = build_router(test_state(test_service_cfg()));
+    let submit = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/v1/requests",
+            r#"{"deadline_seconds": 5}"#,
+        ))
+        .await
+        .unwrap();
+    let submitted = json_body(submit).await;
+    let request_id = submitted["request_id"].as_u64().unwrap();
+
+    let pending = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::OK);
+    let pending = json_body(pending).await;
+    assert_eq!(pending[0]["request_id"], request_id);
+    assert_eq!(pending[0]["task"], "text_generation");
+    assert!(pending[0]["status"] == "pending" || pending[0]["status"] == "scheduled");
+
+    let callback = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/v1/callback/{request_id}"),
+            r#"{"success":true,"result":{"actual_error_pct":7.5,"execution_time_seconds":0.25}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::OK);
+
+    let completed = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let completed = json_body(completed).await;
+    assert_eq!(completed[0]["status"], "completed");
+    assert_eq!(completed[0]["actual_error_pct"], 7.5);
+    assert_eq!(completed[0]["execution_time_seconds"], 0.25);
+}
+
+#[tokio::test]
 async fn qos_profile_defaults_are_stable_and_task_kind_specific() {
     let app = build_router(test_state(test_service_cfg()));
     let inactive = app

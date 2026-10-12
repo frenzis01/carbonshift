@@ -54,6 +54,8 @@ curl -X POST localhost:9100/v1/advance-slot -H 'Content-Type: application/json' 
 | `PROVIDER_MANUAL_CLOCK` | `0` | Owner-of-time mode; never in production |
 | `PROVIDER_AUTO_ADVANCE_CLOCK` | `1` | Realtime self-advance (ignored when manual) |
 | `CARBONSHIFT_URL` | `http://localhost:8080` | Primary peer to notify |
+| `CLIENT_URL` | `http://localhost:8100` | Legacy single-client URL used when `PROVIDER_CLIENT_URLS` is unset or blank |
+| `PROVIDER_CLIENT_URLS` | *(unset)* | Comma-separated client URLs to notify; each client is added as an ordered producer peer |
 | `EXECUTOR_URL` | *(empty)* | Optional second peer to notify |
 | `PROVIDER_NOTIFY_MAX_ATTEMPTS` | `3` | Retries per peer |
 | `PROVIDER_GENERATOR_SEED` | `26` | Synthetic curve seed |
@@ -78,6 +80,9 @@ to a real peer.
   synchronizes consumer clocks before the client's initial batch, so
   CarbonShift has the slot offset and UTC boundary before accepting those
   requests. See `INTERFACE.md` for the initial announce and rollover order.
+  For multiple clients, set `PROVIDER_CLIENT_URLS` to their comma-separated
+  base URLs; if it is unset, the existing `CLIENT_URL` single-client setting
+  remains in effect.
 * The upstream GB API is natively half-hourly, so a `remote` role only maps
   1:1 onto slots at `PROVIDER_SLOT_MINUTES=30`.
 * There is **no `actual` for a future slot** and there never will be — a

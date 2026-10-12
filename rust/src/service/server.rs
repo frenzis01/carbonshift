@@ -12,7 +12,10 @@ pub fn build_router(state: AppState) -> Router {
     // `/v1/callback/*` requires the executor's shared token instead — the
     // two audiences must never be able to use each other's credential.
     let caller_routes = Router::new()
-        .route("/v1/requests", post(handlers::submit_request))
+        .route(
+            "/v1/requests",
+            post(handlers::submit_request).get(handlers::list_request_statuses),
+        )
         .route("/v1/requests/:id", get(handlers::get_request_status))
         .route(
             "/v1/profiles",

@@ -15,6 +15,7 @@ from app.notifications import (
     notify_peers,
     peers_from_settings,
 )
+from app.config import _client_urls_from_environment
 from app.source import SyntheticCarbonIntensitySource
 
 EPOCH = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -36,10 +37,10 @@ class _FakeSettings:
     """Minimal stand-in so `peers_from_settings` can be tested without env."""
 
     def __init__(self, carbonshift_url="http://cs:8080", executor_url="",
-                 client_url="http://localhost:8100") -> None:
+                 client_urls=("http://localhost:8100",)) -> None:
         self.carbonshift_url = carbonshift_url
         self.executor_url = executor_url
-        self.client_url = client_url
+        self.client_urls = client_urls
 
 
 def _source() -> SyntheticCarbonIntensitySource:
@@ -281,6 +282,41 @@ def test_client_is_the_first_peer_because_it_produces_the_slot_work():
     assert peers[0].role is Role.PRODUCER
 
 
+def test_all_configured_clients_are_ordered_producers_before_consumers():
+    configured = peers_from_settings(
+        _FakeSettings(client_urls=("http://client-a:8100", "http://client-b:8100"))
+    )
+    peers = sorted(configured, key=lambda p: p.order)
+    assert [p.name for p in peers] == ["client", "client-2", "carbonshift"]
+    assert [p.url for p in peers[:2]] == [
+        "http://client-a:8100/v1/tick",
+        "http://client-b:8100/v1/tick",
+    ]
+    assert all(peer.role is Role.PRODUCER for peer in peers[:2])
+
+    seen: list[str] = []
+
+    def post(url, json=None, timeout=None):
+        seen.append(url)
+        return _Resp(200)
+
+    notify_peers(
+        configured,
+        {"current_slot": 1},
+        timeout_seconds=1,
+        max_attempts=1,
+        backoff_seconds=0,
+        post=post,
+        sleep=lambda _: None,
+    )
+    assert seen == [peer.url for peer in peers]
+
+
+def test_no_configured_clients_leaves_only_the_consumer_peers():
+    peers = peers_from_settings(_FakeSettings(client_urls=()))
+    assert [peer.name for peer in peers] == ["carbonshift"]
+
+
 def test_carbonshift_is_a_consumer_and_follows_the_client():
     peers = sorted(peers_from_settings(_FakeSettings()), key=lambda p: p.order)
     carbonshift = next(p for p in peers if p.name == "carbonshift")
@@ -298,6 +334,21 @@ def test_executor_joins_last_when_configured():
 def test_blank_executor_url_is_treated_as_not_configured():
     names = [p.name for p in peers_from_settings(_FakeSettings(executor_url="   "))]
     assert names == ["client", "carbonshift"]
+
+
+def test_plural_client_urls_preserve_order_and_legacy_single_client_fallback(monkeypatch):
+    monkeypatch.setenv(
+        "PROVIDER_CLIENT_URLS",
+        " http://client-a:8100, http://client-b:8100 ",
+    )
+    monkeypatch.setenv("CLIENT_URL", "http://legacy-client:8100")
+    assert _client_urls_from_environment() == (
+        "http://client-a:8100",
+        "http://client-b:8100",
+    )
+
+    monkeypatch.setenv("PROVIDER_CLIENT_URLS", "")
+    assert _client_urls_from_environment() == ("http://legacy-client:8100",)
 
 
 def test_trailing_slash_does_not_double_up_in_urls():

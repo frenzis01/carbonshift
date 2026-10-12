@@ -378,6 +378,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <tr><td>Selected Profile Threshold</td><td id="info-error-threshold">Not applicable</td></tr>
           <tr><td>Horizon Total Slots</td><td id="info-total-slots">-</td></tr>
           <tr><td>Completed Requests</td><td id="info-completed-reqs">-</td></tr>
+          <tr><td>In-progress Requests</td><td id="info-dispatched-reqs">-</td></tr>
+          <tr><td>Failed Requests</td><td id="info-failed-reqs">-</td></tr>
           <tr><td>Pending Requests</td><td id="info-pending-reqs">-</td></tr>
         </tbody>
       </table>
@@ -551,7 +553,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('kpi-global-slot').textContent = globalSlot !== null ? `Global Epoch Slot: ${globalSlot}` : `Local Horizon: ${ind.total_slots}`;
       document.getElementById('kpi-assigned-count').textContent = ind.scheduled_requests;
       document.getElementById('kpi-assigned-breakdown').textContent =
-        `${ind.completed_requests} completed, ${ind.pending_requests} pending · ${ind.total_requests} total`;
+        `${ind.completed_requests} completed, ${ind.dispatched_requests} in progress, ${ind.failed_requests} failed, ${ind.pending_requests} awaiting assignment · ${ind.total_requests} total`;
       
       document.getElementById('kpi-actual-costs').textContent = `${ind.actual_carbon_cost} vs ${ind.actual_baseline_carbon_cost} gCO₂`;
       const savingEl = document.getElementById('kpi-actual-saving');
@@ -598,6 +600,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           : 'Not applicable';
       document.getElementById('info-total-slots').textContent = ind.total_slots;
       document.getElementById('info-completed-reqs').textContent = ind.completed_requests;
+      document.getElementById('info-dispatched-reqs').textContent = ind.dispatched_requests;
+      document.getElementById('info-failed-reqs').textContent = ind.failed_requests;
       document.getElementById('info-pending-reqs').textContent = ind.pending_requests;
     }
 
