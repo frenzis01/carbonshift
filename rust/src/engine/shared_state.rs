@@ -962,7 +962,16 @@ mod tests {
     }
 
     fn make_assignment(id: u64, slot: i32, error: f64) -> Assignment {
-        Assignment::new(id, slot, "Accurate".to_string(), 1.0, error, 60, None, None)
+        Assignment::new(
+            id,
+            slot,
+            "Accurate".to_string(),
+            1.0,
+            error,
+            60.0,
+            None,
+            None,
+        )
     }
 
     fn make_profiled_assignment(id: u64, slot: i32, error: f64, profile_id: &str) -> Assignment {
@@ -972,7 +981,7 @@ mod tests {
             "Accurate".to_string(),
             1.0,
             error,
-            60,
+            60.0,
             Some(slot),
             Some(slot + 1),
             QosProfileId::parse(profile_id).unwrap(),
@@ -1041,7 +1050,7 @@ mod tests {
             flavours: vec![crate::types::Flavour {
                 name: "Accurate".to_string(),
                 error: 0.0,
-                duration: 10,
+                duration: 10.0,
             }],
             error_semantics: "word-overlap-f1-v1".to_string(),
             max_error_threshold: 10.0,

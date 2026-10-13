@@ -51,7 +51,7 @@ additional_strategies: list[str]   – offline strategies to run once per scenar
 flavours             : list        – optional; overrides Config::default()'s 3 built-in
                                      Accurate/Balanced/Fast flavours for every phase/scenario
                                      in this run. Each entry: {"name": str, "error": float
-                                     (%), "duration": int (seconds)}. Omit to keep nshift's
+                                     (%), "duration_sec": float}. Omit to keep nshift's
                                      built-in defaults (see config.rs). Printed at the start
                                      of every scenario (Python side) and at every nshift
                                      invocation (Rust stdout, "Flavours in use: [...]").

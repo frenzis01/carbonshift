@@ -1,31 +1,31 @@
-"""Calibration rows become stable profile definitions with millisecond costs."""
+"""Calibration rows become stable profile definitions with seconds-based costs."""
 from __future__ import annotations
 
 from app.qos_profiles import build_task_profiles, default_error_threshold
 
 
-def test_profile_builder_groups_latest_task_flavours_and_converts_units():
+def test_profile_builder_groups_latest_task_flavours_without_changing_units():
     stats = {
         "distilgpt2": {"task": "text_generation", "flavour": "fast",
-                       "error_pct": 5.1, "avg_execution_time_seconds": 0.02},
+                       "error_pct": 5.1, "avg_execution_time_sec": 0.02},
         "gpt2": {"task": "text_generation", "flavour": "balanced",
-                 "error_pct": 2.3, "avg_execution_time_seconds": 0.05},
+                 "error_pct": 2.3, "avg_execution_time_sec": 0.05},
         "distilbert-base-cased-distilled-squad": {"task": "question_answering", "flavour": "fast",
-                                                    "error_pct": 1.0, "avg_execution_time_seconds": 0.016},
+                                                    "error_pct": 1.0, "avg_execution_time_sec": 0.016},
     }
     result = build_task_profiles(stats)
     tg = {f["name"]: f for f in result["text_generation"]["flavours"]}
     assert tg["Fast"]["error"] == 5.1
-    assert tg["Fast"]["duration"] == 20  # 0.02s -> 20ms
-    assert tg["Balanced"]["duration"] == 50
+    assert tg["Fast"]["duration_sec"] == 0.02
+    assert tg["Balanced"]["duration_sec"] == 0.05
 
     assert len(result["question_answering"]["flavours"]) == 1
 
 
 def test_duration_is_never_zero_for_very_fast_models():
-    stats = {"m": {"task": "ner", "flavour": "fast", "error_pct": 0.0, "avg_execution_time_seconds": 0.0001}}
+    stats = {"m": {"task": "ner", "flavour": "fast", "error_pct": 0.0, "avg_execution_time_sec": 0.0001}}
     result = build_task_profiles(stats)
-    assert result["ner"]["flavours"][0]["duration"] == 1
+    assert result["ner"]["flavours"][0]["duration_sec"] == 0.001
 
 
 def test_stale_model_for_the_same_task_flavour_is_superseded_by_the_newer_one():
@@ -34,10 +34,10 @@ def test_stale_model_for_the_same_task_flavour_is_superseded_by_the_newer_one():
     # model id), but only the newer one should ever be pushed.
     stats = {
         "old-model": {"task": "question_answering", "flavour": "balanced",
-                      "error_pct": 38.9, "avg_execution_time_seconds": 0.17,
+                      "error_pct": 38.9, "avg_execution_time_sec": 0.17,
                       "measured_at": "2026-09-07T14:30:00+00:00"},
         "new-model": {"task": "question_answering", "flavour": "balanced",
-                      "error_pct": 13.5, "avg_execution_time_seconds": 0.10,
+                      "error_pct": 13.5, "avg_execution_time_sec": 0.10,
                       "measured_at": "2026-09-07T16:00:00+00:00"},
     }
     result = build_task_profiles(stats)
@@ -61,13 +61,13 @@ def test_profile_builder_creates_a_stable_complete_profile_for_legacy_calibratio
             "task": "question_answering",
             "flavour": "accurate",
             "error_pct": 3.0,
-            "avg_execution_time_seconds": 0.2,
+            "avg_execution_time_sec": 0.2,
         },
         "qa-fast": {
             "task": "question_answering",
             "flavour": "fast",
             "error_pct": 15.0,
-            "avg_execution_time_seconds": 0.05,
+            "avg_execution_time_sec": 0.05,
         },
     }
 
@@ -83,7 +83,7 @@ def test_profile_builder_creates_a_stable_complete_profile_for_legacy_calibratio
         "past_decay_slots": 12,
     }
     assert profile["cumulative_error"] == {"enabled": True, "hard": True}
-    assert all(flavour["duration"] >= 1 for flavour in profile["flavours"])
+    assert all(flavour["duration_sec"] >= 0.001 for flavour in profile["flavours"])
 
 
 def test_profile_builder_uses_recorded_semantics_for_open_task_kinds():
@@ -92,7 +92,7 @@ def test_profile_builder_uses_recorded_semantics_for_open_task_kinds():
             "task": "summarization",
             "flavour": "balanced",
             "error_pct": 12.0,
-            "avg_execution_time_seconds": 0.08,
+            "avg_execution_time_sec": 0.08,
             "error_semantics": "rouge-l-error-v1",
         }
     }
@@ -110,7 +110,7 @@ def test_profile_builder_allows_an_explicit_version_bump():
             "task": "question_answering",
             "flavour": "balanced",
             "error_pct": 5.0,
-            "avg_execution_time_seconds": 0.1,
+            "avg_execution_time_sec": 0.1,
             "error_semantics": "word-overlap-f1-v1",
         }
     }
@@ -127,14 +127,14 @@ def test_profile_builder_rejects_mixed_semantics_for_one_task():
             "task": "custom_task",
             "flavour": "accurate",
             "error_pct": 1.0,
-            "avg_execution_time_seconds": 0.1,
+            "avg_execution_time_sec": 0.1,
             "error_semantics": "metric-a-v1",
         },
         "fast": {
             "task": "custom_task",
             "flavour": "fast",
             "error_pct": 5.0,
-            "avg_execution_time_seconds": 0.02,
+            "avg_execution_time_sec": 0.02,
             "error_semantics": "metric-b-v1",
         },
     }

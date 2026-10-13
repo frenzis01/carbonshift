@@ -168,7 +168,7 @@ def _text_generation_confidence(pipe, prompt: str, generated_text: str) -> float
 def _run_single(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, Any]:
     """Runs exactly one `(task, flavour)` pipeline once.
 
-    Returns `{output, model, confidence, execution_time_seconds}` — no
+    Returns `{output, model, confidence, execution_time_sec}` — no
     `quality_score`, since that requires a reference to compare against
     (either caller-supplied or another flavour's output; see `run_task`,
     which may call this twice).
@@ -213,7 +213,7 @@ def _run_single(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str
         raise ValueError(f"unsupported task {task!r}")
 
     elapsed = time.perf_counter() - t0
-    return {"output": output, "model": model_id, "confidence": confidence, "execution_time_seconds": elapsed}
+    return {"output": output, "model": model_id, "confidence": confidence, "execution_time_sec": elapsed}
 
 
 def _reference_quality_score(task: str, task_input: dict[str, Any], output: dict[str, Any]) -> float | None:
@@ -258,7 +258,7 @@ def run_task(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, A
     """Runs the model configured for `(task, flavour)`.
 
     Returns `{output, model, confidence, quality_score, actual_error_pct,
-    execution_time_seconds, baseline_execution_time_seconds, baseline_model}`.
+    execution_time_sec, baseline_execution_time_sec, baseline_model}`.
 
     `confidence` is always populated when the model can produce one: the
     pipeline's own score for QA/NER, or a self-supervised exp(mean log-prob)
@@ -288,7 +288,7 @@ def run_task(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, A
     error average up to ~80-90% for perfectly normal generations. `None`
     (no correction applied) if nothing usable is available for either.
 
-    `baseline_execution_time_seconds`/`baseline_model`: the Accurate
+    `baseline_execution_time_sec`/`baseline_model`: the Accurate
     flavour's own measured execution time/model on this same input — an
     *empirical* reference point for actual energy/time savings, independent
     of carbonshift's analytical `baseline_carbon_cost` estimate. `None` when
@@ -299,15 +299,15 @@ def run_task(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, A
     primary = _run_single(task, flavour, task_input)
     quality_score = _reference_quality_score(task, task_input, primary["output"])
 
-    baseline_execution_time_seconds: float | None = None
+    baseline_execution_time_sec: float | None = None
     baseline_model: str | None = None
     accurate_confidence: float | None = None
     if flavour == Flavour.ACCURATE:
-        baseline_execution_time_seconds = primary["execution_time_seconds"]
+        baseline_execution_time_sec = primary["execution_time_sec"]
         baseline_model = primary["model"]
     elif settings.compute_quality_baseline:
         accurate = _run_single(task, Flavour.ACCURATE, task_input)
-        baseline_execution_time_seconds = accurate["execution_time_seconds"]
+        baseline_execution_time_sec = accurate["execution_time_sec"]
         baseline_model = accurate["model"]
         accurate_confidence = accurate["confidence"]
         if quality_score is None:
@@ -348,7 +348,7 @@ def run_task(task: str, flavour: str, task_input: dict[str, Any]) -> dict[str, A
         "confidence": primary["confidence"],
         "quality_score": quality_score,
         "actual_error_pct": actual_error_pct,
-        "execution_time_seconds": primary["execution_time_seconds"],
-        "baseline_execution_time_seconds": baseline_execution_time_seconds,
+        "execution_time_sec": primary["execution_time_sec"],
+        "baseline_execution_time_sec": baseline_execution_time_sec,
         "baseline_model": baseline_model,
     }

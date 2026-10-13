@@ -210,10 +210,10 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
 
     # Execution times overall & per flavour
     exec_times_all = [
-        r["execution_time_seconds"] for r in completed_requests if r.get("execution_time_seconds") is not None
+        r["execution_time_sec"] for r in completed_requests if r.get("execution_time_sec") is not None
     ]
     baseline_exec_times_all = [
-        r["baseline_execution_time_seconds"] for r in completed_requests if r.get("baseline_execution_time_seconds") is not None
+        r["baseline_execution_time_sec"] for r in completed_requests if r.get("baseline_execution_time_sec") is not None
     ]
     overall_avg_exec_sec = (sum(exec_times_all) / len(exec_times_all)) if exec_times_all else None
     overall_baseline_exec_sec = (sum(baseline_exec_times_all) / len(baseline_exec_times_all)) if baseline_exec_times_all else None
@@ -237,8 +237,8 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     by_flavour_stats: Dict[str, Dict[str, Any]] = {}
     for flv in flavours:
         flv_reqs = [r for r in completed_requests if (r.get("flavour") or "").lower() == flv.lower()]
-        flv_execs = [r["execution_time_seconds"] for r in flv_reqs if r.get("execution_time_seconds") is not None]
-        flv_base = [r["baseline_execution_time_seconds"] for r in flv_reqs if r.get("baseline_execution_time_seconds") is not None]
+        flv_execs = [r["execution_time_sec"] for r in flv_reqs if r.get("execution_time_sec") is not None]
+        flv_base = [r["baseline_execution_time_sec"] for r in flv_reqs if r.get("baseline_execution_time_sec") is not None]
         by_flavour_stats[flv] = {
             "count": len(flv_reqs),
             "avg_exec_sec": (sum(flv_execs) / len(flv_execs)) if flv_execs else None,

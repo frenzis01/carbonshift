@@ -62,7 +62,7 @@ const ASSIGNMENT_FIELDS: &[&str] = &[
     "is_new_assignment_in_run",
     "scheduled_slot",
     "flavour_name",
-    "flavour_duration",
+    "flavour_duration_sec",
     "error",
     "carbon_cost",
     "arrival_slot",

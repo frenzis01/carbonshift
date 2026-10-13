@@ -154,7 +154,7 @@ pub struct BatchScheduler {
     /// Pre-computed carbon-intensity forecast for the planning horizon.
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
     /// flavour_name → duration_seconds lookup (immutable after construction).
-    flavour_duration_by_name: Arc<HashMap<String, i32>>,
+    flavour_duration_by_name: Arc<HashMap<String, f64>>,
     running: Arc<AtomicBool>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
     pub metrics_logger: Arc<MetricsLogger>,
@@ -176,7 +176,7 @@ impl BatchScheduler {
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
         let capacity_tier_revision = shared_state.capacity_tier_revision();
         let carbon_forecast = carbon_forecast;
-        let flavour_duration_by_name: HashMap<String, i32> = cfg
+        let flavour_duration_by_name: HashMap<String, f64> = cfg
             .flavours
             .iter()
             .map(|f| (f.name.clone(), f.duration))
@@ -298,7 +298,7 @@ fn main_loop(
     shared_state: SharedState,
     cfg: Arc<Config>,
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
-    fdb: Arc<HashMap<String, i32>>,
+    fdb: Arc<HashMap<String, f64>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
     ml: Arc<MetricsLogger>,
 ) {
@@ -583,7 +583,7 @@ fn dispatch_batch_workers(
     shared_state: &SharedState,
     cfg: &Arc<Config>,
     carbon_forecast: &Arc<Vec<f64>>,
-    fdb: &Arc<HashMap<String, i32>>,
+    fdb: &Arc<HashMap<String, f64>>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &Arc<MetricsLogger>,
     running: &Arc<AtomicBool>,
@@ -692,7 +692,7 @@ fn batch_worker_entry(
     shared_state: &SharedState,
     cfg: &Config,
     carbon_forecast: &[f64],
-    fdb: &HashMap<String, i32>,
+    fdb: &HashMap<String, f64>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
 ) -> bool {
@@ -1350,7 +1350,10 @@ fn build_assignment_rows(
         );
         row.insert("scheduled_slot".into(), a.scheduled_slot.to_string());
         row.insert("flavour_name".into(), a.flavour_name.clone());
-        row.insert("flavour_duration".into(), a.flavour_duration.to_string());
+        row.insert(
+            "flavour_duration_sec".into(),
+            a.flavour_duration.to_string(),
+        );
         row.insert("error".into(), a.error.to_string());
         row.insert("carbon_cost".into(), a.carbon_cost.to_string());
         row.insert(

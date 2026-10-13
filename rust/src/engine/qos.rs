@@ -148,7 +148,7 @@ impl QosProfile {
                     flavour.name
                 ));
             }
-            if flavour.duration <= 0 {
+            if flavour.duration <= 0.0 {
                 return Err(format!(
                     "flavour {} duration must be positive",
                     flavour.name

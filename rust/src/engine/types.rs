@@ -80,8 +80,8 @@ pub struct Assignment {
     pub flavour_name: String,
     pub carbon_cost: f64,
     pub error: f64,
-    /// Duration in seconds of the assigned flavour (integer, as in FLAVOURS).
-    pub flavour_duration: i32,
+    /// Duration in seconds of the assigned flavour.
+    pub flavour_duration: f64,
     pub arrival_slot: Option<i32>,
     pub deadline_slot: Option<i32>,
     pub assignment_time: f64,
@@ -95,7 +95,7 @@ impl Assignment {
         flavour_name: String,
         carbon_cost: f64,
         error: f64,
-        flavour_duration: i32,
+        flavour_duration: f64,
         arrival_slot: Option<i32>,
         deadline_slot: Option<i32>,
     ) -> Self {
@@ -120,7 +120,7 @@ impl Assignment {
         flavour_name: String,
         carbon_cost: f64,
         error: f64,
-        flavour_duration: i32,
+        flavour_duration: f64,
         arrival_slot: Option<i32>,
         deadline_slot: Option<i32>,
         qos_profile_id: QosProfileId,
@@ -157,15 +157,43 @@ pub struct RequestAssignment {
 
 /// Execution flavour definition.
 ///
-/// `duration` is in seconds (integer) and is used as a relative cost weight
-/// in the DP.  Carbon cost is reported in gCO₂ by the scale factor in Config.
+/// `duration` is in seconds and is used as a relative cost weight in the DP.
+/// Carbon cost is reported in gCO₂ by the scale factor in Config.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Flavour {
     pub name: String,
     /// Approximation error introduced by this flavour (%).
     pub error: f64,
     /// Processing duration in seconds.
-    pub duration: i32,
+    #[serde(rename = "duration_sec")]
+    pub duration: f64,
+}
+
+#[cfg(test)]
+mod flavour_wire_tests {
+    use super::Flavour;
+
+    #[test]
+    fn flavour_duration_wire_value_is_fractional_seconds() {
+        let flavour = Flavour {
+            name: "Fast".into(),
+            error: 5.0,
+            duration: 0.005,
+        };
+        let value = serde_json::to_value(&flavour).unwrap();
+
+        assert_eq!(value["duration_sec"], 0.005);
+        assert!(value.get("duration").is_none());
+        assert!(
+            serde_json::from_value::<Flavour>(serde_json::json!({
+                "name": "Fast",
+                "error": 5.0,
+                "duration": 0.005
+            }))
+            .is_err()
+        );
+    }
 }
 
 // ─── CapacityTier ────────────────────────────────────────────────────────────

@@ -79,7 +79,7 @@ def calibrate_one(task: str, flavour: str, count: int, seed: int, source: str) -
     durations: list[float] = []
     for ex in examples:
         result = run_task(task, flavour, ex["input"])
-        durations.append(result["execution_time_seconds"])
+        durations.append(result["execution_time_sec"])
 
         if task == Task.TEXT_GENERATION:
             if flavour == Flavour.ACCURATE:
@@ -103,7 +103,7 @@ def calibrate_one(task: str, flavour: str, count: int, seed: int, source: str) -
         # (it *is* the reference) -> `errors` stays empty -> 0.0, matching
         # the existing "accurate = 0% error" convention.
         "error_pct": sum(errors) / len(errors) if errors else 0.0,
-        "avg_execution_time_seconds": sum(durations) / len(durations),
+        "avg_execution_time_sec": sum(durations) / len(durations),
         "sample_count": len(durations),
         "measured_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -130,7 +130,7 @@ def main() -> None:
                 print("  skipped: no samples produced")
                 continue
             stats[entry["model"]] = entry
-            print(f"  error_pct={entry['error_pct']:.2f} avg_execution_time_seconds={entry['avg_execution_time_seconds']:.4f}")
+            print(f"  error_pct={entry['error_pct']:.2f} avg_execution_time_sec={entry['avg_execution_time_sec']:.4f}")
 
     output_path.write_text(json.dumps(stats, indent=2, sort_keys=True) + "\n")
     print(f"\nWrote {len(stats)} model entries to {output_path}")

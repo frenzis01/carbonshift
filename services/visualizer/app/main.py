@@ -352,7 +352,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- Detailed Breakdowns -->
   <section class="breakdown-grid">
     <div class="card">
-      <div class="card-label">Execution Time By Flavour</div>
+      <div class="card-label">Execution Time By Flavour (sec)</div>
       <table>
         <thead>
           <tr>

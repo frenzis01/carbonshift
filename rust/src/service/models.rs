@@ -137,8 +137,8 @@ pub struct TrackedRequestResponse {
     pub baseline_carbon_cost: f64,
     pub actual_baseline_carbon_cost: Option<f64>,
     pub actual_error_pct: Option<f64>,
-    pub execution_time_seconds: Option<f64>,
-    pub baseline_execution_time_seconds: Option<f64>,
+    pub execution_time_sec: Option<f64>,
+    pub baseline_execution_time_sec: Option<f64>,
     pub scheduled_at: Option<f64>,
     pub error: Option<String>,
 }
@@ -154,10 +154,10 @@ pub struct ExecutorCallbackPayload {
     pub error: Option<String>,
     /// Actual execution time reported by the executor, if available.
     #[serde(default)]
-    pub execution_time_seconds: Option<f64>,
+    pub execution_time_sec: Option<f64>,
     /// Actual baseline execution time, if available.
     #[serde(default)]
-    pub baseline_execution_time_seconds: Option<f64>,
+    pub baseline_execution_time_sec: Option<f64>,
 }
 
 /// Body POSTed by this service to the executor at dispatch time, and in turn
@@ -190,9 +190,9 @@ pub struct CallerCallbackPayload {
     /// carbon intensity at the request's *arrival* slot instead.
     pub actual_baseline_carbon_cost: Option<f64>,
     /// Actual execution time reported by the executor, if available.
-    pub execution_time_seconds: Option<f64>,
+    pub execution_time_sec: Option<f64>,
     /// Actual baseline execution time, if available.
-    pub baseline_execution_time_seconds: Option<f64>,
+    pub baseline_execution_time_sec: Option<f64>,
 }
 
 /// Response of `GET /v1/stats` — counts of tracked requests by status plus
@@ -256,7 +256,8 @@ pub struct AssignmentItem {
     pub flavour_name: String,
     pub carbon_cost: f64,
     pub error: f64,
-    pub flavour_duration: i32,
+    #[serde(rename = "flavour_duration_sec")]
+    pub flavour_duration: f64,
     pub arrival_slot: Option<i32>,
     pub deadline_slot: Option<i32>,
     pub assignment_time: f64,

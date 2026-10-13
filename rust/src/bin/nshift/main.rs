@@ -60,7 +60,7 @@
 //!   concurrency), e.g. `["greedy_cheapest", "ant_colony", "bandit"]`. Fully independent of
 //!   `batch_sizes`/`rollback_max_consecutive`/`max_batch_solver_parallelism`.
 //! - `flavours`: overrides `Config::flavours` (the 3 built-in Accurate/Balanced/Fast
-//!   defaults) with `[{"name": "...", "error": <f64>, "duration": <seconds>}, ...]`.
+//!   defaults) with `[{"name": "...", "error": <f64>, "duration_sec": <f64>}, ...]`.
 //!   Printed at startup alongside the other config knobs so it's clear which flavours
 //!   a given run actually used.
 //!
@@ -356,7 +356,7 @@ struct RunSummary {
     realtime_slots: bool,
     realtime_speed_scale: f64,
     baseline_flavour_name: String,
-    baseline_flavour_duration: i32,
+    baseline_flavour_duration: f64,
     baseline_flavour_error: f64,
     requests_total: usize,
     requests_scheduled: usize,
@@ -604,7 +604,7 @@ fn compute_summary(
     batch_timings: &[BatchTiming],
     total_received: usize,
     baseline_flavour_name: &str,
-    baseline_flavour_duration: i32,
+    baseline_flavour_duration: f64,
     baseline_flavour_error: f64,
     total_rollbacks: u64,
     max_consecutive_rollbacks: u64,
@@ -715,7 +715,7 @@ fn recompute_carbon_costs(
     scale: f64,
 ) {
     // Group assignments by slot, sorted by request_id for a canonical position order.
-    let mut slot_requests: HashMap<i32, Vec<(u64, i32)>> = HashMap::new();
+    let mut slot_requests: HashMap<i32, Vec<(u64, f64)>> = HashMap::new();
     for a in final_assignments.values() {
         slot_requests
             .entry(a.scheduled_slot)
@@ -778,7 +778,7 @@ fn run_greedy_baseline(
             seq += 1;
             let position = before_count + 1;
             let mult = get_capacity_multiplier(tiers, position);
-            let cost = ci * mult * flav.duration as f64 * scale;
+            let cost = ci * mult * flav.duration * scale;
             before_count = position;
             per_req.push(PerRequest {
                 request_id: req.id,
@@ -865,7 +865,7 @@ fn run_greedy_cheapest(
 
     // Sort flavours cheapest-first (shortest duration = lowest carbon cost per slot).
     let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
-    sorted_flavours.sort_by_key(|f| f.duration);
+    sorted_flavours.sort_by(|a, b| a.duration.total_cmp(&b.duration));
 
     // Fallback flavour = minimum error (for infeasible cases).
     let fallback_flav = assignment
@@ -929,7 +929,7 @@ fn run_greedy_cheapest(
             let mult = get_capacity_multiplier(tiers, position as i64);
 
             for flav in &allowed_flavours {
-                let cost = ci * mult * flav.duration as f64 * scale;
+                let cost = ci * mult * flav.duration * scale;
 
                 {
                     // Error window is anchored to `arrival` (when the request is
@@ -960,7 +960,7 @@ fn run_greedy_cheapest(
             let ci = carbon.get(slot as usize).copied().unwrap_or(1.0);
             let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
             let mult = get_capacity_multiplier(tiers, position as i64);
-            let cost = ci * mult * fallback_flav.duration as f64 * scale;
+            let cost = ci * mult * fallback_flav.duration * scale;
             (cost, slot, fallback_flav)
         });
 
@@ -1196,7 +1196,7 @@ const SUMMARY_CSV_HEADER: &[&str] = &[
     "realtime_slots",
     "realtime_speed_scale",
     "baseline_flavour_name",
-    "baseline_flavour_duration",
+    "baseline_flavour_duration_sec",
     "baseline_flavour_error",
     "requests_total",
     "requests_scheduled",
@@ -1239,7 +1239,7 @@ fn summary_to_json(s: &RunSummary) -> Value {
         "realtime_slots":                          s.realtime_slots,
         "realtime_speed_scale":                    s.realtime_speed_scale,
         "baseline_flavour_name":                   s.baseline_flavour_name,
-        "baseline_flavour_duration":               s.baseline_flavour_duration,
+        "baseline_flavour_duration_sec":        s.baseline_flavour_duration,
         "baseline_flavour_error":                  s.baseline_flavour_error,
         "requests_total":                          s.requests_total,
         "requests_scheduled":                      s.requests_scheduled,
@@ -1580,7 +1580,7 @@ fn schedule_late_requests(
             .copied()
             .unwrap_or(1.0);
         let mult = get_capacity_multiplier(tiers, position as i64);
-        let cost = ci * mult * fallback_flav.duration as f64 * scale;
+        let cost = ci * mult * fallback_flav.duration * scale;
         // Lateness = how many slots past the deadline the request sat unprocessed.
         // We measure from the end of the run (total_slots-1), not from sched_slot,
         // because all drained requests were unprocessed until the run ended.
@@ -1776,7 +1776,7 @@ fn run_single_n(
         &batch_timings,
         total_received,
         "",
-        0,
+        0.0,
         0.0,
         rollback_stats.total_rollbacks,
         rollback_stats.max_consecutive_rollbacks as u64,
@@ -2178,7 +2178,7 @@ mod tests {
     use super::*;
     use carbonshift_rs::types::CapacityTier;
 
-    fn make_assignment(id: u64, slot: i32, dur: i32) -> Assignment {
+    fn make_assignment(id: u64, slot: i32, dur: f64) -> Assignment {
         Assignment::new(id, slot, "Balanced".into(), 0.0, 0.0, dur, None, None)
     }
 
@@ -2220,7 +2220,7 @@ mod tests {
 
         // 10 requests in slot 0, all duration 30s
         let final_assignments: HashMap<u64, Assignment> = (1..=10u64)
-            .map(|id| (id, make_assignment(id, 0, 30)))
+            .map(|id| (id, make_assignment(id, 0, 30.0)))
             .collect();
 
         let mut per_req: Vec<PerRequest> = (1..=10u64).map(|id| make_per_req(id, 0)).collect();
@@ -2272,7 +2272,7 @@ mod tests {
         let scale = 1.0 / 3600.0;
 
         let final_assignments: HashMap<u64, Assignment> = (1..=70u64)
-            .map(|id| (id, make_assignment(id, 0, 30)))
+            .map(|id| (id, make_assignment(id, 0, 30.0)))
             .collect();
         let mut per_req: Vec<PerRequest> = (1..=70u64).map(|id| make_per_req(id, 0)).collect();
 

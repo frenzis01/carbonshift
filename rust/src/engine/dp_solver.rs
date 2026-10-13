@@ -742,7 +742,7 @@ impl DpSolver {
             let fallback_flavour = self
                 .flavours_for(request.request_id, request_flavours)
                 .iter()
-                .max_by_key(|f| f.duration)
+                .max_by(|a, b| a.duration.total_cmp(&b.duration))
                 .expect("at least one flavour");
             let mut best: Option<(f64, i32)> = None;
             let empty_base = vec![0i32; self.window_size as usize];
@@ -791,7 +791,7 @@ impl DpSolver {
     fn incremental_carbon_cost(
         &self,
         slot: i32,
-        add_duration: i32,
+        add_duration: f64,
         base_counts: &[i32],
         inc_counts: &[i32],
         tiers: &[CapacityTier],
@@ -800,7 +800,7 @@ impl DpSolver {
         let position = (base_counts[s] + inc_counts[s]) as i64 + 1; // 1-indexed position of this request
         let mult = get_capacity_multiplier(tiers, position);
         let carbon = self.carbon_forecast[s];
-        carbon * mult * add_duration as f64 * self.carbon_cost_scale
+        carbon * mult * add_duration * self.carbon_cost_scale
     }
 }
 
@@ -867,7 +867,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "A".to_string(),
                 error: 0.0,
-                duration: 60,
+                duration: 60.0,
             }],
             window_size: 5,
             carbon_forecast: forecast,
@@ -894,7 +894,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "A".to_string(),
                 error: 0.0,
-                duration: 60,
+                duration: 60.0,
             }],
             window_size: 5,
             carbon_forecast: vec![1.0, 100.0, 10.0, 20.0, 30.0],
@@ -923,7 +923,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "Accurate".to_string(),
                 error: 0.0,
-                duration: 60,
+                duration: 60.0,
             }],
             window_size: 5,
             carbon_forecast: vec![1.0, 100.0, 10.0, 20.0, 30.0],
@@ -965,7 +965,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "A".to_string(),
                 error: 0.0,
-                duration: 60,
+                duration: 60.0,
             }],
             window_size: 5,
             carbon_forecast: forecast,
@@ -975,7 +975,7 @@ mod tests {
             carbon_cost_scale: 1.0 / 3600.0,
         };
         // First request is at position 1 → tier 1 (mult=1.0): cost = 40 * 1.0 * 60/3600
-        let cost_first = solver.incremental_carbon_cost(0, 60, &vec![0; 5], &vec![0; 5], &tiers);
+        let cost_first = solver.incremental_carbon_cost(0, 60.0, &vec![0; 5], &vec![0; 5], &tiers);
         assert!(
             (cost_first - 40.0 * 1.0 * 60.0 / 3600.0).abs() < 1e-9,
             "cost_first={cost_first}"
@@ -983,7 +983,7 @@ mod tests {
 
         // Second request is at position 2 → tier 2 (mult=2.0): cost = 40 * 2.0 * 60/3600
         // Previous request is NOT repriced — this is the per-request model.
-        let cost_second = solver.incremental_carbon_cost(0, 60, &vec![0; 5], &vec![1; 5], &tiers);
+        let cost_second = solver.incremental_carbon_cost(0, 60.0, &vec![0; 5], &vec![1; 5], &tiers);
         let expected_second = 40.0 * 2.0 * 60.0 / 3600.0;
         assert!(
             (cost_second - expected_second).abs() < 1e-9,
@@ -1021,7 +1021,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "F".to_string(),
                 error: 0.0,
-                duration: 30,
+                duration: 30.0,
             }],
             window_size: 5,
             carbon_forecast: forecast.clone(),
@@ -1042,7 +1042,7 @@ mod tests {
         for (i, &expected) in expected_costs.iter().enumerate() {
             let mut inc_counts = vec![0i32; 5];
             inc_counts[0] = i as i32; // i requests already placed at slot 0
-            let cost = solver.incremental_carbon_cost(0, 30, &vec![0; 5], &inc_counts, &tiers);
+            let cost = solver.incremental_carbon_cost(0, 30.0, &vec![0; 5], &inc_counts, &tiers);
             assert!(
                 (cost - expected).abs() < 1e-9,
                 "position={}: cost={cost}, expected={expected}",
@@ -1061,12 +1061,12 @@ mod tests {
                 Flavour {
                     name: "Accurate".to_string(),
                     error: 0.0,
-                    duration: 60,
+                    duration: 60.0,
                 },
                 Flavour {
                     name: "Fast".to_string(),
                     error: 5.0,
-                    duration: 10,
+                    duration: 10.0,
                 },
             ],
             window_size: 5,
@@ -1098,7 +1098,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "Accurate".to_string(),
                 error: 0.0,
-                duration: 60,
+                duration: 60.0,
             }],
             window_size: 5,
             carbon_forecast: flat_forecast(5, 40.0),
@@ -1120,7 +1120,7 @@ mod tests {
             vec![Flavour {
                 name: "TaskOnly".to_string(),
                 error: 1.0,
-                duration: 5,
+                duration: 5.0,
             }],
         );
         let result = solver.solve_batch(SolveBatchInput {
@@ -1138,7 +1138,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "Accurate".to_string(),
                 error: 0.0,
-                duration: 60,
+                duration: 60.0,
             }],
             window_size: 5,
             carbon_forecast: flat_forecast(5, 40.0),
@@ -1160,7 +1160,7 @@ mod tests {
             vec![Flavour {
                 name: "TaskOnly".to_string(),
                 error: 1.0,
-                duration: 45,
+                duration: 45.0,
             }],
         );
         let result = solver.greedy_fallback(&requests, 0, &tiers, &base, &overrides);
@@ -1185,17 +1185,17 @@ mod tests {
                 Flavour {
                     name: "A".to_string(),
                     error: 0.0,
-                    duration: 60,
+                    duration: 60.0,
                 },
                 Flavour {
                     name: "B".to_string(),
                     error: 2.5,
-                    duration: 30,
+                    duration: 30.0,
                 },
                 Flavour {
                     name: "C".to_string(),
                     error: 5.0,
-                    duration: 10,
+                    duration: 10.0,
                 },
             ],
             window_size: 24,
@@ -1232,12 +1232,12 @@ mod tests {
                 Flavour {
                     name: "Accurate".to_string(),
                     error: 0.0,
-                    duration: 60,
+                    duration: 60.0,
                 },
                 Flavour {
                     name: "Fast".to_string(),
                     error: 5.0,
-                    duration: 10,
+                    duration: 10.0,
                 },
             ],
             window_size: 5,
@@ -1285,7 +1285,7 @@ mod tests {
             flavours: vec![Flavour {
                 name: "A".to_string(),
                 error: 0.0,
-                duration: 60,
+                duration: 60.0,
             }],
             window_size: 5,
             carbon_forecast: flat_forecast(5, 100.0),

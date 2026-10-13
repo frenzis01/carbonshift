@@ -16,14 +16,14 @@ from app.queue_worker import DuplicateRequestIdError, JobQueue
 
 def fake_run_task(task, flavour, task_input):
     return {"output": {"echo": task_input}, "model": "fake", "confidence": None,
-            "quality_score": None, "execution_time_seconds": 0.0}
+            "quality_score": None, "execution_time_sec": 0.0}
 
 
 def make_slow_run_task(delay_seconds):
     def _slow_run_task(task, flavour, task_input):
         time.sleep(delay_seconds)
         return {"output": {"echo": task_input}, "model": "fake", "confidence": None,
-                "quality_score": None, "execution_time_seconds": delay_seconds}
+                "quality_score": None, "execution_time_sec": delay_seconds}
     return _slow_run_task
 
 

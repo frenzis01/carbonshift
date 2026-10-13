@@ -226,21 +226,21 @@ def test_on_callback_exposes_execution_time_from_result(tmp_path):
     submitted_at = datetime.now(timezone.utc)
     tracker.add(TrackedRequest("1", "text_generation", 30.0, submitted_at, make_ack()))
 
-    tracker.on_callback("1", True, {"execution_time_seconds": 2.5}, None)
+    tracker.on_callback("1", True, {"execution_time_sec": 2.5}, None)
     record = tracker.get("1").to_dict()
-    assert record["execution_time_seconds"] == 2.5
+    assert record["execution_time_sec"] == 2.5
 
 
 def test_summary_includes_execution_time_and_carbon_saving_stats(tmp_path):
     tracker = make_tracker(tmp_path)
     tracker.add(TrackedRequest("1", "text_generation", 30.0, datetime.now(timezone.utc),
                                 make_ack(flavour="Fast", carbon_cost=1.5, baseline_carbon_cost=3.0)))
-    tracker.on_callback("1", True, {"execution_time_seconds": 2.0, "baseline_execution_time_seconds": 4.0}, None)
+    tracker.on_callback("1", True, {"execution_time_sec": 2.0, "baseline_execution_time_sec": 4.0}, None)
 
     summary = tracker.summary()
     group = summary["by_task_flavour"]["text_generation/Fast"]
-    assert group["execution_time_seconds"]["avg"] == 2.0
-    assert group["baseline_execution_time_seconds"]["avg"] == 4.0
+    assert group["execution_time_sec"]["avg"] == 2.0
+    assert group["baseline_execution_time_sec"]["avg"] == 4.0
     assert group["baseline_carbon_cost"]["avg"] == 3.0
     assert group["carbon_saving_pct"]["avg"] == 50.0
 
@@ -251,8 +251,8 @@ def test_progress_reports_counts_and_averages(tmp_path):
                                 make_ack(carbon_cost=1.5, baseline_carbon_cost=3.0)))
     tracker.add(TrackedRequest("2", "text_generation", 30.0, datetime.now(timezone.utc),
                                 make_ack(carbon_cost=1.5, baseline_carbon_cost=3.0)))
-    tracker.on_callback("1", True, {"confidence": 0.9, "execution_time_seconds": 1.0,
-                                    "baseline_execution_time_seconds": 2.0}, None)
+    tracker.on_callback("1", True, {"confidence": 0.9, "execution_time_sec": 1.0,
+                                    "baseline_execution_time_sec": 2.0}, None)
     tracker.on_callback("2", False, None, "boom")
 
     progress = tracker.progress()
@@ -261,5 +261,5 @@ def test_progress_reports_counts_and_averages(tmp_path):
     assert progress["requests_completed"] == 1
     assert progress["requests_failed"] == 1
     assert progress["avg_confidence"] == 0.9
-    assert progress["avg_execution_time_seconds"] == 1.0
+    assert progress["avg_execution_time_sec"] == 1.0
     assert progress["avg_carbon_saving_pct"] == 50.0

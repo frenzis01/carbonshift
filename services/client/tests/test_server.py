@@ -126,7 +126,7 @@ def test_callback_completes_a_tracked_request(client):
         "success": True,
         "result": {"task": "question_answering", "flavour": "balanced", "model": "m",
                    "output": {"answer": "Paris"}, "confidence": 0.95, "quality_score": 1.0,
-                   "execution_time_seconds": 0.2},
+                   "execution_time_sec": 0.2},
         "error": None,
     })
     assert resp.status_code == 200

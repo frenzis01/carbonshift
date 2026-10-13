@@ -12,7 +12,7 @@ from app.config import Flavour, Task
 def test_accurate_flavour_gets_zero_error_and_default_quality_one(monkeypatch):
     monkeypatch.setattr(inference.settings, "compute_quality_baseline", True)
     monkeypatch.setattr(inference, "_run_single", lambda task, flavour, task_input: {
-        "output": {"generated_text": "hello"}, "model": "m", "confidence": 0.9, "execution_time_seconds": 0.1,
+        "output": {"generated_text": "hello"}, "model": "m", "confidence": 0.9, "execution_time_sec": 0.1,
     })
 
     result = inference.run_task(Task.TEXT_GENERATION, Flavour.ACCURATE, {"prompt": "hi", "max_new_tokens": 5})
@@ -21,13 +21,24 @@ def test_accurate_flavour_gets_zero_error_and_default_quality_one(monkeypatch):
     assert result["quality_score"] == 1.0
 
 
+def test_single_inference_reports_elapsed_seconds(monkeypatch):
+    times = iter((10.0, 10.025))
+    monkeypatch.setattr(inference, "resolve_model", lambda task, flavour: ("ner", "fake-model"))
+    monkeypatch.setattr(inference._cache, "get", lambda task, flavour: lambda text: [])
+    monkeypatch.setattr(inference.time, "perf_counter", lambda: next(times))
+
+    result = inference._run_single(Task.NER, Flavour.FAST, {"text": "hello"})
+
+    assert result["execution_time_sec"] == pytest.approx(0.025)
+
+
 def test_text_generation_uses_confidence_ratio_for_actual_error(monkeypatch):
     def fake_run_single(task, flavour, task_input):
         if flavour == Flavour.ACCURATE:
             return {"output": {"generated_text": "hi X"}, "model": "acc", "confidence": 0.8,
-                    "execution_time_seconds": 0.2}
+                    "execution_time_sec": 0.2}
         return {"output": {"generated_text": "hi Y"}, "model": "primary", "confidence": 0.4,
-                "execution_time_seconds": 0.1}
+                "execution_time_sec": 0.1}
 
     monkeypatch.setattr(inference, "_run_single", fake_run_single)
     monkeypatch.setattr(inference.settings, "compute_quality_baseline", True)
@@ -39,7 +50,7 @@ def test_text_generation_uses_confidence_ratio_for_actual_error(monkeypatch):
 
 def test_qa_uses_quality_score_for_actual_error(monkeypatch):
     monkeypatch.setattr(inference, "_run_single", lambda task, flavour, task_input: {
-        "output": {"answer": "Paris"}, "model": "m", "confidence": 0.9, "execution_time_seconds": 0.1,
+        "output": {"answer": "Paris"}, "model": "m", "confidence": 0.9, "execution_time_sec": 0.1,
     })
     monkeypatch.setattr(inference.settings, "compute_quality_baseline", True)
 
@@ -55,7 +66,7 @@ def test_accurate_qa_uses_measured_quality_error_instead_of_leaving_it_unset(mon
         "output": {"answer": "partially correct answer"},
         "model": "accurate-qa",
         "confidence": 0.8,
-        "execution_time_seconds": 0.25,
+        "execution_time_sec": 0.25,
     })
     monkeypatch.setattr(inference, "_reference_quality_score", lambda task, task_input, output: 0.75)
     monkeypatch.setattr(inference.settings, "compute_quality_baseline", True)
@@ -75,7 +86,7 @@ def test_accurate_qa_without_ground_truth_has_zero_reference_error(monkeypatch):
         "output": {"answer": "answer"},
         "model": "accurate-qa",
         "confidence": 0.8,
-        "execution_time_seconds": 0.25,
+        "execution_time_sec": 0.25,
     })
     monkeypatch.setattr(inference.settings, "compute_quality_baseline", True)
 

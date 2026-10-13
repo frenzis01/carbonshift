@@ -16,14 +16,14 @@ def _write_calibration(path):
             "task": "question_answering",
             "flavour": "accurate",
             "error_pct": 4.0,
-            "avg_execution_time_seconds": 0.3,
+            "avg_execution_time_sec": 0.3,
             "error_semantics": "word-overlap-f1-v1",
         },
         "qa-fast": {
             "task": "question_answering",
             "flavour": "fast",
             "error_pct": 20.0,
-            "avg_execution_time_seconds": 0.05,
+            "avg_execution_time_sec": 0.05,
             "error_semantics": "word-overlap-f1-v1",
         },
     }))
@@ -83,7 +83,7 @@ def test_startup_adds_explicit_shared_profiles_to_the_local_recovery_catalog(tmp
     definition = {
         "profile_id": "qa-shared-v2",
         "task_kind": "question_answering",
-        "flavours": [{"name": "Accurate", "error": 4.0, "duration": 120}],
+        "flavours": [{"name": "Accurate", "error": 4.0, "duration_sec": 120.0}],
         "error_semantics": "word-overlap-f1-v1",
         "max_error_threshold": 10.0,
         "error_window": {"past_slots": 12, "future_slots": 14, "past_decay_slots": 12},

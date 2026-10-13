@@ -21,17 +21,17 @@
     {
       "name": "Accurate",
       "error": 0.0,
-      "duration": 60
+      "duration_sec": 60.0
     },
     {
       "name": "Balanced",
       "error": 2.5,
-      "duration": 30
+      "duration_sec": 30.0
     },
     {
       "name": "Fast",
       "error": 5.0,
-      "duration": 10
+      "duration_sec": 10.0
     }
   ],
   "rust_binary_path": "rust/target/release/nshift",

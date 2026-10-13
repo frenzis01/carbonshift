@@ -84,7 +84,7 @@ _RESOLVED_STATUSES = {"completed", "failed", "timed_out"}
 SCENARIO_CSV_COLUMNS = [
     "scenario_id", "task", "qos_profile_id", "mode", "source", "count",
     "requests_sent", "requests_scheduled", "requests_completed", "requests_failed", "requests_timed_out",
-    "avg_quality_score", "avg_confidence", "avg_execution_time_seconds",
+    "avg_quality_score", "avg_confidence", "avg_execution_time_sec",
     "avg_ack_latency_seconds", "avg_carbon_saving_pct", "elapsed_seconds",
 ]
 
@@ -161,7 +161,7 @@ def _scenario_metrics(items: list[dict[str, Any]]) -> dict[str, Any]:
                if i.get("result") and i["result"].get("quality_score") is not None]
     confidence = [i["result"]["confidence"] for i in completed
                   if i.get("result") and i["result"].get("confidence") is not None]
-    exec_time = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
+    exec_time = [i["execution_time_sec"] for i in completed if i["execution_time_sec"] is not None]
     ack = [i["ack_latency_seconds"] for i in items]
     saving = [i["carbon_saving_pct"] for i in items if i["carbon_saving_pct"] is not None]
     return {
@@ -176,7 +176,7 @@ def _scenario_metrics(items: list[dict[str, Any]]) -> dict[str, Any]:
         "requests_timed_out": sum(1 for i in items if i["status"] == "timed_out"),
         "avg_quality_score": _stats(quality)["avg"],
         "avg_confidence": _stats(confidence)["avg"],
-        "avg_execution_time_seconds": _stats(exec_time)["avg"],
+        "avg_execution_time_sec": _stats(exec_time)["avg"],
         "avg_ack_latency_seconds": _stats(ack)["avg"],
         "avg_carbon_saving_pct": _stats(saving)["avg"],
     }
@@ -272,7 +272,7 @@ def _write_battery_readme(run_dir: Path, battery_id: str, start_dt: datetime, ro
             f"| {r['scenario_id']} | {r['task']} | {r['qos_profile_id'] or '-'} | {r['mode']} | {r['requests_sent']} | "
             f"{r['requests_completed']} | {r['requests_failed']} | {r['requests_timed_out']} | "
             f"{_fmt(r['avg_quality_score'])} | {_fmt(r['avg_confidence'])} | "
-            f"{_fmt(r['avg_execution_time_seconds'])} | {_fmt(r['avg_ack_latency_seconds'])} | "
+            f"{_fmt(r['avg_execution_time_sec'])} | {_fmt(r['avg_ack_latency_seconds'])} | "
             f"{_fmt(r['avg_carbon_saving_pct'])} |"
         )
     lines.append("")

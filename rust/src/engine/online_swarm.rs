@@ -120,7 +120,7 @@ fn pick_feasible_flavour<'a>(
         if win_sum / win_cnt as f64 > max_err {
             continue;
         }
-        let cost = ci * mult * flav.duration as f64 * scale;
+        let cost = ci * mult * flav.duration * scale;
         return Some((flav, cost));
     }
     None
@@ -137,7 +137,7 @@ fn slot_cost(
     let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
     let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
     let mult = capacity_mult(tiers, position as i64);
-    ci * mult * flav.duration as f64 * scale
+    ci * mult * flav.duration * scale
 }
 
 #[inline]
@@ -156,7 +156,7 @@ fn make_assignment(req: &Request, slot: i32, flav: &Flavour, cost: f64) -> Assig
 
 fn sorted_flavours_and_fallback(flavours: &[Flavour]) -> (Vec<&Flavour>, &Flavour) {
     let mut sorted: Vec<&Flavour> = flavours.iter().collect();
-    sorted.sort_by_key(|f| f.duration);
+    sorted.sort_by(|a, b| a.duration.total_cmp(&b.duration));
     let fallback = flavours
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
@@ -330,7 +330,7 @@ impl OnlineAcoState {
     ) -> Self {
         let cheapest = flavours
             .iter()
-            .min_by_key(|f| f.duration)
+            .min_by(|a, b| a.duration.total_cmp(&b.duration))
             .expect("at least one flavour");
         let eta: Vec<f64> = (0..total_slots)
             .map(|s| {
@@ -341,7 +341,7 @@ impl OnlineAcoState {
                     .get(s)
                     .copied()
                     .unwrap_or(1.0);
-                let base = ci * cheapest.duration as f64 * carbon_cost_duration_scale;
+                let base = ci * cheapest.duration * carbon_cost_duration_scale;
                 if base > 0.0 { 1.0 / base } else { 1e9 }
             })
             .collect();

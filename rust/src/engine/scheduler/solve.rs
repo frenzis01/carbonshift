@@ -68,7 +68,7 @@ pub(super) struct BatchSolveContext<'a> {
     pub(super) recovery_state: &'a RecoveryState,
     pub(super) verbose: bool,
     pub(super) carbon_forecast: &'a [f64],
-    pub(super) flavour_duration_by_name: &'a HashMap<String, i32>,
+    pub(super) flavour_duration_by_name: &'a HashMap<String, f64>,
 }
 
 /// Common result contract consumed by the worker commit/rollback coordinator.
@@ -571,7 +571,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .get(&dp_a.request_id)
                 .and_then(|flavours| flavours.iter().find(|f| f.name == dp_a.flavour_name))
                 .map(|f| f.duration)
-                .unwrap_or_else(|| fdb.get(&dp_a.flavour_name).copied().unwrap_or(0));
+                .unwrap_or_else(|| fdb.get(&dp_a.flavour_name).copied().unwrap_or(0.0));
             Assignment::new_for_profile(
                 dp_a.request_id,
                 dp_a.slot,
@@ -695,7 +695,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
 
     // ── Step 5: exhaustive greedy scan over (slot, flavour) ─────────────────
     let mut sorted_flavours: Vec<&Flavour> = prep.solver_flavours.iter().collect();
-    sorted_flavours.sort_by_key(|f| f.duration);
+    sorted_flavours.sort_by(|a, b| a.duration.total_cmp(&b.duration));
     let fallback_flav = prep
         .solver_flavours
         .iter()
@@ -771,7 +771,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
                     continue;
                 }
 
-                let cost = ci * mult * flav.duration as f64 * assignment.carbon_cost_duration_scale;
+                let cost = ci * mult * flav.duration * assignment.carbon_cost_duration_scale;
                 if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
                     best = Some((cost, slot, flav));
                 }
@@ -790,8 +790,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .unwrap_or(1.0);
             let position = *slot_count.get(&start_slot).unwrap_or(&0) + 1;
             let mult = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
-            let cost =
-                ci * mult * fallback_flav.duration as f64 * assignment.carbon_cost_duration_scale;
+            let cost = ci * mult * fallback_flav.duration * assignment.carbon_cost_duration_scale;
             (cost, start_slot, fallback_flav)
         });
 
@@ -822,7 +821,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .get(&ra.request_id)
                 .and_then(|flavours| flavours.iter().find(|f| f.name == ra.flavour_name))
                 .map(|f| f.duration)
-                .unwrap_or_else(|| fdb.get(&ra.flavour_name).copied().unwrap_or(0));
+                .unwrap_or_else(|| fdb.get(&ra.flavour_name).copied().unwrap_or(0.0));
             Assignment::new_for_profile(
                 ra.request_id,
                 ra.slot,

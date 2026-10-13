@@ -1,6 +1,6 @@
 {
   "deepset/bert-large-uncased-whole-word-masking-squad2": {
-    "avg_execution_time_seconds": 0.3648508861724895,
+    "avg_execution_time_sec": 0.3648508861724895,
     "error_pct": 7.057902679733308,
     "flavour": "accurate",
     "measured_at": "2026-09-20T16:32:15.054607+00:00",
@@ -9,7 +9,7 @@
     "task": "question_answering"
   },
   "deepset/roberta-base-squad2": {
-    "avg_execution_time_seconds": 0.10934789336735776,
+    "avg_execution_time_sec": 0.10934789336735776,
     "error_pct": 21.770864246494263,
     "flavour": "balanced",
     "measured_at": "2026-09-20T16:35:29.912894+00:00",
@@ -18,7 +18,7 @@
     "task": "question_answering"
   },
   "distilbert-base-cased-distilled-squad": {
-    "avg_execution_time_seconds": 0.05712585492244216,
+    "avg_execution_time_sec": 0.05712585492244216,
     "error_pct": 24.65539598015735,
     "flavour": "fast",
     "measured_at": "2026-09-20T16:38:23.073066+00:00",
@@ -27,7 +27,7 @@
     "task": "question_answering"
   },
   "distilgpt2": {
-    "avg_execution_time_seconds": 0.20503475264247753,
+    "avg_execution_time_sec": 0.20503475264247753,
     "error_pct": 36.63400196259251,
     "flavour": "fast",
     "measured_at": "2026-09-20T16:28:59.995154+00:00",
@@ -36,7 +36,7 @@
     "task": "text_generation"
   },
   "dslim/bert-base-NER": {
-    "avg_execution_time_seconds": 0.007376465797524361,
+    "avg_execution_time_sec": 0.007376465797524361,
     "error_pct": 41.740073422953856,
     "flavour": "balanced",
     "measured_at": "2026-09-20T16:29:28.889568+00:00",
@@ -45,7 +45,7 @@
     "task": "ner"
   },
   "dslim/bert-large-NER": {
-    "avg_execution_time_seconds": 0.013484723807496267,
+    "avg_execution_time_sec": 0.013484723807496267,
     "error_pct": 9.706927794427795,
     "flavour": "accurate",
     "measured_at": "2026-09-20T16:29:17.329661+00:00",
@@ -54,7 +54,7 @@
     "task": "ner"
   },
   "dslim/distilbert-NER": {
-    "avg_execution_time_seconds": 0.005157313575000444,
+    "avg_execution_time_sec": 0.005157313575000444,
     "error_pct": 62.714430781636665,
     "flavour": "fast",
     "measured_at": "2026-09-20T16:29:40.775759+00:00",
@@ -63,7 +63,7 @@
     "task": "ner"
   },
   "gpt2": {
-    "avg_execution_time_seconds": 0.3673217160923559,
+    "avg_execution_time_sec": 0.3673217160923559,
     "error_pct": 18.072461048777516,
     "flavour": "balanced",
     "measured_at": "2026-09-20T16:18:36.366624+00:00",
@@ -72,7 +72,7 @@
     "task": "text_generation"
   },
   "gpt2-medium": {
-    "avg_execution_time_seconds": 0.6645656221499939,
+    "avg_execution_time_sec": 0.6645656221499939,
     "error_pct": 0.0,
     "flavour": "accurate",
     "measured_at": "2026-09-20T16:06:43.591211+00:00",

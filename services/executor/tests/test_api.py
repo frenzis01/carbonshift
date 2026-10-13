@@ -23,7 +23,7 @@ def fake_run_task(task, flavour, task_input):
         "model": f"fake-{task}-{flavour}",
         "confidence": 0.9,
         "quality_score": None,
-        "execution_time_seconds": 0.01,
+        "execution_time_sec": 0.01,
     }
 
 

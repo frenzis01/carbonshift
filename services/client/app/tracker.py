@@ -91,8 +91,8 @@ class TrackedRequest:
             )
         
         # get execution times from result
-        execution_time_seconds = self.result.get("execution_time_seconds") if self.result else None
-        baseline_execution_time_seconds = self.result.get("baseline_execution_time_seconds") if self.result else None
+        execution_time_sec = self.result.get("execution_time_sec") if self.result else None
+        baseline_execution_time_sec = self.result.get("baseline_execution_time_sec") if self.result else None
         
         return {
             "request_id": self.request_id,
@@ -115,8 +115,8 @@ class TrackedRequest:
             "actual_carbon_cost": self.actual_carbon_cost,
             "actual_baseline_carbon_cost": self.actual_baseline_carbon_cost,
             "actual_carbon_saving_pct": actual_carbon_saving_pct,
-            "execution_time_seconds": execution_time_seconds,
-            "baseline_execution_time_seconds": baseline_execution_time_seconds,
+            "execution_time_sec": execution_time_sec,
+            "baseline_execution_time_sec": baseline_execution_time_sec,
             "callback_received_at": self.callback_received_at.isoformat() if self.callback_received_at else None,
             "end_to_end_seconds": end_to_end_seconds,
             "late": late,
@@ -159,8 +159,8 @@ class RequestTracker:
                      error: Optional[str], actual_carbon_cost: Optional[float] = None,
                      actual_baseline_carbon_cost: Optional[float] = None, 
                     #  TODO FIX
-                     execution_time_seconds: Optional[float] = None,
-                     baseline_execution_time_seconds: Optional[float] = None,
+                     execution_time_sec: Optional[float] = None,
+                     baseline_execution_time_sec: Optional[float] = None,
                      ) -> bool:
         with self._lock:
             t = self._by_id.get(request_id)
@@ -183,18 +183,28 @@ class RequestTracker:
 
         # result is a JSON containing the actual error percentage
         actual_error_pct = result.get("actual_error_pct") if result else None
+        callback_result = result
+        if execution_time_sec is not None or baseline_execution_time_sec is not None:
+            callback_result = dict(result or {})
+            if execution_time_sec is not None and callback_result.get("execution_time_sec") is None:
+                callback_result["execution_time_sec"] = execution_time_sec
+            if (
+                baseline_execution_time_sec is not None
+                and callback_result.get("baseline_execution_time_sec") is None
+            ):
+                callback_result["baseline_execution_time_sec"] = baseline_execution_time_sec
         # TODO: remove these prints
         # logger.info("actual_error_pct=%s", actual_error_pct)
         # logger.info("result=%s", result)
         # logger.info("actual_carbon_cost=%s, actual_baseline_carbon_cost=%s", actual_carbon_cost, actual_baseline_carbon_cost)
-        # logger.info("execution_time_seconds=%s, baseline_execution_time_seconds=%s", execution_time_seconds, baseline_execution_time_seconds)
+        # logger.info("execution_time_sec=%s, baseline_execution_time_sec=%s", execution_time_sec, baseline_execution_time_sec)
         # TODO: Log at which slot the request was sent and what is the current slot
         # logger.info("sent_at_slot=%s, current_slot=%s", t.sent_at_slot, get_current_slot())
         # logger.info("Received callback for request_id=%s / scheduled slot %s ", request_id, t.scheduled_slot if t else None)
         with self._lock:
             t.callback_received_at = datetime.now(timezone.utc)
             t.success = success
-            t.result = result
+            t.result = callback_result
             t.error = error
             t.actual_carbon_cost = actual_carbon_cost
             t.actual_baseline_carbon_cost = actual_baseline_carbon_cost
@@ -242,9 +252,9 @@ class RequestTracker:
         ack = [i["ack_latency_seconds"] for i in its]
         carbon = [i["carbon_cost"] for i in its if i["carbon_cost"] is not None]
         baseline_carbon = [i["baseline_carbon_cost"] for i in its if i["baseline_carbon_cost"] is not None]
-        exec_time = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
-        baseline_exec_time = [i["baseline_execution_time_seconds"] for i in completed
-                               if i["baseline_execution_time_seconds"] is not None]
+        exec_time = [i["execution_time_sec"] for i in completed if i["execution_time_sec"] is not None]
+        baseline_exec_time = [i["baseline_execution_time_sec"] for i in completed
+                               if i["baseline_execution_time_sec"] is not None]
         confidences = [i["result"]["confidence"] for i in completed
                         if i.get("result") and i["result"].get("confidence") is not None]
         qualities = [i["result"]["quality_score"] for i in completed
@@ -304,7 +314,7 @@ class RequestTracker:
             # Calculate the forecasted execution time based on the matching models
             if matching_models:
                 forecasted_exec_time = fmean(
-                    stats["avg_execution_time_seconds"]
+                    stats["avg_execution_time_sec"]
                     for stats in matching_models
                 )
                 forecasted_error = fmean(
@@ -320,11 +330,11 @@ class RequestTracker:
             "late_rate": round(late_count / len(its), ROUND_DIGITS) if its else 0.0,
             "ack_latency_seconds": _stats(ack),
             "end_to_end_seconds": _stats(e2e),
-            "forecasted_execution_time_seconds": round(forecasted_exec_time, ROUND_DIGITS) if forecasted_exec_time is not None else None,
+            "forecasted_execution_time_sec": round(forecasted_exec_time, ROUND_DIGITS) if forecasted_exec_time is not None else None,
             "forecasted_error_pct": round(forecasted_error, ROUND_DIGITS) if forecasted_error is not None else None,
             "actual_error_pct_avg": round(actual_error_pct_avg, ROUND_DIGITS) if actual_error_pct_avg is not None else None,
-            "execution_time_seconds": _stats(exec_time),
-            "baseline_execution_time_seconds": _stats(baseline_exec_time),
+            "execution_time_sec": _stats(exec_time),
+            "baseline_execution_time_sec": _stats(baseline_exec_time),
             "carbon_cost": round(sum(carbon), ROUND_DIGITS),
             "baseline_carbon_cost": round(sum(baseline_carbon), ROUND_DIGITS),
             "carbon_saving_pct": round(carbon_saving_value, ROUND_DIGITS) if carbon_saving_value is not None else None,
@@ -377,11 +387,11 @@ class RequestTracker:
         # what its own ack said, so count those too.
         scheduled = [i for i in items if i["scheduled_slot"] is not None or i["status"] == "completed"]
         ack = [i["ack_latency_seconds"] for i in items]
-        exec_time = [i["execution_time_seconds"] for i in completed if i["execution_time_seconds"] is not None]
+        exec_time = [i["execution_time_sec"] for i in completed if i["execution_time_sec"] is not None]
         carbon_cost = [i["carbon_cost"] for i in items if i["carbon_cost"] is not None]
         baseline_carbon_cost = [i["baseline_carbon_cost"] for i in items if i["baseline_carbon_cost"] is not None]
-        baseline_execution_cost = [i["baseline_execution_time_seconds"] for i in completed
-                                   if i["baseline_execution_time_seconds"] is not None]
+        baseline_execution_cost = [i["baseline_execution_time_sec"] for i in completed
+                                   if i["baseline_execution_time_sec"] is not None]
         confidences = [i["result"]["confidence"] for i in completed
                         if i.get("result") and i["result"].get("confidence") is not None]
         qualities = [i["result"]["quality_score"] for i in completed
@@ -421,7 +431,7 @@ class RequestTracker:
             "requests_pending": sum(1 for i in items if i["status"] == "submitted"),
             "avg_quality_score": _stats(qualities)["avg"],
             "avg_confidence": _stats(confidences)["avg"],
-            "avg_execution_time_seconds": _stats(exec_time)["avg"],
+            "avg_execution_time_sec": _stats(exec_time)["avg"],
             "avg_ack_latency_seconds": _stats(ack)["avg"],
             "avg_carbon_saving_pct": round(avg_carbon_saving_pct, ROUND_DIGITS) if avg_carbon_saving_pct is not None else None,
             "avg_actual_carbon_saving_pct": round(avg_actual_carbon_saving_pct, ROUND_DIGITS) if avg_actual_carbon_saving_pct is not None else None,

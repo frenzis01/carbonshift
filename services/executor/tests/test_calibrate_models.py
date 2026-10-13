@@ -14,7 +14,7 @@ def test_calibration_persists_task_error_semantics(monkeypatch):
         calibrate_models,
         "run_task",
         lambda task, flavour, inputs: {
-            "execution_time_seconds": 0.2,
+            "execution_time_sec": 0.2,
             "quality_score": 0.75,
         },
     )
@@ -35,3 +35,4 @@ def test_calibration_persists_task_error_semantics(monkeypatch):
     assert result["error_semantics"] == "word-overlap-f1-v1"
     assert result["task"] == "question_answering"
     assert result["error_pct"] == 25.0
+    assert result["avg_execution_time_sec"] == 0.2

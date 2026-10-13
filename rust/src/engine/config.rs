@@ -304,17 +304,17 @@ impl Default for Config {
                 Flavour {
                     name: "Accurate".to_string(),
                     error: 0.0,
-                    duration: 60,
+                    duration: 60.0,
                 },
                 Flavour {
                     name: "Balanced".to_string(),
                     error: 2.5,
-                    duration: 30,
+                    duration: 30.0,
                 },
                 Flavour {
                     name: "Fast".to_string(),
                     error: 5.0,
-                    duration: 10,
+                    duration: 10.0,
                 },
             ],
             carbon_cost_duration_scale: 1.0 / 3600.0,
@@ -473,7 +473,7 @@ mod tests {
         cfg.flavours = vec![Flavour {
             name: "PolicySentinel".to_string(),
             error: 6.25,
-            duration: 137,
+            duration: 137.0,
         }];
         cfg.capacity_tiers = vec![
             CapacityTier {
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(policy.flavours.len(), 1);
         assert_eq!(policy.flavours[0].name, "PolicySentinel");
         assert_eq!(policy.flavours[0].error, 6.25);
-        assert_eq!(policy.flavours[0].duration, 137);
+        assert_eq!(policy.flavours[0].duration, 137.0);
         assert_eq!(policy.capacity_tiers.len(), 2);
         assert_eq!(policy.capacity_tiers[0].max_requests, Some(7));
         assert_eq!(policy.capacity_tiers[0].multiplier, 2.75);

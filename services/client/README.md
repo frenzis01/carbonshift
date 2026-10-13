@@ -255,8 +255,8 @@ Per ogni richiesta (persistite anche su `data/metrics.jsonl` non appena
 arriva il risultato/timeout):
 - `ack_latency_seconds`: tempo fra l'invio e la risposta sincrona di carbonshift
   (**non** include il tempo di esecuzione lato executor).
-- `execution_time_seconds`: tempo speso dal solo executor per eseguire il
-  modello (dal risultato inoltrato da carbonshift), quando disponibile.
+- `execution_time_sec`: tempo speso dal solo executor per eseguire il
+  modello, in secondi (dal risultato inoltrato da carbonshift), quando disponibile.
 - `end_to_end_seconds`: tempo fra l'invio e la ricezione del callback finale
   (include sia l'attesa dello scheduling sia l'esecuzione).
 - `late`: `true` se `end_to_end_seconds > deadline_seconds` richiesta.
@@ -279,13 +279,13 @@ arriva il risultato/timeout):
 - `carbon_saving_pct`: `(baseline_carbon_cost - carbon_cost) / baseline_carbon_cost * 100`
   — quanto si risparmia grazie alla scelta di carbonshift (flavour + slot)
   rispetto a quella baseline **analitica** (stima, non misura reale).
-- `baseline_execution_time_seconds`: tempo di esecuzione **misurato** di una
+- `baseline_execution_time_sec`: tempo di esecuzione **misurato**, in secondi, di una
   passata "ombra" con il flavour Accurate sullo stesso input (eseguita
   dall'executor subito dopo quella assegnata, a meno di
   `EXECUTOR_COMPUTE_QUALITY_BASELINE=0` — vedi executor/README.md). A
   differenza di `baseline_carbon_cost`, questo è un dato **empirico**, utile
   per un risparmio energetico/tempo reale invece che stimato.
-- `energy_saving_pct`: `(baseline_execution_time_seconds - execution_time_seconds) / baseline_execution_time_seconds * 100`
+- `energy_saving_pct`: `(baseline_execution_time_sec - execution_time_sec) / baseline_execution_time_sec * 100`
   — l'analogo empirico di `carbon_saving_pct`, basato su tempi di esecuzione
   realmente misurati anziché sulle durate assunte in `config.rs`.
 - `confidence`, `quality_score`: dal risultato dell'executor. `confidence` è
@@ -316,7 +316,7 @@ finestra e vincolo cumulativo dei profili effettivamente usati.
 `GET /metrics/progress` dà invece una fotografia unica e leggera dell'intero
 test (non per task/flavour): quante richieste sono state inviate, quante
 schedulate da carbonshift, quante completate/fallite/scadute, e le medie di
-quality_score, confidence, `execution_time_seconds`, `ack_latency_seconds`,
+quality_score, confidence, `execution_time_sec`, `ack_latency_seconds`,
 `carbon_saving_pct` e `energy_saving_pct`.
 
 ```sh
@@ -473,7 +473,7 @@ devono poterlo ripristinare:
   {
     "profile_id": "qa-standard-v2",
     "task_kind": "question_answering",
-    "flavours": [{"name": "Accurate", "error": 4.0, "duration": 120}],
+    "flavours": [{"name": "Accurate", "error": 4.0, "duration_sec": 120.0}],
     "error_semantics": "word-overlap-f1-v1",
     "max_error_threshold": 10.0,
     "error_window": {"past_slots": 12, "future_slots": 14, "past_decay_slots": 12},

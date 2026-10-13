@@ -27,11 +27,11 @@ def _latest_entries_by_task_flavour(stats: dict[str, dict[str, Any]]) -> dict[st
 
 
 def _flavour_definition(entry: dict[str, Any]) -> dict[str, Any]:
-    """Convert a measured row to Carbonshift's duration-in-milliseconds API."""
+    """Convert a measured row to Carbonshift's seconds-based API."""
     return {
         "name": entry["flavour"].capitalize(),
         "error": entry["error_pct"],
-        "duration": max(round(entry["avg_execution_time_seconds"] * 1000), 1),
+        "duration_sec": max(float(entry["avg_execution_time_sec"]), 0.001),
     }
 
 

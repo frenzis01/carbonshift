@@ -36,7 +36,7 @@ pub struct TrackedRequest {
     /// time so it stays comparable even after the real assignment changes.
     pub baseline_carbon_cost: f64,
     /// Duration in seconds of the accurate flavour used to compute baseline_carbon_cost.
-    pub baseline_duration: i32,
+    pub baseline_duration: f64,
     /// Slot the request arrived at — needed to look up the *actual* (not
     /// forecast) carbon intensity for that slot once known, to correct
     /// `baseline_carbon_cost` the same way `Assignment::carbon_cost` gets
@@ -48,8 +48,8 @@ pub struct TrackedRequest {
     pub actual_carbon_cost: Option<f64>,
     pub actual_baseline_carbon_cost: Option<f64>,
     pub actual_error_pct: Option<f64>,
-    pub execution_time_seconds: Option<f64>,
-    pub baseline_execution_time_seconds: Option<f64>,
+    pub execution_time_sec: Option<f64>,
+    pub baseline_execution_time_sec: Option<f64>,
 }
 
 impl TrackedRequest {
@@ -57,7 +57,7 @@ impl TrackedRequest {
         callback_url: Option<String>,
         payload: serde_json::Value,
         baseline_carbon_cost: f64,
-        baseline_duration: i32,
+        baseline_duration: f64,
         arrival_slot: i32,
         qos_profile_id: QosProfileId,
     ) -> Self {
@@ -75,8 +75,8 @@ impl TrackedRequest {
             actual_carbon_cost: None,
             actual_baseline_carbon_cost: None,
             actual_error_pct: None,
-            execution_time_seconds: None,
-            baseline_execution_time_seconds: None,
+            execution_time_sec: None,
+            baseline_execution_time_sec: None,
         }
     }
 }
@@ -431,7 +431,7 @@ mod tests {
         cfg.flavours = vec![Flavour {
             name: "ServiceSentinel".to_string(),
             error: 3.75,
-            duration: 91,
+            duration: 91.0,
         }];
         cfg.capacity_tiers = vec![
             CapacityTier {
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(service.flavours.len(), 1);
         assert_eq!(service.flavours[0].name, "ServiceSentinel");
         assert_eq!(service.flavours[0].error, 3.75);
-        assert_eq!(service.flavours[0].duration, 91);
+        assert_eq!(service.flavours[0].duration, 91.0);
         assert_eq!(service.carbon_cost_duration_scale, 0.375);
         assert_eq!(service.max_error_threshold, 8.25);
         assert_eq!(service.error_window_past, 5);

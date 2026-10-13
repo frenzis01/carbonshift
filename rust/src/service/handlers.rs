@@ -338,7 +338,7 @@ fn compute_baseline_carbon_cost(
     state: &AppState,
     arrival_slot: i32,
     flavours: &[Flavour],
-) -> (f64, i32) {
+) -> (f64, f64) {
     // Reserve the next 1-indexed position in the arrival slot. The baseline is
     // calculated at submission time and its position is kept stable even if
     // CarbonShift later moves or re-prices the real assignment.
@@ -361,8 +361,7 @@ fn compute_baseline_carbon_cost(
         .iter()
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("task must have at least one flavour");
-    let cost =
-        carbon * mult * accurate.duration as f64 * state.scheduler.carbon_cost_duration_scale;
+    let cost = carbon * mult * accurate.duration * state.scheduler.carbon_cost_duration_scale;
     (cost, accurate.duration)
 }
 
@@ -1432,8 +1431,8 @@ pub async fn list_request_statuses(
                     request.actual_baseline_carbon_cost,
                     request.actual_carbon_cost,
                     request.actual_error_pct,
-                    request.execution_time_seconds,
-                    request.baseline_execution_time_seconds,
+                    request.execution_time_sec,
+                    request.baseline_execution_time_sec,
                     request.error.clone(),
                 )
             })
@@ -1453,8 +1452,8 @@ pub async fn list_request_statuses(
                 actual_baseline_carbon_cost,
                 actual_carbon_cost,
                 actual_error_pct,
-                execution_time_seconds,
-                baseline_execution_time_seconds,
+                execution_time_sec,
+                baseline_execution_time_sec,
                 error,
             )| {
                 let assignment = assignments.get(&request_id);
@@ -1471,8 +1470,8 @@ pub async fn list_request_statuses(
                     baseline_carbon_cost,
                     actual_baseline_carbon_cost,
                     actual_error_pct,
-                    execution_time_seconds,
-                    baseline_execution_time_seconds,
+                    execution_time_sec,
+                    baseline_execution_time_sec,
                     scheduled_at: assignment.map(|item| item.assignment_time),
                     error,
                 }
@@ -1503,7 +1502,7 @@ pub async fn list_request_statuses(
 /// Also corrects `carbon_cost`/`baseline_carbon_cost` with the *actual*
 /// carbon intensity for their slots (if reported via `advance_slot` or
 /// `set_carbon_intensity`) AND the *actual* execution time measured by the
-/// executor (`execution_time_seconds` and `baseline_execution_time_seconds`).
+/// executor (`execution_time_sec` and `baseline_execution_time_sec`).
 /// For `carbon_cost`, slot is `assignment.scheduled_slot` and duration is
 /// `assignment.flavour_duration`. For `baseline_carbon_cost`, slot is
 /// `t.arrival_slot` (the slot where baseline would execute immediately) and
@@ -1535,13 +1534,13 @@ pub async fn executor_callback(
 
     // Older executor responses may omit the explicit baseline duration. If
     // the Accurate flavour itself ran, its measured time is also the baseline.
-    let actual_execution_time = body
+    let actual_execution_time_sec = body
         .result
-        .get("execution_time_seconds")
+        .get("execution_time_sec")
         .and_then(|v| v.as_f64());
-    let baseline_execution_time = body
+    let baseline_execution_time_sec = body
         .result
-        .get("baseline_execution_time_seconds")
+        .get("baseline_execution_time_sec")
         .and_then(|v| v.as_f64())
         .or_else(|| {
             body.result
@@ -1549,7 +1548,7 @@ pub async fn executor_callback(
                 .and_then(|f| f.as_str())
                 .and_then(|f| {
                     if f.eq_ignore_ascii_case("accurate") {
-                        actual_execution_time
+                        actual_execution_time_sec
                     } else {
                         None
                     }
@@ -1574,8 +1573,8 @@ pub async fn executor_callback(
         .get(&request_id)
     {
         let ci_ratio = state.carbon_intensity_ratio(assignment.scheduled_slot);
-        let time_ratio = match (actual_execution_time, assignment.flavour_duration) {
-            (Some(t_exec), dur) if dur > 0 => Some(t_exec / dur as f64),
+        let time_ratio = match (actual_execution_time_sec, assignment.flavour_duration) {
+            (Some(t_exec), dur) if dur > 0.0 => Some(t_exec / dur),
             _ => None,
         };
 
@@ -1607,12 +1606,12 @@ pub async fn executor_callback(
             .result
             .get("actual_error_pct")
             .and_then(|value| value.as_f64());
-        t.execution_time_seconds = actual_execution_time;
-        t.baseline_execution_time_seconds = baseline_execution_time;
+        t.execution_time_sec = actual_execution_time_sec;
+        t.baseline_execution_time_sec = baseline_execution_time_sec;
 
         let ci_ratio = state.carbon_intensity_ratio(t.arrival_slot);
-        let time_ratio = match (baseline_execution_time, t.baseline_duration) {
-            (Some(t_exec), dur) if dur > 0 => Some(t_exec / dur as f64),
+        let time_ratio = match (baseline_execution_time_sec, t.baseline_duration) {
+            (Some(t_exec), dur) if dur > 0.0 => Some(t_exec / dur),
             _ => None,
         };
 
@@ -1639,8 +1638,8 @@ pub async fn executor_callback(
             error: body.error,
             actual_carbon_cost,
             actual_baseline_carbon_cost,
-            execution_time_seconds: actual_execution_time,
-            baseline_execution_time_seconds: baseline_execution_time,
+            execution_time_sec: actual_execution_time_sec,
+            baseline_execution_time_sec,
         };
         tokio::spawn(async move {
             if let Err(e) = http.post(&url).json(&payload).send().await {
@@ -1722,12 +1721,12 @@ mod tests {
             Flavour {
                 name: "Cheap".to_string(),
                 error: 5.0,
-                duration: 60,
+                duration: 60.0,
             },
             Flavour {
                 name: "Precise".to_string(),
                 error: 0.0,
-                duration: 10,
+                duration: 10.0,
             },
         ];
         let cfg = Arc::new(cfg);
@@ -1767,7 +1766,7 @@ mod tests {
             (baseline - expected).abs() < 1e-9,
             "baseline={baseline}, expected={expected}"
         );
-        assert_eq!(duration, 10);
+        assert_eq!(duration, 10.0);
     }
 
     #[tokio::test]

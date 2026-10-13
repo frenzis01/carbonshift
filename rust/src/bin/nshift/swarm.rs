@@ -36,7 +36,7 @@ pub struct SwarmAssignment {
     pub flavour_name: String,
     // TODO verify if this is needed later on in the development or not
     #[allow(dead_code)]
-    pub flavour_duration: i32,
+    pub flavour_duration: f64,
     pub error: f64,
     pub carbon_cost: f64,
 }
@@ -106,7 +106,7 @@ fn pick_feasible_flavour<'a>(
                 continue;
             }
         }
-        let cost = ci * mult * flav.duration as f64 * scale;
+        let cost = ci * mult * flav.duration * scale;
         return Some((flav, cost));
     }
     None
@@ -124,7 +124,7 @@ fn slot_cost(
     let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
     let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
     let mult = capacity_mult(tiers, position as i64);
-    ci * mult * flav.duration as f64 * scale
+    ci * mult * flav.duration * scale
 }
 
 // ─── Bandit ───────────────────────────────────────────────────────────────────
@@ -174,7 +174,7 @@ pub fn run_bandit(
 
     // Flavours sorted cheapest-first; fallback = minimum-error flavour.
     let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
-    sorted_flavours.sort_by_key(|f| f.duration);
+    sorted_flavours.sort_by(|a, b| a.duration.total_cmp(&b.duration));
     let fallback_flav = assignment
         .flavours
         .iter()
@@ -330,7 +330,7 @@ pub fn run_ant_colony(
 
     // Flavours sorted cheapest-first; fallback = minimum-error flavour.
     let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
-    sorted_flavours.sort_by_key(|f| f.duration);
+    sorted_flavours.sort_by(|a, b| a.duration.total_cmp(&b.duration));
     let fallback_flav = assignment
         .flavours
         .iter()
@@ -342,7 +342,7 @@ pub fn run_ant_colony(
     let eta: Vec<f64> = (0..total_slots as usize)
         .map(|s| {
             let ci = carbon_forecast.get(s).copied().unwrap_or(1.0);
-            let base = ci * cheapest.duration as f64 * scale;
+            let base = ci * cheapest.duration * scale;
             if base > 0.0 { 1.0 / base } else { 1e9 }
         })
         .collect();

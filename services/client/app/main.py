@@ -148,7 +148,7 @@ def callback(body: CallerCallbackPayload) -> dict[str, str]:
     logger.info("received callback for request_id=%s, success=%s", body.request_id, body.success)
     found = tracker.on_callback(str(body.request_id), body.success, body.result, body.error,
                                  body.actual_carbon_cost, body.actual_baseline_carbon_cost,
-                                 body.execution_time_seconds, body.baseline_execution_time_seconds)
+                                 body.execution_time_sec, body.baseline_execution_time_sec)
     if not found:
         logger.warning("callback for unknown/untracked request_id=%s", body.request_id)
     return {"status": "ok"}

@@ -194,7 +194,7 @@ fn test_lock_future_pins_and_excludes_future_assignments() {
         "Fast".to_string(),
         1.0,
         5.0,
-        10,
+        10.0,
         Some(0),
         Some(8),
     )]);
@@ -231,7 +231,7 @@ fn test_unlock_future_includes_future_in_dp() {
         "Fast".to_string(),
         1.0,
         5.0,
-        10,
+        10.0,
         Some(0),
         Some(8),
     )]);
@@ -259,7 +259,7 @@ fn test_greedy_fallback_covers_all_requests() {
         c.flavours = vec![Flavour {
             name: "Only".to_string(),
             error: 1.0,
-            duration: 10,
+            duration: 10.0,
         }];
     });
 
@@ -330,12 +330,12 @@ fn qos_profile_flavours_and_threshold_reach_the_dp_solver() {
     let cheap = Flavour {
         name: "Cheap".to_string(),
         error: 30.0,
-        duration: 5,
+        duration: 5.0,
     };
     let accurate = Flavour {
         name: "Accurate2".to_string(),
         error: 0.0,
-        duration: 60,
+        duration: 60.0,
     };
 
     let policy = profile(
@@ -472,12 +472,12 @@ fn profile_batches_ignore_other_profiles_window_errors() {
             Flavour {
                 name: "Accurate".to_string(),
                 error: 0.0,
-                duration: 100,
+                duration: 100.0,
             },
             Flavour {
                 name: "Fast".to_string(),
                 error: 15.0,
-                duration: 1,
+                duration: 1.0,
             },
         ];
     });
@@ -493,7 +493,7 @@ fn profile_batches_ignore_other_profiles_window_errors() {
         vec![Flavour {
             name: "NerFast".to_string(),
             error: 90.0,
-            duration: 1,
+            duration: 1.0,
         }],
         90.0,
     );
@@ -504,7 +504,7 @@ fn profile_batches_ignore_other_profiles_window_errors() {
         "NerFast".to_string(),
         1.0,
         90.0,
-        1,
+        1.0,
         Some(0),
         Some(1),
         ner_profile.profile_id.clone(),
@@ -536,12 +536,12 @@ fn cumulative_error_constraint_uses_only_the_selected_profile() {
             Flavour {
                 name: "Accurate".to_string(),
                 error: 0.0,
-                duration: 100,
+                duration: 100.0,
             },
             Flavour {
                 name: "Fast".to_string(),
                 error: 15.0,
-                duration: 1,
+                duration: 1.0,
             },
         ],
         20.0,
@@ -559,7 +559,7 @@ fn cumulative_error_constraint_uses_only_the_selected_profile() {
         "Fast".to_string(),
         1.0,
         90.0,
-        1,
+        1.0,
         Some(0),
         Some(1),
         qa.profile_id.clone(),
@@ -598,7 +598,7 @@ fn profile_solve_prices_capacity_using_global_cross_profile_occupancy() {
         vec![Flavour {
             name: "Only".to_string(),
             error: 0.0,
-            duration: 60,
+            duration: 60.0,
         }],
         1.0,
     );
@@ -609,7 +609,7 @@ fn profile_solve_prices_capacity_using_global_cross_profile_occupancy() {
         "Ner".to_string(),
         1.0,
         0.0,
-        60,
+        60.0,
         Some(0),
         Some(0),
         QosProfileId::parse("ner-cost-v1").unwrap(),
@@ -780,9 +780,14 @@ fn test_greedy_singleton_respects_existing_slot_load() {
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].scheduled_slot, 0);
     // Cost must reflect the 5.0× multiplier (position 2), not the 1.0× baseline.
-    let cheapest_flavour_duration = cfg.flavours.iter().map(|f| f.duration).min().unwrap();
+    let cheapest_flavour_duration = cfg
+        .flavours
+        .iter()
+        .map(|flavour| flavour.duration)
+        .min_by(f64::total_cmp)
+        .unwrap();
     let expected_min_cost =
-        100.0 * 5.0 * cheapest_flavour_duration as f64 * cfg.carbon_cost_duration_scale;
+        100.0 * 5.0 * cheapest_flavour_duration * cfg.carbon_cost_duration_scale;
     assert!(
         assignments[0].carbon_cost >= expected_min_cost - 1e-9,
         "cost {} should reflect the higher capacity tier (>= {})",
@@ -811,7 +816,7 @@ fn test_greedy_singleton_global_error_constraint_is_retrospective() {
         "Slow".to_string(),
         1.0,
         10.0,
-        20,
+        20.0,
         Some(0),
         Some(0),
     )]);

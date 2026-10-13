@@ -51,7 +51,7 @@ class MetricsStore:
 
         by_task_flavour = {}
         for (task, flavour), items in groups.items():
-            times = [i["execution_time_seconds"] for i in items if i.get("success")]
+            times = [i["execution_time_sec"] for i in items if i.get("success")]
             confidences = [i["confidence"] for i in items if i.get("confidence") is not None]
             qualities = [i["quality_score"] for i in items if i.get("quality_score") is not None]
             success_count = sum(1 for i in items if i.get("success"))
@@ -59,7 +59,7 @@ class MetricsStore:
                 "count": len(items),
                 "success_count": success_count,
                 "success_rate": success_count / len(items) if items else 0.0,
-                "execution_time_seconds": _stats(times),
+                "execution_time_sec": _stats(times),
                 "confidence": _stats(confidences),
                 "quality_score": _stats(qualities),
             }

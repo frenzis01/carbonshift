@@ -168,8 +168,8 @@ class ErrorMetricsTests(unittest.TestCase):
                 "actual_baseline_carbon_cost": 5.0,
                 "carbon_cost": 3.0,
                 "baseline_carbon_cost": 5.0,
-                "execution_time_seconds": 0.2,
-                "baseline_execution_time_seconds": 0.3,
+                "execution_time_sec": 0.2,
+                "baseline_execution_time_sec": 0.3,
             },
             {
                 "request_id": 2,
@@ -184,8 +184,8 @@ class ErrorMetricsTests(unittest.TestCase):
                 "actual_baseline_carbon_cost": 10.0,
                 "carbon_cost": 9.0,
                 "baseline_carbon_cost": 10.0,
-                "execution_time_seconds": 0.1,
-                "baseline_execution_time_seconds": 0.2,
+                "execution_time_sec": 0.1,
+                "baseline_execution_time_sec": 0.2,
             },
         ]
         second_client_requests = [

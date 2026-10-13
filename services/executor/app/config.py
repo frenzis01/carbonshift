@@ -89,7 +89,7 @@ class Settings:
     slot_minutes: float = float(os.environ.get("EXECUTOR_SLOT_MINUTES", "30"))
     # When true (default), any non-"accurate" flavour also runs a same-input
     # "shadow" Accurate-flavour pass to (a) get an empirical
-    # baseline_execution_time_seconds/baseline_model and (b) derive a
+    # baseline_execution_time_sec/baseline_model and (b) derive a
     # quality_score by comparing outputs when no reference* was supplied.
     # Roughly doubles executor compute per request — disable for large-scale
     # runs that only care about actual scheduling/carbon behavior.

@@ -86,8 +86,8 @@ fn qos_profile_payload(profile_id: &str, threshold: f64) -> String {
         "profile_id": profile_id,
         "task_kind": "question_answering",
         "flavours": [
-            {"name": "Accurate", "error": 2.0, "duration": 120},
-            {"name": "Fast", "error": 15.0, "duration": 30}
+            {"name": "Accurate", "error": 2.0, "duration_sec": 120.0},
+            {"name": "Fast", "error": 15.0, "duration_sec": 30.0}
         ],
         "error_semantics": "word-overlap-f1-v1",
         "max_error_threshold": threshold,
@@ -384,7 +384,7 @@ async fn request_list_reports_scheduler_status_and_executor_completion() {
         .oneshot(json_request(
             "POST",
             &format!("/v1/callback/{request_id}"),
-            r#"{"success":true,"result":{"actual_error_pct":7.5,"execution_time_seconds":0.25}}"#,
+            r#"{"success":true,"result":{"actual_error_pct":7.5,"execution_time_sec":0.25}}"#,
         ))
         .await
         .unwrap();
@@ -402,7 +402,7 @@ async fn request_list_reports_scheduler_status_and_executor_completion() {
     let completed = json_body(completed).await;
     assert_eq!(completed[0]["status"], "completed");
     assert_eq!(completed[0]["actual_error_pct"], 7.5);
-    assert_eq!(completed[0]["execution_time_seconds"], 0.25);
+    assert_eq!(completed[0]["execution_time_sec"], 0.25);
 }
 
 #[tokio::test]
@@ -560,7 +560,7 @@ async fn profile_listing_includes_only_profiles_with_assignments_by_default() {
             "Accurate".to_string(),
             1.0,
             10.0,
-            60,
+            60.0,
             Some(0),
             Some(1),
             QosProfileId::parse("default-question-answering").unwrap(),
@@ -744,7 +744,7 @@ async fn qos_profile_registration_rejects_invalid_ids_and_policy_values() {
     let profile_with_local_capacity_tiers = serde_json::json!({
         "profile_id": "qa-capacity-v1",
         "task_kind": "question_answering",
-        "flavours": [{"name": "Accurate", "error": 1.0, "duration": 10}],
+        "flavours": [{"name": "Accurate", "error": 1.0, "duration_sec": 10.0}],
         "error_semantics": "word-overlap-f1-v1",
         "max_error_threshold": 10.0,
         "error_window": {"past_slots": 1, "future_slots": 1, "past_decay_slots": 0},
@@ -774,7 +774,7 @@ async fn qos_profile_registration_rejects_invalid_ids_and_policy_values() {
     let invalid_window = serde_json::json!({
         "profile_id": "qa-invalid-window-v1",
         "task_kind": "question_answering",
-        "flavours": [{"name": "Accurate", "error": 1.0, "duration": 10}],
+        "flavours": [{"name": "Accurate", "error": 1.0, "duration_sec": 10.0}],
         "error_semantics": "word-overlap-f1-v1",
         "max_error_threshold": 10.0,
         "error_window": {"past_slots": -1, "future_slots": 2, "past_decay_slots": 0},
@@ -811,7 +811,7 @@ async fn qos_profile_task_kind_is_an_open_validated_identifier() {
     let body = serde_json::json!({
         "profile_id": "summarization-standard-v1",
         "task_kind": "summarization",
-        "flavours": [{"name": "Accurate", "error": 2.0, "duration": 60}],
+        "flavours": [{"name": "Accurate", "error": 2.0, "duration_sec": 60.0}],
         "error_semantics": "rouge-l-f1-v1",
         "max_error_threshold": 10.0,
         "error_window": {"past_slots": 2, "future_slots": 2, "past_decay_slots": 0},
@@ -1169,7 +1169,7 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
             "Accurate".to_string(),
             1.0,
             10.0,
-            60,
+            60.0,
             Some(0),
             Some(1),
             carbonshift_rs::engine::qos::QosProfileId::parse("qa-standard-v1").unwrap(),
@@ -1180,7 +1180,7 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
             "NerFast".to_string(),
             1.0,
             90.0,
-            10,
+            10.0,
             Some(0),
             Some(1),
             carbonshift_rs::engine::qos::QosProfileId::parse("ner-standard-v1").unwrap(),
@@ -1206,7 +1206,7 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
         let body = serde_json::json!({
             "profile_id": profile_id,
             "task_kind": task_kind,
-            "flavours": [{"name": "Accurate", "error": 0.0, "duration": 60}],
+            "flavours": [{"name": "Accurate", "error": 0.0, "duration_sec": 60.0}],
             "error_semantics": semantics,
             "max_error_threshold": threshold,
             "error_window": {
@@ -1280,7 +1280,7 @@ async fn cost_metrics_filter_request_totals_but_keep_capacity_tiers_global() {
             "Accurate".to_string(),
             1.0,
             10.0,
-            60,
+            60.0,
             Some(0),
             Some(1),
             text_profile.clone(),
@@ -1291,7 +1291,7 @@ async fn cost_metrics_filter_request_totals_but_keep_capacity_tiers_global() {
             "Fast".to_string(),
             7.0,
             20.0,
-            30,
+            30.0,
             Some(0),
             Some(1),
             ner_profile.clone(),
@@ -1302,7 +1302,7 @@ async fn cost_metrics_filter_request_totals_but_keep_capacity_tiers_global() {
             "Balanced".to_string(),
             2.0,
             15.0,
-            45,
+            45.0,
             Some(0),
             Some(1),
             text_profile.clone(),
@@ -1322,7 +1322,7 @@ async fn cost_metrics_filter_request_totals_but_keep_capacity_tiers_global() {
         (42, text_profile, RequestStatus::Scheduled, 3.0),
     ] {
         let mut tracked =
-            TrackedRequest::new(None, serde_json::Value::Null, baseline, 60, 0, profile_id);
+            TrackedRequest::new(None, serde_json::Value::Null, baseline, 60.0, 0, profile_id);
         tracked.status = status;
         state.tracked.lock().unwrap().insert(request_id, tracked);
     }
@@ -1449,7 +1449,7 @@ async fn scheduler_dispatches_profile_homogeneous_batches_for_distinct_qos_polic
         serde_json::json!({
             "profile_id": "ner-standard-v1",
             "task_kind": "ner",
-            "flavours": [{"name": "NerFast", "error": 30.0, "duration": 15}],
+            "flavours": [{"name": "NerFast", "error": 30.0, "duration_sec": 15.0}],
             "error_semantics": "entity-set-f1-v1",
             "max_error_threshold": 35.0,
             "error_window": {
@@ -1939,9 +1939,8 @@ async fn executor_callback_corrects_carbon_cost_with_actual_execution_time() {
 
     // Actual execution time is 40% of nominal duration.
     let actual_exec_time = duration * 0.4;
-    let callback_body = format!(
-        r#"{{"success": true, "result": {{"execution_time_seconds": {actual_exec_time}}}}}"#
-    );
+    let callback_body =
+        format!(r#"{{"success": true, "result": {{"execution_time_sec": {actual_exec_time}}}}}"#);
 
     let resp = app
         .oneshot(json_request(
@@ -2021,7 +2020,7 @@ async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and
     // Baseline execution time turns out to be 0.75x nominal baseline duration
     let actual_baseline_time = baseline_dur * 0.75;
     let callback_body = format!(
-        r#"{{"success": true, "result": {{"baseline_execution_time_seconds": {actual_baseline_time}}}}}"#
+        r#"{{"success": true, "result": {{"baseline_execution_time_sec": {actual_baseline_time}}}}}"#
     );
 
     let resp = app

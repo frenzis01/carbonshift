@@ -45,7 +45,7 @@ def test_submit_restores_known_profile_once_after_scheduler_restart(monkeypatch)
     profile = {
         "profile_id": "restart-recovery-v1",
         "task_kind": "question_answering",
-        "flavours": [{"name": "Accurate", "error": 4.0, "duration": 120}],
+        "flavours": [{"name": "Accurate", "error": 4.0, "duration_sec": 120.0}],
         "error_semantics": "word-overlap-f1-v1",
         "max_error_threshold": 10.0,
         "error_window": {"past_slots": 12, "future_slots": 14, "past_decay_slots": 12},

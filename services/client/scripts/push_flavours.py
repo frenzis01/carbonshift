@@ -86,7 +86,7 @@ def main() -> None:
             f"max_error_threshold={profile['max_error_threshold']:.2f}%"
         )
         for f in profile["flavours"]:
-            print(f"  {f['name']}: error={f['error']:.2f}% duration={f['duration']}ms")
+            print(f"  {f['name']}: error={f['error']:.2f}% duration={f['duration_sec']:.4f}s")
 
     if failures:
         raise SystemExit(f"failed to register {len(failures)} QoS profile(s): {', '.join(failures)}")

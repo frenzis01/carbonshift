@@ -79,7 +79,12 @@ Variabili d'ambiente (tutte opzionali):
 | `EXECUTOR_CALLBACK_TIMEOUT_SECONDS` | `10` | Timeout HTTP per l'invio del callback. |
 | `EXECUTOR_MANUAL_CLOCK` | `0` | Congela l'orologio della coda eccetto via `POST /admin/advance-slot` (solo test/emulazione). |
 | `EXECUTOR_SLOT_MINUTES` | `30` | Durata di un timeslot in modalit\u00e0 manual clock; deve combaciare con `PROVIDER_SLOT_MINUTES` e con `SLOT_DURATION_SECONDS / 60` di CarbonShift. |
-| `EXECUTOR_COMPUTE_QUALITY_BASELINE` | `1` | Se attivo, ogni richiesta con flavour diverso da `accurate` esegue anche una passata "ombra" col flavour Accurate sullo stesso input, per ottenere `baseline_execution_time_seconds`/`baseline_model` (misura reale, non stimata) e un `quality_score` per confronto quando non è fornito un `reference*`. Circa raddoppia il calcolo per richiesta — disattivalo (`0`) nei test su larga scala dove non serve il confronto di qualità/tempo. |
+| `EXECUTOR_COMPUTE_QUALITY_BASELINE` | `1` | Se attivo, ogni richiesta con flavour diverso da `accurate` esegue anche una passata "ombra" col flavour Accurate sullo stesso input, per ottenere `baseline_execution_time_sec`/`baseline_model` (misura reale, non stimata) e un `quality_score` per confronto quando non è fornito un `reference*`. Circa raddoppia il calcolo per richiesta — disattivalo (`0`) nei test su larga scala dove non serve il confronto di qualità/tempo. |
+
+Le durate dei flavour e i tempi misurati dall'executor sono numeri in secondi:
+le definizioni usano `duration_sec` e i risultati `execution_time_sec` e
+`baseline_execution_time_sec`. I tempi di inferenza possono essere frazioni di
+secondo; CarbonShift li conserva senza convertirli in millisecondi.
 
 ## API
 

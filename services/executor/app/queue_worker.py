@@ -218,7 +218,7 @@ class JobQueue:
             success = False
             error = str(exc)
             outcome = {"output": None, "model": None, "confidence": None, "quality_score": None,
-                       "execution_time_seconds": 0.0, "baseline_execution_time_seconds": None,
+                       "execution_time_sec": 0.0, "baseline_execution_time_sec": None,
                        "baseline_model": None}
             logger.exception("job %s failed", job.request_id)
 
@@ -234,11 +234,11 @@ class JobQueue:
             "model": outcome["model"],
             "success": success,
             "error": error,
-            "execution_time_seconds": outcome["execution_time_seconds"],
+            "execution_time_sec": outcome["execution_time_sec"],
             "confidence": outcome["confidence"],
             "quality_score": outcome["quality_score"],
             "actual_error_pct": outcome.get("actual_error_pct"),
-            "baseline_execution_time_seconds": outcome.get("baseline_execution_time_seconds"),
+            "baseline_execution_time_sec": outcome.get("baseline_execution_time_sec"),
             "baseline_model": outcome.get("baseline_model"),
             "queued_at": job.queued_at.isoformat(),
             "execute_at": job.execute_at.isoformat(),
@@ -262,8 +262,8 @@ class JobQueue:
                 "confidence": outcome["confidence"],
                 "quality_score": outcome["quality_score"],
                 "actual_error_pct": outcome.get("actual_error_pct"),
-                "execution_time_seconds": outcome["execution_time_seconds"],
-                "baseline_execution_time_seconds": outcome.get("baseline_execution_time_seconds"),
+                "execution_time_sec": outcome["execution_time_sec"],
+                "baseline_execution_time_sec": outcome.get("baseline_execution_time_sec"),
                 "baseline_model": outcome.get("baseline_model"),
             },
             "error": error,
