@@ -88,14 +88,51 @@ def test_on_callback_does_not_refresh_already_scheduled_ack(tmp_path, monkeypatc
     assert tracker.on_callback("1", True, {}, None) is True
 
 
-def test_sweep_timeouts_marks_stale_requests(tmp_path):
+def test_sweep_timeouts_marks_stale_requests(tmp_path, monkeypatch):
     tracker = make_tracker(tmp_path, timeout_seconds=0.1)
     submitted_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     tracker.add(TrackedRequest("1", "ner", 30.0, submitted_at, make_ack()))
+    monkeypatch.setattr("app.tracker.get_status", lambda request_id: {"status": "submitted"})
 
     tracker.sweep_timeouts()
     record = tracker.get("1").to_dict()
     assert record["status"] == "timed_out"
+
+def test_sweep_timeouts_reconciles_completed_scheduler_status(tmp_path, monkeypatch):
+    tracker = make_tracker(tmp_path, timeout_seconds=6000.0)
+    submitted_at = datetime.now(timezone.utc) - timedelta(seconds=31)
+    pending_ack = make_ack(status="pending", flavour=None, carbon_cost=None, scheduled_slot=None)
+    tracker.add(TrackedRequest("1", "ner", 30.0, submitted_at, pending_ack))
+    monkeypatch.setattr(
+        "app.tracker.get_status",
+        lambda request_id: make_ack(status="completed", flavour="Fast", carbon_cost=0.8),
+    )
+
+    tracker.sweep_timeouts()
+
+    record = tracker.get("1").to_dict()
+    assert record["status"] == "completed"
+    assert record["success"] is True
+    assert record["callback_received_at"] is None
+    assert record["flavour"] == "Fast"
+    assert record["carbon_cost"] == 0.8
+    assert tracker.progress()["requests_completed"] == 1
+
+
+def test_sweep_timeouts_throttles_scheduler_status_checks(tmp_path, monkeypatch):
+    tracker = make_tracker(tmp_path, timeout_seconds=6000.0)
+    submitted_at = datetime.now(timezone.utc) - timedelta(seconds=31)
+    tracker.add(TrackedRequest("1", "ner", 30.0, submitted_at, make_ack()))
+    calls = []
+    monkeypatch.setattr(
+        "app.tracker.get_status",
+        lambda request_id: calls.append(request_id) or {"status": "dispatched"},
+    )
+
+    tracker.sweep_timeouts()
+    tracker.sweep_timeouts()
+
+    assert calls == ["1"]
 
 
 def test_sweep_timeouts_ignores_already_completed(tmp_path):

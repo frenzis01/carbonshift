@@ -19,6 +19,8 @@ from .carbonshift_client import CarbonshiftError, get_status
 logger = logging.getLogger("client.tracker")
 
 ROUND_DIGITS = 4
+# Keep callback-loss recovery bounded without polling the scheduler every sweep.
+_SCHEDULER_STATUS_RECONCILIATION_INTERVAL_SECONDS = 30.0
 DEFAULT_MODEL_STATS = Path(__file__).resolve().parent.parent / "model_stats.json"
 
 
@@ -50,6 +52,7 @@ class TrackedRequest:
         self.submitted_at = submitted_at
         self.ack = ack
         self.arrival_slot = arrival_slot
+        self.last_status_check_at: Optional[datetime] = None
         # The response also includes the resolved default profile when the
         # client omitted one, so dashboard filtering remains accurate either way.
         self.qos_profile_id = qos_profile_id or ack.get("qos_profile_id")
@@ -219,22 +222,48 @@ class RequestTracker:
         with self._lock:
             pending = [t for t in self._by_id.values() if t.status == "submitted"]
         for t in pending:
-            if (now - t.submitted_at).total_seconds() <= self.timeout_seconds:
+            age_seconds = (now - t.submitted_at).total_seconds()
+            check_after = min(
+                _SCHEDULER_STATUS_RECONCILIATION_INTERVAL_SECONDS,
+                self.timeout_seconds,
+            )
+            if age_seconds <= check_after:
                 continue
             with self._lock:
                 if t.status != "submitted":
                     continue
-                # Before marking as timed out, double-check by requesting the latest status from the server
-                try:
-                    fresh_status = get_status(t.request_id)
-                    if fresh_status.get("status") != "submitted":
-                        continue
-                except CarbonshiftError:
-                    logger.warning("failed to refresh status for request_id=%s", t.request_id, exc_info=True)
-                t.status = "timed_out"
-                t.error = f"no callback within {self.timeout_seconds}s"
-                record = t.to_dict()
-            self._persist(record)
+                if (
+                    t.last_status_check_at is not None
+                    and (now - t.last_status_check_at).total_seconds()
+                    < _SCHEDULER_STATUS_RECONCILIATION_INTERVAL_SECONDS
+                ):
+                    continue
+                t.last_status_check_at = now
+
+            try:
+                fresh_status = get_status(t.request_id)
+            except CarbonshiftError:
+                logger.warning("failed to refresh status for request_id=%s", t.request_id, exc_info=True)
+                fresh_status = None
+
+            record = None
+            with self._lock:
+                if t.status != "submitted":
+                    continue
+                if fresh_status is not None:
+                    t.ack.update(fresh_status)
+                    scheduler_status = fresh_status.get("status")
+                    if scheduler_status in ("completed", "failed"):
+                        t.status = scheduler_status
+                        t.success = scheduler_status == "completed"
+                        t.error = fresh_status.get("error")
+                        record = t.to_dict()
+                if record is None and age_seconds > self.timeout_seconds:
+                    t.status = "timed_out"
+                    t.error = f"no callback within {self.timeout_seconds}s"
+                    record = t.to_dict()
+            if record is not None:
+                self._persist(record)
 
     def round_dict(self, record: dict[str, Any]) -> dict[str, Any]:
         return {k: (round(v, ROUND_DIGITS) if isinstance(v, float) and v is not None else v) for k, v in record.items()}

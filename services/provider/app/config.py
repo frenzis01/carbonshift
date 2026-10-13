@@ -63,7 +63,7 @@ class Settings:
     generator_night_max: float = float(os.environ.get("PROVIDER_GENERATOR_NIGHT_MAX", "160.0"))
     generator_day_min: float = float(os.environ.get("PROVIDER_GENERATOR_DAY_MIN", "70.0"))
     generator_noise_std: float = float(os.environ.get("PROVIDER_GENERATOR_NOISE_STD", "2.0"))
-    generator_cycle_slots: int = int(os.environ.get("PROVIDER_GENERATOR_CYCLE_SLOTS", "12"))
+    generator_cycle_slots: int = int(os.environ.get("PROVIDER_GENERATOR_CYCLE_SLOTS", "24"))
 
     # ── synthetic "actual" (local role only) ──────────────────────────────
     # A `local` provider has no real measurement to report, so it perturbs

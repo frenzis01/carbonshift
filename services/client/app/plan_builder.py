@@ -36,7 +36,7 @@ def build_requests(
     rng = random.Random(seed)
 
     if cycle_slots is None:
-        cycle_slots = max(1, int(round(720.0 / slot_minutes)))  # 12 hours
+        cycle_slots = max(1, int(round(1440.0 / slot_minutes)))  # 24 hours
 
     match pattern:
         case "flat":
