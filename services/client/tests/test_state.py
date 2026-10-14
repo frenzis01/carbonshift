@@ -188,10 +188,12 @@ def test_reset_clears_everything():
 
 
 def test_state_module_exposes_no_clock():
-    """Guards the design rule: the provider owns the clock, so the client's
-    plan registry must not grow a slot counter of its own."""
+    """The plan registry must not store a slot counter.
+
+    Realtime derives the global slot from wall time in the service entrypoint;
+    manual emulation consumes provider ticks.
+    """
     for forbidden in ("current_slot", "advance_slot", "get_current_slot", "force_set_current_slot"):
         assert not hasattr(state, forbidden), (
-            f"state.{forbidden} reintroduces a client-side clock; the provider "
-            f"is the single owner of 'which slot are we in'"
+            f"state.{forbidden} reintroduces a mutable clock into plan storage"
         )

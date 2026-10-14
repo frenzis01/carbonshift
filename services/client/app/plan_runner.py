@@ -45,12 +45,13 @@ def get_batch_from_slot(requests_spec: list[dict[str, Any]], slot_minutes: float
 
 
 def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
-                    slot_minutes: float, slot: int = 0) -> int:
+                    slot_minutes: float, slot: int = 0,
+                    deadline_reference: datetime | None = None) -> int:
     """Submit every request in `batch` to carbonshift, synchronously.
 
-    Returns the number actually submitted. Synchronous on purpose: the
-    provider blocks on this call, and that is what guarantees slot N's work is
-    in carbonshift's queue *before* carbonshift is told to process slot N.
+    Returns the number actually submitted. Synchronous on purpose: in manual
+    mode the provider blocks on this call, guaranteeing slot N's work is in
+    CarbonShift's queue before it is told to process slot N.
 
     A submission failure is logged and skipped rather than raised: one bad
     request should not abort the whole slot. The request is simply not tracked,
@@ -64,7 +65,8 @@ def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
     for r in batch:
         submitted_at = datetime.now(timezone.utc)
         deadline_end = ceil_to_slot_end(r["deadline_at"], slot_minutes)
-        deadline_seconds = max((deadline_end - submitted_at).total_seconds(), 1.0)
+        deadline_now = deadline_reference or submitted_at
+        deadline_seconds = max((deadline_end - deadline_now).total_seconds(), 1.0)
         payload = {"task": r["task"], "input": r["input"]}
         qos_profile_id = r.get("qos_profile_id")
         try:

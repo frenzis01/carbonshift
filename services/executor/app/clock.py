@@ -26,13 +26,15 @@ class VirtualClock:
         if not self.manual:
             raise RuntimeError("advance_to_next_slot() requires EXECUTOR_MANUAL_CLOCK=1")
         assert self._virtual_now is not None
-        self._virtual_now = _floor_to_slot(self._virtual_now, self.slot_minutes) + timedelta(minutes=self.slot_minutes)
+        self._virtual_now += timedelta(minutes=self.slot_minutes)
         return self._virtual_now
-    
+
     def force_set(self, new_time: datetime) -> None:
         if not self.manual:
             raise RuntimeError("force_set() requires EXECUTOR_MANUAL_CLOCK=1")
-        self._virtual_now = _floor_to_slot(new_time, self.slot_minutes)
+        if new_time.tzinfo is None:
+            new_time = new_time.replace(tzinfo=timezone.utc)
+        self._virtual_now = new_time.astimezone(timezone.utc)
 
 
 def _floor_to_slot(dt: datetime, slot_minutes: float) -> datetime:

@@ -41,9 +41,9 @@ class Settings:
     qos_profile_registration_retry_seconds: float = float(
         os.environ.get("CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS", "2.0")
     )
-    # ── carbon-intensity provider ─────────────────────────────────────────
-    # The provider owns the clock (see provider/ARCHITECTURE.md §2). The
-    # client is a *peer* it notifies, not a driver.
+    # ── shared slot clock ─────────────────────────────────────────────────
+    # Manual emulation consumes provider ticks; realtime derives the same
+    # epoch-aligned global slot locally without maintaining a counter.
     provider_url: str = os.environ.get("PROVIDER_URL", "http://localhost:9100")
     # Slot origin. MUST match the provider's PROVIDER_EPOCH exactly — the
     # default is part of the contract between the two services, so it is
@@ -54,6 +54,11 @@ class Settings:
     # Slot length. MUST match the provider's PROVIDER_SLOT_MINUTES and
     # carbonshift's SLOT_DURATION_SECONDS.
     provider_slot_minutes: float = float(os.environ.get("PROVIDER_SLOT_MINUTES", "60"))
+    # Manual emulation is driven by provider notifications. In realtime the
+    # client instead ticks its stored plans at the shared wall-clock boundary.
+    manual_clock: bool = os.environ.get(
+        "CLIENT_MANUAL_CLOCK", os.environ.get("MANUAL_CLOCK", "0")
+    ) == "1"
 
 
 settings = Settings()

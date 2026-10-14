@@ -24,6 +24,15 @@ def test_manual_clock_now_is_slot_aligned():
     assert now.second == 0 and now.microsecond == 0
 
 
+def test_manual_clock_preserves_the_provider_boundary_exactly():
+    clock = VirtualClock(manual=True, slot_minutes=60)
+    boundary = datetime(2026, 10, 12, 22, 0, tzinfo=timezone.utc)
+
+    clock.force_set(boundary)
+    assert clock.now() == boundary
+    assert clock.advance_to_next_slot() == boundary + timedelta(hours=1)
+
+
 def test_non_manual_clock_returns_real_time_and_rejects_advance():
     clock = VirtualClock(manual=False, slot_minutes=30)
     before = datetime.now(timezone.utc)

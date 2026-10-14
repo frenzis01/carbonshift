@@ -54,7 +54,7 @@ class PlanRequestSpec(BaseModel):
 
 class SendPlanRequest(BaseModel):
     requests: list[PlanRequestSpec]
-    slot_minutes: float = 30.0
+    slot_minutes: float = 60.0
     # "realtime": waits for each request's real `start_at` wall-clock time.
     # "emulated": fires each timeslot's requests immediately, then
     # synchronizes via carbonshift's and the executor's `/admin/advance-slot`
@@ -83,7 +83,7 @@ class TickRequest(BaseModel):
     """
 
     current_slot: int
-    slot_start_utc: str
+    slot_start_utc: Optional[str] = None
     source: str = ""
     observed: Optional[dict[str, Any]] = None
     forecast: list[dict[str, Any]] = []

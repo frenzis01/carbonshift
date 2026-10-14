@@ -16,16 +16,14 @@ Endpoints
 `POST /v1/advance-slot`   manual-clock only: roll one slot and fan out
 `POST /v1/forecast`       not implemented (forecast is not caller-supplied)
 
-The provider is intentionally stateless apart from the clock and the log of
-readings it has taken: it keeps no per-request state, so it can be restarted at
-any slot without losing anything a peer cannot re-derive from
-`GET /v1/forecast`.
+The provider is intentionally stateless apart from its manual clock and the
+readings it has taken. Realtime slots are derived from wall time; restarting a
+manual emulation resets its virtual start to today's local midnight, so restart
+the whole emulated stack together.
 """
 from __future__ import annotations
 
 import logging
-import threading
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -45,24 +43,36 @@ from .models import (
     ObservedPointModel,
 )
 from .source import ObservedPoint, build_source
-from .slots import parse_epoch
+from .slots import floor_to_slot, local_midnight_utc, parse_epoch, slot_of
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("provider.main")
 
-# Build the source once at import: a bad PROVIDER_ROLE should fail at startup,
-# not on the first slot rollover.
-source = build_source(settings)
+epoch = parse_epoch(settings.epoch_iso)
+cycle_origin = local_midnight_utc()
+emulation_start = cycle_origin if settings.manual_clock else None
+if floor_to_slot(cycle_origin, settings.slot_minutes, epoch) != cycle_origin:
+    raise ValueError(
+        "local midnight is not aligned to the configured slot grid; "
+        "use a slot duration and timezone whose boundaries include midnight"
+    )
+
+# Keep the fixed epoch for globally comparable slot IDs. Emulation changes
+# only its virtual start instant, not the shared timestamp/numbering contract.
+source = build_source(
+    settings,
+    cycle_origin_slot=slot_of(cycle_origin, settings.slot_minutes, epoch),
+)
 clock = ProviderClock(
     manual=settings.manual_clock,
     slot_minutes=settings.slot_minutes,
-    epoch=parse_epoch(settings.epoch_iso),
+    epoch=epoch,
+    start_at=emulation_start,
 )
 peers = notifications.peers_from_settings(settings)
 
-#: Readings actually taken, keyed by the slot they describe. Only ever
-#: populated by `rollover`, i.e. only for slots that have been reached —
-#: there is no way to obtain a reading for a future slot, by construction.
+#: Readings actually taken, keyed by the slot they describe. Manual mode
+#: records them during rollover; realtime mode lazily records the current slot.
 observed_readings: dict[int, ObservedPoint] = {}
 
 #: Set once a fan-out partially fails. After that the run is unrecoverable:
@@ -88,31 +98,8 @@ def _mark_desynced(report: notifications.RolloverReport) -> None:
 def is_desynced() -> bool:
     return _desynced is not None
 
-_auto_advance_stop = threading.Event()
-_auto_advance_thread: threading.Thread | None = None
-
-
-def _auto_advance_loop() -> None:
-    """Realtime role: roll the slot on our own every `slot_minutes`.
-
-    Disabled when the clock is manual, because then the *client* drives the
-    advance and two drivers would double-advance the system.
-    """
-    while not _auto_advance_stop.is_set():
-        # Wake up a little before the boundary so the fan-out lands in the
-        # new slot rather than racing its start.
-        slept = _auto_advance_stop.wait(max(1.0, settings.slot_minutes * 60.0))
-        if slept or _auto_advance_stop.is_set():
-            continue
-        try:
-            rollover(notify=True)
-        except Exception:  # never let the loop die on one bad rollover
-            logger.exception("auto-advance rollover failed")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _auto_advance_thread
     logger.info(
         "provider started role=%s source=%s slot_minutes=%s manual_clock=%s",
         settings.role,
@@ -130,14 +117,7 @@ async def lifespan(app: FastAPI):
             "is required",
             settings.slot_minutes,
         )
-    if not clock.manual and settings.auto_advance_clock:
-        _auto_advance_stop.clear()
-        _auto_advance_thread = threading.Thread(
-            target=_auto_advance_loop, daemon=True, name="provider-auto-advance"
-        )
-        _auto_advance_thread.start()
     yield
-    _auto_advance_stop.set()
 
 
 app = FastAPI(title="CarbonShift Carbon Intensity Provider", lifespan=lifespan)
@@ -237,7 +217,8 @@ async def health() -> JSONResponse:
         "source": info,
         "current_slot": clock.current_slot(),
         "manual_clock": clock.manual,
-        # Non-zero is normal in a fast manual run (see clock.drift_slots).
+        # Manual emulation starts at today's midnight, so negative drift is
+        # expected until the simulated clock catches up with wall time.
         "drift_slots": clock.drift_slots(),
         # Present only once a rollover has partially failed; see `_mark_desynced`.
         "desynced": _desynced,
@@ -255,7 +236,9 @@ async def meta() -> MetaResponse:
         epoch_utc=clock.epoch.isoformat(),
         forecast_horizon_slots=settings.forecast_horizon_slots,
         manual_clock=clock.manual,
-        auto_advance_clock=settings.auto_advance_clock and not clock.manual,
+        # Realtime peers derive slot changes locally; the provider does not
+        # run a periodic push/advance loop.
+        auto_advance_clock=False,
         peers=[{"name": p.name, "url": p.url, "order": p.order} for p in peers],
     )
 
@@ -297,8 +280,13 @@ async def observed(slot: int | None = Query(default=None)) -> dict:
     reached — a measurement of a future slot does not exist, so it is not
     reported as one.
     """
-    target = clock.current_slot() if slot is None else slot
+    current = clock.current_slot()
+    target = current if slot is None else slot
     reading = observed_readings.get(target)
+    if reading is None and not clock.manual and target == current:
+        reading = source.observe(current)
+        if reading is not None:
+            observed_readings[current] = reading
     if reading is None:
         return {"slot": target, "known": False, "actual": None, "observed_at_slot": None}
     return {"known": True, **reading.to_dict()}

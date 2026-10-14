@@ -498,6 +498,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       return slots.map(displaySlotValue);
     }
 
+    function slotAxisClockTicks(slots, plot) {
+      const origin = Date.parse(plot.slot_zero_start_utc || '');
+      const slotMinutes = Number(plot.slot_minutes);
+      if (!slots || slots.length === 0 || !Number.isFinite(origin) ||
+          !Number.isFinite(slotMinutes) || slotMinutes <= 0) {
+        return {};
+      }
+
+      const maxLabels = 7;
+      const step = Math.max(1, Math.ceil((slots.length - 1) / (maxLabels - 1)));
+      const indexes = [];
+      for (let index = 0; index < slots.length; index += step) indexes.push(index);
+      if (indexes[indexes.length - 1] !== slots.length - 1) indexes.push(slots.length - 1);
+
+      const pad2 = value => String(value).padStart(2, '0');
+      const tickvals = indexes.map(index => Number(slots[index]));
+      const ticktext = tickvals.map(slot => {
+        // Displayed slots are one-based; the provider timestamp anchors engine slot zero.
+        const utc = new Date(origin + (slot - 1) * slotMinutes * 60 * 1000);
+        return `${slot}<br>${pad2(utc.getUTCHours())}:${pad2(utc.getUTCMinutes())} ` +
+          `${pad2(utc.getUTCDate())}/${pad2(utc.getUTCMonth() + 1)} UTC`;
+      });
+      return { tickmode: 'array', tickvals, ticktext, tickfont: { size: 10 } };
+    }
+
     function filterAndResample(slots, arrays, binSize) {
       if (!slots || slots.length === 0) return { slots: [], arrays: arrays.map(() => []) };
       
@@ -716,11 +741,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: { color: '#f8fafc', family: 'inherit' },
-        margin: { l: 50, r: 50, t: 30, b: 60 },
+        margin: { l: 50, r: 50, t: 30, b: 82 },
         legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
-          title: 'Scheduled Slot',
+          title: plot.slot_zero_start_utc ? 'Slot / UTC time' : 'Slot',
           gridcolor: '#334155',
+          ...slotAxisClockTicks(slots, plot),
           rangeslider: { visible: true, thickness: 0.05, bgcolor: '#1e293b' }
         },
         yaxis: {
@@ -853,11 +879,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: { color: '#f8fafc', family: 'inherit' },
-        margin: { l: 50, r: 50, t: 30, b: 60 },
+        margin: { l: 50, r: 50, t: 30, b: 82 },
         legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
-          title: 'Scheduled Slot',
+          title: plot.slot_zero_start_utc ? 'Slot / UTC time' : 'Slot',
           gridcolor: '#334155',
+          ...slotAxisClockTicks(slots, plot),
           rangeslider: { visible: true, thickness: 0.05, bgcolor: '#1e293b' }
         },
         yaxis: {
@@ -917,11 +944,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
         font: { color: '#f8fafc', family: 'inherit' },
-        margin: { l: 50, r: 50, t: 30, b: 60 },
+        margin: { l: 50, r: 50, t: 30, b: 82 },
         legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
-          title: 'Arrival Slot',
+          title: plot.slot_zero_start_utc ? 'Slot / UTC time' : 'Slot',
           gridcolor: '#334155',
+          ...slotAxisClockTicks(slots, plot),
           rangeslider: { visible: true, thickness: 0.05, bgcolor: '#1e293b' }
         },
         yaxis: {

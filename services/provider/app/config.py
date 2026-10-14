@@ -11,6 +11,19 @@ import os
 from dataclasses import dataclass
 
 
+def _default_generator_cycle_slots() -> int:
+    """Use one synthetic day, regardless of the configured slot length."""
+    slot_minutes = float(os.environ.get("PROVIDER_SLOT_MINUTES", "60"))
+    if slot_minutes <= 0:
+        raise ValueError("PROVIDER_SLOT_MINUTES must be greater than zero")
+    return max(1, int(round(1440.0 / slot_minutes)))
+
+
+def _generator_cycle_slots_from_environment() -> int:
+    configured = os.environ.get("PROVIDER_GENERATOR_CYCLE_SLOTS", "").strip()
+    return int(configured) if configured else _default_generator_cycle_slots()
+
+
 def _client_urls_from_environment() -> tuple[str, ...]:
     configured = os.environ.get("PROVIDER_CLIENT_URLS", "").strip()
     if not configured:
@@ -63,7 +76,7 @@ class Settings:
     generator_night_max: float = float(os.environ.get("PROVIDER_GENERATOR_NIGHT_MAX", "160.0"))
     generator_day_min: float = float(os.environ.get("PROVIDER_GENERATOR_DAY_MIN", "70.0"))
     generator_noise_std: float = float(os.environ.get("PROVIDER_GENERATOR_NOISE_STD", "2.0"))
-    generator_cycle_slots: int = int(os.environ.get("PROVIDER_GENERATOR_CYCLE_SLOTS", "24"))
+    generator_cycle_slots: int = _generator_cycle_slots_from_environment()
 
     # ── synthetic "actual" (local role only) ──────────────────────────────
     # A `local` provider has no real measurement to report, so it perturbs
@@ -83,11 +96,6 @@ class Settings:
     notify_max_attempts: int = int(os.environ.get("PROVIDER_NOTIFY_MAX_ATTEMPTS", "3"))
     notify_retry_backoff_seconds: float = float(os.environ.get("PROVIDER_NOTIFY_RETRY_BACKOFF_SECONDS", "1.0"))
 
-    # ── realtime auto-advance ─────────────────────────────────────────────
-    # When the clock is NOT manual, a background thread advances the slot on
-    # its own every `slot_minutes`. With the manual clock the client drives
-    # this explicitly instead.
-    auto_advance_clock: bool = os.environ.get("PROVIDER_AUTO_ADVANCE_CLOCK", "1") == "1"
 
 
 settings = Settings()

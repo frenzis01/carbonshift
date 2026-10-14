@@ -7,7 +7,7 @@ and 8101. Additional clients can be configured with repeated --client-url and
 manual-clock mode (see README.md "Emulazione a tempo fittizio").
 
 Usage:
-    python scripts/run_emulation_multi.py --slots 4 --per-slot 3 --slot-minutes 30
+    python scripts/run_emulation_multi.py --slots 4 --per-slot 3
 """
 from __future__ import annotations
 
@@ -189,7 +189,7 @@ def main() -> None:
     parser.add_argument("--per-slot", type=int, default=20)
     parser.add_argument("--pattern", default="sinusoidal", choices=["flat", "sinusoidal", "random"],
                          help="Pattern for request generation per slot (default: flat).")
-    parser.add_argument("--slot-minutes", type=float, default=30.0)
+    parser.add_argument("--slot-minutes", type=float, default=settings.provider_slot_minutes)
     parser.add_argument("--source", default="synthetic", choices=["synthetic", "dataset"])
     parser.add_argument("--seed", type=int, default=None,
                          help="Fix for a reproducible run; omitted = a fresh random seed every run.")

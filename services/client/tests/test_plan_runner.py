@@ -165,3 +165,27 @@ def test_send_slot_batch_derives_a_positive_deadline(monkeypatch, tmp_path):
     plan_runner.send_slot_batch(tracker, _specs(past, [0]), slot_minutes=30.0)
 
     assert calls[0]["deadline_seconds"] >= 1.0
+
+
+def test_send_slot_batch_uses_simulated_time_for_manual_deadline_slack(monkeypatch, tmp_path):
+    fake_submit, calls = make_fake_submit()
+    monkeypatch.setattr(plan_runner, "submit", fake_submit)
+
+    boundary = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    batch = [{
+        "task": "text_generation",
+        "input": {"prompt": "midnight"},
+        "start_at": boundary,
+        "deadline_at": boundary + timedelta(hours=1),
+    }]
+    tracker = RequestTracker(str(tmp_path / "metrics.jsonl"), timeout_seconds=60)
+
+    plan_runner.send_slot_batch(
+        tracker,
+        batch,
+        slot_minutes=60.0,
+        slot=0,
+        deadline_reference=boundary,
+    )
+
+    assert calls[0]["deadline_seconds"] == 3600.0

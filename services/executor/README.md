@@ -78,7 +78,8 @@ Variabili d'ambiente (tutte opzionali):
 | `EXECUTOR_METRICS_PATH` | `data/metrics.jsonl` | File JSONL di append delle metriche. |
 | `EXECUTOR_CALLBACK_TIMEOUT_SECONDS` | `10` | Timeout HTTP per l'invio del callback. |
 | `EXECUTOR_MANUAL_CLOCK` | `0` | Congela l'orologio della coda eccetto via `POST /admin/advance-slot` (solo test/emulazione). |
-| `EXECUTOR_SLOT_MINUTES` | `30` | Durata di un timeslot in modalit\u00e0 manual clock; deve combaciare con `PROVIDER_SLOT_MINUTES` e con `SLOT_DURATION_SECONDS / 60` di CarbonShift. |
+| `TZ` | `UTC` in Compose | Fuso comune dei servizi per la visualizzazione; gli istanti `execute_at` viaggiano sempre in UTC. |
+| `EXECUTOR_SLOT_MINUTES` | `60` | Durata di un timeslot in modalit\u00e0 manual clock; deve combaciare con `PROVIDER_SLOT_MINUTES` e con `SLOT_DURATION_SECONDS / 60` di CarbonShift. |
 | `EXECUTOR_COMPUTE_QUALITY_BASELINE` | `1` | Se attivo, ogni richiesta con flavour diverso da `accurate` esegue anche una passata "ombra" col flavour Accurate sullo stesso input, per ottenere `baseline_execution_time_sec`/`baseline_model` (misura reale, non stimata) e un `quality_score` per confronto quando non è fornito un `reference*`. Circa raddoppia il calcolo per richiesta — disattivalo (`0`) nei test su larga scala dove non serve il confronto di qualità/tempo. |
 
 Le durate dei flavour e i tempi misurati dall'executor sono numeri in secondi:
@@ -121,6 +122,9 @@ Stesso schema esatto del payload che il dispatcher Rust di carbonshift invia
 `{request_id, scheduled_slot, execute_at, flavour, carbon_cost, callback_url, payload}`.
 `execute_at` è il confine UTC dello slot assegnato, serializzato come timestamp
 RFC 3339 con fuso orario; l'executor mantiene il job in coda fino a quell'istante.
+In realtime usa l'orologio UTC di sistema e non mantiene un contatore di slot
+indipendente. In emulazione l'annuncio iniziale imposta il timestamp virtuale
+esatto del provider e ogni rollover avanza di una durata di slot.
 L'executor legge `task`/`input` da dentro `payload` — vedi
 [Integrazione con carbonshift](#integrazione-con-carbonshift).
 Il `request_id` è anche una chiave d'idempotenza: una ripetizione dello

@@ -139,12 +139,11 @@ class SyntheticCarbonIntensitySource(CarbonIntensitySource):
     `engine::scheduler::generate_carbon_intensity_forecast` (a daylight
     sigmoid plus autocorrelated noise). Two properties matter:
 
-    * **Deterministic given (seed, slot)**: the generator is re-seeded per
-      slot rather than advanced sequentially, so `forecast(s)` returns the
-      same value no matter what order/when slots were requested. A stateful
-      RNG would make the series depend on call history, and the scheduler
-      would then re-plan against a *different* forecast for the same slot
-      after a restart — quietly invalidating every committed assignment.
+    * **Deterministic given (seed, slot, cycle origin)**: the generator is
+      re-seeded per relative slot rather than advanced sequentially, so
+      `forecast(s)` returns the same value no matter what order/when slots were
+      requested. The cycle origin is today's local midnight, while `slot`
+      remains a stable fixed-epoch ID shared with peers.
     * **No real dependency**: keeps `docker compose up` and CI working with
       no network and no API key.
     * **It does NOT fabricate a future "actual".** Even though it could, doing
@@ -166,6 +165,7 @@ class SyntheticCarbonIntensitySource(CarbonIntensitySource):
         cycle_slots: int,
         noise_std: float,
         actual_jitter_std: float,
+        cycle_origin_slot: int = 0,
     ) -> None:
         self._seed = seed
         self._slot_minutes = slot_minutes
@@ -173,6 +173,7 @@ class SyntheticCarbonIntensitySource(CarbonIntensitySource):
         self._night_max = night_max
         self._day_min = day_min
         self._cycle_slots = max(1, cycle_slots)
+        self._cycle_origin_slot = cycle_origin_slot
         self._noise_std = noise_std
         self._actual_jitter_std = actual_jitter_std
 
@@ -181,7 +182,7 @@ class SyntheticCarbonIntensitySource(CarbonIntensitySource):
     def _forecast_value(self, slot: int) -> float:
         """Forecast for `slot` — delegates to the pure model in `forecast.py`."""
         return forecast_model.forecast_value(
-            slot,
+            slot - self._cycle_origin_slot,
             seed=self._seed,
             cycle_slots=self._cycle_slots,
             night_max=self._night_max,
@@ -302,7 +303,7 @@ class RemoteCarbonIntensitySource(CarbonIntensitySource):
 # ─── factory ─────────────────────────────────────────────────────────────────
 
 
-def build_source(settings) -> CarbonIntensitySource:
+def build_source(settings, *, cycle_origin_slot: int = 0) -> CarbonIntensitySource:
     """Select the adapter from configuration.
 
     Fails loudly on an unknown role instead of silently defaulting to
@@ -320,6 +321,7 @@ def build_source(settings) -> CarbonIntensitySource:
             night_max=settings.generator_night_max,
             day_min=settings.generator_day_min,
             cycle_slots=settings.generator_cycle_slots,
+            cycle_origin_slot=cycle_origin_slot,
             noise_std=settings.generator_noise_std,
             actual_jitter_std=settings.actual_jitter_std,
         )

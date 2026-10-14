@@ -52,6 +52,11 @@ def slot_of(dt: datetime, slot_minutes: float) -> int:
     return int((dt - _EPOCH) / timedelta(minutes=slot_minutes))
 
 
+def slot_start_utc(slot: int, slot_minutes: float) -> datetime:
+    """Return the UTC boundary for a global slot number."""
+    return _EPOCH + timedelta(minutes=slot * slot_minutes)
+
+
 def ceil_to_slot_end(dt: datetime, slot_minutes: float) -> datetime:
     """End of the timeslot `dt` falls into (e.g. 19:32 -> 20:00); a `dt`
     that already sits exactly on a boundary maps to itself."""

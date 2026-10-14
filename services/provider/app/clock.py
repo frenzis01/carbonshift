@@ -104,11 +104,10 @@ class ProviderClock:
         HTTP handler) turns that into a 409, mirroring carbonshift's and the
         executor's own `/admin/advance-slot` behaviour.
 
-        A single advance moves exactly one slot *from the frozen instant*, and
-        `global_slot` follows real wall time. That means in a slow manual run
-        the two can diverge: `global_slot` tracks the calendar, the frozen
-        instant tracks the simulation. The divergence is intentional and is
-        reported by `/health` (`drift_slots`) instead of being hidden.
+        A single advance moves exactly one slot *from the frozen instant*.
+        Emulation begins at local midnight, so the frozen instant can be hours
+        behind wall time; `/health` reports that intentional offset as
+        `drift_slots` rather than pretending simulated time is realtime.
         """
         if not self._manual:
             raise RuntimeError("advance() requires the manual clock (PROVIDER_MANUAL_CLOCK=1)")

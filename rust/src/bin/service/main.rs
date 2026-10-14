@@ -28,11 +28,16 @@
 //!   elapsed beyond which `GET /ready` returns `503`, so an orchestrator can
 //!   roll a replacement instance before the finite planning horizon runs out
 //!   (see PLAN_SERVICE.md Fase 6 — there is no in-engine rolling window).
-//! - `SLOT_DURATION_SECONDS` (default `10`): length of one planning slot.
-//!   Set to e.g. `1800` for 30-minute timeslots.
-//! - `MANUAL_CLOCK` (default `0`): freezes the virtual clock except via
-//!   `POST /v1/admin/advance-slot` — test/emulation mode only, see
-//!   PLAN_SERVICE.md §"Emulazione a tempo fittizio".
+//! - `SLOT_DURATION_SECONDS` (default `10`): length of one planning slot;
+//!   use `1800` for 30-minute timeslots.
+//! - `PROVIDER_SLOT_MINUTES` (default derived from `SLOT_DURATION_SECONDS`):
+//!   the shared wall-clock slot length; it must match the scheduler duration.
+//! - `PROVIDER_EPOCH` (default `2020-01-01T00:00:00+00:00`): global slot-number
+//!   origin shared with the provider and client.
+//! - `MANUAL_CLOCK` (default `0`): in emulation, freezes the virtual clock
+//!   except via `POST /v1/admin/advance-slot`. In realtime, local engine slot
+//!   zero starts at the current epoch-aligned boundary and advances with wall
+//!   time.
 //! - `DISPATCHER_POLL_INTERVAL_MS` (default `200`): how often the dispatcher
 //!   checks for assignments ready to send to the executor; lower it (e.g.
 //!   `20`) for snappier emulation tests.
@@ -41,6 +46,7 @@
 //! `docker stop`/Kubernetes send), letting in-flight requests finish.
 
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use carbonshift_rs::engine::config::Config;
 use carbonshift_rs::engine::metrics_logger::MetricsLogger;
@@ -48,7 +54,7 @@ use carbonshift_rs::engine::scheduler::BatchScheduler;
 use carbonshift_rs::engine::shared_state::SharedState;
 use carbonshift_rs::service::dispatcher;
 use carbonshift_rs::service::server::build_router;
-use carbonshift_rs::service::state::{AppState, ServiceConfig};
+use carbonshift_rs::service::state::{AppState, ServiceConfig, wall_clock_alignment};
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -56,6 +62,14 @@ fn env_or(name: &str, default: &str) -> String {
 
 fn env_secret(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn provider_epoch() -> SystemTime {
+    let raw = env_or("PROVIDER_EPOCH", "2020-01-01T00:00:00+00:00");
+    chrono::DateTime::parse_from_rfc3339(&raw)
+        .unwrap_or_else(|error| panic!("PROVIDER_EPOCH must be an RFC 3339 timestamp: {error}"))
+        .with_timezone(&chrono::Utc)
+        .into()
 }
 
 #[tokio::main]
@@ -74,7 +88,22 @@ async fn main() {
     let slot_duration_seconds: f64 = env_or("SLOT_DURATION_SECONDS", "10")
         .parse()
         .expect("SLOT_DURATION_SECONDS must be a number");
+    let provider_slot_minutes: f64 = env_or(
+        "PROVIDER_SLOT_MINUTES",
+        &(slot_duration_seconds / 60.0).to_string(),
+    )
+    .parse()
+    .expect("PROVIDER_SLOT_MINUTES must be a number");
+    if !provider_slot_minutes.is_finite()
+        || (provider_slot_minutes * 60.0 - slot_duration_seconds).abs() > 1e-6
+    {
+        panic!(
+            "PROVIDER_SLOT_MINUTES ({provider_slot_minutes}) must match \
+             SLOT_DURATION_SECONDS ({slot_duration_seconds})"
+        );
+    }
     let manual_clock = env_or("MANUAL_CLOCK", "0") == "1";
+    let provider_epoch = provider_epoch();
 
     let mut cfg = Config::default();
     cfg.total_slots = total_slots;
@@ -146,6 +175,20 @@ async fn main() {
         metrics_logger,
         shared_carbon_forecast.clone(),
     );
+    // Realtime slot zero is a local horizon index, but its first transition
+    // must still land on the same global wall-clock boundary as every peer.
+    let realtime_alignment = if manual_clock {
+        None
+    } else {
+        let alignment = wall_clock_alignment(
+            SystemTime::now(),
+            provider_epoch,
+            cfg.effective_slot_duration_secs(),
+        )
+        .unwrap_or_else(|error| panic!("cannot align CarbonShift to the slot clock: {error}"));
+        shared_state.set_virtual_elapsed_ms(alignment.elapsed_in_slot_ms);
+        Some(alignment)
+    };
     scheduler.start();
 
     let service_cfg = ServiceConfig {
@@ -172,6 +215,9 @@ async fn main() {
             .expect("DISPATCHER_POLL_INTERVAL_MS must be an integer"),
     };
     let state = AppState::new(shared_state, cfg, service_cfg, shared_carbon_forecast);
+    if let Some(alignment) = realtime_alignment {
+        state.set_wall_clock_alignment(alignment);
+    }
     tokio::spawn(dispatcher::run(state.clone()));
 
     let app = build_router(state);

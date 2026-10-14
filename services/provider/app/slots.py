@@ -9,14 +9,14 @@ Two different "slot" identities must never be mixed up (see ARCHITECTURE.md):
 - **local index** — a position inside one forecast array (0 = the slot the
   caller asked about).
 
-carbonshift's own `current_slot` is currently an *uptime counter* derived from
-`virtual_elapsed_ms`, i.e. it is NOT a global slot. Until that is reconciled,
-the offset between the two must be applied explicitly and in ONE place
-(`notifications.py`); do not scatter it.
+CarbonShift's `current_slot` is a local index into its finite planning
+horizon, not a global slot number. Manual mode maps provider ticks into that
+index; realtime mode starts the local index at the same wall-clock boundary.
+The provider-to-engine offset remains explicit at the HTTP boundary.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 _EPOCH_FALLBACK = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -43,6 +43,23 @@ def parse_epoch(epoch_iso: str) -> datetime:
 
 def as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def local_midnight_utc(now_local: datetime | None = None) -> datetime:
+    """Return today's local midnight as a UTC instant.
+
+    Manual emulation starts at midnight for a readable day-based slot axis.
+    The timestamp is still converted to UTC before it is shared with peers.
+    `now_local` is injectable so timezone conversion can be tested without
+    changing the host's timezone.
+    """
+    if now_local is None:
+        local_date = datetime.now().astimezone().date()
+        return datetime.combine(local_date, time.min).astimezone(timezone.utc)
+    if now_local.tzinfo is None:
+        raise ValueError("now_local must be timezone-aware")
+    midnight = datetime.combine(now_local.date(), time.min, tzinfo=now_local.tzinfo)
+    return midnight.astimezone(timezone.utc)
 
 
 def floor_to_slot(dt: datetime, slot_minutes: float, epoch: datetime) -> datetime:

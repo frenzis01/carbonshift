@@ -114,8 +114,8 @@ Oltre a `deadline_seconds` (relativo, usato da `/run/send-batch`), il
 nuovo endpoint `POST /run/send-plan` accetta **orari assoluti** (con data,
 per evitare ambiguità) per `start_at` (quando la richiesta "nasce") e
 `deadline_at` (entro quando deve finire): entrambi discretizzati in timeslot
-di `slot_minutes` (default 30) — es. una `deadline_at` di `19:32` con slot da
-30 minuti diventa "entro le 20:00" (fine del timeslot `19:30–20:00`).
+di `slot_minutes` (default 60) — es. una `deadline_at` di `16:43` con slot da
+60 minuti diventa "entro le 17:00" (fine del timeslot `16:00–17:00`).
 
 ```sh
 curl -X POST localhost:8100/run/send-plan -H 'Content-Type: application/json' -d '{
@@ -129,14 +129,25 @@ curl -X POST localhost:8100/run/send-plan -H 'Content-Type: application/json' -d
 }'
 ```
 
-Con `mode: "realtime"` il client aspetta davvero che arrivi ogni `start_at`.
-Con `mode: "emulated"` no — vedi sotto.
+Con `mode: "realtime"` il client invia il batch dello slot corrente e poi
+genera autonomamente un tick ad ogni confine allineato all'epoch condiviso.
+Il batch viene quindi inviato quando inizia il suo timeslot, senza aspettare
+un tick dal provider. Con `mode: "emulated"` il client consuma invece i tick
+manuali del provider — vedi sotto.
 
 ## Emulazione a tempo fittizio
 
 Per testare un piano che copre ore/giorni di traffico senza aspettare il
 tempo reale, usa `mode: "emulated"`. Il client registra il piano; è il provider
-che guida i tick in ordine verso client, Carbonshift ed executor.
+che guida i tick in ordine verso client, Carbonshift ed executor. In questo
+modo il provider avvia l'orologio virtuale alle **00:00 locali del giorno
+corrente**: il primo timeslot simulato è quello 00:00–01:00 (o l'intervallo
+corrispondente alla durata configurata), anche se la simulazione parte più
+tardi. L'epoch globale configurato non cambia: il provider mantiene gli ID
+globali e invia a tutti lo stesso timestamp UTC della mezzanotte virtuale.
+Compose usa `TZ=UTC` per default; se vuoi la mezzanotte locale, imposta la
+stessa `TZ` (per esempio `Europe/Rome`) su tutti i servizi. Il fuso e la
+durata degli slot devono fare sì che la mezzanotte locale sia un confine valido.
 Richiede carbonshift avviato con `MANUAL_CLOCK=1` (e idealmente
 `SUBMIT_WAIT_TIMEOUT_SECS` basso, es. `0.3`, altrimenti ogni invio blocca
 fino a 5s di default) e l'executor con `EXECUTOR_MANUAL_CLOCK=1` — vedi
@@ -144,9 +155,14 @@ fino a 5s di default) e l'executor con `EXECUTOR_MANUAL_CLOCK=1` — vedi
 razionale completo del protocollo.
 
 ```sh
-python scripts/run_emulation.py --slots 4 --per-slot 3 --slot-minutes 30 \
+python scripts/run_emulation.py --slots 4 --per-slot 3 \
   --task text_generation --executor-url http://localhost:9000
 ```
+
+`--slot-minutes` defaults to `PROVIDER_SLOT_MINUTES`. To use 30-minute slots,
+configure `PROVIDER_SLOT_MINUTES=30`, `SLOT_DURATION_SECONDS=1800`, and
+`EXECUTOR_SLOT_MINUTES=30` for the stack; the client rejects a plan whose
+duration does not match its configured slot clock.
 
 Per impostazione predefinita lo script registra il profilo calibrato con ID
 stabile `<task>-calibrated-v1` e lo include in ogni richiesta del piano.
@@ -211,8 +227,12 @@ cd ..
 export MANUAL_CLOCK=1 SUBMIT_WAIT_TIMEOUT_SECS=0.3 DISPATCHER_POLL_INTERVAL_MS=20
 docker compose down   # se lo stack era già su con altre variabili
 docker compose up -d --build
-docker compose run --rm emulation --slots 4 --per-slot 3 --slot-minutes 30 --task text_generation
+docker compose run --rm emulation --slots 4 --per-slot 3 --task text_generation
 ```
+
+Per l'uso realtime imposta `MANUAL_CLOCK=0`: CarbonShift, client ed executor
+seguono i confini dell'orologio UTC condiviso; il client genera i propri tick
+senza dipendere da notifiche periodiche del provider.
 
 Per l'emulazione multi-client usa il profilo Compose `multi-client`, che
 aggiunge un secondo servizio client con callback e metriche isolati. Il runner
@@ -228,7 +248,7 @@ export MANUAL_CLOCK=1 SUBMIT_WAIT_TIMEOUT_SECS=0.3
 export PROVIDER_CLIENT_URLS=http://client:8100,http://client-2:8100
 docker compose --profile multi-client up -d --build carbonshift executor client client-2 provider
 docker compose --profile multi-client run --rm emulation-multi \
-  --slots 4 --per-slot 3 --slot-minutes 30
+  --slots 4 --per-slot 3
 ```
 
 `--per-slot` è per client; la ladder globale viene dimensionata sul carico
@@ -344,6 +364,12 @@ Ogni scenario del file di config specifica liberamente `task`, `count`
 `seed` e `mode` (`realtime` o `emulated`). Il flavour non è impostabile
 direttamente (lo sceglie carbonshift), ma i risultati sono comunque
 osservabili per flavour tramite `/metrics/summary`.
+Il runner usa `/v1/slot` del provider come riferimento e, in modalità
+`emulated`, avanza il provider (non CarbonShift/executor direttamente), così
+client, scheduler ed executor ricevono lo stesso slot/timestamp. Le durate
+nei file di scenario devono coincidere con `PROVIDER_SLOT_MINUTES`,
+`SLOT_DURATION_SECONDS / 60` e `EXECUTOR_SLOT_MINUTES`; i file predefiniti
+usano 60 minuti come Compose.
 
 Ogni run scrive in `tests/battery/results/<battery_id>_<timestamp>/`:
 - `battery_config.json`: snapshot della config usata;
@@ -364,6 +390,11 @@ Ogni run scrive in `tests/battery/results/<battery_id>_<timestamp>/`:
 | `CLIENT_HTTP_TIMEOUT_SECONDS` | `10` | Timeout della chiamata a carbonshift. |
 | `CLIENT_CALLBACK_TIMEOUT_SECONDS` | `120` | Dopo quanto una richiesta senza callback viene marcata `timed_out`. |
 | `CLIENT_METRICS_PATH` | `data/metrics.jsonl` | File di append delle metriche. |
+| `CLIENT_MANUAL_CLOCK` | `MANUAL_CLOCK`, altrimenti `0` | In emulazione consuma i tick del provider; in realtime abilita il ticker locale allineato all'epoch. |
+| `PROVIDER_URL` | `http://localhost:9100` | Provider usato per slot e osservazioni. |
+| `PROVIDER_EPOCH` | `2020-01-01T00:00:00+00:00` | Deve coincidere con l'epoch configurato sul provider e su CarbonShift. |
+| `PROVIDER_SLOT_MINUTES` | `60` | Durata dei timeslot; deve corrispondere a CarbonShift e all'executor. |
+| `TZ` | `UTC` in Compose | Fuso locale comune; in emulazione determina la mezzanotte virtuale. |
 | `CLIENT_QOS_PROFILE_VERSION` | `v1` | Versione stabile usata per generare gli ID dei profili calibrati; aumentala quando cambia la policy. |
 | `CLIENT_QOS_PROFILE_THRESHOLD_POSITION` | `0.75` | Posizione fra errore minimo e massimo usata per la soglia dei profili calibrati. |
 | `CLIENT_QOS_PROFILE_STATS_PATH` | `model_stats.json` nel servizio client | Snapshot di calibrazione da cui ricostruire i profili calibrati all'avvio. |

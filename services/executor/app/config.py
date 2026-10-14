@@ -86,7 +86,7 @@ class Settings:
     # time, only via POST /admin/advance-slot (mirrors carbonshift's own
     # MANUAL_CLOCK) — never enable in production.
     manual_clock: bool = os.environ.get("EXECUTOR_MANUAL_CLOCK", "0") == "1"
-    slot_minutes: float = float(os.environ.get("EXECUTOR_SLOT_MINUTES", "30"))
+    slot_minutes: float = float(os.environ.get("EXECUTOR_SLOT_MINUTES", "60"))
     # When true (default), any non-"accurate" flavour also runs a same-input
     # "shadow" Accurate-flavour pass to (a) get an empirical
     # baseline_execution_time_sec/baseline_model and (b) derive a

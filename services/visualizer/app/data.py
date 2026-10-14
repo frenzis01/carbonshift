@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 import requests
 from urllib.parse import quote
@@ -81,6 +82,31 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     current_slot = horizon_info.get("current_slot", stats_info.get("current_slot", 0))
     total_slots = horizon_info.get("total_slots", 8640)
     global_slot = provider_slot.get("current_slot")
+    slot_clock: dict[str, Any] = {}
+    provider_boundary = provider_slot.get("slot_start_utc")
+    slot_minutes = provider_slot.get("slot_minutes")
+    if (
+        isinstance(provider_boundary, str)
+        and isinstance(current_slot, int)
+        and isinstance(slot_minutes, (int, float))
+        and slot_minutes > 0
+    ):
+        try:
+            current_boundary = datetime.fromisoformat(
+                provider_boundary.replace("Z", "+00:00")
+            )
+            if current_boundary.tzinfo is None:
+                current_boundary = current_boundary.replace(tzinfo=timezone.utc)
+            # Translate the provider's current UTC boundary back to CarbonShift's local slot zero.
+            local_zero = current_boundary.astimezone(timezone.utc) - timedelta(
+                minutes=current_slot * float(slot_minutes)
+            )
+            slot_clock = {
+                "slot_zero_start_utc": local_zero.isoformat(),
+                "slot_minutes": float(slot_minutes),
+            }
+        except (OverflowError, ValueError):
+            logger.warning("provider returned an invalid slot boundary; UTC axis labels omitted")
 
     # Fetch with lookahead so carbon intensity and forecast for future slots are always available
     lookahead_slot = current_slot + 24
@@ -465,6 +491,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
         },
         "assignment_plot": {
             "slots": slot_axis,
+            **slot_clock,
             "flavours": flavours,
             "flavour_counts": [flavour_counts[flavour] for flavour in flavours],
             "fast": fast_counts,
@@ -487,6 +514,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
         },
         "error_plot": {
             "slots": slot_axis,
+            **slot_clock,
             "flavours": flavours,
             "error_by_flavour": [
                 flavour_error_contribs[flavour] for flavour in flavours
@@ -521,6 +549,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
         },
         "input_plot": {
             "slots": slot_axis,
+            **slot_clock,
             "arrived_requests": input_arrival_counts,
             "carbon_intensity_forecast": ci_forecast_series,
             "carbon_intensity_actual": ci_actual_series,

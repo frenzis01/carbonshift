@@ -66,6 +66,7 @@ def client(monkeypatch):
     from app import main as client_main
 
     monkeypatch.setattr(client_main, "register_configured_qos_profiles", lambda: [])
+    monkeypatch.setattr(client_main.settings, "manual_clock", True)
     with TestClient(app) as c:
         yield c
 
@@ -163,6 +164,45 @@ def test_tick_accepts_the_providers_real_payload_shape(client):
     })
     assert resp.status_code == 200
     assert resp.json()["submitted"] == 1
+
+
+def test_realtime_plan_registration_processes_the_current_slot(client, monkeypatch):
+    from app import main as client_main
+
+    monkeypatch.setattr(client_main.settings, "manual_clock", False)
+    reference = _boundary(datetime.now(timezone.utc))
+    expected_slot = slot_of(reference, SLOT_MINUTES)
+    monkeypatch.setattr(client_main, "slot_of", lambda _now, _minutes: expected_slot)
+    plan_id = _register_plan(client, reference, [0])
+
+    plan = state.get_plan(plan_id)
+    assert plan is not None
+    assert plan["last_processed_slot"] == plan["plan_start_slot"]
+    assert len(client.get("/requests").json()) == 1
+
+
+def test_manual_tick_is_rejected_when_client_clock_mode_is_realtime(client, monkeypatch):
+    from app import main as client_main
+
+    monkeypatch.setattr(client_main.settings, "manual_clock", False)
+    response = _tick(client, 0)
+
+    assert response.status_code == 409
+
+
+def test_plan_rejects_a_slot_length_that_differs_from_the_clock(client):
+    response = client.post("/run/send-plan", json={
+        "requests": [{
+            "task": "text_generation",
+            "input": {"prompt": "p"},
+            "start_at": "2026-01-01T00:00:00+00:00",
+            "deadline_at": "2026-01-01T01:00:00+00:00",
+        }],
+        "slot_minutes": 30,
+        "mode": "emulated",
+    })
+
+    assert response.status_code == 409
 
 
 # ─── slots outside the plan ──────────────────────────────────────────────────

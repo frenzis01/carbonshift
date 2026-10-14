@@ -8,7 +8,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.slots import floor_to_slot, parse_epoch, parse_iso, slot_of, slot_start_utc
+from app.slots import (
+    floor_to_slot,
+    local_midnight_utc,
+    parse_epoch,
+    parse_iso,
+    slot_of,
+    slot_start_utc,
+)
 
 EPOCH = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
@@ -52,6 +59,15 @@ def test_floor_to_slot_aligns_to_the_epoch_not_the_hour():
     t = datetime(2024, 5, 1, 19, 32, tzinfo=timezone.utc)
     epoch = datetime(2024, 5, 1, tzinfo=timezone.utc)
     assert floor_to_slot(t, 30, epoch) == datetime(2024, 5, 1, 19, 30, tzinfo=timezone.utc)
+
+
+def test_local_midnight_is_returned_as_one_shared_utc_instant():
+    local = datetime(2026, 10, 13, 16, 43, tzinfo=timezone(timedelta(hours=2)))
+    midnight = local_midnight_utc(local)
+
+    assert midnight == datetime(2026, 10, 12, 22, 0, tzinfo=timezone.utc)
+    for slot_minutes in (60, 30, 15):
+        assert floor_to_slot(midnight, slot_minutes, EPOCH) == midnight
 
 
 def test_slot_of_is_negative_before_the_epoch():

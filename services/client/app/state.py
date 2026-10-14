@@ -3,23 +3,19 @@
 ## Why this module exists
 
 The client used to run a plan by starting a thread that fired every slot's
-requests in a loop, driving the clock itself. Now the **provider owns the
-clock** (see `provider/ARCHITECTURE.md` §2): it tells the client "the system
-has entered slot N" via `POST /v1/tick`, and the client answers "here is slot
-N's work".
+requests in a loop, driving the clock itself. Manual emulation now uses the
+provider's `POST /v1/tick`; realtime derives the same global slot from the
+shared epoch and wall clock.
 
-That inversion means the plan can no longer be a running loop — it has to be
-*stored* between ticks, because each tick is a separate HTTP request. This
+Plans are stored between ticks rather than run by a plan-specific loop. This
 module is that store. It holds **plans only**.
 
 ## What this module deliberately does NOT hold
 
-**No clock.** There is no `current_slot` counter here, and there must never be
-one. The provider is the single owner of "which slot are we in"; every other
-component *derives* its position from the slot it is told about. A local
-counter would drift the moment a tick is retried or missed, and the two
-services would silently disagree about which slot is current — the exact class
-of bug this design exists to prevent.
+There is no persisted `current_slot` counter here. In manual emulation the
+provider supplies each global slot; in realtime the service derives the same
+global slot from the shared epoch and wall clock. In neither mode does the
+client increment its own counter, so a retry or restart cannot shift a plan.
 
 The client's position is therefore always computed, never stored:
 
@@ -71,7 +67,8 @@ def store_plan(requests_spec: list[dict[str, Any]], slot_minutes: float,
                mode: str, executor_url: Optional[str]) -> int:
     """Register a plan and return its id.
 
-    The plan is stored, not started: the provider's ticks drive it. The two
+    The plan is stored, not started: provider ticks in manual mode or the
+    realtime wall-clock ticker drive it. The two
     derived fields are what make the tick→plan-index mapping a subtraction:
 
     * `plan_start_slot` — the **global** slot the plan begins in, computed

@@ -31,10 +31,9 @@ from .config import settings
 class ProviderError(RuntimeError):
     """Raised for any failure talking to the provider.
 
-    Deliberately not swallowed anywhere: the provider is the clock, so if it
-    is unreachable the run cannot proceed meaningfully. See
-    `provider/ARCHITECTURE.md` §4 — a silent fallback here is exactly the
-    class of bug the design exists to prevent.
+    Deliberately not swallowed anywhere: the provider owns manual emulation
+    time and is the source of observations, so failures must remain visible.
+    Realtime slot ticking does not depend on provider notifications.
     """
 
 

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from app.config import Settings
+from app.config import Settings, _default_generator_cycle_slots
 from app.source import (
     CarbonIntensitySource,
     RemoteCarbonIntensitySource,
@@ -57,6 +57,20 @@ def test_local_forecast_is_reproducible_from_the_seed():
     assert [p.forecast for p in _local(seed=1).forecast(0, 4)] != [
         p.forecast for p in _local(seed=2).forecast(0, 4)
     ]
+
+
+def test_local_forecast_phase_is_relative_to_its_configured_day_origin():
+    reference = _local(noise_std=0.0)
+    shifted = _local(noise_std=0.0, cycle_origin_slot=100)
+
+    assert [point.forecast for point in shifted.forecast(100, 12)] == [
+        point.forecast for point in reference.forecast(0, 12)
+    ]
+
+
+def test_default_generator_cycle_covers_one_day_for_thirty_minute_slots(monkeypatch):
+    monkeypatch.setenv("PROVIDER_SLOT_MINUTES", "30")
+    assert _default_generator_cycle_slots() == 48
 
 
 # ─── shape ───────────────────────────────────────────────────────────────────

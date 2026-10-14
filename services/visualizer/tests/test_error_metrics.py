@@ -27,6 +27,8 @@ class ErrorMetricsTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("function plotUiRevision(chartName", response.text)
+        self.assertIn("function slotAxisClockTicks(slots, plot)", response.text)
+        self.assertIn("getUTCHours()", response.text)
         self.assertIn("uirevision: uiRevision", response.text)
         self.assertIn("legend: { uirevision: uiRevision", response.text)
 
@@ -48,7 +50,11 @@ class ErrorMetricsTests(unittest.TestCase):
                 "total_slots": 100,
             },
             "http://carbonshift:8080/v1/stats": {},
-            "http://provider:9100/v1/slot": {"current_slot": 2},
+            "http://provider:9100/v1/slot": {
+                "current_slot": 2,
+                "slot_start_utc": "2026-10-14T02:00:00+00:00",
+                "slot_minutes": 60,
+            },
             "http://carbonshift:8080/v1/metrics/costs": {},
             "http://carbonshift:8080/v1/metrics/error-history": {
                 "current_slot": 2,
@@ -85,6 +91,18 @@ class ErrorMetricsTests(unittest.TestCase):
             self.assertEqual(dashboard["indicators"]["global_error_avg"], 12.5)
             self.assertEqual(dashboard["error_plot"]["global_error_avg"], 12.5)
             self.assertEqual(dashboard["error_plot"]["window_error_avg"], 8.5)
+            self.assertEqual(
+                dashboard["assignment_plot"]["slot_zero_start_utc"],
+                "2026-10-14T00:00:00+00:00",
+            )
+            self.assertEqual(
+                dashboard["error_plot"]["slot_zero_start_utc"],
+                dashboard["assignment_plot"]["slot_zero_start_utc"],
+            )
+            self.assertEqual(
+                dashboard["input_plot"]["slot_zero_start_utc"],
+                dashboard["assignment_plot"]["slot_zero_start_utc"],
+            )
 
             responses["http://carbonshift:8080/v1/metrics/error-history"] = {
                 "current_slot": 2,
@@ -101,6 +119,7 @@ class ErrorMetricsTests(unittest.TestCase):
 
             responses["http://carbonshift:8080/v1/horizon"]["current_slot"] = 3
             responses["http://provider:9100/v1/slot"]["current_slot"] = 3
+            responses["http://provider:9100/v1/slot"]["slot_start_utc"] = "2026-10-14T03:00:00+00:00"
             responses["http://carbonshift:8080/v1/metrics/error-history"] = {
                 "current_slot": 3,
                 "global_error_avg": 17.0,

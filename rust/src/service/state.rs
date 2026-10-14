@@ -16,6 +16,65 @@ use crate::engine::types::Flavour;
 use crate::service::models::RequestStatus;
 use chrono::{SecondsFormat, Utc};
 
+/// Wall-clock position captured when CarbonShift's local slot zero is started.
+///
+/// The global slot identifies the shared calendar boundary; `elapsed_in_slot_ms`
+/// lets the local engine reach its next transition at the next wall-clock edge.
+#[derive(Debug, Clone, Copy)]
+pub struct WallClockAlignment {
+    /// Provider-global slot that corresponds to CarbonShift local slot zero.
+    pub global_slot: i32,
+    /// UTC start boundary of CarbonShift local slot zero.
+    pub slot_start_utc: SystemTime,
+    /// Elapsed milliseconds within the active wall-clock slot at startup.
+    pub elapsed_in_slot_ms: u64,
+}
+
+/// Calculate the global slot and elapsed fraction for a wall-clock instant.
+///
+/// This keeps CarbonShift's local horizon zero-based while ensuring local slot
+/// transitions land on the same epoch-anchored boundaries as the provider.
+pub fn wall_clock_alignment(
+    now: SystemTime,
+    // The service default is 2020-01-01 00:00:00 UTC; the environment may override it.
+    epoch: SystemTime,
+    // The service's effective slot duration, in seconds.
+    slot_duration_secs: f64,
+) -> Result<WallClockAlignment, String> {
+    let slot_duration = Duration::try_from_secs_f64(slot_duration_secs)
+        .map_err(|error| format!("invalid slot duration: {error}"))?;
+    let slot_duration_ms = u64::try_from(slot_duration.as_millis())
+        .map_err(|error| format!("slot duration is too large: {error}"))?;
+    if slot_duration_ms == 0 {
+        return Err("slot duration must be at least one millisecond".to_string());
+    }
+
+    // Keep the global slot number tied to the shared epoch, not to process uptime.
+    let elapsed = now
+        .duration_since(epoch)
+        .map_err(|error| format!("provider epoch is in the future: {error}"))?;
+    let elapsed_ms = u64::try_from(elapsed.as_millis())
+        .map_err(|error| format!("elapsed wall time is too large: {error}"))?;
+    // The quotient is the global slot; the remainder seeds local slot zero so
+    // CarbonShift reaches the next boundary at the correct wall-clock time.
+    let global_slot = elapsed_ms / slot_duration_ms;
+    let global_slot = i32::try_from(global_slot)
+        .map_err(|error| format!("global slot does not fit the service index: {error}"))?;
+    let slot_offset_ms = u64::try_from(global_slot)
+        .map_err(|error| format!("global slot is negative: {error}"))?
+        .checked_mul(slot_duration_ms)
+        .ok_or_else(|| "slot boundary offset overflowed".to_string())?;
+    let slot_start_utc = epoch
+        .checked_add(Duration::from_millis(slot_offset_ms))
+        .ok_or_else(|| "slot boundary is outside the system clock range".to_string())?;
+
+    Ok(WallClockAlignment {
+        global_slot,
+        slot_start_utc,
+        elapsed_in_slot_ms: elapsed_ms % slot_duration_ms,
+    })
+}
+
 /// Per-request bookkeeping that lives outside the scheduling engine: the
 /// caller's callback URL, the opaque payload to forward to the executor, and
 /// where the request currently stands in the dispatch/callback lifecycle.
@@ -307,19 +366,12 @@ pub struct AppState {
     /// solver, which keeps planning against the original forecast.
     pub actual_carbon_intensity: Arc<Mutex<HashMap<i32, f64>>>,
 
-    /// This is the offset between the provider's global slot numbering (based on the fixed epoch)
-    /// and carbonshift's local slot numbering.
-    /// We cannot use it inside cfg because cfg is shared and immutable, while this
-    /// offset is discovered at runtime
-    /// carbonshift's `current_slot` starts at **0** and counts up from process start
-    /// (`virtual_elapsed_ms` is an uptime counter). The provider publishes **global**
-    /// slots aligned to a fixed epoch — measured live, `118015` right now. The two are
-    /// off by the process-uptime offset, so a pushed forecast indexed by global slot
-    /// would be read by the scheduler at the wrong index — and because it would land
-    /// outside its array it would be **silently ignored**, not obviously broken.
+    /// Offset from the provider's fixed-epoch global slot numbers to the local
+    /// engine horizon. Manual mode learns it from the provider's first announce;
+    /// realtime mode installs it from the shared epoch at service startup.
     pub slot_epoch_offset: Arc<Mutex<Option<i32>>>,
-    /// UTC start of engine slot zero. Manual-clock announcements synchronize
-    /// this anchor with the provider; real-time mode derives it from service uptime.
+    /// UTC start of engine slot zero. Manual announcements or realtime startup
+    /// align this anchor to the shared wall-clock boundary.
     pub slot_epoch_start_utc: Arc<Mutex<SystemTime>>,
     next_id: Arc<AtomicU64>,
 }
@@ -395,6 +447,16 @@ impl AppState {
         Ok(())
     }
 
+    /// Apply the wall-clock origin captured before the scheduler loop starts.
+    ///
+    /// Unlike a provider announcement, realtime mode has no peer tick to teach
+    /// CarbonShift the global-to-local offset, so install that same mapping at
+    /// startup instead.
+    pub fn set_wall_clock_alignment(&self, alignment: WallClockAlignment) {
+        *self.slot_epoch_offset.lock().unwrap() = Some(alignment.global_slot);
+        *self.slot_epoch_start_utc.lock().unwrap() = alignment.slot_start_utc;
+    }
+
     /// Return the RFC 3339 UTC boundary for an engine slot.
     pub fn execute_at_for_slot(&self, slot: i32) -> Result<String, String> {
         if slot < 0 {
@@ -420,6 +482,34 @@ mod tests {
     use crate::types::CapacityTier;
     use std::sync::RwLock;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn realtime_alignment_starts_local_slot_zero_at_the_current_boundary() {
+        let epoch = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let now = epoch + Duration::from_secs(16 * 60 * 60 + 43 * 60);
+        let alignment = wall_clock_alignment(now, epoch, 60.0 * 60.0).unwrap();
+
+        assert_eq!(alignment.global_slot, 16);
+        assert_eq!(
+            alignment.slot_start_utc,
+            epoch + Duration::from_secs(16 * 60 * 60)
+        );
+        assert_eq!(alignment.elapsed_in_slot_ms, 43 * 60 * 1000);
+    }
+
+    #[test]
+    fn realtime_alignment_uses_half_hour_boundaries() {
+        let epoch = UNIX_EPOCH;
+        let now = epoch + Duration::from_secs(16 * 60 * 60 + 43 * 60);
+        let alignment = wall_clock_alignment(now, epoch, 30.0 * 60.0).unwrap();
+
+        assert_eq!(alignment.global_slot, 33);
+        assert_eq!(
+            alignment.slot_start_utc,
+            epoch + Duration::from_secs(16 * 60 * 60 + 30 * 60)
+        );
+        assert_eq!(alignment.elapsed_in_slot_ms, 13 * 60 * 1000);
+    }
 
     #[test]
     fn service_scheduler_projection_preserves_custom_runtime_settings() {
@@ -506,6 +596,19 @@ mod tests {
         assert_eq!(
             state.execute_at_for_slot(3).unwrap(),
             "2023-11-14T22:16:20.000Z"
+        );
+
+        let realtime_boundary = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        state.set_wall_clock_alignment(WallClockAlignment {
+            global_slot: 59_480,
+            slot_start_utc: realtime_boundary,
+            elapsed_in_slot_ms: 0,
+        });
+        assert_eq!(*state.slot_epoch_offset.lock().unwrap(), Some(59_480));
+        assert_eq!(
+            state.execute_at_for_slot(0).unwrap(),
+            chrono::DateTime::<Utc>::from(realtime_boundary)
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
         );
     }
 }

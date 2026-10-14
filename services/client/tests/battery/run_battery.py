@@ -9,12 +9,11 @@ executor + client, instead of a pure in-process Rust solver benchmark. Output
 goes to a separate location and a simpler, per-scenario format (see
 `output_dir` below) rather than reusing the Rust battery's `tests/results/`.
 
-Requires carbonshift and the executor already running. Scenarios with
-`"mode": "emulated"` additionally require both to be running in manual-clock
-mode (`MANUAL_CLOCK=1` / `EXECUTOR_MANUAL_CLOCK=1`) — see README.md
-"Emulazione a tempo fittizio". `"mode": "realtime"` works against normal,
-real-time-clock services but a scenario can then take as long as its
-`slot_minutes * number_of_slots`.
+Requires the client, CarbonShift, executor, and provider already running.
+Scenarios with `"mode": "emulated"` require all manual clocks enabled; the
+provider drives the client, CarbonShift, and executor in the documented order.
+`"mode": "realtime"` uses each service's aligned wall-clock behavior and can
+take as long as `slot_minutes * number_of_slots`.
 
 Usage (from client/):
     python tests/battery/run_battery.py [--config tests/battery/battery_config.json]
@@ -24,8 +23,8 @@ Config file (JSON) — see battery_config.json / battery_config_micro.json for
 full examples:
     battery_id             : str   – label used in the output folder name
     client_url             : str   – base URL of the running client
-    executor_url           : str   – base URL of the running executor admin
-                                      API (only used for "emulated" scenarios)
+    provider_url           : str   – base URL of the running provider
+    executor_url           : str   – base URL sent to the client plan
     output_dir             : str   – where per-run folders are written
                                       (relative to this repo's client/ root)
     poll_interval_seconds  : float – how often to re-poll while waiting for a
@@ -42,7 +41,7 @@ full examples:
                                       across the whole battery run, so later
                                       scenarios may need more of this budget
                                       than earlier ones)
-    admin_timeout_seconds  : float – timeout for each individual advance-slot
+    admin_timeout_seconds  : float – timeout for each provider advance-slot
                                       call while draining (default 60)
     scenarios              : list  – each entry:
         id           : str  – unique label (subfolder + CSV row name)
@@ -52,7 +51,7 @@ full examples:
                                quick "does the architecture work" microtest,
                                much larger for a real performance evaluation)
         per_slot     : int  – requests per timeslot (default 5)
-        slot_minutes : float (default 30)
+        slot_minutes : float (default PROVIDER_SLOT_MINUTES, 60 in Compose)
         source       : "synthetic" (no download) | "dataset" (real HF data,
                        see client/README.md for which dataset backs each task)
         seed         : int (default 42)
@@ -75,6 +74,7 @@ CLIENT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CLIENT_ROOT))
 
 from app.plan_builder import build_requests  # noqa: E402
+from app.config import settings as client_settings  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = CLIENT_ROOT / "tests" / "battery" / "results"
 DEFAULT_CONFIG = CLIENT_ROOT / "tests" / "battery" / "battery_config.json"
@@ -99,36 +99,29 @@ def _new_items(client_url: str, before_ids: set[str]) -> list[dict[str, Any]]:
     return [i for i in _get_requests(client_url) if str(i["request_id"]) not in before_ids]
 
 
-def _advance_emulated_clock(carbonshift_url: str, executor_url: str, admin_timeout: float) -> bool:
-    """One manual-clock tick: advances carbonshift (which flushes/dispatches
-    anything due) then the executor (which runs anything now due). Returns
-    False without raising on any failure, so the caller can just stop
-    draining instead of crashing the whole battery run."""
+def _advance_emulated_clock(provider_url: str, admin_timeout: float) -> bool:
+    """Advance one provider-owned slot, including the ordered peer fan-out."""
     try:
-        requests.post(f"{carbonshift_url}/v1/admin/advance-slot", timeout=admin_timeout).raise_for_status()
-        requests.post(f"{executor_url}/admin/advance-slot", timeout=admin_timeout).raise_for_status()
+        requests.post(f"{provider_url}/v1/advance-slot", timeout=admin_timeout).raise_for_status()
         return True
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        print(f"  ! provider advance failed: {exc}")
         return False
 
 
 def _wait_for_scenario(client_url: str, before_ids: set[str], expected_count: int, mode: str,
-                       carbonshift_url: str, executor_url: str, poll_interval: float,
+                       provider_url: str, poll_interval: float,
                        poll_timeout: float, admin_timeout: float) -> list[dict[str, Any]]:
     """Waits until this scenario's own requests (those not present in
     `before_ids`) have all reached a terminal status, or gives up after
     `poll_timeout` seconds and returns whatever is available so far.
 
-    carbonshift's DP solver is free to defer a request to any slot within its
-    horizon to optimize carbon cost, not just the slots the plan itself
-    advanced through (and, since carbonshift's manual clock is a single
-    global counter shared across the whole battery run, a later scenario's
-    requests can be scheduled arbitrarily far past a *previous* scenario's
-    own slots too) — so in `mode="emulated"` we keep "fast-forwarding" the
-    manual clock with extra ticks (as fast as `poll_timeout` allows) instead
-    of just waiting on a clock nothing is advancing. This stops on 3
-    consecutive advance-slot failures (carbonshift/executor unreachable),
-    falling back to passive polling for the rest of `poll_timeout`.
+    CarbonShift's DP solver is free to defer a request to any slot within its
+    horizon, not just the slots the plan itself spans. In `mode="emulated"`
+    the runner therefore keeps advancing the provider (which fans out to the
+    client, CarbonShift, and executor) until the work resolves. This stops on
+    3 consecutive provider-advance failures, then falls back to passive polling
+    for the rest of `poll_timeout`.
     """
     deadline = time.monotonic() + poll_timeout
     items: list[dict[str, Any]] = []
@@ -138,7 +131,7 @@ def _wait_for_scenario(client_url: str, before_ids: set[str], expected_count: in
         if len(items) >= expected_count and all(i["status"] in _RESOLVED_STATUSES for i in items):
             return items
         if mode == "emulated" and consecutive_advance_failures < 3:
-            if _advance_emulated_clock(carbonshift_url, executor_url, admin_timeout):
+            if _advance_emulated_clock(provider_url, admin_timeout):
                 consecutive_advance_failures = 0
                 continue
             consecutive_advance_failures += 1
@@ -182,18 +175,22 @@ def _scenario_metrics(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: str, executor_url: str,
+def _run_scenario(scenario: dict[str, Any], client_url: str, provider_url: str, executor_url: str,
                    poll_interval: float, poll_timeout: float, admin_timeout: float,
                    scenario_dir: Path) -> dict[str, Any]:
     task = scenario["task"]
     count = int(scenario["count"])
     per_slot = int(scenario.get("per_slot", 5))
-    slot_minutes = float(scenario.get("slot_minutes", 30.0))
+    slot_minutes = float(scenario.get("slot_minutes", client_settings.provider_slot_minutes))
     source = scenario.get("source", "synthetic")
     seed = int(scenario.get("seed", 42))
     mode = scenario.get("mode", "emulated")
     pattern = scenario.get("pattern", "flat")
     qos_profile_id = scenario.get("qos_profile_id")
+    provider_slot = requests.get(f"{provider_url}/v1/slot", timeout=10)
+    provider_slot.raise_for_status()
+    slot_info = provider_slot.json()
+    reference = datetime.fromisoformat(slot_info["slot_start_utc"].replace("Z", "+00:00"))
 
     print(f"[{scenario['id']}] task={task} count={count} source={source} mode={mode}")
 
@@ -207,6 +204,7 @@ def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: st
         source,
         seed,
         pattern=pattern,
+        reference=reference,
         qos_profile_id=qos_profile_id,
     )
 
@@ -216,7 +214,15 @@ def _run_scenario(scenario: dict[str, Any], client_url: str, carbonshift_url: st
     })
     resp.raise_for_status()
 
-    items = _wait_for_scenario(client_url, before_ids, len(plan), mode, carbonshift_url, executor_url,
+    if mode == "emulated" and slot_info.get("local_step", 0) > 0:
+        # The provider announces the starting slot only once per process. For
+        # later scenarios, submit this plan's current slot before advancing.
+        requests.post(f"{client_url}/v1/tick", json={
+            "current_slot": slot_info["current_slot"],
+            "slot_start_utc": slot_info["slot_start_utc"],
+        }, timeout=admin_timeout).raise_for_status()
+
+    items = _wait_for_scenario(client_url, before_ids, len(plan), mode, provider_url,
                                poll_interval, poll_timeout, admin_timeout)
     elapsed = time.monotonic() - t0
 
@@ -289,7 +295,7 @@ def run_battery(config_path: Path) -> None:
 
     battery_id = cfg.get("battery_id", "client_battery")
     client_url = cfg.get("client_url", "http://localhost:8100")
-    carbonshift_url = cfg.get("carbonshift_url", "http://localhost:8080")
+    provider_url = cfg.get("provider_url", "http://localhost:9100")
     executor_url = cfg.get("executor_url", "http://localhost:9000")
     poll_interval = float(cfg.get("poll_interval_seconds", 1.0))
     poll_timeout = float(cfg.get("poll_timeout_seconds", 300.0))
@@ -308,7 +314,7 @@ def run_battery(config_path: Path) -> None:
     rows = []
     for scenario in cfg["scenarios"]:
         scenario_dir = run_dir / scenario["id"]
-        row = _run_scenario(scenario, client_url, carbonshift_url, executor_url, poll_interval, poll_timeout,
+        row = _run_scenario(scenario, client_url, provider_url, executor_url, poll_interval, poll_timeout,
                             admin_timeout, scenario_dir)
         rows.append(row)
 

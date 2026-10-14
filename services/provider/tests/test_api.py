@@ -51,7 +51,7 @@ def test_meta_describes_the_effective_configuration(client):
     assert body["slot_minutes"] == 30
     assert body["forecast_horizon_slots"] == 24
     assert body["manual_clock"] is True
-    assert body["auto_advance_clock"] is False  # disabled by conftest
+    assert body["auto_advance_clock"] is False
 
 
 def test_meta_lists_the_peer_order(client):
@@ -106,6 +106,22 @@ def test_observed_is_unknown_for_a_future_slot(client):
     current = client.get("/v1/slot").json()["current_slot"]
     body = client.get("/v1/observed", params={"slot": current + 5}).json()
     assert body["known"] is False
+
+
+def test_realtime_observed_reads_the_current_slot_on_demand(client):
+    from app.clock import ProviderClock
+    from app.slots import parse_epoch
+
+    main.clock = ProviderClock(
+        manual=False,
+        slot_minutes=30,
+        epoch=parse_epoch(main.settings.epoch_iso),
+    )
+    body = client.get("/v1/observed").json()
+
+    assert body["known"] is True
+    assert body["slot"] == main.clock.current_slot()
+    assert body["observed_at_slot"] == body["slot"]
 
 
 def test_advance_records_a_reading_for_the_new_slot(client, monkeypatch):

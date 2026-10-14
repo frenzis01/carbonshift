@@ -3,12 +3,25 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.timeslots import ceil_to_slot_end, floor_to_slot, slot_index
+from app.timeslots import (
+    ceil_to_slot_end,
+    floor_to_slot,
+    slot_index,
+    slot_of,
+    slot_start_utc,
+)
 
 
 def test_floor_to_slot_rounds_down_to_boundary():
     dt = datetime(2026, 8, 26, 19, 32, tzinfo=timezone.utc)
     assert floor_to_slot(dt, 30) == datetime(2026, 8, 26, 19, 30, tzinfo=timezone.utc)
+
+
+def test_global_slot_start_inverts_slot_of():
+    dt = datetime(2026, 8, 26, 19, 32, tzinfo=timezone.utc)
+    slot = slot_of(dt, 30)
+
+    assert slot_start_utc(slot, 30) == datetime(2026, 8, 26, 19, 30, tzinfo=timezone.utc)
 
 
 def test_ceil_to_slot_end_rounds_up_to_next_boundary():

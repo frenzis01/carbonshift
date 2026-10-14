@@ -273,8 +273,9 @@ pub struct SharedState {
     /// Monotonic marker used to invalidate cost-learned online solver state
     /// after an administrative tier replacement.
     capacity_tier_revision: Arc<AtomicU64>,
-    /// Virtual elapsed time in milliseconds since the run started.
-    /// Written only by the scheduler loop; read by generator and monitor.
+    /// Virtual elapsed milliseconds from the engine's slot-zero boundary.
+    /// Realtime startup seeds the active-slot fraction; manual emulation starts
+    /// at zero. Written by the scheduler loop and manual advance handler.
     pub virtual_elapsed_ms: Arc<AtomicU64>,
     /// Last slot index fully processed by the generator.
     /// Used by the scheduler's skip-empty-slots logic to avoid skipping a slot
