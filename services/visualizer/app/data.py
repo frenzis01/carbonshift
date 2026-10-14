@@ -396,7 +396,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     if window_error_avg is not None:
         window_error_avg = round(float(window_error_avg), 2)
 
-    # Each view gets its own time series. A cached fleet point must never be
+    # Each view gets its own time series. A cached all-profile point must never be
     # reused as a profile QoS point (or vice versa) after selector changes.
     cache_profile_key = selected_profile_id or "__all_profiles__"
     error_metrics_by_slot = _cache["error_metrics_by_profile"].setdefault(
@@ -530,7 +530,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
             "error_avg_label": (
                 "Profile cumulative error"
                 if selected_profile_id is not None
-                else "Fleet descriptive average"
+                else "All profile cumulative error"
             ),
             "qos_profile_id": selected_profile_id,
             "error_history_slots": error_history_slots,

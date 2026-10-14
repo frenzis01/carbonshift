@@ -30,7 +30,7 @@ async def index() -> str:
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -39,6 +39,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {
+      color-scheme: dark;
       --bg-color: #0f172a;
       --card-bg: #1e293b;
       --card-border: #334155;
@@ -51,6 +52,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       --fast-color: #1f77b4;
       --balanced-color: #2ca02c;
       --accurate-color: #ff7f0e;
+      --button-hover-bg: #334155;
+      --button-hover-border: #475569;
+      --plot-grid-color: #334155;
+      --plot-zero-line-color: #475569;
+      --plot-annotation-color: #94a3b8;
+      --plot-hover-bg: #1e293b;
+      --plot-slider-bg: #1e293b;
+      --plot-slider-border: #334155;
+    }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg-color: #f1f5f9;
+      --card-bg: #ffffff;
+      --card-border: #cbd5e1;
+      --text-main: #0f172a;
+      --text-muted: #475569;
+      --accent-blue: #0284c7;
+      --accent-green: #16a34a;
+      --accent-orange: #ea580c;
+      --accent-red: #dc2626;
+      --button-hover-bg: #e2e8f0;
+      --button-hover-border: #94a3b8;
+      --plot-grid-color: #e2e8f0;
+      --plot-zero-line-color: #94a3b8;
+      --plot-annotation-color: #64748b;
+      --plot-hover-bg: #ffffff;
+      --plot-slider-bg: #f1f5f9;
+      --plot-slider-border: #cbd5e1;
     }
     * {
       box-sizing: border-box;
@@ -111,8 +140,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       transition: all 0.15s ease;
     }
     .btn:hover {
-      background-color: #334155;
-      border-color: #475569;
+      background-color: var(--button-hover-bg);
+      border-color: var(--button-hover-border);
     }
     .btn.active {
       background-color: var(--accent-blue);
@@ -262,7 +291,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="controls">
       <label for="profile-select" style="font-size:0.85rem; color:var(--text-muted);">QoS profile:</label>
       <select id="profile-select" onchange="selectProfile(this.value)">
-        <option value="">All profiles (fleet telemetry)</option>
+        <option value="">All profiles</option>
       </select>
 
       <span style="font-size:0.85rem; color:var(--text-muted);">Slots:</span>
@@ -279,6 +308,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </select>
 
       <button id="toggle-refresh-btn" class="btn btn-toggle" onclick="toggleAutoRefresh()">Pause</button>
+      <button id="theme-toggle-btn" class="btn" onclick="toggleTheme()">Use light theme</button>
       <button class="btn" onclick="fetchData()">⟳ Refresh</button>
     </div>
   </header>
@@ -317,7 +347,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chart-header">
       <div>
         <div class="chart-title">Assignment Timeline & Carbon Intensity</div>
-        <div class="chart-desc">Selected-profile assignments, with global slot occupancy, capacity tiers, and carbon intensity shown separately.</div>
+        <div class="chart-desc">Selected-profile assignments, with capacity tiers and carbon intensity shown separately.</div>
       </div>
     </div>
     <div id="assignment-plot" class="plot-wrapper"></div>
@@ -328,10 +358,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chart-header">
       <div>
         <div class="chart-title">Error Tracking by Scheduled Slot</div>
-        <div class="chart-desc">Selected-profile error contributions; the unfiltered fleet average is descriptive only and has no QoS threshold.</div>
+        <div class="chart-desc">Selected-profile error contributions; the all-profile average is descriptive only and has no QoS threshold.</div>
       </div>
       <div class="chart-current-metrics">
-        <span id="plot-error-avg-label">Current fleet descriptive avg: <strong id="plot-global-error-avg">-</strong></span>
+        <span id="plot-error-avg-label">Current all-profile cumulative error: <strong id="plot-global-error-avg">-</strong></span>
         <span>Current window error avg: <strong id="plot-window-error-avg">-</strong></span>
       </div>
     </div>
@@ -374,7 +404,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <tr><td>Selected QoS Profile</td><td id="info-profile">All profiles</td></tr>
           <tr><td>Error Semantics</td><td id="info-error-semantics">-</td></tr>
           <tr><td>Error Window (past/future/decay)</td><td id="info-error-window">-</td></tr>
-          <tr><td>Profile / Fleet Error Avg</td><td id="info-global-error">-</td></tr>
+          <tr><td>Profile / All-profile Error Avg</td><td id="info-global-error">-</td></tr>
           <tr><td>Selected Profile Threshold</td><td id="info-error-threshold">Not applicable</td></tr>
           <tr><td>Horizon Total Slots</td><td id="info-total-slots">-</td></tr>
           <tr><td>Completed Requests</td><td id="info-completed-reqs">-</td></tr>
@@ -393,6 +423,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let resampleBin = 1;
     let autoRefresh = true;
     let refreshTimer = null;
+    let selectedTheme = 'dark';
 
     const FLAVOUR_COLORS = {
       'Fast': '#1f77b4',
@@ -405,6 +436,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     function flavourColor(name, index) {
       return FLAVOUR_COLORS[name] || CUSTOM_FLAVOUR_COLORS[index % CUSTOM_FLAVOUR_COLORS.length];
+    }
+
+    function chartTheme() {
+      const styles = getComputedStyle(document.documentElement);
+      return {
+        text: styles.getPropertyValue('--text-main').trim(),
+        grid: styles.getPropertyValue('--plot-grid-color').trim(),
+        zeroLine: styles.getPropertyValue('--plot-zero-line-color').trim(),
+        annotation: styles.getPropertyValue('--plot-annotation-color').trim(),
+        hoverBackground: styles.getPropertyValue('--plot-hover-bg').trim(),
+        sliderBackground: styles.getPropertyValue('--plot-slider-bg').trim(),
+        sliderBorder: styles.getPropertyValue('--plot-slider-border').trim(),
+      };
+    }
+
+    function toggleTheme() {
+      selectedTheme = selectedTheme === 'dark' ? 'light' : 'dark';
+      document.documentElement.dataset.theme = selectedTheme;
+      document.getElementById('theme-toggle-btn').textContent =
+        selectedTheme === 'dark' ? 'Use light theme' : 'Use dark theme';
+      if (rawData) renderAll();
     }
 
     function plotUiRevision(chartName, viewMode = '') {
@@ -438,7 +490,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       const allOption = document.createElement('option');
       allOption.value = '';
-      allOption.textContent = 'All profiles (fleet telemetry)';
+      allOption.textContent = 'All profiles';
       selector.appendChild(allOption);
 
       for (const profile of profiles) {
@@ -506,7 +558,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         return {};
       }
 
-      const maxLabels = 7;
+      const maxLabels = 12;
       const step = Math.max(1, Math.ceil((slots.length - 1) / (maxLabels - 1)));
       const indexes = [];
       for (let index = 0; index < slots.length; index += step) indexes.push(index);
@@ -518,7 +570,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         // Displayed slots are one-based; the provider timestamp anchors engine slot zero.
         const utc = new Date(origin + (slot - 1) * slotMinutes * 60 * 1000);
         return `${slot}<br>${pad2(utc.getUTCHours())}:${pad2(utc.getUTCMinutes())} ` +
-          `${pad2(utc.getUTCDate())}/${pad2(utc.getUTCMonth() + 1)} UTC`;
+          `${pad2(utc.getUTCDate())}/${pad2(utc.getUTCMonth() + 1)}`;
       });
       return { tickmode: 'array', tickvals, ticktext, tickfont: { size: 10 } };
     }
@@ -632,10 +684,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     function renderAssignmentPlot(plot, ind) {
       const flavourCount = plot.flavours.length;
-      const occupancyVisibleByDefault = plot.global_slot_occupancy_visible_by_default;
+      const theme = chartTheme();
+      const showGlobalSlotOccupancy = Boolean(
+        selectedProfileId && plot.global_slot_occupancy_visible_by_default
+      );
       const uiRevision = plotUiRevision(
         'assignments',
-        occupancyVisibleByDefault ? 'multiple-active-profiles' : 'single-active-profile',
+        showGlobalSlotOccupancy ? 'multiple-active-profiles' : 'single-active-profile',
       );
       const filtered = filterAndResample(
         plot.slots,
@@ -657,9 +712,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         name,
         type: 'bar',
         marker: { color: flavourColor(name, index) },
+        hovertemplate: 'Slot %{x}<br>Requests: %{y}<extra></extra>',
       }));
-      traces.push(
-        {
+      if (selectedProfileId) {
+        traces.push({
           x: slots,
           y: globalOccupancy,
           name: 'Global Slot Occupancy',
@@ -667,10 +723,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           mode: 'lines+markers',
           // Start hidden for one active profile and shown for multiple
           // profiles. A legend click is remembered by `uirevision` after this.
-          visible: occupancyVisibleByDefault ? true : 'legendonly',
+          visible: showGlobalSlotOccupancy ? true : 'legendonly',
           marker: { size: 4, color: '#cbd5e1' },
           line: { color: '#cbd5e1', width: 1.5, dash: 'dash' },
-        },
+          hovertemplate: 'Slot %{x}<br>Requests: %{y}<extra></extra>',
+        });
+      }
+      traces.push(
         {
           x: slots,
           y: ciForecast,
@@ -678,7 +737,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           type: 'scatter',
           mode: 'lines',
           line: { color: '#d62728', width: 2, dash: 'dot' },
-          yaxis: 'y2'
+          yaxis: 'y2',
+          hovertemplate: 'Slot %{x}<br>%{y:.2f} gCO₂/kWh<extra></extra>',
         },
         {
           x: slots,
@@ -688,7 +748,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           mode: 'lines+markers',
           marker: { size: 5, color: '#ef4444' },
           line: { color: '#ef4444', width: 2.2 },
-          yaxis: 'y2'
+          yaxis: 'y2',
+          hovertemplate: 'Slot %{x}<br>%{y:.2f} gCO₂/kWh<extra></extra>',
         }
       );
 
@@ -719,7 +780,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               x1: 1,
               y0: threshold,
               y1: threshold,
-              line: { color: '#94a3b8', width: 1.2, dash: 'dash' }
+              line: { color: theme.annotation, width: 1.2, dash: 'dash' }
             });
             annotations.push({
               xref: 'paper',
@@ -729,7 +790,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               yanchor: 'bottom',
               text: `cap > ${threshold} (x${tier.multiplier})`,
               showarrow: false,
-              font: { size: 10, color: '#94a3b8' }
+              font: { size: 10, color: theme.annotation }
             });
           }
         }
@@ -740,19 +801,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         barmode: 'stack',
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
-        font: { color: '#f8fafc', family: 'inherit' },
+        font: { color: theme.text, family: 'inherit' },
+        hoverlabel: { bgcolor: theme.hoverBackground, font: { color: theme.text } },
         margin: { l: 50, r: 50, t: 30, b: 82 },
         legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
           title: plot.slot_zero_start_utc ? 'Slot / UTC time' : 'Slot',
-          gridcolor: '#334155',
+          gridcolor: theme.grid,
           ...slotAxisClockTicks(slots, plot),
-          rangeslider: { visible: true, thickness: 0.05, bgcolor: '#1e293b' }
+          rangeslider: {
+            visible: true,
+            thickness: 0.05,
+            bgcolor: theme.sliderBackground,
+            bordercolor: theme.sliderBorder,
+          }
         },
         yaxis: {
           title: 'Requests Scheduled',
-          gridcolor: '#334155',
-          zerolinecolor: '#475569'
+          gridcolor: theme.grid,
+          zerolinecolor: theme.zeroLine
         },
         yaxis2: {
           title: 'Carbon Intensity (gCO₂/kWh)',
@@ -770,6 +837,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderErrorPlot(plot) {
+      const theme = chartTheme();
       const uiRevision = plotUiRevision('errors');
       document.getElementById('plot-error-avg-label').firstChild.textContent =
         `Current ${plot.error_avg_label.toLowerCase()}: `;
@@ -805,9 +873,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const traces = plot.flavours.map((name, index) => ({
         x: slots,
         y: filtered.arrays[index],
-        name: `${name} Error (Slot Contrib)`,
+        name: `${name} (Slot Contrib)`,
         type: 'bar',
         marker: { color: flavourColor(name, index) },
+        hovertemplate: 'Slot %{x}<br>Error Contribution: %{y:.2f}%<extra></extra>',
       }));
       if (historySlots.length > 0) {
         traces.push(
@@ -878,19 +947,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         barmode: 'stack',
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
-        font: { color: '#f8fafc', family: 'inherit' },
+        font: { color: theme.text, family: 'inherit' },
+        hoverlabel: { bgcolor: theme.hoverBackground, font: { color: theme.text } },
         margin: { l: 50, r: 50, t: 30, b: 82 },
         legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
           title: plot.slot_zero_start_utc ? 'Slot / UTC time' : 'Slot',
-          gridcolor: '#334155',
+          gridcolor: theme.grid,
           ...slotAxisClockTicks(slots, plot),
-          rangeslider: { visible: true, thickness: 0.05, bgcolor: '#1e293b' }
+          rangeslider: {
+            visible: true,
+            thickness: 0.05,
+            bgcolor: theme.sliderBackground,
+            bordercolor: theme.sliderBorder,
+          }
         },
         yaxis: {
           title: 'Error (%)',
-          gridcolor: '#334155',
-          zerolinecolor: '#475569'
+          gridcolor: theme.grid,
+          zerolinecolor: theme.zeroLine
         },
         shapes: shapes,
         annotations: annotations
@@ -901,6 +976,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function renderInputPlot(plot) {
+      const theme = chartTheme();
       const uiRevision = plotUiRevision('inputs');
       const filtered = filterAndResample(
         plot.slots,
@@ -916,7 +992,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           y: arrived,
           name: 'Arrived Requests',
           type: 'bar',
-          marker: { color: '#0ea5e9', opacity: 0.75 }
+          marker: { color: '#0ea5e9', opacity: 0.75 },
+          hovertemplate: 'Slot %{x}<br>Requests: %{y}<extra></extra>',
         },
         {
           x: slots,
@@ -925,7 +1002,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           type: 'scatter',
           mode: 'lines',
           line: { color: '#d62728', width: 2, dash: 'dot' },
-          yaxis: 'y2'
+          yaxis: 'y2',
+          hovertemplate: 'Slot %{x}<br>%{y:.2f} gCO₂/kWh<extra></extra>',
         },
         {
           x: slots,
@@ -935,7 +1013,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           mode: 'lines+markers',
           marker: { size: 4, color: '#ef4444' },
           line: { color: '#ef4444', width: 2 },
-          yaxis: 'y2'
+          yaxis: 'y2',
+          hovertemplate: 'Slot %{x}<br>%{y:.2f} gCO₂/kWh<extra></extra>',
         }
       ];
 
@@ -943,19 +1022,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         uirevision: uiRevision,
         paper_bgcolor: 'transparent',
         plot_bgcolor: 'transparent',
-        font: { color: '#f8fafc', family: 'inherit' },
+        font: { color: theme.text, family: 'inherit' },
+        hoverlabel: { bgcolor: theme.hoverBackground, font: { color: theme.text } },
         margin: { l: 50, r: 50, t: 30, b: 82 },
         legend: { uirevision: uiRevision, orientation: 'h', x: 0, y: 1.15 },
         xaxis: {
           title: plot.slot_zero_start_utc ? 'Slot / UTC time' : 'Slot',
-          gridcolor: '#334155',
+          gridcolor: theme.grid,
           ...slotAxisClockTicks(slots, plot),
-          rangeslider: { visible: true, thickness: 0.05, bgcolor: '#1e293b' }
+          rangeslider: {
+            visible: true,
+            thickness: 0.05,
+            bgcolor: theme.sliderBackground,
+            bordercolor: theme.sliderBorder,
+          }
         },
         yaxis: {
           title: 'Requests Arrived',
-          gridcolor: '#334155',
-          zerolinecolor: '#475569'
+          gridcolor: theme.grid,
+          zerolinecolor: theme.zeroLine
         },
         yaxis2: {
           title: 'Carbon Intensity (gCO₂/kWh)',

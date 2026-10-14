@@ -28,7 +28,32 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("function plotUiRevision(chartName", response.text)
         self.assertIn("function slotAxisClockTicks(slots, plot)", response.text)
+        self.assertIn("const maxLabels = 12;", response.text)
         self.assertIn("getUTCHours()", response.text)
+        self.assertNotIn("${pad2(utc.getUTCMonth() + 1)} UTC", response.text)
+        self.assertNotIn("fleet", response.text.lower())
+        self.assertIn(
+            "hovertemplate: 'Slot %{x}<br>Requests: %{y}<extra></extra>'",
+            response.text,
+        )
+        self.assertIn(
+            "hovertemplate: 'Slot %{x}<br>%{y:.2f} gCO₂/kWh<extra></extra>'",
+            response.text,
+        )
+        self.assertIn(
+            "hovertemplate: 'Slot %{x}<br>Error Contribution: %{y:.2f}%<extra></extra>'",
+            response.text,
+        )
+        self.assertIn('id="theme-toggle-btn"', response.text)
+        self.assertIn("function toggleTheme()", response.text)
+        self.assertIn(":root[data-theme=\"light\"]", response.text)
+        self.assertIn("hoverlabel: { bgcolor: theme.hoverBackground", response.text)
+        self.assertIn("bgcolor: theme.sliderBackground", response.text)
+        self.assertIn("bordercolor: theme.sliderBorder", response.text)
+        self.assertIn(
+            "selectedProfileId && plot.global_slot_occupancy_visible_by_default",
+            response.text,
+        )
         self.assertIn("uirevision: uiRevision", response.text)
         self.assertIn("legend: { uirevision: uiRevision", response.text)
 
@@ -332,6 +357,7 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(qa["indicators"]["error_semantics"], "word-overlap-f1-v1")
         self.assertEqual(qa["indicators"]["max_error_threshold"], 20.0)
         self.assertEqual(qa["error_plot"]["displayed_error_avg"], 14.0)
+        self.assertEqual(qa["error_plot"]["error_avg_label"], "Profile cumulative error")
         self.assertEqual(qa["error_plot"]["error_history_slots"], [0, 1, 2])
         self.assertEqual(qa["error_plot"]["error_history"], [10.0, 12.0, 14.0])
         self.assertEqual(qa["error_plot"]["window_error_history"], [9.0, 11.0, 13.0])
@@ -371,6 +397,10 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(cache["error_metrics_by_profile"]["ner-calibrated-v1"][2]["error_avg"], 85.0)
 
         self.assertEqual(all_profiles["error_plot"]["qos_profile_id"], None)
+        self.assertEqual(
+            all_profiles["error_plot"]["error_avg_label"],
+            "All profile cumulative error",
+        )
         self.assertEqual(
             all_profiles["error_plot"]["profile_thresholds"],
             qa["error_plot"]["profile_thresholds"],

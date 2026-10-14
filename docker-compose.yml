@@ -127,7 +127,6 @@ services:
       PROVIDER_URL: http://provider:9100
     depends_on:
       - carbonshift
-      - client
 
   # One-off runners for fake-time emulation (see client/README.md
   # §"Emulazione a tempo fittizio"). Not started by `docker compose up`
