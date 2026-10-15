@@ -116,7 +116,7 @@ python scripts/run_emulation.py --slots 4 --per-slot 3 \
 
 By default, the script registers the calibrated profile with the stable ID `<task>-calibrated-v1` and includes it in every plan request. If a new calibration changes the definition, use `--profile-version v2` to register a new profile rather than overwriting the existing one. To have multiple clients submit requests under the same profile, one client can register it and the others can use `--no-register --qos-profile-id question_answering-calibrated-v1`. To use the task kind's default profile, pass `--no-register` without `--qos-profile-id`; the field is omitted.
 
-The visualizer reads individual request status and callback data directly from CarbonShift (`GET /v1/requests`), so it does not require a client URL. It displays `completed`, `in progress`, `failed`, and `pending` according to the lifecycle maintained by the scheduler.
+The visualizer's live mode reads request status and callback data from CarbonShift. It can also run without CarbonShift and browse saved snapshots from its mounted `snapshots/` directory; snapshot mode preserves the QoS-profile selector and does not poll live endpoints.
 
 The capacity-tier ladder is global and does not belong to a profile. To set it explicitly for an emulation, add:
 
@@ -133,7 +133,7 @@ If omitted, `--seed` is **random on every run** and printed to the console (for 
 
 ### With Docker Compose
 
-From the workspace root (not this directory), the one-off `emulation` service runs the script inside the Docker network and is already configured to reach `client`, `carbonshift`, and `executor` by hostname. Only workload options such as `--task` and `--slots` need to be supplied.
+From the workspace root (not this directory), the one-off `emulation` service runs the script inside the Docker network and is already configured to reach `client`, `carbonshift`, `executor`, and `visualizer` by hostname. Only workload options such as `--task` and `--slots` need to be supplied.
 
 ```sh
 cd ..
@@ -157,6 +157,8 @@ docker compose --profile multi-client run --rm emulation-multi \
 ```
 
 `--per-slot` applies to each client; the global ladder is sized for the combined load. For a single client, pass one `--client-url` and `--task` pair. If using custom QoS profiles, provide one `--qos-profile-id` for each pair.
+
+Both emulation runners export a paired chart snapshot and summary by default using the same shared snapshot module. Files are stored under `snapshots/YYYYMMDD/` using UTC capture time; multi-client summaries label entries `_1`, `_2`, and so on. Compose persists these files in `carbonshift/snapshots/`, shared read/write by the runner and visualizer. Override the location with `SNAPSHOTS_DIR` or `--snapshot-dir`, set a human-readable name with `--snapshot-label`, or skip snapshot creation with `--no-snapshot`. The visualizer's `Export snapshot` action uses the same storage implementation: in live mode it captures current dashboard data, and in snapshot mode it creates a named copy of the selected snapshot and its summary. The snapshot selector keeps per-profile dashboard data available offline and disables polling until `Live data` is selected again. Run only `docker compose up -d visualizer` to browse saved data without starting CarbonShift.
 
 ## Client API
 

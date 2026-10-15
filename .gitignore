@@ -15,6 +15,7 @@ rust/target/
 tests/battery/results
 tests/battery/output
 tests/battery/scenarios/json
+snapshots/
 tests/battery/EvaluationTest.md
 tests/battery/battery_config_*.json
 tests/battery/TEST_structure*.md

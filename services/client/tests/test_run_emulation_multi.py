@@ -68,6 +68,7 @@ def test_runner_submits_a_separate_task_plan_to_each_client(monkeypatch):
     submissions = []
     generated_tasks = []
     tier_updates = []
+    exported_snapshots = []
 
     class Response:
         status_code = 200
@@ -89,7 +90,7 @@ def test_runner_submits_a_separate_task_plan_to_each_client(monkeypatch):
         submissions.append((url, json))
         return Response({"current_slot": 1, "plan_id": len(submissions)})
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, params=None):
         if url.endswith("/v1/slot"):
             return Response(
                 {
@@ -119,6 +120,11 @@ def test_runner_submits_a_separate_task_plan_to_each_client(monkeypatch):
     )
     monkeypatch.setattr(run_emulation_multi.requests, "post", fake_post)
     monkeypatch.setattr(run_emulation_multi.requests, "get", fake_get)
+    monkeypatch.setattr(
+        run_emulation_multi,
+        "export_emulation_snapshot",
+        lambda **kwargs: exported_snapshots.append(kwargs) or {"snapshot_filename": "snapshot.json"},
+    )
     monkeypatch.setattr(run_emulation_multi.time, "sleep", lambda _: None)
 
     run_emulation_multi.main()
@@ -138,3 +144,8 @@ def test_runner_submits_a_separate_task_plan_to_each_client(monkeypatch):
     ]
     assert generated_tasks == [("ner", 10, None), ("question_answering", 11, None)]
     assert tier_updates == [build_capacity_tiers(2)]
+    assert [client["label"] for client in exported_snapshots[0]["clients"]] == ["_1", "_2"]
+    assert [client["task"] for client in exported_snapshots[0]["clients"]] == [
+        "ner",
+        "question_answering",
+    ]

@@ -1,12 +1,13 @@
 FROM python:3.11-slim
 WORKDIR /app
 
-COPY requirements.txt .
+COPY client/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
-COPY scripts ./scripts
-COPY model_stats.json .
+COPY client/app ./app
+COPY client/scripts ./scripts
+COPY client/model_stats.json .
+COPY common ./common
 
 ENV CLIENT_HOST=0.0.0.0
 EXPOSE 8100

@@ -21,14 +21,24 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import requests
 
 # Use the root logger for simplicity
 logger = logging.getLogger()
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+service_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(service_root))
+shared_root = service_root.parent
+if (shared_root / "common").is_dir():
+    sys.path.insert(0, str(shared_root))
 
+from common.snapshots import (  # noqa: E402
+    SnapshotError,
+    default_snapshot_directory,
+    export_emulation_snapshot,
+)
 from app.carbonshift_client import (  # noqa: E402
     CarbonshiftError,
     force_set_global_capacity_tiers,
@@ -218,6 +228,23 @@ def main() -> None:
                          help="Seconds between progress checks while advancing the clock.")
     parser.add_argument("--timeout", type=float, default=600.0,
                          help="Total timeout in seconds for the emulation to finish.")
+    parser.add_argument(
+        "--visualizer-url",
+        default=os.environ.get("VISUALIZER_URL", "http://localhost:8500"),
+        help="Visualizer URL used to capture chart-ready snapshot data.",
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        type=Path,
+        default=default_snapshot_directory(),
+        help="Persistent snapshot directory (default: SNAPSHOTS_DIR or ./snapshots).",
+    )
+    parser.add_argument("--snapshot-label", default=None, help="Optional human-readable snapshot name.")
+    parser.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="Do not export dashboard and summary snapshots when the run ends.",
+    )
     args = parser.parse_args()
 
     try:
@@ -402,16 +429,39 @@ def main() -> None:
 
     # Fetch and display final summary
     print("\n=== Final Metrics Summary ===")
-    for target in targets:
+    summary_records: list[dict[str, Any]] = []
+    for index, target in enumerate(targets, start=1):
         print(f"\n--- task={target.task} client={target.client_url} ---")
+        summary_record: dict[str, Any] = {
+            "label": f"_{index}",
+            "task": target.task,
+            "client_url": target.client_url,
+            "summary": None,
+        }
         try:
             summary_resp = requests.get(f"{target.client_url}/metrics/summary", timeout=10)
             if summary_resp.status_code == 200:
-                print(json.dumps(summary_resp.json(), indent=2))
+                summary_record["summary"] = summary_resp.json()
+                print(json.dumps(summary_record["summary"], indent=2))
             else:
+                summary_record["error"] = f"summary returned HTTP {summary_resp.status_code}"
                 print(f"Summary returned HTTP {summary_resp.status_code}")
-        except Exception as exc:
+        except (requests.RequestException, ValueError) as exc:
+            summary_record["error"] = f"could not fetch metrics summary: {exc}"
             print(f"Could not fetch metrics summary: {exc}")
+        summary_records.append(summary_record)
+
+    if not args.no_snapshot:
+        try:
+            snapshot = export_emulation_snapshot(
+                snapshots_dir=args.snapshot_dir,
+                visualizer_url=args.visualizer_url,
+                clients=summary_records,
+                label=args.snapshot_label,
+            )
+        except (SnapshotError, OSError, TypeError, ValueError) as exc:
+            raise SystemExit(f"emulation finished, but snapshot export failed: {exc}") from exc
+        print(f"Snapshot saved: {snapshot['snapshot_filename']}")
 
 
 if __name__ == "__main__":

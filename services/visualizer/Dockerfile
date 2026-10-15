@@ -1,10 +1,11 @@
 FROM python:3.11-slim
 WORKDIR /app
 
-COPY requirements.txt .
+COPY visualizer/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
+COPY visualizer/app ./app
+COPY common ./common
 
 ENV VISUALIZER_HOST=0.0.0.0
 ENV VISUALIZER_PORT=8500

@@ -43,7 +43,9 @@ services:
       - hf-cache:/root/.cache/huggingface
 
   client:
-    build: ./services/client
+    build:
+      context: ./services
+      dockerfile: client/Dockerfile
     ports:
       - "8100:8100"
     environment:
@@ -66,7 +68,9 @@ services:
       - provider
 
   client-2:
-    build: ./services/client
+    build:
+      context: ./services
+      dockerfile: client/Dockerfile
     profiles: ["multi-client"]
     ports:
       - "8101:8100"
@@ -115,7 +119,9 @@ services:
       # - executor
 
   visualizer:
-    build: ./services/visualizer
+    build:
+      context: ./services
+      dockerfile: visualizer/Dockerfile
     ports:
       - "8500:8500"
     environment:
@@ -125,27 +131,34 @@ services:
       CARBONSHIFT_URL: http://carbonshift:8080
       CARBONSHIFT_API_KEY: "${CARBONSHIFT_API_KEY:-}"
       PROVIDER_URL: http://provider:9100
-    depends_on:
-      - carbonshift
+      SNAPSHOTS_DIR: /snapshots
+    volumes:
+      # The visualizer writes named exports and reads the same persistent archive.
+      - ./snapshots:/snapshots
 
   # One-off runners for fake-time emulation (see client/README.md
-  # §"Emulazione a tempo fittizio"). Not started by `docker compose up`
+  # "Manual-clock emulation"). Not started by `docker compose up`
   # (profile-gated); run explicitly once the stack above is up. The
   # multi-client runner uses the `multi-client` profile and client-2:
   #   MANUAL_CLOCK=1 SUBMIT_WAIT_TIMEOUT_SECS=0.3 docker compose up -d --build
   #   docker compose run --rm emulation --slots 4 --per-slot 3
   emulation:
-    build: ./services/client
+    build:
+      context: ./services
+      dockerfile: client/Dockerfile
     profiles: ["emulation"]
     healthcheck:
       disable: true
     depends_on:
       - client
       - provider
+      - visualizer
     environment:
       TZ: "${TZ:-UTC}"
       CARBONSHIFT_URL: http://carbonshift:8080
       CARBONSHIFT_API_KEY: "${CARBONSHIFT_API_KEY:-}"
+      VISUALIZER_URL: http://visualizer:8500
+      SNAPSHOTS_DIR: /snapshots
       CLIENT_SELF_BASE_URL: http://client:8100
       PROVIDER_URL: http://provider:9100
       PROVIDER_SLOT_MINUTES: "${PROVIDER_SLOT_MINUTES:-60}"
@@ -153,6 +166,8 @@ services:
       CLIENT_QOS_PROFILE_VERSION: "${CLIENT_QOS_PROFILE_VERSION:-v1}"
       CLIENT_QOS_PROFILE_THRESHOLD_POSITION: "${CLIENT_QOS_PROFILE_THRESHOLD_POSITION:-0.75}"
       CLIENT_QOS_PROFILE_DEFINITIONS_PATH: "${CLIENT_QOS_PROFILE_DEFINITIONS_PATH:-}"
+    volumes:
+      - ./snapshots:/snapshots
     entrypoint:
       - python3
       - scripts/run_emulation.py
@@ -164,7 +179,9 @@ services:
       - http://provider:9100
 
   emulation-multi:
-    build: ./services/client
+    build:
+      context: ./services
+      dockerfile: client/Dockerfile
     profiles: ["multi-client"]
     healthcheck:
       disable: true
@@ -172,10 +189,13 @@ services:
       - client
       - client-2
       - provider
+      - visualizer
     environment:
       TZ: "${TZ:-UTC}"
       CARBONSHIFT_URL: http://carbonshift:8080
       CARBONSHIFT_API_KEY: "${CARBONSHIFT_API_KEY:-}"
+      VISUALIZER_URL: http://visualizer:8500
+      SNAPSHOTS_DIR: /snapshots
       CLIENT_SELF_BASE_URL: http://client:8100
       PROVIDER_URL: http://provider:9100
       PROVIDER_SLOT_MINUTES: "${PROVIDER_SLOT_MINUTES:-60}"
@@ -198,6 +218,8 @@ services:
       - http://executor:9000
       - --provider-url
       - http://provider:9100
+    volumes:
+      - ./snapshots:/snapshots
 
 volumes:
   hf-cache:

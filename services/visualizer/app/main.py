@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import logging
-from fastapi import FastAPI, Query
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from .config import settings
+from common.snapshots import (
+    SnapshotError,
+    collect_dashboard_views,
+    list_snapshots,
+    load_snapshot,
+    write_snapshot,
+)
 from .data import get_dashboard_data
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -13,15 +23,89 @@ logger = logging.getLogger("visualizer.main")
 app = FastAPI(title="Carbonshift Live Visualizer")
 
 
+class SnapshotExportRequest(BaseModel):
+    """Optional label and source for exporting the currently displayed data."""
+
+    label: str | None = Field(default=None, max_length=100)
+    source_snapshot_id: str | None = None
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/api/data")
-def api_data(qos_profile_id: str | None = Query(default=None)) -> JSONResponse:
+def api_data(
+    qos_profile_id: str | None = Query(default=None),
+    snapshot_id: str | None = Query(default=None),
+) -> JSONResponse:
+    if snapshot_id is not None:
+        try:
+            snapshot, _ = load_snapshot(settings.snapshots_dir, snapshot_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Snapshot not found") from exc
+        views = snapshot["views"]
+        if qos_profile_id is None:
+            data = views["all"]
+        else:
+            data = views["by_profile"].get(qos_profile_id)
+            if data is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"QoS profile {qos_profile_id!r} is not available in this snapshot",
+                )
+        return JSONResponse(data)
+
     data = get_dashboard_data(qos_profile_id=qos_profile_id)
     return JSONResponse(data)
+
+
+@app.get("/api/snapshots")
+def api_snapshots() -> JSONResponse:
+    return JSONResponse(list_snapshots(settings.snapshots_dir))
+
+
+@app.get("/api/snapshots/{snapshot_id}/summary")
+def api_snapshot_summary(snapshot_id: str) -> JSONResponse:
+    try:
+        _, summary = load_snapshot(settings.snapshots_dir, snapshot_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Snapshot not found") from exc
+    return JSONResponse(summary)
+
+
+@app.post("/api/snapshots")
+def api_export_snapshot(request: SnapshotExportRequest) -> JSONResponse:
+    clients: list[dict[str, Any]] = []
+    source_snapshot_id = request.source_snapshot_id
+    if source_snapshot_id is not None:
+        try:
+            source_snapshot, source_summary = load_snapshot(
+                settings.snapshots_dir,
+                source_snapshot_id,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Source snapshot not found") from exc
+        views = source_snapshot["views"]
+        clients = source_summary["clients"]
+        source = "visualizer-copy"
+    else:
+        views = collect_dashboard_views(get_dashboard_data)
+        source = "visualizer-live"
+
+    try:
+        record = write_snapshot(
+            snapshots_dir=settings.snapshots_dir,
+            views=views,
+            clients=clients,
+            label=request.label,
+            source=source,
+            source_snapshot_id=source_snapshot_id,
+        )
+    except SnapshotError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse(record, status_code=201)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -128,6 +212,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       gap: 12px;
       flex-wrap: wrap;
     }
+    #snapshot-status {
+      flex-basis: 100%;
+      text-align: left;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+    #snapshot-status:empty {
+      display: none;
+    }
     .btn {
       background-color: var(--card-bg);
       color: var(--text-main);
@@ -159,7 +252,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       color: var(--accent-red);
       border-color: rgba(248, 113, 113, 0.3);
     }
-    select {
+    select, input[type="text"] {
       background-color: var(--card-bg);
       color: var(--text-main);
       border: 1px solid var(--card-border);
@@ -167,6 +260,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       border-radius: 6px;
       font-size: 0.85rem;
       cursor: pointer;
+    }
+    input[type="text"] {
+      width: 140px;
+      cursor: text;
     }
 
     /* KPI Cards Grid */
@@ -289,10 +386,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div class="controls">
+      <label for="source-select" style="font-size:0.85rem; color:var(--text-muted);">Data:</label>
+      <select id="source-select" onchange="setDataSource(this.value)">
+        <option value="live">Live data</option>
+        <option value="snapshot">Choose snapshot</option>
+      </select>
+      <select id="snapshot-select" aria-label="Saved snapshot" onchange="selectSnapshot(this.value)" disabled>
+        <option value="">No snapshots available</option>
+      </select>
+
       <label for="profile-select" style="font-size:0.85rem; color:var(--text-muted);">QoS profile:</label>
       <select id="profile-select" onchange="selectProfile(this.value)">
         <option value="">All profiles</option>
       </select>
+
+      <input id="snapshot-label" type="text" maxlength="100" placeholder="Snapshot name" aria-label="Snapshot name">
+      <button id="export-snapshot-btn" class="btn" onclick="exportSnapshot()">Export snapshot</button>
+      <a id="summary-download-btn" class="btn" hidden>Download summary</a>
 
       <span style="font-size:0.85rem; color:var(--text-muted);">Slots:</span>
       <button class="btn time-filter" data-range="24" onclick="setTimeRange(24)">Last 24</button>
@@ -311,6 +421,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button id="theme-toggle-btn" class="btn" onclick="toggleTheme()">Use light theme</button>
       <button class="btn" onclick="fetchData()">⟳ Refresh</button>
     </div>
+    <span id="snapshot-status" role="status"></span>
   </header>
 
   <!-- Key Metrics Row -->
@@ -420,6 +531,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let rawData = null;
     let selectedRange = 'all';
     let selectedProfileId = '';
+    let dataMode = 'live';
+    let selectedSnapshotId = '';
+    let dataSourceGeneration = 0;
+    let snapshots = [];
+    let dataRequestGeneration = 0;
     let resampleBin = 1;
     let autoRefresh = true;
     let refreshTimer = null;
@@ -469,17 +585,96 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     async function fetchData() {
+      const requestGeneration = ++dataRequestGeneration;
+      if (dataMode === 'snapshot' && !selectedSnapshotId) return;
       try {
         const url = new URL('/api/data', window.location.origin);
         if (selectedProfileId) url.searchParams.set('qos_profile_id', selectedProfileId);
+        if (dataMode === 'snapshot') url.searchParams.set('snapshot_id', selectedSnapshotId);
         const resp = await fetch(url);
-        if (!resp.ok) return;
-        rawData = await resp.json();
+        if (!resp.ok) throw new Error(`Dashboard request failed with HTTP ${resp.status}`);
+        const data = await resp.json();
+        if (requestGeneration !== dataRequestGeneration) return;
+        rawData = data;
         selectedProfileId = rawData.indicators.qos_profile_id || '';
         renderProfileSelector(rawData.active_profiles || []);
         renderAll();
+        renderSourceState();
       } catch (e) {
         console.error("Fetch error:", e);
+        document.getElementById('snapshot-status').textContent = String(e);
+      }
+    }
+
+    async function refreshSnapshots() {
+      const response = await fetch('/api/snapshots');
+      if (!response.ok) throw new Error(`Snapshot list failed with HTTP ${response.status}`);
+      snapshots = await response.json();
+      const selector = document.getElementById('snapshot-select');
+      selector.replaceChildren();
+
+      if (snapshots.length === 0) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No snapshots available';
+        selector.appendChild(option);
+        selectedSnapshotId = '';
+      } else {
+        for (const snapshot of snapshots) {
+          const option = document.createElement('option');
+          option.value = snapshot.snapshot_id;
+          const capturedAt = new Date(snapshot.captured_at_utc).toLocaleString();
+          option.textContent = `${capturedAt} · ${snapshot.label || snapshot.source}`;
+          selector.appendChild(option);
+        }
+        if (!snapshots.some(snapshot => snapshot.snapshot_id === selectedSnapshotId)) {
+          selectedSnapshotId = snapshots[0].snapshot_id;
+        }
+        selector.value = selectedSnapshotId;
+      }
+      renderSourceState();
+      if (dataMode === 'snapshot' && selectedSnapshotId) fetchData();
+    }
+
+    function setDataSource(mode) {
+      if (mode !== dataMode) {
+        dataSourceGeneration += 1;
+        document.getElementById('snapshot-status').textContent = '';
+      }
+      dataMode = mode;
+      if (dataMode === 'snapshot' && !selectedSnapshotId && snapshots.length > 0) {
+        selectedSnapshotId = snapshots[0].snapshot_id;
+      }
+      document.getElementById('snapshot-select').disabled =
+        dataMode !== 'snapshot' || snapshots.length === 0;
+      syncRefreshTimer();
+      renderSourceState();
+      fetchData();
+    }
+
+    function selectSnapshot(snapshotId) {
+      selectedSnapshotId = snapshotId;
+      renderSourceState();
+      fetchData();
+    }
+
+    function renderSourceState() {
+      const snapshotMode = dataMode === 'snapshot';
+      const selector = document.getElementById('snapshot-select');
+      selector.disabled = !snapshotMode || snapshots.length === 0;
+      const summaryLink = document.getElementById('summary-download-btn');
+      summaryLink.hidden = !snapshotMode || !selectedSnapshotId;
+      if (selectedSnapshotId) {
+        summaryLink.href = `/api/snapshots/${encodeURIComponent(selectedSnapshotId)}/summary`;
+        summaryLink.download = `${selectedSnapshotId}_summary.json`;
+      }
+      if (snapshotMode) {
+        const selected = snapshots.find(snapshot => snapshot.snapshot_id === selectedSnapshotId);
+        document.getElementById('live-badge').textContent =
+          selected ? `◆ Snapshot · ${selected.label || selected.captured_at_utc}` : '◆ Choose a snapshot';
+      } else {
+        document.getElementById('live-badge').textContent =
+          autoRefresh ? '● Live Polling' : '⏸ Paused';
       }
     }
 
@@ -508,22 +703,62 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function toggleAutoRefresh() {
+      if (dataMode !== 'live') return;
       autoRefresh = !autoRefresh;
       const btn = document.getElementById('toggle-refresh-btn');
-      const badge = document.getElementById('live-badge');
-      if (autoRefresh) {
-        btn.textContent = 'Pause';
-        btn.className = 'btn btn-toggle';
-        badge.textContent = '● Live Polling';
-        badge.style.color = 'var(--accent-blue)';
-        if (!refreshTimer) refreshTimer = setInterval(fetchData, 2000);
-      } else {
-        btn.textContent = 'Resume';
-        btn.className = 'btn btn-toggle paused';
-        badge.textContent = '⏸ Paused';
-        badge.style.color = 'var(--accent-red)';
+      btn.textContent = autoRefresh ? 'Pause' : 'Resume';
+      btn.className = autoRefresh ? 'btn btn-toggle' : 'btn btn-toggle paused';
+      syncRefreshTimer();
+      renderSourceState();
+    }
+
+    function syncRefreshTimer() {
+      const shouldPoll = dataMode === 'live' && autoRefresh;
+      const button = document.getElementById('toggle-refresh-btn');
+      button.disabled = dataMode !== 'live';
+      button.textContent = dataMode !== 'live' ? 'Polling off' : (autoRefresh ? 'Pause' : 'Resume');
+      button.className = autoRefresh && dataMode === 'live' ? 'btn btn-toggle' : 'btn btn-toggle paused';
+      if (shouldPoll && !refreshTimer) {
+        refreshTimer = setInterval(fetchData, 2000);
+      } else if (!shouldPoll && refreshTimer) {
         clearInterval(refreshTimer);
         refreshTimer = null;
+      }
+    }
+
+    async function exportSnapshot() {
+      const status = document.getElementById('snapshot-status');
+      const button = document.getElementById('export-snapshot-btn');
+      const exportGeneration = dataSourceGeneration;
+      if (dataMode === 'snapshot' && !selectedSnapshotId) {
+        status.textContent = 'Select a saved snapshot before exporting.';
+        return;
+      }
+      button.disabled = true;
+      status.textContent = 'Saving snapshot...';
+      try {
+        const response = await fetch('/api/snapshots', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            label: document.getElementById('snapshot-label').value.trim() || null,
+            source_snapshot_id: dataMode === 'snapshot' ? selectedSnapshotId : null,
+          }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || `Export failed with HTTP ${response.status}`);
+        if (dataMode === 'snapshot' && exportGeneration === dataSourceGeneration) {
+          selectedSnapshotId = result.snapshot_id;
+        }
+        await refreshSnapshots();
+        if (exportGeneration === dataSourceGeneration) {
+          status.textContent = `Saved ${result.snapshot_filename}`;
+        }
+      } catch (e) {
+        console.error("Snapshot export error:", e);
+        if (exportGeneration === dataSourceGeneration) status.textContent = String(e);
+      } finally {
+        button.disabled = false;
       }
     }
 
@@ -1055,9 +1290,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       Plotly.react('input-plot', traces, layout, config);
     }
 
-    // Initial Fetch & Start Timer
+    // The visualizer is intentionally usable without CarbonShift; live data
+    // requests degrade to the empty/cached dashboard while snapshots stay local.
+    refreshSnapshots().catch(error => {
+      console.error("Snapshot list error:", error);
+      document.getElementById('snapshot-status').textContent = String(error);
+    });
     fetchData();
-    refreshTimer = setInterval(fetchData, 2000);
+    syncRefreshTimer();
   </script>
 </body>
 </html>
