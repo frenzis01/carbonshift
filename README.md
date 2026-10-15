@@ -112,5 +112,3 @@ The executor and client defer heavy optional imports so their services and unit 
 - [Executor guide](carbonshift/services/executor/README.md) — model execution, API, calibration, and tests.
 - [Provider guide](carbonshift/services/provider/README.md) — configuration and run instructions.
 - [Provider interface](carbonshift/services/provider/INTERFACE.md) — clock notification and slot-close contract.
-
-Legacy Python scheduling prototypes are kept in [`carbonshift/ignore/`](carbonshift/ignore/) for reference only and are not used by the services.
