@@ -1,27 +1,17 @@
 # CarbonShift Client
 
-Client dell'architettura CarbonShift: invia richieste a **carbonshift**
-(non direttamente all'esecutore), carbonshift le inoltra all'esecutore nello
-slot che decide, e il risultato torna a questo client tramite callback.
-Raccoglie metriche end-to-end (tempi di invio/risposta, richieste servite
-dopo la deadline, qualità/confidence riportate dal modello, ecc.).
+The CarbonShift client submits requests to **CarbonShift**, never directly to the executor. CarbonShift chooses when and how to execute each request, then returns the result to this client through a callback. The client collects end-to-end metrics such as submission and response times, deadline misses, and model quality and confidence.
 
 ```
-client (questo)  --POST /v1/requests-->  carbonshift  --POST /dispatch-->  executor
+client (this)    --POST /v1/requests-->  carbonshift  --POST /dispatch-->  executor
        ^                                       |                              |
-       |                                  (sceglie flavour                    |
-       |                                   e slot in base al                  |
-       |                                   carbon budget)                     |
-       +--------------- POST /callback (risultato) <---- POST /v1/callback/{id} --+
+       |                                  (chooses flavour                    |
+       |                                   and slot based on                  |
+       |                                   the carbon budget)                 |
+       +--------------- POST /callback (result) <---- POST /v1/callback/{id} --+
 ```
 
-**Importante**: il client non sceglie il flavour (Accurate/Balanced/Fast) —
-lo decide carbonshift in base alla sua ottimizzazione carbon-aware. Il client
-sceglie il *task kind* dell'executor (`text_generation`/`ner`/
-`question_answering`), l'input, la deadline e, opzionalmente, il QoS profile.
-Il profilo è identificato da un ID stabile e condivisibile: due client che
-inviano lo stesso `qos_profile_id` condividono il relativo budget; se il campo
-è omesso, Carbonshift seleziona il profilo predefinito per quel task kind.
+**Important:** The client does not choose the flavour (`Accurate`, `Balanced`, or `Fast`); CarbonShift selects it through its carbon-aware optimization. The client chooses the executor's *task kind* (`text_generation`, `ner`, or `question_answering`), the input, the deadline, and optionally the QoS profile. A profile has a stable, shareable ID: clients that submit the same `qos_profile_id` share its budget. If the field is omitted, CarbonShift selects the default profile for that task kind.
 
 ## Setup
 
@@ -29,42 +19,34 @@ inviano lo stesso `qos_profile_id` condividono il relativo budget; se il campo
 cd client
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt        # o requirements-dev.txt per i test
+pip install -r requirements.txt        # use requirements-dev.txt for tests
 ```
 
-Il pacchetto `datasets` (Hugging Face) serve solo se userai `source: "dataset"`
-(vedi sotto); con `source: "synthetic"` (default) non serve scaricare nulla e
-puoi testare subito tutta la pipeline.
+The Hugging Face `datasets` package is only needed when using `source: "dataset"` (see below). With the default `source: "synthetic"`, no downloads are required and the full pipeline can be tested immediately.
 
-**Se vuoi usare dataset HuggingFace veri**: nessun account/login richiesto
-per quelli usati qui. Per scaricarli in anticipo:
+**To use real Hugging Face datasets:** The datasets used here require no account or login. Download them in advance with:
 
 ```sh
 python scripts/download_datasets.py
 ```
 
-Scarica `wikitext-2-raw-v1` (~4MB, prompt per text_generation), `squad_v2`
-(~40MB, domande/risposte per question_answering) e `tomaarsen/conll2003`
-(NER, mirror Parquet dello stesso dataset).
+This downloads `wikitext-2-raw-v1` (~4 MB, text-generation prompts), `squad_v2` (~40 MB, question-answering examples), and `tomaarsen/conll2003` (NER, a Parquet mirror of the same dataset).
 
-## Avvio (ordine consigliato)
+## Start (recommended order)
 
-1. **Executor** (cartella `../executor`): `uvicorn app.main:app --port 9000`
-2. **Carbonshift** (cartella `../carbonshift/rust`), puntato all'executor:
+1. **Executor** (directory `../executor`): `uvicorn app.main:app --port 9000`
+2. **CarbonShift** (directory `../carbonshift/rust`), configured to use the executor:
    ```sh
    EXECUTOR_URL=http://localhost:9000/dispatch \
    CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS=1 \
      ./target/release/carbonshift-service
    ```
-   `CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS=1` è necessario perché in locale sia
-   l'URL di callback del client sia quello di carbonshift verso l'executor
-   puntano a `localhost` — la guardia SSRF di carbonshift li rifiuterebbe
-   altrimenti (vedi `carbonshift/rust/PLAN_SERVICE.md`).
-3. **Client** (questa cartella): `uvicorn app.main:app --port 8100`
+`CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS=1` is required locally because both the client's callback URL and CarbonShift's executor URL point to `localhost`; otherwise CarbonShift's SSRF guard rejects them. See `carbonshift/rust/PLAN_SERVICE.md`.
+3. **Client** (this directory): `uvicorn app.main:app --port 8100`
 
-## Uso
+## Usage
 
-Innesca l'invio di un batch di richieste (background, non blocca la risposta HTTP):
+Start sending a request batch in the background; the HTTP response does not wait for the batch to finish:
 
 ```sh
 curl -X POST localhost:8100/run/send-batch -H 'Content-Type: application/json' -d '{
@@ -72,8 +54,7 @@ curl -X POST localhost:8100/run/send-batch -H 'Content-Type: application/json' -
 }'
 ```
 
-Per selezionare un budget condiviso, aggiungi `qos_profile_id` senza
-sostituire il task kind:
+To select a shared budget, add `qos_profile_id` without replacing the task kind:
 
 ```json
 {
@@ -84,38 +65,27 @@ sostituire il task kind:
 }
 ```
 
-Il profilo deve essere già registrato su Carbonshift con `POST /v1/profiles`.
-L'helper `register_qos_profile` nel client e `scripts/push_flavours.py`
-registrano profili; l'ID e la definizione devono essere identici tra i client
-che vogliono condividere il budget.
+The profile must already be registered with CarbonShift using `POST /v1/profiles`. The client's `register_qos_profile` helper and `scripts/push_flavours.py` can register profiles; clients that share a budget must use the same ID and definition.
 
-oppure con lo script CLI:
+Alternatively, use the CLI script:
 
 ```sh
 python scripts/send_batch.py --task text_generation --count 5 --deadline-seconds 30
 ```
 
-Poi osserva lo stato:
+Then inspect the request status:
 
 ```sh
-curl localhost:8100/requests               # tutte le richieste tracciate
-curl localhost:8100/requests/<request_id>   # dettaglio di una
-curl localhost:8100/metrics/summary         # report aggregato
+curl localhost:8100/requests               # all tracked requests
+curl localhost:8100/requests/<request_id>   # details for one request
+curl localhost:8100/metrics/summary         # aggregated report
 ```
 
-**Nota sui modelli scaricati**: se sul tuo executor hai scaricato solo i
-modelli di `text_generation`, usa `--task text_generation` — per `ner`/
-`question_answering` l'executor scaricherà i modelli al primo utilizzo (o
-usa `executor/scripts/download_models.py` prima).
+**Downloaded models:** If the executor only has the `text_generation` models downloaded, use `--task text_generation`. Models for `ner` and `question_answering` are downloaded on first use; alternatively, download them first with `executor/scripts/download_models.py`.
 
-## Timeslot e deadline con data
+## Time slots and dated deadlines
 
-Oltre a `deadline_seconds` (relativo, usato da `/run/send-batch`), il
-nuovo endpoint `POST /run/send-plan` accetta **orari assoluti** (con data,
-per evitare ambiguità) per `start_at` (quando la richiesta "nasce") e
-`deadline_at` (entro quando deve finire): entrambi discretizzati in timeslot
-di `slot_minutes` (default 60) — es. una `deadline_at` di `16:43` con slot da
-60 minuti diventa "entro le 17:00" (fine del timeslot `16:00–17:00`).
+In addition to the relative `deadline_seconds` used by `/run/send-batch`, `POST /run/send-plan` accepts **absolute timestamps** (including dates to avoid ambiguity) for `start_at` (when the request arrives) and `deadline_at` (when it must be completed). Both are discretized into `slot_minutes` time slots (default 60); for example, a `deadline_at` of 16:43 with 60-minute slots becomes a deadline of 17:00, the end of the 16:00–17:00 slot.
 
 ```sh
 curl -X POST localhost:8100/run/send-plan -H 'Content-Type: application/json' -d '{
@@ -129,118 +99,53 @@ curl -X POST localhost:8100/run/send-plan -H 'Content-Type: application/json' -d
 }'
 ```
 
-Con `mode: "realtime"` il client invia il batch dello slot corrente e poi
-genera autonomamente un tick ad ogni confine allineato all'epoch condiviso.
-Il batch viene quindi inviato quando inizia il suo timeslot, senza aspettare
-un tick dal provider. Con `mode: "emulated"` il client consuma invece i tick
-manuali del provider — vedi sotto.
+With `mode: "realtime"`, the client submits the current slot's batch and then generates a tick at each boundary aligned to the shared epoch. The batch is submitted when its time slot begins, without waiting for a provider tick. With `mode: "emulated"`, the client instead consumes manual provider ticks; see below.
 
-## Emulazione a tempo fittizio
+## Manual-clock emulation
 
-Per testare un piano che copre ore/giorni di traffico senza aspettare il
-tempo reale, usa `mode: "emulated"`. Il client registra il piano; è il provider
-che guida i tick in ordine verso client, Carbonshift ed executor. In questo
-modo il provider avvia l'orologio virtuale alle **00:00 locali del giorno
-corrente**: il primo timeslot simulato è quello 00:00–01:00 (o l'intervallo
-corrispondente alla durata configurata), anche se la simulazione parte più
-tardi. L'epoch globale configurato non cambia: il provider mantiene gli ID
-globali e invia a tutti lo stesso timestamp UTC della mezzanotte virtuale.
-Compose usa `TZ=UTC` per default; se vuoi la mezzanotte locale, imposta la
-stessa `TZ` (per esempio `Europe/Rome`) su tutti i servizi. Il fuso e la
-durata degli slot devono fare sì che la mezzanotte locale sia un confine valido.
-Richiede carbonshift avviato con `MANUAL_CLOCK=1` (e idealmente
-`SUBMIT_WAIT_TIMEOUT_SECS` basso, es. `0.3`, altrimenti ogni invio blocca
-fino a 5s di default) e l'executor con `EXECUTOR_MANUAL_CLOCK=1` — vedi
-`carbonshift/rust/PLAN_SERVICE.md` §"Emulazione a tempo fittizio" per il
-razionale completo del protocollo.
+To test a plan that spans hours or days of traffic without waiting for real time, use `mode: "emulated"`. The client stores the plan; the provider coordinates each slot. At slot entry, CarbonShift and the executor enter the slot before the provider ticks the client, allowing the scheduler to dispatch already-due assignments and the executor to process them while the client submits more requests for that slot. Before advancing, the provider waits for every client's `TickResponse` and asks CarbonShift to close the slot; CarbonShift flushes partial batches and waits for executor callbacks for all jobs due in that slot. Only after this barrier does the provider advance the clocks. The executor's advance endpoint does not wait for inference; its worker continues in the background.
+
+The provider starts its virtual clock at **local midnight on the current day**. The first simulated time slot is therefore 00:00–01:00 (or the configured slot interval), even if the simulation starts later. The configured global epoch does not change: the provider preserves global slot IDs and sends all peers the same UTC timestamp for virtual midnight. Compose defaults to `TZ=UTC`; to use local midnight, set the same `TZ` (for example, `Europe/Rome`) for every service. The timezone and slot duration must align local midnight to a slot boundary. Run CarbonShift with `MANUAL_CLOCK=1` and the executor with `EXECUTOR_MANUAL_CLOCK=1`; it is also useful to lower `SUBMIT_WAIT_TIMEOUT_SECS` (for example, to `0.3`) because otherwise each request may wait for the default five-second submission timeout. See `carbonshift/rust/PLAN_SERVICE.md` for the full protocol rationale.
 
 ```sh
 python scripts/run_emulation.py --slots 4 --per-slot 3 \
   --task text_generation --executor-url http://localhost:9000
 ```
 
-`--slot-minutes` defaults to `PROVIDER_SLOT_MINUTES`. To use 30-minute slots,
-configure `PROVIDER_SLOT_MINUTES=30`, `SLOT_DURATION_SECONDS=1800`, and
-`EXECUTOR_SLOT_MINUTES=30` for the stack; the client rejects a plan whose
-duration does not match its configured slot clock.
+`--slot-minutes` defaults to `PROVIDER_SLOT_MINUTES`. For 30-minute slots, configure `PROVIDER_SLOT_MINUTES=30`, `SLOT_DURATION_SECONDS=1800`, and `EXECUTOR_SLOT_MINUTES=30` for the stack; the client rejects plans whose duration does not match its slot clock.
 
-Per impostazione predefinita lo script registra il profilo calibrato con ID
-stabile `<task>-calibrated-v1` e lo include in ogni richiesta del piano.
-Se una nuova calibrazione cambia la definizione, usa
-`--profile-version v2` per registrare un profilo nuovo invece di sovrascrivere
-quello esistente.
-Per fare inviare richieste a più client sotto lo stesso profilo, un client
-può registrarlo e gli altri possono usare `--no-register
---qos-profile-id question_answering-calibrated-v1`. Per usare il profilo
-predefinito del task kind, passa `--no-register`
-senza `--qos-profile-id`: il campo viene omesso.
+By default, the script registers the calibrated profile with the stable ID `<task>-calibrated-v1` and includes it in every plan request. If a new calibration changes the definition, use `--profile-version v2` to register a new profile rather than overwriting the existing one. To have multiple clients submit requests under the same profile, one client can register it and the others can use `--no-register --qos-profile-id question_answering-calibrated-v1`. To use the task kind's default profile, pass `--no-register` without `--qos-profile-id`; the field is omitted.
 
-Il visualizer legge ora stati e callback dei singoli request direttamente da
-CarbonShift (`GET /v1/requests`), quindi non richiede un URL del client e
-mostra `completed`, `in progress`, `failed` e `pending` secondo il ciclo di
-vita mantenuto dallo scheduler.
+The visualizer reads individual request status and callback data directly from CarbonShift (`GET /v1/requests`), so it does not require a client URL. It displays `completed`, `in progress`, `failed`, and `pending` according to the lifecycle maintained by the scheduler.
 
-La capacity-tier ladder è globale e non appartiene al profilo. Se vuoi
-impostarla esplicitamente per un'emulazione, aggiungi:
+The capacity-tier ladder is global and does not belong to a profile. To set it explicitly for an emulation, add:
 
 ```sh
 python scripts/run_emulation.py --slots 4 --per-slot 3 \
   --set-global-capacity-tiers
 ```
 
-Questo ricostruisce la ladder usata prima della migrazione ai QoS profile
-(`per-slot` a moltiplicatore 1.0, fino a `1.5 × per-slot` a moltiplicatore
-1.5, poi overflow a 5.0) e la invia **una volta prima del piano**. È un
-override globale: influenza le richieste di tutti i profili e di tutti i
-client su quell'istanza Carbonshift. Senza il flag il client non cambia le
-tiers configurate nel server. L'endpoint
-`PUT /v1/admin/capacity-tiers` è protetto dalla API key e restituisce `204`
-quando la ladder globale è stata sostituita. Un aggiornamento attende che i
-batch attivi finiscano solve e commit; le assegnazioni e baseline già
-memorizzate restano ai costi precedenti, mentre i calcoli successivi usano la
-nuova ladder. Per questo è consigliato impostarla prima di inviare il piano.
+This reconstructs the ladder used before the QoS-profile migration (`per-slot` at multiplier 1.0, up to `1.5 × per-slot` at multiplier 1.5, followed by overflow at 5.0) and sends it **once before the plan**. This is a global override that affects requests from every profile and client on that CarbonShift instance. Without the flag, the client leaves the server's configured tiers unchanged. The API-key-protected `PUT /v1/admin/capacity-tiers` endpoint returns `204` when the global ladder has been replaced. An update waits for active batches to finish solving and committing; existing assignments and baselines retain their original costs, while subsequent calculations use the new ladder. Set the ladder before submitting a plan.
 
-Genera un piano sintetico (o da dataset con `--source dataset`) su N
-timeslot e lo invia; segui i risultati con `curl localhost:8100/requests` /
-`/metrics/summary` — un piano di ore/giorni simulati completa in pochi
-secondi reali.
+The script generates a synthetic plan (or a dataset-based plan with `--source dataset`) spanning N time slots and submits it. Follow the results with `curl localhost:8100/requests` or `/metrics/summary`; a plan representing hours or days can complete in a few seconds of real time.
 
-`--seed` è **random a ogni run** se omesso (stampato a schermo, es.
-`seed=123456789 (random)`, per poterlo rifissare in una run successiva se
-serve riprodurre esattamente lo stesso piano); passa `--seed N` per fissarlo.
-Prima di questa modifica il default era sempre `42`, per cui run diverse
-producevano sempre le stesse identiche richieste — ora invece variano a ogni
-esecuzione a meno che tu non fissi esplicitamente il seed. Con `source:
-"synthetic"` (default) ricorda comunque che gli esempi sono scelti (con
-`random.choice`) da un pool piccolo (5 varianti per task) — usa `--source
-dataset` per varietà reale su centinaia/migliaia di esempi.
+If omitted, `--seed` is **random on every run** and printed to the console (for example, `seed=123456789 (random)`) so it can be reused later to reproduce the same plan. Pass `--seed N` to fix it. The previous default was always `42`, so every run produced identical requests; runs now vary unless you set the seed. With the default `source: "synthetic"`, examples are still selected with `random.choice` from a small pool of five variants per task. Use `--source dataset` for real variety across hundreds or thousands of examples.
 
-### Con Docker Compose
+### With Docker Compose
 
-Dalla cartella radice del workspace (non questa): il servizio one-off
-`emulation` esegue lo script dentro la rete Docker, già puntato a
-`client`/`carbonshift`/`executor` per nome host — non serve altro che i flag
-di contenuto (`--task`, `--slots`, ecc.).
+From the workspace root (not this directory), the one-off `emulation` service runs the script inside the Docker network and is already configured to reach `client`, `carbonshift`, and `executor` by hostname. Only workload options such as `--task` and `--slots` need to be supplied.
 
 ```sh
 cd ..
 export MANUAL_CLOCK=1 SUBMIT_WAIT_TIMEOUT_SECS=0.3 DISPATCHER_POLL_INTERVAL_MS=20
-docker compose down   # se lo stack era già su con altre variabili
+docker compose down   # if the stack was already running with other variables
 docker compose up -d --build
 docker compose run --rm emulation --slots 4 --per-slot 3 --task text_generation
 ```
 
-Per l'uso realtime imposta `MANUAL_CLOCK=0`: CarbonShift, client ed executor
-seguono i confini dell'orologio UTC condiviso; il client genera i propri tick
-senza dipendere da notifiche periodiche del provider.
+For realtime operation, set `MANUAL_CLOCK=0`. CarbonShift, the client, and the executor follow the shared UTC clock boundaries; the client generates its own ticks without depending on periodic provider notifications.
 
-Per l'emulazione multi-client usa il profilo Compose `multi-client`, che
-aggiunge un secondo servizio client con callback e metriche isolati. Il runner
-invia per default un piano NER al client su `8100` e un piano question
-answering al client su `8101`; provider e runner condividono la lista degli
-endpoint client configurata. La lista è estensibile con ulteriori coppie
-`--client-url` / `--task`, mentre il provider mantiene il singolo `CLIENT_URL`
-quando `PROVIDER_CLIENT_URLS` non è impostato.
+For multi-client emulation, use the Compose `multi-client` profile, which adds a second client service with isolated callbacks and metrics. By default, the runner sends an NER plan to the client on port `8100` and a question-answering plan to the client on port `8101`; the provider and runner share the configured client endpoint list. Add more clients with additional `--client-url` and `--task` pairs. If `PROVIDER_CLIENT_URLS` is unset, the provider continues to use the single `CLIENT_URL`.
 
 ```sh
 cd ..
@@ -251,163 +156,89 @@ docker compose --profile multi-client run --rm emulation-multi \
   --slots 4 --per-slot 3
 ```
 
-`--per-slot` è per client; la ladder globale viene dimensionata sul carico
-combinato. Per un solo client è possibile passare una sola coppia `--client-url`
-e `--task`; i profili QoS personalizzati, se presenti, si specificano con un
-`--qos-profile-id` per ogni coppia.
+`--per-slot` applies to each client; the global ladder is sized for the combined load. For a single client, pass one `--client-url` and `--task` pair. If using custom QoS profiles, provide one `--qos-profile-id` for each pair.
 
-## API del client
+## Client API
 
-| Endpoint | Scopo |
+| Endpoint | Purpose |
 |---|---|
-| `POST /run/send-batch` | Avvia (in background) l'invio di `count` richieste per il task scelto; accetta `qos_profile_id` opzionale e `deadline_seconds` relativo. `source: "synthetic"` (default) o `"dataset"` (HuggingFace). |
-| `POST /run/send-plan` | Piano con `start_at`/`deadline_at` assoluti e raggruppamento per timeslot; ogni richiesta può avere un `qos_profile_id` opzionale. |
-| `POST /callback` | Riceve da carbonshift il risultato finale (`CallerCallbackPayload`); non richiamarlo manualmente, è per carbonshift. |
-| `GET /requests` | Elenco di tutte le richieste tracciate con il loro stato. |
-| `GET /requests/{id}` | Dettaglio di una richiesta (id = quello assegnato da carbonshift). |
-| `GET /metrics/summary` | Report JSON aggregato per `task/flavour` (dettagliato). |
-| `GET /metrics/progress` | Riepilogo rapido "a colpo d'occhio" di tutto il test in corso (conteggi + medie principali) — pensato per essere interrogato ripetutamente con `curl` mentre un test è in esecuzione. |
+| `POST /run/send-batch` | Starts sending `count` requests for the selected task in the background; accepts an optional `qos_profile_id` and relative `deadline_seconds`. `source` can be `"synthetic"` (default) or `"dataset"` (Hugging Face). |
+| `POST /run/send-plan` | Accepts a plan with absolute `start_at`/`deadline_at` values grouped by time slot; each request may include an optional `qos_profile_id`. |
+| `POST /callback` | Receives the final result from CarbonShift (`CallerCallbackPayload`); do not call it manually. |
+| `GET /requests` | Lists all tracked requests and their status. |
+| `GET /requests/{id}` | Returns a request's details; the ID is assigned by CarbonShift. |
+| `GET /metrics/summary` | Returns a detailed JSON report aggregated by `task/flavour`. |
+| `GET /metrics/progress` | Returns a quick overview of the current test, including counts and key averages; designed for repeated polling with `curl`. |
 | `GET /health` | Liveness. |
 
-## Metriche raccolte
+## Collected metrics
 
-Per ogni richiesta (persistite anche su `data/metrics.jsonl` non appena
-arriva il risultato/timeout):
-- `ack_latency_seconds`: tempo fra l'invio e la risposta sincrona di carbonshift
-  (**non** include il tempo di esecuzione lato executor).
-- `execution_time_sec`: tempo speso dal solo executor per eseguire il
-  modello, in secondi (dal risultato inoltrato da carbonshift), quando disponibile.
-- `end_to_end_seconds`: tempo fra l'invio e la ricezione del callback finale
-  (include sia l'attesa dello scheduling sia l'esecuzione).
-- `late`: `true` se `end_to_end_seconds > deadline_seconds` richiesta.
-- `carbon_cost`, `flavour`, `scheduled_slot`, `eta_seconds`: dalla risposta di carbonshift.
-- `qos_profile_id`: ID effettivamente risolto da Carbonshift, incluso il profilo
-  predefinito quando il client non ne ha selezionato uno.
-- `scheduled_at`: timestamp (ISO8601) di quando il DP solver di carbonshift ha
-  committato l'assegnazione di questa richiesta — distinto da
-  `callback_received_at` (quando arriva il risultato dall'executor). `null`
-  se la richiesta non è mai stata schedulata. Se la risposta sincrona di
-  submit era ancora `pending` (`scheduled_slot`/`flavour`/`carbon_cost`/
-  `scheduled_at` tutti `null`), alla ricezione della callback il client fa
-  un `GET /v1/requests/{id}` per rinfrescarli — un callback arriva solo dopo
-  che la richiesta è stata davvero schedulata e dispacciata, quindi a quel
-  punto sono sempre disponibili.
-- `baseline_carbon_cost`: quanto costerebbe (in termini di carbonio) eseguire
-  la stessa richiesta *subito*, con il flavour più accurato/costoso e senza
-  alcuna ottimizzazione della carbon intensity — calcolato da carbonshift al
-  momento della sottomissione, è la baseline rispetto a cui si misura il risparmio.
-- `carbon_saving_pct`: `(baseline_carbon_cost - carbon_cost) / baseline_carbon_cost * 100`
-  — quanto si risparmia grazie alla scelta di carbonshift (flavour + slot)
-  rispetto a quella baseline **analitica** (stima, non misura reale).
-- `baseline_execution_time_sec`: tempo di esecuzione **misurato**, in secondi, di una
-  passata "ombra" con il flavour Accurate sullo stesso input (eseguita
-  dall'executor subito dopo quella assegnata, a meno di
-  `EXECUTOR_COMPUTE_QUALITY_BASELINE=0` — vedi executor/README.md). A
-  differenza di `baseline_carbon_cost`, questo è un dato **empirico**, utile
-  per un risparmio energetico/tempo reale invece che stimato.
-- `energy_saving_pct`: `(baseline_execution_time_sec - execution_time_sec) / baseline_execution_time_sec * 100`
-  — l'analogo empirico di `carbon_saving_pct`, basato su tempi di esecuzione
-  realmente misurati anziché sulle durate assunte in `config.rs`.
-- `confidence`, `quality_score`: dal risultato dell'executor. `confidence` è
-  sempre popolato quando il modello può produrne uno (score nativo della
-  pipeline per QA/NER; per `text_generation` un self-score
-  `exp(mean log-prob)` calcolato dall'executor sui token generati).
-  `quality_score` usa, in ordine di priorità: (1) un campo `reference*`
-  fornito dal chiamante, se presente (vero ground truth); (2) altrimenti, un
-  confronto fra l'output del flavour assegnato e quello della stessa passata
-  "ombra" col flavour Accurate (proxy di ground truth, sempre disponibile a
-  meno di `EXECUTOR_COMPUTE_QUALITY_BASELINE=0`). Resta `null` solo se
-  entrambe non sono disponibili.
-- Stato: `submitted` → `completed` | `failed` | `timed_out` (nessun callback entro `CLIENT_CALLBACK_TIMEOUT_SECONDS`, default 120s).
+Metrics are stored per request in `data/metrics.jsonl` as soon as the result or timeout is recorded:
+- `ack_latency_seconds`: time between submission and CarbonShift's synchronous response (**does not** include executor processing time).
+- `execution_time_sec`: executor-only model execution time in seconds, when available in the result forwarded by CarbonShift.
+- `end_to_end_seconds`: time between submission and the final callback, including scheduling delay and execution.
+- `late`: `true` if `end_to_end_seconds` exceeds the request's `deadline_seconds`.
+- `carbon_cost`, `flavour`, `scheduled_slot`, and `eta_seconds`: values returned by CarbonShift.
+- `qos_profile_id`: the profile ID actually resolved by CarbonShift, including the default profile when the client did not select one.
+- `scheduled_at`: ISO 8601 timestamp when CarbonShift's DP solver committed the request assignment; distinct from `callback_received_at`, when the executor result arrived. It is `null` if the request was never scheduled. If the synchronous submission response was still `pending` (`scheduled_slot`, `flavour`, `carbon_cost`, and `scheduled_at` are all `null`), the client fetches `GET /v1/requests/{id}` when the callback arrives to refresh them. A callback only arrives after the request has been scheduled and dispatched, so the values are available then.
+- `baseline_carbon_cost`: CarbonShift's estimate of the cost to execute the same request immediately with the most accurate (and costly) flavour, without carbon-intensity optimization. It is computed at submission time and is the baseline for measuring savings.
+- `carbon_saving_pct`: `(baseline_carbon_cost - carbon_cost) / baseline_carbon_cost * 100`, the savings from CarbonShift's flavour and slot selection compared with the **analytical** baseline (an estimate, not a measurement).
+- `baseline_execution_time_sec`: **measured** execution time in seconds for a shadow run using the `Accurate` flavour on the same input. The executor runs it immediately after the assigned flavour unless `EXECUTOR_COMPUTE_QUALITY_BASELINE=0` (see `executor/README.md`). Unlike `baseline_carbon_cost`, this is an **empirical** value that can be used to estimate real time or energy savings.
+- `energy_saving_pct`: `(baseline_execution_time_sec - execution_time_sec) / baseline_execution_time_sec * 100`, the empirical equivalent of `carbon_saving_pct`, based on measured execution times rather than the durations assumed in `config.rs`.
+- `confidence` and `quality_score`: values from the executor result. `confidence` is populated whenever the model can produce it (the pipeline's native score for QA/NER, or an executor-calculated `exp(mean log-prob)` self-score over generated tokens for `text_generation`). `quality_score` uses, in order of priority: (1) a caller-provided `reference*` field, when present (ground truth); otherwise, (2) a comparison between the assigned flavour's output and the output of the `Accurate` shadow run (a ground-truth proxy, available unless `EXECUTOR_COMPUTE_QUALITY_BASELINE=0`). It remains `null` only when neither value is available.
+- Status: `submitted` → `completed` | `failed` | `timed_out` (no callback received within `CLIENT_CALLBACK_TIMEOUT_SECONDS`, default 120 seconds).
 
-`GET /metrics/summary` aggrega tutto questo per coppia `task/flavour`: conteggi,
-tasso di richieste in ritardo (`late_rate`), statistiche (min/avg/max) di
-latenza, tempo di esecuzione (misurato e baseline), carbon cost/baseline/saving
-(analitico), energy saving (empirico), confidence e quality_score. La stessa
-aggregazione, ma su **tutte** le richieste indipendentemente dal task/flavour,
-è disponibile in `overall` (utile per "quanto ho risparmiato in totale in
-questo test?"). C'è anche `scheduler`, letto **in diretta da carbonshift** (non
-derivato dalle richieste tracciate, quindi `null` se carbonshift non è
-raggiungibile): `global_error_avg`/`global_error_count` sono telemetria
-descrittiva aggregata, non una garanzia QoS tra semantiche diverse.
-`profiles.<qos_profile_id>` espone task kind, semantica dell'errore, soglia,
-finestra e vincolo cumulativo dei profili effettivamente usati.
+`GET /metrics/summary` aggregates these values by `task/flavour`: counts, late-request rate (`late_rate`), minimum/average/maximum latency, measured and baseline execution time, carbon cost/baseline/savings (analytical), energy savings (empirical), confidence, and quality score. The same aggregation across **all** requests, regardless of task or flavour, is available in `overall`. The `scheduler` section is read **live from CarbonShift**, not derived from client-tracked requests, so it is `null` if CarbonShift is unreachable. `global_error_avg` and `global_error_count` are descriptive fleet-wide telemetry, not QoS guarantees across different error semantics. `profiles.<qos_profile_id>` exposes the task kind, error semantics, threshold, window, and cumulative constraint for profiles in use.
 
-`GET /metrics/progress` dà invece una fotografia unica e leggera dell'intero
-test (non per task/flavour): quante richieste sono state inviate, quante
-schedulate da carbonshift, quante completate/fallite/scadute, e le medie di
-quality_score, confidence, `execution_time_sec`, `ack_latency_seconds`,
-`carbon_saving_pct` e `energy_saving_pct`.
+`GET /metrics/progress` provides a lightweight snapshot of the entire test, rather than a breakdown by task and flavour. It reports submitted, scheduled, completed, failed, and timed-out requests, along with average `quality_score`, `confidence`, `execution_time_sec`, `ack_latency_seconds`, `carbon_saving_pct`, and `energy_saving_pct`.
 
 ```sh
 curl localhost:8100/metrics/progress
 ```
 
-## Test strutturati (battery runner)
+## Structured tests (battery runner)
 
-Per valutare le performance in modo ripetibile — sia con pochi "microtest"
-(5-10 richieste, per verificare che l'architettura funzioni) sia con run più
-estesi — c'è uno script dedicato in `tests/battery/`, che rispecchia nello
-spirito `carbonshift/tests/battery/run_battery.py` (scenari config-driven,
-cartella di output con timestamp, CSV + README) ma con output in una cartella
-e formato diversi, viste la natura diversa del test (HTTP/async/callback
-contro solver Rust puro):
+For repeatable performance evaluation, whether with a few micro-tests (5–10 requests to check that the architecture works) or larger runs, use the script in `tests/battery/`. It follows the approach of `carbonshift/tests/battery/run_battery.py` (configuration-driven scenarios, timestamped output directory, CSV, and README) but uses a different output directory and format because it tests HTTP, async processing, and callbacks rather than the standalone Rust solver.
 
 ```sh
-python tests/battery/run_battery.py --config tests/battery/battery_config_micro.json   # 6 richieste, sanity check
-python tests/battery/run_battery.py --config tests/battery/battery_config.json          # scenari misti, incl. uno da dataset HF
+python tests/battery/run_battery.py --config tests/battery/battery_config_micro.json   # 6 requests, sanity check
+python tests/battery/run_battery.py --config tests/battery/battery_config.json         # mixed scenarios, including one Hugging Face dataset
 ```
 
-Ogni scenario del file di config specifica liberamente `task`, `count`
-(numero di richieste), `per_slot`/`slot_minutes`, `source` (`synthetic` o
-`dataset`, con relativo dataset HuggingFace scelto in `app/datasets.py`),
-`seed` e `mode` (`realtime` o `emulated`). Il flavour non è impostabile
-direttamente (lo sceglie carbonshift), ma i risultati sono comunque
-osservabili per flavour tramite `/metrics/summary`.
-Il runner usa `/v1/slot` del provider come riferimento e, in modalità
-`emulated`, avanza il provider (non CarbonShift/executor direttamente), così
-client, scheduler ed executor ricevono lo stesso slot/timestamp. Le durate
-nei file di scenario devono coincidere con `PROVIDER_SLOT_MINUTES`,
-`SLOT_DURATION_SECONDS / 60` e `EXECUTOR_SLOT_MINUTES`; i file predefiniti
-usano 60 minuti come Compose.
+Each scenario in the configuration file can specify `task`, `count` (number of requests), `per_slot`/`slot_minutes`, `source` (`synthetic` or `dataset`, with the corresponding Hugging Face dataset selected in `app/datasets.py`), `seed`, and `mode` (`realtime` or `emulated`). The flavour cannot be set directly because CarbonShift selects it, but results are reported by flavour through `/metrics/summary`. The runner uses the provider's `/v1/slot` as its reference and, in `emulated` mode, advances the provider rather than CarbonShift or the executor directly so the client, scheduler, and executor receive the same slot and timestamp. Scenario slot durations must match `PROVIDER_SLOT_MINUTES`, `SLOT_DURATION_SECONDS / 60`, and `EXECUTOR_SLOT_MINUTES`; the default scenario files use the 60-minute Compose setting.
 
-Ogni run scrive in `tests/battery/results/<battery_id>_<timestamp>/`:
-- `battery_config.json`: snapshot della config usata;
-- `README.md`: tabella riassuntiva per scenario (completate/fallite/scadute,
-  quality/confidence medi, tempo di esecuzione medio, carbon saving medio);
-- `results.csv`: le stesse metriche in formato tabellare;
-- una sottocartella per scenario con `config.json`, `requests.jsonl` (i
-  record grezzi per singola richiesta) e `metrics.json`.
+Each run writes to `tests/battery/results/<battery_id>_<timestamp>/`:
+- `battery_config.json`: snapshot of the configuration used.
+- `README.md`: per-scenario summary table (completed/failed/timed-out requests, average quality/confidence, average execution time, and average carbon savings).
+- `results.csv`: the same metrics in tabular form.
+- One subdirectory per scenario, containing `config.json`, `requests.jsonl` (raw per-request records), and `metrics.json`.
 
-## Variabili d'ambiente
+## Environment variables
 
-| Variabile | Default | Scopo |
+| Variable | Default | Purpose |
 |---|---|---|
-| `CARBONSHIFT_URL` | `http://localhost:8080` | Dove sta carbonshift. |
-| `CARBONSHIFT_API_KEY` | *(assente)* | Se carbonshift ha `CARBONSHIFT_API_KEY` impostata, va replicata qui. |
-| `CLIENT_SELF_BASE_URL` | `http://localhost:8100` | URL con cui questo client si presenta a carbonshift per il callback. |
-| `CLIENT_HOST` / `CLIENT_PORT` | `0.0.0.0` / `8100` | Bind HTTP (se avvii con `uvicorn --host/--port`, quelli hanno precedenza). |
-| `CLIENT_HTTP_TIMEOUT_SECONDS` | `10` | Timeout della chiamata a carbonshift. |
-| `CLIENT_CALLBACK_TIMEOUT_SECONDS` | `120` | Dopo quanto una richiesta senza callback viene marcata `timed_out`. |
-| `CLIENT_METRICS_PATH` | `data/metrics.jsonl` | File di append delle metriche. |
-| `CLIENT_MANUAL_CLOCK` | `MANUAL_CLOCK`, altrimenti `0` | In emulazione consuma i tick del provider; in realtime abilita il ticker locale allineato all'epoch. |
-| `PROVIDER_URL` | `http://localhost:9100` | Provider usato per slot e osservazioni. |
-| `PROVIDER_EPOCH` | `2020-01-01T00:00:00+00:00` | Deve coincidere con l'epoch configurato sul provider e su CarbonShift. |
-| `PROVIDER_SLOT_MINUTES` | `60` | Durata dei timeslot; deve corrispondere a CarbonShift e all'executor. |
-| `TZ` | `UTC` in Compose | Fuso locale comune; in emulazione determina la mezzanotte virtuale. |
-| `CLIENT_QOS_PROFILE_VERSION` | `v1` | Versione stabile usata per generare gli ID dei profili calibrati; aumentala quando cambia la policy. |
-| `CLIENT_QOS_PROFILE_THRESHOLD_POSITION` | `0.75` | Posizione fra errore minimo e massimo usata per la soglia dei profili calibrati. |
-| `CLIENT_QOS_PROFILE_STATS_PATH` | `model_stats.json` nel servizio client | Snapshot di calibrazione da cui ricostruire i profili calibrati all'avvio. |
-| `CLIENT_QOS_PROFILE_DEFINITIONS_PATH` | *(assente)* | Percorso opzionale a un array JSON di profili QoS completi da ripristinare all'avvio. |
-| `CLIENT_QOS_PROFILE_REGISTRATION_ATTEMPTS` | `10` | Tentativi di registrazione iniziale per profilo, per gestire l'ordine di avvio dei servizi. |
-| `CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS` | `2` | Attesa fra tentativi transitori di registrazione profilo. |
+| `CARBONSHIFT_URL` | `http://localhost:8080` | CarbonShift base URL. |
+| `CARBONSHIFT_API_KEY` | *(unset)* | Set this if CarbonShift has `CARBONSHIFT_API_KEY` configured. |
+| `CLIENT_SELF_BASE_URL` | `http://localhost:8100` | URL this client advertises to CarbonShift for callbacks. |
+| `CLIENT_HOST` / `CLIENT_PORT` | `0.0.0.0` / `8100` | HTTP bind address (overridden by `uvicorn --host/--port`). |
+| `CLIENT_HTTP_TIMEOUT_SECONDS` | `10` | Timeout for calls to CarbonShift. |
+| `CLIENT_CALLBACK_TIMEOUT_SECONDS` | `120` | Time after which a request without a callback is marked `timed_out`. |
+| `CLIENT_METRICS_PATH` | `data/metrics.jsonl` | Append-only metrics file. |
+| `CLIENT_MANUAL_CLOCK` | `MANUAL_CLOCK`, otherwise `0` | In emulation, consume provider ticks; in realtime, enable the local epoch-aligned ticker. |
+| `PROVIDER_URL` | `http://localhost:9100` | Provider used for slot and observation data. |
+| `PROVIDER_EPOCH` | `2020-01-01T00:00:00+00:00` | Must match the epoch configured on the provider and CarbonShift. |
+| `PROVIDER_SLOT_MINUTES` | `60` | Time-slot duration; must match CarbonShift and the executor. |
+| `TZ` | `UTC` in Compose | Shared local timezone; determines virtual midnight in emulation. |
+| `CLIENT_QOS_PROFILE_VERSION` | `v1` | Stable version used in calibrated profile IDs; increment it when the policy changes. |
+| `CLIENT_QOS_PROFILE_THRESHOLD_POSITION` | `0.75` | Position between minimum and maximum error used to set calibrated profile thresholds. |
+| `CLIENT_QOS_PROFILE_STATS_PATH` | `model_stats.json` in the client service | Calibration snapshot used to rebuild calibrated profiles at startup. |
+| `CLIENT_QOS_PROFILE_DEFINITIONS_PATH` | *(unset)* | Optional path to a JSON array of complete QoS profiles to restore at startup. |
+| `CLIENT_QOS_PROFILE_REGISTRATION_ATTEMPTS` | `10` | Initial registration attempts per profile, to handle service startup order. |
+| `CLIENT_QOS_PROFILE_REGISTRATION_RETRY_SECONDS` | `2` | Delay between transient profile-registration retries. |
 
-## Test
+## Tests
 
-`tests/test_tracker.py` (unità, nessuna rete) e `tests/test_server.py`
-(HTTP via `TestClient`, con `carbonshift_client.submit` sostituito da uno
-stub): **non** serve carbonshift/executor in esecuzione né il pacchetto
-`datasets`.
+`tests/test_tracker.py` contains unit tests that require no network. `tests/test_server.py` exercises HTTP through `TestClient` with `carbonshift_client.submit` replaced by a stub. Neither CarbonShift nor the executor needs to be running, and the `datasets` package is not required.
 
 ```sh
 pip install -r requirements-dev.txt
@@ -421,83 +252,39 @@ docker build -t carbonshift-client .
 docker run --rm -p 8100:8100 -e CARBONSHIFT_URL=http://<host>:8080 carbonshift-client
 ```
 
-Per l'intero stack (carbonshift + executor + client) usa il
-`docker-compose.yml` nella cartella radice del workspace:
+To run the full stack (CarbonShift, executor, and client), use the workspace-root `docker-compose.yml`:
 
 ```sh
 cd ..
 docker compose up --build
 ```
 
-## Flavour dinamici per task (dati freddi calibrati)
+## Task-specific calibrated flavours
 
-Carbonshift non conosce di per sé alcun task: i suoi 3 flavour
-(Accurate/Balanced/Fast) di default sono un'unica lista globale con errori
-stimati "a occhio". Per farlo pianificare in base a **errore/costo reali per
-ciascun task**, invece:
+CarbonShift does not inherently know about tasks. Its three default flavours (`Accurate`, `Balanced`, and `Fast`) form one global list with roughly estimated errors. To schedule using **measured error and cost for each task**, do the following:
 
-1. **Calibrazione una tantum** (nell'ambiente dell'**executor**, ha bisogno di
-   torch/transformers): esegue davvero ogni modello configurato e misura
-   errore reale (da `quality_score`) e tempo di esecuzione medio.
+1. **Calibrate once** in the **executor** environment, which requires `torch` and `transformers`. The calibration runs every configured model and measures actual error (from `quality_score`) and average execution time.
    ```sh
    cd ../executor
    python scripts/calibrate_models.py --samples 20
    ```
-   Scrive/aggiorna `client/model_stats.json`, un dizionario **indicizzato per
-   nome di modello** (non per task/flavour): così puoi cambiare o aggiungere
-   modelli in `executor/app/config.py` e ricalibrare solo quelli, senza
-   perdere le misurazioni più vecchie di modelli non più configurati.
-2. **Registrazione su carbonshift**: raggruppa `model_stats.json` per task e
-   registra un profilo versionato per ogni task kind.
+This writes or updates `client/model_stats.json`, a dictionary **indexed by model name** (not by task or flavour). You can change or add models in `executor/app/config.py` and recalibrate only those models without losing older measurements for models that are no longer configured.
+2. **Register profiles with CarbonShift:** Group `model_stats.json` by task and register a versioned profile for each task kind.
    ```sh
    python scripts/push_flavours.py
    ```
-   I profili usano ID stabili (`<task-kind>-calibrated-v1`), i flavour
-   *misurati*, la soglia interpolata e la semantica d'errore salvata nei dati
-   di calibrazione. La finestra e il vincolo cumulativo sono espliciti nella
-   registrazione: due client che riutilizzano lo stesso ID devono quindi
-   inviare la stessa definizione. Se una nuova calibrazione cambia una policy,
-   usa `--profile-version v2` per creare un ID diverso. Le richieste selezionano il budget con
-   `qos_profile_id`; il task kind continua a descrivere l'operazione
-   dell'executor.
-   Profili differenti non condividono il budget e vengono pianificati in
-   batch separati. Le capacity tiers restano globali e contano le richieste
-   di tutti i profili.
+Profiles use stable IDs (`<task-kind>-calibrated-v1`), measured flavours, an interpolated threshold, and the error semantics stored in the calibration data. The registration explicitly defines the window and cumulative constraint, so clients reusing the same ID must submit the same definition. If recalibration changes a policy, use `--profile-version v2` to create a different ID. Requests select the budget through `qos_profile_id`; the task kind still describes the executor operation. Different profiles do not share budgets and are scheduled in separate batches. Capacity tiers remain global and count requests from every profile.
 
-   La soglia è di default al 75% fra l'errore minimo e massimo dei flavour
-   calibrati (`--threshold-position` per cambiarlo). La soglia e i vincoli
-   cumulativi si applicano al QoS profile, non a una media hard aggregata tra
-   task diversi. L'endpoint `/v1/stats` conserva una media fleet-wide solo
-   come telemetria descrittiva.
-3. **Correzione con l'errore reale** (solo nell'emulazione/prodotto reale, mai
-   nelle simulazioni offline che non passano da carbonshift): quando arriva
-   il callback dell'executor con `result.quality_score`, carbonshift sostituisce
-   l'errore *previsto* del flavour assegnato con il valore riportato dal task
-   nella finestra e nei totali del profilo associato — vedi
-   `carbonshift/rust/PLAN_SERVICE.md`.
+The default threshold is 75% of the range between the minimum and maximum errors of the calibrated flavours; use `--threshold-position` to change it. Thresholds and cumulative constraints apply to the QoS profile, not to a hard aggregate average across different tasks. The `/v1/stats` endpoint retains a fleet-wide average only as descriptive telemetry.
+3. **Correct with measured error** in live emulation or production, not in offline simulations that do not use CarbonShift. When the executor callback includes `result.quality_score`, CarbonShift replaces the assigned flavour's *predicted* error with the task-reported value in the associated profile's window and totals. See `carbonshift/rust/PLAN_SERVICE.md`.
 
-## Riavvii e ripristino dei profili QoS
+## Restart and restore QoS profiles
 
-Carbonshift conserva i profili QoS personalizzati in memoria. All'avvio il
-client ricostruisce i profili calibrati dal proprio `model_stats.json` e
-registra anche gli eventuali profili completi configurati con
-`CLIENT_QOS_PROFILE_DEFINITIONS_PATH`. Le registrazioni identiche sono
-idempotenti; un ID già usato con una definizione diversa è un errore e non
-viene sovrascritto. Il client riprova gli errori di connessione e server con
-limiti configurabili; errori permanenti di definizione impediscono l'avvio.
-Se cambia la calibrazione, aumenta la versione e mantieni allineati
-`CLIENT_QOS_PROFILE_VERSION`, `push_flavours.py --profile-version` e
-`run_emulation.py --profile-version`: i nuovi profili hanno un ID diverso e
-possono essere ripristinati dalla stessa configurazione sui client.
+CarbonShift stores custom QoS profiles in memory. At startup, the client rebuilds calibrated profiles from its `model_stats.json` and registers any complete profiles configured through `CLIENT_QOS_PROFILE_DEFINITIONS_PATH`. Identical registrations are idempotent; reusing an ID with a different definition is an error and does not overwrite the existing profile. The client retries connection and server errors up to configured limits; permanent definition errors prevent startup. When calibration changes, increment the version and keep `CLIENT_QOS_PROFILE_VERSION`, `push_flavours.py --profile-version`, and `run_emulation.py --profile-version` aligned. The new profiles receive distinct IDs and can be restored from the same configuration on each client.
 
-Se Carbonshift viene riavviato mentre il client resta attivo, una richiesta
-con un profilo noto al catalogo locale riceve un solo tentativo di
-registrazione idempotente e viene reinviata una volta. Se il profilo non è
-nel catalogo locale, l'invio fallisce esplicitamente: non viene sostituito
-silenziosamente con un profilo predefinito.
+If CarbonShift restarts while the client remains active, a request using a profile known to the local catalog triggers one idempotent registration attempt and is submitted once more. If the profile is not in the local catalog, submission fails explicitly; it is not silently replaced with a default profile.
 
-Per un profilo personalizzato, configura il file in tutti i client che
-devono poterlo ripristinare:
+For a custom profile, configure the file on every client that must be able to restore it:
 
 ```json
 [
@@ -513,27 +300,12 @@ devono poterlo ripristinare:
 ]
 ```
 
-`CLIENT_QOS_PROFILE_DEFINITIONS_PATH` deve puntare a questo file **dentro**
-ogni container client. Un profilo personalizzato registrato soltanto da uno
-script/altro client non può essere ricostruito da un processo che non possiede
-la sua definizione.
+`CLIENT_QOS_PROFILE_DEFINITIONS_PATH` must point to this file **inside** each client container. A process cannot restore a custom profile registered only by a script or another client unless it has the profile definition.
 
-Il ripristino riguarda le **definizioni** e gli ID stabili, non la persistenza
-dello stato dello scheduler. Un riavvio Carbonshift azzera code, assegnazioni,
-contatori di errore e cronologia in memoria; non reinterpreta però le
-definizioni del profilo con un ID diverso. Le richieste usano `task_kind` per
-identificare l'operazione e `qos_profile_id` per selezionare il budget. I
-filtri di monitoraggio usano lo stesso ID del profilo.
+Restoration covers **definitions** and stable IDs, not scheduler-state persistence. A CarbonShift restart clears in-memory queues, assignments, error counters, and history; it does not reinterpret a profile definition under a different ID. Requests use `task_kind` to identify the operation and `qos_profile_id` to select the budget. Monitoring filters use the same profile ID.
 
-## Semplificazioni note
+## Known simplifications
 
-- Nessun retry sull'invio a carbonshift (se fallisce, quella richiesta viene
-  solo loggata e saltata), salvo il singolo ripristino idempotente di un
-  profilo noto quando Carbonshift segnala che il suo registro in memoria è
-  stato azzerato.
-- `source: "dataset"` per NER usa `tomaarsen/conll2003`, un mirror Parquet
-  senza script di caricamento (il dataset originale `conll2003` non è più
-  caricabile con le versioni recenti di `datasets`).
-- Nessuna persistenza della coda/stato oltre il file JSONL di metriche: un
-  riavvio del client perde il tracking delle richieste in volo (i callback
-  che arrivano nel frattempo per id sconosciuti vengono solo loggati).
+- Requests are not retried when submission to CarbonShift fails; the request is logged and skipped, except for the single idempotent restoration attempt when CarbonShift reports that its in-memory profile registry was cleared.
+- `source: "dataset"` for NER uses `tomaarsen/conll2003`, a Parquet mirror without loading scripts; recent `datasets` versions can no longer load the original `conll2003` dataset.
+- Queues and request state are not persisted beyond the metrics JSONL file. A client restart loses tracking for in-flight requests; callbacks that arrive for unknown IDs are only logged.

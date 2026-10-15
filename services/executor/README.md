@@ -1,20 +1,12 @@
 # CarbonShift Executor
 
-Servizio esterno "esecutore" per l'architettura CarbonShift: riceve job HTTP
-(tipo di task + flavour + orario di esecuzione), li mette in coda per
-timeslot, esegue **un job alla volta** (nessun parallelismo) usando un
-modello Hugging Face, e restituisce il risultato via callback HTTP.
+The executor is an external service in the CarbonShift architecture. It receives HTTP jobs (task type, flavour, and execution time), queues them by time slot, runs **one job at a time** using a Hugging Face model, and returns each result through an HTTP callback.
 
-Vive in una cartella separata (allo stesso livello di `carbonshift/`) perché
-è un servizio indipendente: oggi testabile da solo via `curl`, in futuro
-raggiungibile da `carbonshift` impostando `EXECUTOR_URL` (vedi
-["Integrazione con carbonshift"](#integrazione-con-carbonshift)).
+The executor lives in its own directory beside `carbonshift/` because it is an independent service. It can be tested by itself with `curl` or reached by CarbonShift by setting `EXECUTOR_URL` (see [Integration with CarbonShift](#integration-with-carbonshift)).
 
-## Task e modelli
+## Tasks and models
 
-Tre tipi di task, tre "flavour" ciascuno (stessa idea di Accurate/Balanced/Fast
-di carbonshift), scelti piccoli/veloci per girare su hardware comune (testato
-per un i7-7700, 16GB RAM, GTX 1060 3GB):
+The executor supports three task types and three flavours each, following the same `Accurate`/`Balanced`/`Fast` concept as CarbonShift. The models are selected to run on common hardware (tested on an i7-7700 with 16 GB RAM and a 3 GB GTX 1060):
 
 | Task | Fast | Balanced | Accurate |
 |---|---|---|---|
@@ -22,12 +14,7 @@ per un i7-7700, 16GB RAM, GTX 1060 3GB):
 | `ner` | `dslim/distilbert-NER` (~260MB) | `dslim/bert-base-NER` (~430MB) | `dslim/bert-large-NER` (~1.3GB) |
 | `question_answering` | `distilbert-base-cased-distilled-squad` (~260MB) | `deepset/bert-base-uncased-squad2` (~430MB) | `deepset/bert-large-uncased-whole-word-masking-squad2` (~1.3GB) |
 
-Dimensioni indicative su disco (pesi in fp32); su GPU occupano circa la
-metà con inferenza in fp16. Con una GTX 1060 da 3GB **non tutti e 9 i modelli
-stanno in VRAM insieme** — per questo l'executor tiene un piccolo LRU cache
-(`EXECUTOR_MAX_LOADED_MODELS`, default 2 modelli caricati contemporaneamente)
-e carica gli altri al volo quando servono, scaricando dalla cache il meno
-usato di recente. Per l'uso su CPU questo non è un problema (solo più lento).
+Approximate disk sizes use fp32 weights; on a GPU, fp16 inference uses about half that memory. A 3 GB GTX 1060 cannot fit all nine models in VRAM simultaneously, so the executor keeps a small LRU cache (`EXECUTOR_MAX_LOADED_MODELS`, default 2 concurrently loaded models) and loads other models on demand, evicting the least recently used one. This is not a concern on CPU, though inference is slower.
 
 ## Setup
 
@@ -35,61 +22,49 @@ usato di recente. Per l'uso su CPU questo non è un problema (solo più lento).
 cd executor
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt        # o requirements-dev.txt per i test
+pip install -r requirements.txt        # use requirements-dev.txt for tests
 ```
 
-**Se non hai mai usato Hugging Face**: non serve nessun account/login per
-questi modelli (nessuno è "gated"). Al primo utilizzo di un `(task, flavour)`
-i pesi vengono scaricati automaticamente in `~/.cache/huggingface` (o in
-`$HF_HOME` se impostata). Se preferisci scaricarli tutti in anticipo (utile
-prima di una demo, per non aspettare il download durante la prima richiesta):
+**Hugging Face account:** These models do not require an account or login; none are gated. The weights for each `(task, flavour)` are downloaded automatically on first use to `~/.cache/huggingface` (or `$HF_HOME`, if set). To download all models in advance, for example before a demo:
 
 ```sh
 python scripts/download_models.py
 ```
 
-Per la GPU: `pip install -r requirements.txt` installa `torch` da PyPI, che
-su Linux include già il supporto CUDA per GPU comuni (la GTX 1060, Pascal,
-è supportata). Verifica con:
+For GPU use, `pip install -r requirements.txt` installs `torch` from PyPI, which includes CUDA support on Linux for common GPUs, including the Pascal GTX 1060. Check availability with:
 
 ```sh
 python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-Se stampa `False` ma hai un driver NVIDIA installato, segui le istruzioni per
-la build CUDA corretta su https://pytorch.org/get-started/locally/ — in ogni
-caso l'executor funziona anche su sola CPU (`EXECUTOR_DEVICE=cpu`), solo più
-lentamente.
+If this prints `False` despite an installed NVIDIA driver, follow the instructions for the correct CUDA build at https://pytorch.org/get-started/locally/. The executor also works on CPU alone (`EXECUTOR_DEVICE=cpu`), but more slowly.
 
-## Avvio
+## Start
 
 ```sh
 uvicorn app.main:app --host 0.0.0.0 --port 9000
 ```
 
-Variabili d'ambiente (tutte opzionali):
+All environment variables are optional:
 
-| Variabile | Default | Scopo |
+| Variable | Default | Purpose |
 |---|---|---|
-| `EXECUTOR_HOST` / `EXECUTOR_PORT` | `0.0.0.0` / `9000` | Bind HTTP (usati solo se avvii con `python -m app`; con `uvicorn` passa `--host`/`--port`). |
-| `EXECUTOR_DEVICE` | `auto` | `auto` \| `cpu` \| `cuda`. |
-| `EXECUTOR_MAX_LOADED_MODELS` | `2` | Quante pipeline tenere in cache (RAM/VRAM) contemporaneamente. |
-| `EXECUTOR_POLL_INTERVAL_SECONDS` | `0.5` | Frequenza di controllo della coda quando è vuota/non ancora dovuta. |
-| `EXECUTOR_METRICS_PATH` | `data/metrics.jsonl` | File JSONL di append delle metriche. |
-| `EXECUTOR_CALLBACK_TIMEOUT_SECONDS` | `10` | Timeout HTTP per l'invio del callback. |
-| `EXECUTOR_MANUAL_CLOCK` | `0` | Congela l'orologio della coda eccetto via `POST /admin/advance-slot` (solo test/emulazione). |
-| `TZ` | `UTC` in Compose | Fuso comune dei servizi per la visualizzazione; gli istanti `execute_at` viaggiano sempre in UTC. |
-| `EXECUTOR_SLOT_MINUTES` | `60` | Durata di un timeslot in modalit\u00e0 manual clock; deve combaciare con `PROVIDER_SLOT_MINUTES` e con `SLOT_DURATION_SECONDS / 60` di CarbonShift. |
-| `EXECUTOR_COMPUTE_QUALITY_BASELINE` | `1` | Se attivo, ogni richiesta con flavour diverso da `accurate` esegue anche una passata "ombra" col flavour Accurate sullo stesso input, per ottenere `baseline_execution_time_sec`/`baseline_model` (misura reale, non stimata) e un `quality_score` per confronto quando non è fornito un `reference*`. Circa raddoppia il calcolo per richiesta — disattivalo (`0`) nei test su larga scala dove non serve il confronto di qualità/tempo. |
+| `EXECUTOR_HOST` / `EXECUTOR_PORT` | `0.0.0.0` / `9000` | HTTP bind address (used only when started with `python -m app`; with `uvicorn`, pass `--host` and `--port`). |
+| `EXECUTOR_DEVICE` | `auto` | `auto`, `cpu`, or `cuda`. |
+| `EXECUTOR_MAX_LOADED_MODELS` | `2` | Number of model pipelines to keep in RAM/VRAM at once. |
+| `EXECUTOR_POLL_INTERVAL_SECONDS` | `0.5` | Queue polling interval when empty or when jobs are not yet due. |
+| `EXECUTOR_METRICS_PATH` | `data/metrics.jsonl` | Append-only JSONL metrics file. |
+| `EXECUTOR_CALLBACK_TIMEOUT_SECONDS` | `10` | HTTP timeout for sending callbacks. |
+| `EXECUTOR_MANUAL_CLOCK` | `0` | Freeze the queue clock except when advanced through `POST /admin/advance-slot` (testing/emulation only). |
+| `TZ` | `UTC` in Compose | Shared timezone for display; `execute_at` instants are always sent in UTC. |
+| `EXECUTOR_SLOT_MINUTES` | `60` | Manual-clock time-slot duration; must match `PROVIDER_SLOT_MINUTES` and `SLOT_DURATION_SECONDS / 60` in CarbonShift. |
+| `EXECUTOR_COMPUTE_QUALITY_BASELINE` | `1` | When enabled, requests using a flavour other than `accurate` also run an Accurate-flavour shadow pass on the same input. This supplies measured `baseline_execution_time_sec`/`baseline_model` and a comparison `quality_score` when no `reference*` is provided. It roughly doubles inference work per request; disable it (`0`) for large-scale tests that do not need quality or timing comparisons. |
 
-Le durate dei flavour e i tempi misurati dall'executor sono numeri in secondi:
-le definizioni usano `duration_sec` e i risultati `execution_time_sec` e
-`baseline_execution_time_sec`. I tempi di inferenza possono essere frazioni di
-secondo; CarbonShift li conserva senza convertirli in millisecondi.
+Flavour durations and executor measurements are expressed in seconds: definitions use `duration_sec`, and results use `execution_time_sec` and `baseline_execution_time_sec`. Inference may take fractions of a second; CarbonShift stores those values without converting them to milliseconds.
 
 ## API
 
-### `POST /jobs` — invio nativo (per test standalone, senza carbonshift)
+### `POST /jobs` — Native submission (standalone testing, without CarbonShift)
 
 ```json
 {
@@ -100,50 +75,31 @@ secondo; CarbonShift li conserva senza convertirli in millisecondi.
   "callback_url": "http://localhost:8123/my-callback"
 }
 ```
-`execute_at` è opzionale (default: subito). `callback_url` è opzionale: se
-assente, il risultato va recuperato con `GET /jobs/{request_id}`.
+`execute_at` is optional (default: immediately). `callback_url` is optional; if omitted, retrieve the result with `GET /jobs/{request_id}`.
 
 Risposta `202`: `{"request_id", "status": "queued", "execute_at", "queue_position"}`.
 
-Formato di `input` per task:
+`input` formats by task:
 - `text_generation`: `{"prompt": str, "max_new_tokens"?: int, "reference"?: str}`
 - `ner`: `{"text": str, "reference_entities"?: [{"text": str, "label": str}, ...]}`
 - `question_answering`: `{"question": str, "context": str, "reference_answer"?: str}`
 
-I campi `reference*` sono opzionali: se presenti, l'executor calcola anche un
-`quality_score` (F1 su overlap di token) confrontando l'output con il valore
-atteso — utile quando il client (prossimo step) userà dataset HuggingFace con
-risposte note.
+The `reference*` fields are optional. When present, the executor also calculates a `quality_score` (token-overlap F1) by comparing the output with the expected value. This is useful when the client uses Hugging Face datasets with known answers.
 
-### `POST /dispatch` — adapter per carbonshift
+### `POST /dispatch` — CarbonShift adapter
 
-Stesso schema esatto del payload che il dispatcher Rust di carbonshift invia
-(`ExecutorDispatchPayload`, vedi `carbonshift/rust/src/service/models.rs`):
-`{request_id, scheduled_slot, execute_at, flavour, carbon_cost, callback_url, payload}`.
-`execute_at` è il confine UTC dello slot assegnato, serializzato come timestamp
-RFC 3339 con fuso orario; l'executor mantiene il job in coda fino a quell'istante.
-In realtime usa l'orologio UTC di sistema e non mantiene un contatore di slot
-indipendente. In emulazione l'annuncio iniziale imposta il timestamp virtuale
-esatto del provider e ogni rollover avanza di una durata di slot.
-L'executor legge `task`/`input` da dentro `payload` — vedi
-[Integrazione con carbonshift](#integrazione-con-carbonshift).
-Il `request_id` è anche una chiave d'idempotenza: una ripetizione dello
-stesso dispatch con gli stessi dati restituisce il job già accodato/completato
-senza eseguire un'altra inferenza; riutilizzarlo con dati differenti ritorna
-`409 Conflict`.
+This uses the exact payload schema sent by CarbonShift's Rust dispatcher (`ExecutorDispatchPayload`; see `carbonshift/rust/src/service/models.rs`): `{request_id, scheduled_slot, execute_at, flavour, carbon_cost, callback_url, payload}`. `execute_at` is the UTC boundary of the assigned slot, serialized as a timezone-aware RFC 3339 timestamp; the executor keeps the job queued until that instant. In realtime mode it uses the system UTC clock and has no independent slot counter. In emulation, the initial announcement sets the exact provider virtual timestamp and each rollover advances by one slot duration. The executor reads `task` and `input` from inside `payload`; see [Integration with CarbonShift](#integration-with-carbonshift). `request_id` is also an idempotency key: repeating an identical dispatch returns the existing queued or completed job without running inference again, while reusing the ID with different data returns `409 Conflict`.
 
-### Altri endpoint
+### Other endpoints
 
-- `GET /jobs/{request_id}` — stato/risultato di un job.
-- `GET /queue` — snapshot della coda, raggruppata per timeslot.
-- `GET /models` — registro task → flavour → modello configurato.
-- `GET /metrics/summary` — report JSON aggregato (count, tempo di esecuzione,
-  confidence, quality_score, per ogni coppia task/flavour).
-- `GET /metrics/raw?limit=100` — ultimi record grezzi.
+- `GET /jobs/{request_id}` — job status and result.
+- `GET /queue` — queue snapshot grouped by time slot.
+- `GET /models` — configured task → flavour → model registry.
+- `GET /metrics/summary` — aggregated JSON report (count, execution time, confidence, and quality score for each task/flavour pair).
+- `GET /metrics/raw?limit=100` — most recent raw records.
 - `GET /health` — liveness.
 
-Ogni job eseguito viene anche accodato in append su `data/metrics.jsonl`
-(percorso configurabile), indipendentemente dalle richieste HTTP al report.
+Every executed job is also appended to `data/metrics.jsonl` (configurable path), independently of HTTP report requests.
 
 ## Esempi curl
 
@@ -167,72 +123,40 @@ curl -X POST localhost:9000/jobs -H 'Content-Type: application/json' -d '{
             "context": "Barack Obama was born in Hawaii and became President of the United States."}
 }'
 
-# Risultato (sostituisci <id> con il request_id ricevuto)
+# Result (replace <id> with the received request_id)
 curl localhost:9000/jobs/<id>
 
-# Report metriche
+# Metrics report
 curl localhost:9000/metrics/summary
 ```
 
-## Test
+## Tests
 
-Il test suite (`tests/test_api.py`) monkeypatcha l'esecuzione reale del
-modello (`run_task`) con uno stub veloce: verifica routing HTTP, code per
-timeslot, adapter `/dispatch`, metriche — **senza** scaricare/eseguire alcun
-modello, quindi non serve `torch`/`transformers` installati né una GPU:
+The test suite (`tests/test_api.py`) replaces real model execution (`run_task`) with a fast stub. It verifies HTTP routing, time-slot queues, the `/dispatch` adapter, and metrics **without** downloading or running any model, so neither `torch`/`transformers` nor a GPU is required:
 
 ```sh
 pip install -r requirements-dev.txt
 pytest -q
 ```
 
-### Test manuale con modelli reali
+### Manual tests with real models
 
-Dopo aver installato anche `torch`/`transformers` (`requirements.txt`
-completo) e avviato `uvicorn app.main:app`, usa gli esempi curl sopra: la
-prima chiamata per un dato `(task, flavour)` scarica il modello (se non già
-scaricato con `scripts/download_models.py`), le successive sono immediate.
+After installing `torch` and `transformers` from the full `requirements.txt` and starting `uvicorn app.main:app`, use the curl examples above. The first request for each `(task, flavour)` downloads its model if it has not already been fetched with `scripts/download_models.py`; subsequent requests start immediately.
 
-### Calibrazione modelli (errore/costo reali per carbonshift)
+### Model calibration (measured error and cost for CarbonShift)
 
 ```sh
-pip install datasets  # o requirements-dev.txt, che la include già
+pip install datasets  # or use requirements-dev.txt, which already includes it
 python scripts/calibrate_models.py --source dataset --samples 30
 ```
 
-Esegue davvero ogni `(task, flavour)` configurato in `app/config.py` su
-esempi reali (`--source dataset`, consigliata: centinaia/migliaia di esempi
-con ground truth, invece dei ~5 esempi sintetici per task che possono far
-oscillare la media su un campione piccolo), misura l'errore reale (da
-`quality_score`) e il tempo di esecuzione medio, e aggiorna
-`../client/model_stats.json` (indicizzato per nome di modello, così
-cambiare/aggiungere modelli non perde le misurazioni più vecchie). Da lì,
-ogni record include anche l'ID versionato della semantica usata per misurare
-l'errore. `client/scripts/push_flavours.py` combina i record più recenti per
-task/flavour e registra profili QoS immutabili su carbonshift — vedi
-`client/README.md` §"Flavour dinamici per task". Se cambia una calibrazione,
-usa una nuova versione del profilo invece di riutilizzare un ID con contenuto
-diverso.
+This runs every `(task, flavour)` configured in `app/config.py` on real examples (`--source dataset` is recommended: hundreds or thousands of examples with ground truth, rather than about five synthetic examples per task that can make small-sample averages unstable). It measures actual error (from `quality_score`) and average execution time, then updates `../client/model_stats.json`. The file is indexed by model name, so changing or adding models does not discard older measurements. Each record also includes the versioned ID of the error semantics used for measurement. `client/scripts/push_flavours.py` combines the most recent records by task/flavour and registers immutable QoS profiles with CarbonShift; see the client guide's [task-specific calibrated flavours](../client/README.md#task-specific-calibrated-flavours) section. When calibration changes, register a new profile version instead of reusing an ID with different contents.
 
-For QA/NER, `actual_error_pct` follows the measured `quality_score` even for
-the Accurate flavour when a ground-truth reference is supplied; it is not
-forced to zero merely because Accurate is the comparison baseline. Without a
-reference, Accurate's quality convention is 1.0, so the derived error is zero.
-Text generation uses relative confidence degradation instead, making
-Accurate's error zero against itself.
+For QA/NER, `actual_error_pct` follows the measured `quality_score` even for the Accurate flavour when a ground-truth reference is supplied; it is not forced to zero merely because Accurate is the comparison baseline. Without a reference, Accurate's quality convention is 1.0, so the derived error is zero. Text generation uses relative confidence degradation instead, making Accurate's error zero against itself.
 
-## Emulazione a tempo fittizio
+## Manual-clock emulation
 
-Per test multi-timeslot senza aspettare il tempo reale (vedi
-`carbonshift/rust/PLAN_SERVICE.md` §"Emulazione a tempo fittizio" per il
-protocollo completo insieme a carbonshift), imposta `EXECUTOR_MANUAL_CLOCK=1`:
-l'orologio della coda si congela e avanza solo tramite
-`POST /admin/advance-slot`, che sposta il clock al timeslot successivo,
-esegue (bloccando la risposta HTTP) tutti i job ora dovuti, e restituisce lo
-stato finale della coda. Il provider è il time master: al primo tick invia
-prima un `announce` con `slot_start_utc` per sincronizzare l'executor, poi
-invia i successivi rollover dopo CarbonShift. Se la durata comunicata dal
-provider non coincide con `EXECUTOR_SLOT_MINUTES`, l'endpoint risponde `409`.
+For multi-slot tests without waiting for real time, set `EXECUTOR_MANUAL_CLOCK=1`; see `carbonshift/rust/PLAN_SERVICE.md` for the complete protocol shared with CarbonShift. The queue clock is frozen and advances only through `POST /admin/advance-slot`, which moves it to the next slot, wakes the worker, and returns immediately without waiting for inference. The provider is the time master: after CarbonShift closes the previous slot, it advances CarbonShift and the executor, then starts client ticks. CarbonShift does not close a slot until all clients have submitted their requests and callbacks have arrived for all jobs due in that slot. The worker can therefore process jobs while clients are still submitting requests for the same slot. If the slot duration sent by the provider does not match `EXECUTOR_SLOT_MINUTES`, the endpoint returns `409`.
 
 ```sh
 EXECUTOR_MANUAL_CLOCK=1 EXECUTOR_SLOT_MINUTES=30 uvicorn app.main:app --port 9000
@@ -241,21 +165,16 @@ curl -X POST localhost:9000/admin/advance-slot \
   -d '{"kind":"announce","slot_start_utc":"2026-08-26T18:00:00Z","slot_minutes":30}'
 ```
 
-## Integrazione con carbonshift e con il client
+## Integration with CarbonShift and the client
 
-Il client (cartella `../client/`, vedi il suo README) invia le richieste a
-carbonshift, non direttamente qui — questo executor riceve solo le
-dispatch di carbonshift su `/dispatch`. Per collegarli:
+The client (in `../client/`; see its README) sends requests to CarbonShift, not directly to the executor. This service only receives CarbonShift dispatches on `/dispatch`. To connect them:
 
 ```sh
 EXECUTOR_URL=http://<host-executor>:9000/dispatch \
   ./carbonshift/rust/target/release/carbonshift-service
 ```
 
-Il `payload` (campo opaco che carbonshift inoltra invariato) deve contenere
-`{"task": ..., "input": {...}}` nel formato atteso da questo executor —
-carbonshift si occupa solo di slot/flavour/tempistica, il contenuto del job
-è tutto dentro `payload`.
+The opaque `payload` field is forwarded unchanged by CarbonShift and must contain `{"task": ..., "input": {...}}` in the format expected by this executor. CarbonShift handles only the slot, flavour, and timing; the job input is carried in `payload`.
 
 ## Docker
 
@@ -264,21 +183,11 @@ docker build -t carbonshift-executor .
 docker run --rm -p 9000:9000 -v hf-cache:/root/.cache/huggingface carbonshift-executor
 ```
 
-Il volume `hf-cache` evita di riscaricare i modelli ad ogni riavvio del
-container. Per l'intero stack (carbonshift + executor + client) vedi il
-`docker-compose.yml` nella cartella radice del workspace. L'immagine è
-CPU-only per semplicità; per la GPU serve un'immagine base `nvidia/cuda` +
-`--gpus all` (non incluso qui, per restare semplici — vedi i commenti nel
-`Dockerfile`).
+The `hf-cache` volume avoids downloading models again after container restarts. See the workspace-root `docker-compose.yml` for the complete stack. The image is CPU-only; GPU support requires an `nvidia/cuda` base image and `--gpus all`, which are not included here for simplicity (see the comments in the `Dockerfile`).
 
-## Semplificazioni note
+## Known simplifications
 
-- Nessun retry sul callback (un solo tentativo, poi solo log) — coerente con
-  "keep it simple"; se serve robustezza maggiore si può aggiungere lo stesso
-  schema di backoff usato da carbonshift.
-- Nessuna persistenza della coda: un riavvio perde i job non ancora eseguiti
-  (le metriche già scritte su disco restano).
-- `quality_score` è un semplice F1 su overlap di token, non una metrica NLP
-  "vera" (BLEU/ROUGE/exact-match SQuAD) — sufficiente per un confronto
-  relativo fra flavour, non per un paper.
-- L'immagine Docker non include supporto GPU per default (vedi sezione Docker).
+- Callbacks are not retried; after one attempt, failures are only logged. A retry policy like CarbonShift's backoff could be added if greater robustness is needed.
+- The queue is not persisted. Restarting the service loses jobs that have not run, but metrics already written to disk remain.
+- `quality_score` is a simple token-overlap F1 score, not a full NLP metric such as BLEU, ROUGE, or SQuAD exact match. It is sufficient for relative flavour comparisons, not for academic evaluation.
+- The Docker image does not include GPU support by default; see the Docker section.
