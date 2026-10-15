@@ -92,7 +92,7 @@ class Settings:
     executor_url: str = os.environ.get("EXECUTOR_URL", "")
     client_urls: tuple[str, ...] = _client_urls_from_environment()
     self_base_url: str = os.environ.get("PROVIDER_SELF_BASE_URL", "http://localhost:9100")
-    notify_timeout_seconds: float = float(os.environ.get("PROVIDER_NOTIFY_TIMEOUT_SECONDS", "30"))
+    notify_timeout_seconds: float = float(os.environ.get("PROVIDER_NOTIFY_TIMEOUT_SECONDS", "125"))
     notify_max_attempts: int = int(os.environ.get("PROVIDER_NOTIFY_MAX_ATTEMPTS", "3"))
     notify_retry_backoff_seconds: float = float(os.environ.get("PROVIDER_NOTIFY_RETRY_BACKOFF_SECONDS", "1.0"))
 

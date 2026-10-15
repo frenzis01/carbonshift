@@ -1,9 +1,8 @@
-"""Ordered, retrying fan-out of one slot rollover to the peer services.
+"""Ordered, retrying slot notifications to the peer services.
 
-This is where the user's "is there an ordering problem?" question is answered
-concretely. The design is: **push an idempotent slot notification, in a fixed
-order, with bounded retries — and make the clock advance strictly after the
-peers have acknowledged.**
+The provider closes the active slot before advancing. At a new boundary it
+advances CarbonShift, then the executor, then starts client submissions, so
+already-due work can run concurrently with requests arriving in that slot.
 
 Why push rather than have each peer poll:
 * the provider is the only component that knows a new slot has *started*; if
@@ -12,20 +11,18 @@ Why push rather than have each peer poll:
 * in manual-clock emulation, a poller would have to be *told* to advance
   anyway, which amounts to the same push with more moving parts.
 
-Why a fixed order (carbonshift before executor):
-* carbonshift owns *dispatch*. If the executor advanced first, it could
-  receive `/dispatch` calls for a slot it has already moved past — a job that
-  silently misses its slot. Advancing carbonshift first guarantees that
-  everything due for the slot just left has been handed off before the
-  executor's own clock moves.
-* the order is a *policy*, declared in one place, not implied by dict order.
+Why a fixed order (carbonshift, executor, clients):
+* CarbonShift owns dispatch. It must enter the new slot and hand already-due
+  jobs to the executor before the executor advances.
+* The executor advances without waiting for inference, so its worker can run
+  due jobs while the client is still submitting requests for the new slot.
+* The order is a policy, declared in one place, not implied by dict order.
 
 Why retries + a report rather than "fire and forget":
-* the current client-side launcher ignores advance failures entirely
-  (`_advance_slot` logs and `return`s), so a peer that is briefly down
-  silently desynchronizes the run. Here every attempt is recorded and the
-  caller can refuse to advance, or surface a degraded state, instead of
-  pretending success.
+* a failed close-slot acknowledgement must hold the provider at the current
+  slot, while a failed post-advance notification must be reported as a
+  desynchronization. Recording each attempt lets the caller distinguish those
+  two cases instead of pretending success.
 """
 from __future__ import annotations
 
@@ -44,12 +41,10 @@ logger = logging.getLogger("provider.notifications")
 
 
 class Role(str, Enum):
-    """What a peer does with a slot rollover.
+    """Whether a peer advances a clock or produces work for an entered slot.
 
-    This is not decoration: it is the *reason* the fan-out order is what it is
-    (see the module docstring). A PRODUCER supplies the work for the slot that
-    is starting; a CONSUMER processes it. Producers must be notified first, or
-    their work arrives after the slot it belongs to has already been handled.
+    Clock consumers are notified before client producers so the scheduler and
+    executor can begin work for the slot while clients are still submitting.
     """
 
     CONSUMER = "consumer"
@@ -60,23 +55,23 @@ class Role(str, Enum):
 class Peer:
     """A component to notify on each slot rollover.
 
-    `advance_path` is per-peer rather than hard-coded so the same fan-out
-    works against the client (`/v1/tick`), carbonshift
-    (`/v1/admin/advance-slot`) and the executor (`/admin/advance-slot`), and
-    can be retargeted without touching logic.
+    The notification path is per-peer, so slot ticks and close-slot
+    acknowledgements share one retrying delivery mechanism.
     """
 
     name: str
     base_url: str
-    advance_path: str
+    path: str
     order: int
     # Defaulted to CONSUMER because that is the common case; producers opt in
     # explicitly at the one place that builds the list.
     role: Role = Role.CONSUMER
+    # Some notifications carry a slot-level acknowledgement in their response.
+    ack_slot_field: Optional[str] = None
 
     @property
     def url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.advance_path}"
+        return f"{self.base_url.rstrip('/')}{self.path}"
 
 
 @dataclass
@@ -234,10 +229,35 @@ def _deliver(
                     error="peer refused: its manual clock is not enabled (409)",
                 )
             if status is not None and 200 <= status < 300:
-                return DeliveryResult(
-                    peer=peer.name, url=peer.url, ok=True, attempts=attempt, status_code=status
-                )
-            last_error = f"unexpected status {status}"
+                if peer.ack_slot_field is not None:
+                    try:
+                        acknowledgement = resp.json()
+                    except (AttributeError, ValueError) as exc:
+                        last_error = f"invalid JSON acknowledgement: {exc}"
+                    else:
+                        if (
+                            not isinstance(acknowledgement, dict)
+                            or acknowledgement.get(peer.ack_slot_field)
+                            != payload.get("current_slot")
+                        ):
+                            last_error = (
+                                f"acknowledgement did not confirm slot "
+                                f"{payload.get('current_slot')}"
+                            )
+                        else:
+                            return DeliveryResult(
+                                peer=peer.name,
+                                url=peer.url,
+                                ok=True,
+                                attempts=attempt,
+                                status_code=status,
+                            )
+                else:
+                    return DeliveryResult(
+                        peer=peer.name, url=peer.url, ok=True, attempts=attempt, status_code=status
+                    )
+            if status is None or not 200 <= status < 300:
+                last_error = f"unexpected status {status}"
         except requests.RequestException as exc:
             last_error = str(exc)
 
@@ -252,32 +272,16 @@ def _deliver(
 def peers_from_settings(settings) -> list[Peer]:
     """Build the peer list (and its policy order) from configuration.
 
-    Order rationale is documented in the module docstring; keeping it here
-    makes it a single reviewable place. Client producers are an ordered,
-    configuration-driven group so adding another client does not change the
-    fan-out policy.
+    Order rationale is documented in the module docstring. Client producers
+    remain a configuration-driven group so adding another client does not
+    change the clock-consumer order.
     """
-    client_peers = [
-        Peer(
-            name="client" if index == 1 else f"client-{index}",
-            base_url=base_url,
-            advance_path="/v1/tick",
-            order=index * 10,
-            role=Role.PRODUCER,
-        )
-        for index, base_url in enumerate(settings.client_urls, start=1)
-    ]
-    first_consumer_order = (len(client_peers) + 1) * 10
     peers = [
-        *client_peers,
         Peer(
             name="carbonshift",
             base_url=settings.carbonshift_url,
-            # carbonshift already exposes exactly this endpoint; the provider
-            # assumes the *role* of the clock driver the client plays today.
-            advance_path="/v1/admin/advance-slot",
-            order=first_consumer_order,
-            role=Role.CONSUMER,
+            path="/v1/admin/advance-slot",
+            order=10,
         )
     ]
     if settings.executor_url.strip():
@@ -285,9 +289,20 @@ def peers_from_settings(settings) -> list[Peer]:
             Peer(
                 name="executor",
                 base_url=settings.executor_url,
-                advance_path="/admin/advance-slot",
-                order=first_consumer_order + 10,
-                role=Role.CONSUMER,
+                path="/admin/advance-slot",
+                order=20,
             )
         )
+    first_client_order = (len(peers) + 1) * 10
+    peers.extend(
+        Peer(
+            name="client" if index == 1 else f"client-{index}",
+            base_url=base_url,
+            path="/v1/tick",
+            order=first_client_order + (index - 1) * 10,
+            role=Role.PRODUCER,
+            ack_slot_field="slot",
+        )
+        for index, base_url in enumerate(settings.client_urls, start=1)
+    )
     return peers

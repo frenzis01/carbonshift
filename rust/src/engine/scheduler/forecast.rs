@@ -73,12 +73,9 @@ pub fn generate_carbon_intensity_forecast(
 /// Only meaningful when `Config::simulation.manual_clock` is true (otherwise nothing
 /// else keeps the clock from also drifting with real wall-clock time).
 /// `main_loop` derives `current_slot` from `virtual_elapsed_ms` every tick,
-/// so bumping the latter is all that's needed — `main_loop`'s own slot-end
-/// flush (`current_slot > last_flush_slot`) then drains any request still
-/// stranded in the slot we just left, within its next 1-10ms tick. This
-/// function blocks briefly for that drain so the caller (the REST service's
-/// `/v1/admin/advance-slot`) can rely on "call returned" meaning "this
-/// slot's requests all got a DP assignment", not just "the clock moved".
+/// so bumping the latter is all that's needed. The loop retains its normal
+/// slot-end partial-batch flush; manual emulation can request that same flush
+/// before advancing through the provider's close-slot endpoint.
 pub fn advance_to_next_slot(
     shared_state: &SharedState,
     total_slots: i32,

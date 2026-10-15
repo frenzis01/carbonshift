@@ -370,6 +370,7 @@ fn main_loop(
         shared_state.set_current_slot(current_slot);
 
         let mut did_something = false;
+        let close_slot_flush = shared_state.pending_flush_requested(current_slot);
 
         // unwrap carbon_forecast here so that we get a consistent snapshot for this batch.
         let cf = Arc::new(carbon_forecast.read().unwrap().clone());
@@ -399,11 +400,10 @@ fn main_loop(
             );
         } else if pending_count > 0
             && active_workers < cfg.solver.max_batch_solver_parallelism
-            && (current_slot > last_flush_slot || flush_backlog)
+            && (close_slot_flush || current_slot > last_flush_slot || flush_backlog)
         {
-            // Slot-end flush: requests are stranded (< batch_size) and the slot
-            // has advanced.  Dispatch even a partial batch so requests don't
-            // miss their deadline waiting for the N-th arrival.
+            // Flush stranded partial batches either at slot end or when the
+            // service closes a manual-clock slot before advancing its clock.
             if cfg.logging.verbose {
                 println!("[Scheduler] Flush {pending_count} stale pending (slot={current_slot})");
             }
@@ -472,6 +472,10 @@ fn main_loop(
                 );
             }
             did_something = true;
+        }
+
+        if pending_count == 0 && active_workers == 0 && close_slot_flush {
+            shared_state.clear_pending_flush(current_slot);
         }
 
         // Sleep longer when truly idle; poll at 1ms when workers are running or

@@ -281,6 +281,9 @@ pub struct SharedState {
     /// Used by the scheduler's skip-empty-slots logic to avoid skipping a slot
     /// before the generator has had a chance to add its requests.
     generator_processed_slot: Arc<AtomicI32>,
+    /// Slot whose client submissions have closed and whose partial batch must
+    /// be flushed without advancing the manual clock.
+    flush_requested_slot: Arc<AtomicI32>,
 }
 
 impl SharedState {
@@ -291,6 +294,7 @@ impl SharedState {
             capacity_tier_revision: Arc::new(AtomicU64::new(0)),
             virtual_elapsed_ms: Arc::new(AtomicU64::new(0)),
             generator_processed_slot: Arc::new(AtomicI32::new(-1)),
+            flush_requested_slot: Arc::new(AtomicI32::new(-1)),
         }
     }
 
@@ -366,6 +370,33 @@ impl SharedState {
     #[inline]
     pub fn generator_processed_slot(&self) -> i32 {
         self.generator_processed_slot.load(Ordering::Acquire)
+    }
+
+    /// Request the scheduler loop to flush partial batches for `slot`.
+    ///
+    /// The request is separate from advancing virtual time so manual-clock
+    /// emulation can finish scheduling the active slot before closing it.
+    #[inline]
+    pub fn request_pending_flush(&self, slot: i32) {
+        self.flush_requested_slot.store(slot, Ordering::Release);
+    }
+
+    /// Whether the scheduler loop has a close-slot flush pending for `slot`.
+    #[inline]
+    pub fn pending_flush_requested(&self, slot: i32) -> bool {
+        self.flush_requested_slot.load(Ordering::Acquire) == slot
+    }
+
+    /// Clear a completed flush request without disturbing a newer slot's
+    /// request.
+    #[inline]
+    pub fn clear_pending_flush(&self, slot: i32) {
+        let _ = self.flush_requested_slot.compare_exchange(
+            slot,
+            -1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     // ── request queue ─────────────────────────────────────────────────────

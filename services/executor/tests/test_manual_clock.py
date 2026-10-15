@@ -120,7 +120,7 @@ def test_future_slot_job_waits_for_advance(monkeypatch):
     assert queue.get(job.request_id).status == "queued"
 
     queue.advance_slot()
-    assert queue.get(job.request_id).status == "completed"
+    assert _wait_for_status(queue, job.request_id, "completed")
     queue.stop()
 
 
@@ -132,7 +132,7 @@ def test_advance_slot_only_runs_jobs_up_to_the_new_slot(monkeypatch):
                               execute_at=now + timedelta(minutes=60), callback_url=None)
 
     queue.advance_slot()  # -> now+30min
-    assert queue.get(due_now.request_id).status == "completed"
+    assert _wait_for_status(queue, due_now.request_id, "completed")
     assert queue.get(due_later.request_id).status == "queued"
 
     queue.advance_slot()  # -> now+60min
@@ -140,13 +140,9 @@ def test_advance_slot_only_runs_jobs_up_to_the_new_slot(monkeypatch):
     queue.stop()
 
 
-def test_advance_slot_waits_for_in_flight_execution_not_just_the_queue(monkeypatch):
-    """Regression test: a job can be dequeued (invisible to `_slots`, e.g.
-    downloading its model) while still running when `advance_slot()` checks
-    whether anything is "still due" — it must wait for that job to actually
-    finish, not just for the queue dict to look empty (found via live Docker
-    testing: a cold model download made `advance_slot()` return while the
-    job was still mid-execution)."""
+def test_advance_slot_does_not_wait_for_in_flight_execution(monkeypatch):
+    """Clock fan-out must not wait for inference; CarbonShift's slot barrier
+    waits for the callbacks before the provider advances the next slot."""
     monkeypatch.setattr("app.queue_worker.run_task", make_slow_run_task(0.3))
     clock = VirtualClock(manual=True, slot_minutes=30.0)
     queue = JobQueue(clock)
@@ -157,8 +153,9 @@ def test_advance_slot_waits_for_in_flight_execution_not_just_the_queue(monkeypat
     assert queue.get(job.request_id).status == "running"
 
     result = queue.advance_slot()
-    assert queue.get(job.request_id).status == "completed"
+    assert queue.get(job.request_id).status == "running"
     assert result["queue"] == {}
+    assert _wait_for_status(queue, job.request_id, "completed")
     queue.stop()
 
 

@@ -49,9 +49,9 @@ def send_slot_batch(tracker: RequestTracker, batch: list[dict[str, Any]],
                     deadline_reference: datetime | None = None) -> int:
     """Submit every request in `batch` to carbonshift, synchronously.
 
-    Returns the number actually submitted. Synchronous on purpose: in manual
-    mode the provider blocks on this call, guaranteeing slot N's work is in
-    CarbonShift's queue before it is told to process slot N.
+    Returns the number actually submitted. Synchronous on purpose: the
+    provider does not close slot N until every configured client has finished
+    submitting it, while CarbonShift and the executor can process N concurrently.
 
     A submission failure is logged and skipped rather than raised: one bad
     request should not abort the whole slot. The request is simply not tracked,

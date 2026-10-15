@@ -32,9 +32,25 @@ def client(monkeypatch):
 
 
 class _Resp:
-    def __init__(self, status_code: int = 200) -> None:
+    def __init__(self, status_code: int = 200, body: dict | None = None) -> None:
         self.status_code = status_code
         self.text = ""
+        self.body = body or {}
+
+    def json(self):
+        return self.body
+
+
+def _success_response(url, payload):
+    if url.endswith("/v1/tick"):
+        return _Resp(200, {"slot": payload["current_slot"], "submitted": 0})
+    if url.endswith("/v1/admin/close-slot"):
+        return _Resp(200, {"current_slot": payload["current_slot"], "closed": True})
+    return _Resp(200, {"current_slot": payload["current_slot"]})
+
+
+def _success_post(url, json=None, timeout=None):
+    return _success_response(url, json)
 
 
 def test_health_reports_the_active_source(client):
@@ -55,10 +71,9 @@ def test_meta_describes_the_effective_configuration(client):
 
 
 def test_meta_lists_the_peer_order(client):
-    """The client is first because it produces the slot's work; the consumers
-    follow. See notifications.Role."""
+    """Clock consumers advance before the client starts the entered slot."""
     peers = client.get("/v1/meta").json()["peers"]
-    assert [p["name"] for p in peers] == ["client", "carbonshift"]
+    assert [p["name"] for p in peers] == ["carbonshift", "client"]
     assert peers[0]["order"] < peers[1]["order"]
 
 
@@ -125,7 +140,7 @@ def test_realtime_observed_reads_the_current_slot_on_demand(client):
 
 
 def test_advance_records_a_reading_for_the_new_slot(client, monkeypatch):
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     client.post("/v1/advance-slot", json={})
 
     current = client.get("/v1/slot").json()["current_slot"]
@@ -138,7 +153,7 @@ def test_advance_records_a_reading_for_the_new_slot(client, monkeypatch):
 def test_observed_reading_deviates_from_the_forecast(client, monkeypatch):
     """The emulated measurement must drift from the prediction, otherwise the
     correction path in carbonshift would never be exercised."""
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     client.post("/v1/advance-slot", json={})
 
     current = client.get("/v1/slot").json()["current_slot"]
@@ -154,7 +169,7 @@ def test_reading_describes_the_slot_entered_not_the_one_left(client, monkeypatch
     slot just left, and every correction they apply would be off by one slot —
     a bug that produces plausible numbers and would be very hard to spot.
     """
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     before = client.get("/v1/slot").json()["current_slot"]
     client.post("/v1/advance-slot", json={})
 
@@ -164,7 +179,7 @@ def test_reading_describes_the_slot_entered_not_the_one_left(client, monkeypatch
 
 
 def test_reading_is_recorded_once_per_advanced_slot(client, monkeypatch):
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     first = client.get("/v1/slot").json()["current_slot"]
     for _ in range(3):
         client.post("/v1/advance-slot", json={})
@@ -178,7 +193,7 @@ def test_advance_slot_moves_one_slot_and_reports_deliveries(client, monkeypatch)
 
     def fake_post(url, json=None, timeout=None):
         calls.append(url)
-        return _Resp(200)
+        return _success_response(url, json)
 
     monkeypatch.setattr(main.notifications.requests, "post", fake_post)
 
@@ -188,15 +203,15 @@ def test_advance_slot_moves_one_slot_and_reports_deliveries(client, monkeypatch)
     assert body["current_slot"] == before + 1
     assert body["local_step"] == 1
     assert body["all_ok"] is True
-    # Initial announcement synchronizes consumers before the first client
-    # batch; normal rollover then submits client work before CarbonShift ticks.
+    # The initial announcement aligns consumers and submits the starting slot.
+    # Each rollover drains the current slot before advancing consumers and
+    # starting client submissions for the entered slot.
     assert calls == [
-        # First advance announces slot 0 to CarbonShift before the client.
         "http://localhost:8080/v1/admin/advance-slot",
         "http://localhost:8100/v1/tick",
-        # Followed by rollover into slot 1, with the usual producer-first order.
-        "http://localhost:8100/v1/tick",
+        "http://localhost:8080/v1/admin/close-slot",
         "http://localhost:8080/v1/admin/advance-slot",
+        "http://localhost:8100/v1/tick",
     ]
 
 
@@ -218,19 +233,52 @@ def test_failed_initial_consumer_announcement_does_not_tick_client(client, monke
     assert client.get("/v1/slot").json()["current_slot"] == before
 
 
+def test_close_slot_failure_does_not_advance_or_desynchronize(client, monkeypatch):
+    def fail_close(url, json=None, timeout=None):
+        if url.endswith("/v1/admin/close-slot"):
+            return _Resp(503)
+        return _success_response(url, json)
+
+    monkeypatch.setattr(main.notifications.requests, "post", fail_close)
+    before = client.get("/v1/slot").json()["current_slot"]
+
+    response = client.post("/v1/advance-slot", json={})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["slot_close_failed"] is True
+    assert client.get("/v1/slot").json()["current_slot"] == before
+    assert main.is_desynced() is False
+
+
+def test_client_tick_must_acknowledge_the_slot_before_it_can_be_closed(client, monkeypatch):
+    def wrong_client_slot(url, json=None, timeout=None):
+        if url.endswith("/v1/tick"):
+            return _Resp(200, {"slot": json["current_slot"] + 1, "submitted": 0})
+        return _success_response(url, json)
+
+    monkeypatch.setattr(main.notifications.requests, "post", wrong_client_slot)
+    before = client.get("/v1/slot").json()["current_slot"]
+
+    response = client.post("/v1/advance-slot", json={})
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["announcement_failed"] is True
+    assert client.get("/v1/slot").json()["current_slot"] == before
+
+
 def test_initial_announcement_synchronizes_all_consumers_before_client(client, monkeypatch):
     from app.notifications import Peer, Role
 
     monkeypatch.setattr(main, "peers", [
-        Peer("client", "http://client", "/v1/tick", 10, Role.PRODUCER),
-        Peer("carbonshift", "http://carbonshift", "/v1/admin/advance-slot", 20),
-        Peer("executor", "http://executor", "/admin/advance-slot", 30),
+        Peer("carbonshift", "http://carbonshift", "/v1/admin/advance-slot", 10),
+        Peer("executor", "http://executor", "/admin/advance-slot", 20),
+        Peer("client", "http://client", "/v1/tick", 30, Role.PRODUCER, "slot"),
     ])
     calls: list[tuple[str, str]] = []
 
     def fake_post(url, json=None, timeout=None):
-        calls.append((url, json["kind"]))
-        return _Resp(200)
+        calls.append((url, json.get("kind", "close")))
+        return _success_response(url, json)
 
     monkeypatch.setattr(main.notifications.requests, "post", fake_post)
 
@@ -241,9 +289,10 @@ def test_initial_announcement_synchronizes_all_consumers_before_client(client, m
         ("http://carbonshift/v1/admin/advance-slot", "announce"),
         ("http://executor/admin/advance-slot", "announce"),
         ("http://client/v1/tick", "announce"),
-        ("http://client/v1/tick", "rollover"),
+        ("http://carbonshift/v1/admin/close-slot", "close"),
         ("http://carbonshift/v1/admin/advance-slot", "rollover"),
         ("http://executor/admin/advance-slot", "rollover"),
+        ("http://client/v1/tick", "rollover"),
     ]
 
 
@@ -252,7 +301,7 @@ def test_advance_slot_pushes_the_forecast_window_to_peers(client, monkeypatch):
 
     def fake_post(url, json=None, timeout=None):
         captured.update(json)
-        return _Resp(200)
+        return _success_response(url, json)
 
     monkeypatch.setattr(main.notifications.requests, "post", fake_post)
     client.post("/v1/advance-slot", json={})
@@ -266,7 +315,7 @@ def test_advance_slot_pushes_the_forecast_window_to_peers(client, monkeypatch):
 
 
 def test_advance_slot_accepts_expect_slot_when_it_matches(client, monkeypatch):
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     current = client.get("/v1/slot").json()["current_slot"]
     assert client.post("/v1/advance-slot", json={"expect_slot": current}).status_code == 200
 
@@ -287,36 +336,52 @@ def test_advance_slot_can_skip_notifying_peers(client):
 
 
 def test_advance_slot_fails_hard_when_a_peer_does_not_ack(client, monkeypatch):
-    """A partial fan-out must not return 200: the clock moved but not every
-    peer followed, so the run is unrecoverable and must be reported as such."""
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    """A partial post-advance fan-out leaves the run unrecoverably desynced."""
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     assert client.post("/v1/advance-slot", json={}).status_code == 200
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
+    def fail_rollover(url, json=None, timeout=None):
+        if json.get("kind") == "rollover":
+            return _Resp(500)
+        return _success_response(url, json)
+
+    monkeypatch.setattr(main.notifications.requests, "post", fail_rollover)
     resp = client.post("/v1/advance-slot", json={})
     assert resp.status_code == 503
     detail = resp.json()["detail"]
     assert detail["desynced"] is True
-    assert detail["deliveries"][0]["ok"] is False
+    assert any(not delivery["ok"] for delivery in detail["deliveries"])
 
 
 def test_a_desynced_provider_refuses_all_further_advances(client, monkeypatch):
     """The latch is what stops a desynced run from quietly continuing."""
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     assert client.post("/v1/advance-slot", json={}).status_code == 200
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
+    monkeypatch.setattr(
+        main.notifications.requests,
+        "post",
+        lambda url, json=None, timeout=None: (
+            _Resp(500) if json.get("kind") == "rollover" else _success_response(url, json)
+        ),
+    )
     assert client.post("/v1/advance-slot", json={}).status_code == 503
 
     # Even with a healthy peer now, the run stays refused.
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     resp = client.post("/v1/advance-slot", json={})
     assert resp.status_code == 503
     assert "restart the stack" in resp.json()["detail"]["reason"]
 
 
 def test_health_reports_degraded_once_desynced(client, monkeypatch):
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(200))
+    monkeypatch.setattr(main.notifications.requests, "post", _success_post)
     assert client.post("/v1/advance-slot", json={}).status_code == 200
-    monkeypatch.setattr(main.notifications.requests, "post", lambda *a, **k: _Resp(500))
+    monkeypatch.setattr(
+        main.notifications.requests,
+        "post",
+        lambda url, json=None, timeout=None: (
+            _Resp(500) if json.get("kind") == "rollover" else _success_response(url, json)
+        ),
+    )
     client.post("/v1/advance-slot", json={})
 
     resp = client.get("/health")

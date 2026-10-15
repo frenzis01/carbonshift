@@ -47,6 +47,15 @@ pub struct AdvanceSlotBody {
     pub forecast: Option<Vec<ForecastPoint>>,
 }
 
+/// Payload sent by the provider after every client has finished submitting
+/// work for the current slot.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseSlotBody {
+    pub current_slot: i64,
+    pub slot_minutes: f64,
+}
+
 /// One provider forecast value expressed in the provider's global slot space.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ForecastPoint {
@@ -534,12 +543,10 @@ pub async fn ready(State(state): State<AppState>) -> (StatusCode, Json<HorizonRe
     (status, Json(h))
 }
 
-/// `POST /v1/admin/advance-slot` — test-only: force the virtual clock to
-/// the next slot boundary (`Config::simulation.manual_clock` must be enabled), then
-/// block until every assignment produced for the slot just left has been
-/// handed off to the executor (status `Dispatched`, not just `Scheduled`).
-/// See PLAN_SERVICE.md "Emulazione a tempo fittizio" for the full protocol
-/// this enables together with the executor's own `/admin/advance-slot`.
+/// `POST /v1/admin/advance-slot` — enter the provider's announced slot in
+/// manual-clock mode, update its forecast/observation, and hand already-due
+/// assignments to the executor. The provider closes the previous slot through
+/// `close_slot` before issuing this transition.
 ///
 /// The JSON body carries the provider's current global slot, optional observed
 /// reading, and forecast window. Observations correct committed costs after
@@ -697,9 +704,9 @@ pub async fn advance_slot(
         }
     }
 
-    // The provider calls peers sequentially, so do not report this transition
-    // before assignment solving and due dispatch have had a chance to finish.
-    // Keep the wait bounded so one slow batch cannot block the provider forever.
+    // Do not acknowledge the transition before assignment solving and due
+    // dispatch have had a chance to finish. Execution callbacks are drained
+    // separately by `close_slot`, not by this clock-advance endpoint.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     // Wait until all pending requests are solved and any request due at or before curr_slot
     // has been dispatched to the executor.
@@ -722,6 +729,208 @@ pub async fn advance_slot(
     }
 
     Ok(Json(serde_json::json!({ "current_slot": curr_slot })))
+}
+
+/// `POST /v1/admin/close-slot` — synchronously close the provider's active slot.
+///
+/// The provider calls this only after all clients have returned their tick
+/// responses for the slot. This handler does not make a callback to the
+/// provider or advance CarbonShift's clock: it keeps the HTTP request open
+/// while it closes admission, asks the scheduler loop to flush its existing
+/// partial-batch path, and polls until the slot is drained. Executor callbacks
+/// arrive independently at `executor_callback` while this request is waiting.
+///
+/// A successful response means requests arriving in this slot have been
+/// assigned and all assignments due in this slot have been dispatched and
+/// have terminal executor callbacks (when an executor is configured). A
+/// dispatch failure or timeout returns `503`, so the provider must not advance.
+pub async fn close_slot(
+    State(state): State<AppState>,
+    Json(body): Json<CloseSlotBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.scheduler.manual_clock {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "MANUAL_CLOCK is not enabled on this instance",
+        ));
+    }
+    let provider_slot_duration_secs = body.slot_minutes * 60.0;
+    if !provider_slot_duration_secs.is_finite()
+        || (provider_slot_duration_secs - state.scheduler.effective_slot_duration_secs).abs() > 1e-6
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "provider slot length ({} minutes) does not match CarbonShift slot duration ({} seconds)",
+                body.slot_minutes, state.scheduler.effective_slot_duration_secs
+            ),
+        ));
+    }
+
+    let slot_epoch_offset = *state.slot_epoch_offset.lock().unwrap();
+    let slot_epoch_offset = slot_epoch_offset.ok_or_else(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "provider slot offset is not initialized",
+        )
+    })?;
+    let engine_slot =
+        i32::try_from(body.current_slot - i64::from(slot_epoch_offset)).map_err(|_| {
+            api_error(
+                StatusCode::CONFLICT,
+                "provider slot is outside the engine range",
+            )
+        })?;
+    if engine_slot < 0 || engine_slot >= state.scheduler.total_slots {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "provider slot is outside the engine horizon",
+        ));
+    }
+    if state.shared_state.get_current_slot() != engine_slot {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "cannot close engine slot {engine_slot}; CarbonShift is at {}",
+                state.shared_state.get_current_slot()
+            ),
+        ));
+    }
+
+    // Publish the admission fence before requesting a flush. `submit_request`
+    // checks this same fence while enqueueing, so no request for this slot can
+    // be accepted after the provider's client acknowledgements and race behind
+    // the flush.
+    {
+        let mut closed_through = state.closed_through_slot.lock().unwrap();
+        if engine_slot < *closed_through {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!("engine slot {engine_slot} is already behind the close-slot barrier"),
+            ));
+        }
+        *closed_through = engine_slot;
+    }
+    // This wakes the scheduler's existing partial-batch flush condition. It
+    // intentionally leaves current_slot and virtual time unchanged.
+    state.shared_state.request_pending_flush(engine_slot);
+
+    // The provider's POST remains pending during this loop. Callback traffic
+    // uses separate requests to this service and marks each job terminal;
+    // there is no follow-up callback from CarbonShift to the provider.
+    let timeout_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (
+            unscheduled,
+            due_assignment_count,
+            dispatching,
+            dispatch_failed,
+            callbacks_pending,
+            callback_count,
+        ) = {
+            let assignments = state.shared_state.get_current_assignments();
+            let tracked = state.tracked.lock().unwrap();
+            // Include every accepted request that arrived in or before the
+            // closing slot: a solver may legally schedule it in a later slot,
+            // but it still must not be left pending when the slot is closed.
+            let unscheduled = tracked
+                .iter()
+                .filter(|(id, request)| {
+                    request.arrival_slot <= engine_slot && !assignments.contains_key(id)
+                })
+                .count();
+            // Only work due by this boundary must finish before advancing.
+            // Later assignments remain queued for their own slot transitions.
+            let due_assignments: Vec<_> = assignments
+                .iter()
+                .filter(|(_, assignment)| assignment.scheduled_slot <= engine_slot)
+                .collect();
+            let dispatching = due_assignments
+                .iter()
+                .filter(|(id, _)| {
+                    tracked.get(*id).map_or(true, |request| {
+                        matches!(
+                            request.status,
+                            RequestStatus::Pending | RequestStatus::Scheduled
+                        )
+                    })
+                })
+                .count();
+            // A terminal dispatch failure is not an executor completion. Fail
+            // the barrier explicitly instead of counting it as a callback.
+            let dispatch_failed = due_assignments.iter().any(|(id, _)| {
+                tracked.get(*id).is_some_and(|request| {
+                    request.status == RequestStatus::Failed && !request.executor_callback_received
+                })
+            });
+            // In dry-run mode there is no external executor and therefore no
+            // callback to await; successful dispatch is the terminal action.
+            let callbacks_pending = if state.service_cfg.executor_url.is_some() {
+                due_assignments
+                    .iter()
+                    .filter(|(id, _)| {
+                        tracked.get(*id).map_or(true, |request| {
+                            !request.executor_callback_received
+                                || !matches!(
+                                    request.status,
+                                    RequestStatus::Completed | RequestStatus::Failed
+                                )
+                        })
+                    })
+                    .count()
+            } else {
+                0
+            };
+            let callback_count = due_assignments
+                .iter()
+                .filter(|(id, _)| {
+                    tracked.get(*id).is_some_and(|request| {
+                        request.executor_callback_received
+                            && matches!(
+                                request.status,
+                                RequestStatus::Completed | RequestStatus::Failed
+                            )
+                    })
+                })
+                .count();
+            (
+                unscheduled,
+                due_assignments.len(),
+                dispatching,
+                dispatch_failed,
+                callbacks_pending,
+                callback_count,
+            )
+        };
+
+        if dispatch_failed {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("slot {engine_slot} has an assignment that failed to dispatch"),
+            ));
+        }
+        // This is the close-slot acknowledgement consumed by the provider.
+        // Report only after scheduling, dispatch, and callback barriers pass.
+        if unscheduled == 0 && dispatching == 0 && callbacks_pending == 0 {
+            return Ok(Json(serde_json::json!({
+                "current_slot": body.current_slot,
+                "closed": true,
+                "assignments": due_assignment_count,
+                "callbacks": callback_count,
+            })));
+        }
+        if tokio::time::Instant::now() >= timeout_deadline {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "slot {engine_slot} did not drain before timeout \
+                     (unscheduled={unscheduled}, dispatching={dispatching}, \
+                     callbacks_pending={callbacks_pending})"
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// Establish or return the fixed provider-to-engine slot-number offset.
@@ -1221,7 +1430,6 @@ pub async fn submit_request(
             .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
     }
     let profile = resolve_request_profile(&state, &body)?;
-    let profile_id = profile.profile_id.clone();
 
     let request_id = state.next_request_id();
     let current_slot = state.shared_state.get_current_slot();
@@ -1265,40 +1473,16 @@ pub async fn submit_request(
             "deadline falls before arrival_slot; the request cannot be scheduled",
         ));
     }
-    // Freeze the no-shifting counterfactual now. It must not change when the
-    // optimizer later moves the real assignment or global tiers are replaced.
-    let task_flavours = profile.flavours.clone();
-    let (baseline_carbon_cost, baseline_duration) =
-        compute_baseline_carbon_cost(&state, arrival_slot, &task_flavours);
-    let mut executor_payload = body.payload.clone();
-    if !executor_payload
-        .as_object()
-        .is_some_and(|payload| payload.contains_key("task"))
-    {
-        executor_payload["task"] = serde_json::Value::String(profile.task_kind.to_string());
-    }
-
-    // Install callback and baseline metadata before enqueueing: the scheduler
-    // may solve quickly, and an executor callback must always find its record.
-    state.tracked.lock().unwrap().insert(
+    let (profile_id, baseline_carbon_cost) = admit_request(
+        &state,
         request_id,
-        TrackedRequest::new(
-            body.callback_url.clone(),
-            executor_payload,
-            baseline_carbon_cost,
-            baseline_duration,
-            arrival_slot,
-            profile_id.clone(),
-        ),
-    );
-    state
-        .shared_state
-        .add_request(EngineRequest::new_for_qos_profile(
-            request_id,
-            arrival_slot,
-            deadline_slot,
-            profile,
-        ));
+        arrival_slot,
+        deadline_slot,
+        profile,
+        body.callback_url.clone(),
+        body.payload.clone(),
+    )
+    .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
 
     // TODO: remove this debug print
     println!("[Service] Submitted request ID: {}", request_id);
@@ -1318,7 +1502,9 @@ pub async fn submit_request(
                 as f64
                 * eff_slot_dur;
             if let Some(t) = state.tracked.lock().unwrap().get_mut(&request_id) {
-                t.status = RequestStatus::Scheduled;
+                if !t.executor_callback_received {
+                    t.status = RequestStatus::Scheduled;
+                }
             }
             // TODO: remove this debug print
             println!(
@@ -1362,6 +1548,69 @@ pub async fn submit_request(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Atomically install service metadata and enqueue an accepted request.
+///
+/// The admission mutex is shared with `close_slot`: holding it through both
+/// the closed-slot check and queue insertion makes acceptance indivisible
+/// with respect to the close barrier. Otherwise a request could pass the
+/// check, lose a race to the barrier's flush, and then enter the queue too
+/// late to be included in that slot's drain.
+///
+/// This helper is deliberately synchronous. Its mutex guard is dropped before
+/// `submit_request` begins its async assignment wait, so no standard mutex
+/// guard is retained across an `.await`.
+fn admit_request(
+    state: &AppState,
+    request_id: u64,
+    arrival_slot: i32,
+    deadline_slot: i32,
+    profile: Arc<QosProfile>,
+    callback_url: Option<String>,
+    mut executor_payload: serde_json::Value,
+) -> Result<(String, f64), String> {
+    // Keep the fence through metadata and engine-queue insertion so close_slot
+    // cannot seal the slot between validation and admission.
+    let _admission = state.closed_through_slot.lock().unwrap();
+    if state.scheduler.manual_clock && arrival_slot <= *_admission {
+        return Err(format!(
+            "arrival slot {arrival_slot} has already been closed"
+        ));
+    }
+    let profile_id = profile.profile_id.clone();
+    // Freeze the no-shifting counterfactual before enqueueing. A rejected
+    // late request must not affect baseline capacity accounting.
+    let task_flavours = profile.flavours.clone();
+    let (baseline_carbon_cost, baseline_duration) =
+        compute_baseline_carbon_cost(state, arrival_slot, &task_flavours);
+    if !executor_payload
+        .as_object()
+        .is_some_and(|payload| payload.contains_key("task"))
+    {
+        executor_payload["task"] = serde_json::Value::String(profile.task_kind.to_string());
+    }
+
+    state.tracked.lock().unwrap().insert(
+        request_id,
+        TrackedRequest::new(
+            callback_url,
+            executor_payload,
+            baseline_carbon_cost,
+            baseline_duration,
+            arrival_slot,
+            profile_id.clone(),
+        ),
+    );
+    state
+        .shared_state
+        .add_request(EngineRequest::new_for_qos_profile(
+            request_id,
+            arrival_slot,
+            deadline_slot,
+            profile,
+        ));
+    Ok((profile_id.to_string(), baseline_carbon_cost))
 }
 
 /// `GET /v1/requests/{id}` — poll current status of a previously submitted job.
@@ -1513,6 +1762,22 @@ pub async fn executor_callback(
     Path(request_id): Path<u64>,
     Json(body): Json<ExecutorCallbackPayload>,
 ) -> Result<StatusCode, ApiError> {
+    // Claim the callback exactly once, then release the tracked-request lock
+    // before corrections and subsequent bookkeeping. The lexical scope drops
+    // the mutex guard here: later code reacquires the lock to update the final
+    // status, and callback forwarding must never happen while this lock is held.
+    {
+        let mut tracked = state.tracked.lock().unwrap();
+        let request = tracked
+            .get_mut(&request_id)
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
+        if request.executor_callback_received {
+            tracing::debug!(request_id, "ignoring duplicate executor callback");
+            return Ok(StatusCode::OK);
+        }
+        request.executor_callback_received = true;
+    }
+
     // Executor feedback corrects predictions in place; absent optional
     // measurements leave the corresponding forecast estimate unchanged.
     if let Some(actual_error) = body.result.get("actual_error_pct").and_then(|v| v.as_f64()) {

@@ -13,7 +13,7 @@ Endpoints
 `GET  /v1/slot`           the current slot (cheap; safe to poll)
 `GET  /v1/forecast`       `?from_slot=`/`?count=` forecast window
 `GET  /v1/observed`       `?slot=` the reading taken for a reached slot
-`POST /v1/advance-slot`   manual-clock only: roll one slot and fan out
+`POST /v1/advance-slot`   manual-clock only: drain the active slot, then roll
 `POST /v1/forecast`       not implemented (forecast is not caller-supplied)
 
 The provider is intentionally stateless apart from its manual clock and the
@@ -24,6 +24,7 @@ the whole emulated stack together.
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -81,6 +82,7 @@ observed_readings: dict[int, ObservedPoint] = {}
 #: advance is refused until the process is restarted, so a desynced run can
 #: never quietly continue and produce plausible-looking metrics.
 _desynced: dict | None = None
+_advance_lock = threading.Lock()
 
 
 def _mark_desynced(report: notifications.RolloverReport) -> None:
@@ -159,6 +161,27 @@ def announce(notify: bool) -> notifications.RolloverReport:
             )
     return notifications.RolloverReport(tick=None, deliveries=deliveries)
 
+def close_current_slot(*, notify: bool) -> notifications.RolloverReport:
+    """Ask CarbonShift to flush and drain the slot clients have finished."""
+    if not notify:
+        return notifications.RolloverReport(tick=None)
+    carbonshift_peer = next(peer for peer in peers if peer.name == "carbonshift")
+    peer = notifications.Peer(
+        name="carbonshift-close-slot",
+        base_url=carbonshift_peer.base_url,
+        path="/v1/admin/close-slot",
+        order=10,
+        ack_slot_field="current_slot",
+    )
+    deliveries = notifications.notify_peers(
+        [peer],
+        {"current_slot": clock.current_slot(), "slot_minutes": clock.slot_minutes},
+        timeout_seconds=settings.notify_timeout_seconds,
+        max_attempts=settings.notify_max_attempts,
+        backoff_seconds=settings.notify_retry_backoff_seconds,
+    )
+    return notifications.RolloverReport(tick=None, deliveries=deliveries)
+
 def rollover(*, notify: bool) -> notifications.RolloverReport:
     """Advance the clock one slot, observe the new slot, then notify peers.
 
@@ -169,8 +192,9 @@ def rollover(*, notify: bool) -> notifications.RolloverReport:
     1. we enter slot N;
     2. we take the reading that belongs to slot N (a measurement can only be
        taken about the slot you are standing in);
-    3. we tell the peers "you are now in slot N, here is the reading, and here
-       is the forecast for what comes next".
+    3. CarbonShift enters N and dispatches due jobs;
+    4. the executor enters N and wakes its worker;
+    5. clients submit work for N while the executor processes due jobs.
 
     Observing *before* advancing would report a reading for the slot we are
     leaving, which is a different number and would silently disable any
@@ -294,12 +318,18 @@ async def observed(slot: int | None = Query(default=None)) -> dict:
 
 @app.post("/v1/advance-slot")
 def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
+    """Drain the active slot, advance once, and start work for the next slot."""
+    with _advance_lock:
+        return _advance_slot_locked(body)
+
+
+def _advance_slot_locked(body: AdvanceRequest | None) -> AdvanceResponse:
     """Manual-clock only: roll exactly one slot, then fan out.
 
-    409 if the clock is not manual (same convention as carbonshift and the
-    executor). 409 also if `expect_slot` does not match the current slot,
-    which is what makes a retried notification idempotent rather than
-    double-advancing the system.
+    Client ticks for the active slot have already returned when this closes
+    it. CarbonShift then flushes and drains that slot before the provider
+    advances and notifies CarbonShift, the executor, and the clients of the
+    next slot.
     """
     if not clock.manual:
         raise HTTPException(status_code=409, detail="PROVIDER_MANUAL_CLOCK is not enabled")
@@ -322,7 +352,7 @@ def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
             detail=f"slot mismatch: expected {request.expect_slot}, provider is at {current}",
         )
 
-    # If this is the first local step, announce the current slot to all peers before rolling over.
+    announcement_deliveries: list[notifications.DeliveryResult] = []
     if clock.local_step() == 0:
         announcement = announce(notify=request.notify_peers)  # slot G
         if request.notify_peers and announcement.any_failed:
@@ -334,19 +364,41 @@ def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
                     "deliveries": [delivery.to_dict() for delivery in announcement.deliveries],
                 },
             )
+        announcement_deliveries = announcement.deliveries
+
+    close_report = close_current_slot(notify=request.notify_peers)
+    if request.notify_peers and close_report.any_failed:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "slot_close_failed": True,
+                "current_slot": current,
+                "all_ok": False,
+                "deliveries": [delivery.to_dict() for delivery in close_report.deliveries],
+            },
+        )
+
     report = rollover(notify=request.notify_peers)  # slot G+1
     tick = report.tick
+    complete_report = notifications.RolloverReport(
+        tick=tick,
+        deliveries=[
+            *announcement_deliveries,
+            *close_report.deliveries,
+            *report.deliveries,
+        ],
+    )
 
-    # Fail hard on fan-out failures. The clock has ALREADY moved at this point
+    # Fail hard on fan-out failures. The provider clock has ALREADY moved at this point
     # and cannot be un-moved, so this is not "the advance didn't happen" — it
     # is "the clock moved and not every peer followed". Rolling time back would
     # be worse (some peers already advanced), so the honest response is to
     # refuse to continue and make the operator restart the stack.
     if request.notify_peers and report.any_failed:
-        _mark_desynced(report)
+        _mark_desynced(complete_report)
         raise HTTPException(
             status_code=503,
-            detail={"desynced": True, **report.to_dict()},
+            detail={"desynced": True, **complete_report.to_dict()},
         )
 
     return AdvanceResponse(
@@ -355,6 +407,6 @@ def advance_slot(body: AdvanceRequest | None = None) -> AdvanceResponse:
         local_step=tick.local_step if tick else clock.local_step(),
         source=source.name,
         notified=request.notify_peers,
-        all_ok=report.all_ok,
-        deliveries=[d.to_dict() for d in report.deliveries],
+        all_ok=complete_report.all_ok,
+        deliveries=[d.to_dict() for d in complete_report.deliveries],
     )

@@ -12,10 +12,12 @@ use tower::ServiceExt;
 
 use carbonshift_rs::engine::config::Config;
 use carbonshift_rs::engine::metrics_logger::MetricsLogger;
+use carbonshift_rs::engine::qos::QosProfileId;
 use carbonshift_rs::engine::scheduler::BatchScheduler;
 use carbonshift_rs::engine::shared_state::SharedState;
+use carbonshift_rs::engine::types::Assignment;
 use carbonshift_rs::service::server::build_router;
-use carbonshift_rs::service::state::{AppState, ServiceConfig};
+use carbonshift_rs::service::state::{AppState, ServiceConfig, TrackedRequest};
 
 fn test_service_cfg() -> ServiceConfig {
     ServiceConfig {
@@ -123,6 +125,7 @@ async fn health_check_ok() {
 async fn submit_rejects_negative_deadline() {
     let app = build_router(test_state(test_service_cfg()));
     let resp = app
+        .clone()
         .oneshot(json_request(
             "POST",
             "/v1/requests",
@@ -186,7 +189,7 @@ async fn callback_for_unknown_request_id_returns_404() {
 }
 
 #[tokio::test]
-async fn request_with_deadline_before_future_arrival_is_rejected() {
+async fn zero_deadline_for_future_arrival_keeps_the_minimum_one_slot_deadline() {
     let mut cfg = test_engine_config();
     cfg.simulation.manual_clock = true;
     let cfg = Arc::new(cfg);
@@ -217,7 +220,8 @@ async fn request_with_deadline_before_future_arrival_is_rejected() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(json_body(response).await["status"], "pending");
 
     let response = app
         .oneshot(json_request(
@@ -1804,17 +1808,14 @@ async fn advance_slot_moves_clock_and_waits_for_dispatch() {
     scheduler.stop();
 }
 
-/// Regression test: a request whose tracked status is stuck at `Pending`
-/// (its own submit poll timed out before the DP solver assigned it) must
-/// still be picked up by the dispatcher once an assignment appears — found
-/// via live "fake time" emulation testing, where this is the *common* case
-/// (submissions routinely outlive a short poll window, relying on the
-/// explicit slot-advance flush instead of the synchronous poll).
+/// A close-slot signal reuses the scheduler's partial-batch flush without
+/// advancing its clock, and fences off late requests for the closed slot.
 #[tokio::test]
-async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
+async fn close_slot_flushes_pending_requests_without_advancing() {
     let mut cfg = test_engine_config();
     cfg.simulation.manual_clock = true;
     let cfg = Arc::new(cfg);
+    let slot_minutes = cfg.effective_slot_duration_secs() / 60.0;
 
     let shared_state = SharedState::new();
     let metrics_logger = Arc::new(MetricsLogger::new(
@@ -1837,6 +1838,7 @@ async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
     svc_cfg.submit_wait_timeout_secs = 0.02; // times out well before any flush/advance
     svc_cfg.dispatcher_poll_interval_ms = 5;
     let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast);
+    *state.slot_epoch_offset.lock().unwrap() = Some(0);
     tokio::spawn(carbonshift_rs::service::dispatcher::run(state.clone()));
     let app = build_router(state.clone());
 
@@ -1854,8 +1856,8 @@ async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
         .unwrap();
     assert_eq!(json_body(resp).await["status"], "scheduled");
 
-    // Second request: no more automatic flush until the slot advances, so
-    // the poll times out and it's left `pending`.
+    // Second request: the startup flush has already happened, so a partial
+    // batch remains pending until the provider closes the slot.
     let resp = app
         .clone()
         .oneshot(json_request(
@@ -1868,30 +1870,103 @@ async fn dispatcher_picks_up_requests_stuck_pending_after_poll_timeout() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(json_body(resp).await["status"], "pending");
 
-    // Advancing the slot flushes + assigns it; the dispatcher must still
-    // deliver it despite the tracked status never having become `Scheduled`.
+    // Closing the slot flushes + assigns it but leaves engine time at slot 0.
     let resp = app
+        .clone()
         .oneshot(json_request(
             "POST",
-            "/v1/admin/advance-slot",
-            r#"{"current_slot":1}"#,
+            "/v1/admin/close-slot",
+            &serde_json::json!({"current_slot": 0, "slot_minutes": slot_minutes}).to_string(),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["current_slot"], 0);
+    assert_eq!(shared_state.get_current_slot(), 0);
 
-    let all_dispatched = state
-        .tracked
-        .lock()
-        .unwrap()
-        .values()
-        .all(|t| t.status == carbonshift_rs::service::models::RequestStatus::Dispatched);
-    assert!(
-        all_dispatched,
-        "both requests should have been dispatched, including the one stuck Pending"
-    );
+    let assignments = shared_state.get_current_assignments();
+    assert_eq!(assignments.len(), 2, "the partial batch must be assigned");
+
+    let late_request = app
+        .oneshot(json_request(
+            "POST",
+            "/v1/requests",
+            r#"{"deadline_seconds":5}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(late_request.status(), StatusCode::CONFLICT);
 
     scheduler.stop();
+}
+
+#[tokio::test]
+async fn close_slot_waits_for_executor_callbacks_for_due_assignments() {
+    let mut cfg = test_engine_config();
+    cfg.simulation.manual_clock = true;
+    let cfg = Arc::new(cfg);
+    let slot_minutes = cfg.effective_slot_duration_secs() / 60.0;
+    let shared_state = SharedState::new();
+    let forecast = test_forecast(cfg.total_slots);
+    let mut svc_cfg = test_service_cfg();
+    svc_cfg.executor_url = Some("http://executor/dispatch".to_string());
+    let state = AppState::new(shared_state.clone(), cfg, svc_cfg, forecast);
+    *state.slot_epoch_offset.lock().unwrap() = Some(100);
+
+    let request_id = 77;
+    shared_state.add_assignments(vec![Assignment::new(
+        request_id,
+        0,
+        "Fast".to_string(),
+        1.0,
+        0.1,
+        20.0,
+        Some(0),
+        Some(0),
+    )]);
+    let mut tracked = TrackedRequest::new(
+        None,
+        serde_json::json!({"task": "text_generation", "input": {}}),
+        1.0,
+        20.0,
+        0,
+        QosProfileId::default_profile(),
+    );
+    tracked.status = carbonshift_rs::service::models::RequestStatus::Dispatched;
+    state.tracked.lock().unwrap().insert(request_id, tracked);
+    let app = build_router(state);
+
+    let close_app = app.clone();
+    let close = tokio::spawn(async move {
+        close_app
+            .oneshot(json_request(
+                "POST",
+                "/v1/admin/close-slot",
+                &serde_json::json!({"current_slot": 100, "slot_minutes": slot_minutes}).to_string(),
+            ))
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !close.is_finished(),
+        "close-slot must wait for the callback"
+    );
+
+    let callback = app
+        .oneshot(json_request(
+            "POST",
+            &format!("/v1/callback/{request_id}"),
+            r#"{"success":true,"result":{}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::OK);
+
+    let closed = close.await.unwrap();
+    assert_eq!(closed.status(), StatusCode::OK);
+    assert_eq!(json_body(closed).await["callbacks"], 1);
+    assert_eq!(shared_state.get_current_slot(), 0);
 }
 
 #[tokio::test]

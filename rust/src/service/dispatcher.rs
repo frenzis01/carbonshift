@@ -39,8 +39,8 @@ pub async fn run(state: AppState) {
                                 // Not `== Scheduled`: `submit_request`'s own poll only
                                 // marks it Scheduled if the assignment shows up within
                                 // its wait timeout — if the DP solver assigns it later
-                                // (e.g. via a flush triggered by an explicit slot
-                                // advance in manual-clock/emulation mode), the tracked
+                                // (e.g. via the close-slot flush in
+                                // manual-clock/emulation mode), the tracked
                                 // status is still `Pending` even though a real
                                 // assignment now exists. Anything not yet
                                 // dispatched/completed/failed is fair game here.
@@ -141,8 +141,10 @@ async fn dispatch_one(state: &AppState, request_id: u64, assignment: &Assignment
 
 fn set_status(state: &AppState, request_id: u64, status: RequestStatus, error: Option<String>) {
     if let Some(t) = state.tracked.lock().unwrap().get_mut(&request_id) {
-        t.status = status;
-        t.error = error;
+        if !t.executor_callback_received {
+            t.status = status;
+            t.error = error;
+        }
     }
 }
 
@@ -158,6 +160,9 @@ fn record_failure(state: &AppState, request_id: u64, error: String) {
     let Some(t) = guard.get_mut(&request_id) else {
         return;
     };
+    if t.executor_callback_received {
+        return;
+    }
     t.dispatch_attempts += 1;
 
     if t.dispatch_attempts >= max_retries {

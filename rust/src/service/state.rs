@@ -85,6 +85,9 @@ pub struct TrackedRequest {
     pub payload: serde_json::Value,
     pub status: RequestStatus,
     pub error: Option<String>,
+    /// True once the executor has called back for this request. Kept separate
+    /// from `status` because dispatch failures are also marked `Failed`.
+    pub executor_callback_received: bool,
     /// Number of failed dispatch attempts to the executor so far.
     pub dispatch_attempts: u32,
     /// Backoff gate: the dispatcher skips this request until this instant.
@@ -125,6 +128,7 @@ impl TrackedRequest {
             payload,
             status: RequestStatus::Pending,
             error: None,
+            executor_callback_received: false,
             dispatch_attempts: 0,
             next_attempt_at: None,
             baseline_carbon_cost,
@@ -373,6 +377,10 @@ pub struct AppState {
     /// UTC start of engine slot zero. Manual announcements or realtime startup
     /// align this anchor to the shared wall-clock boundary.
     pub slot_epoch_start_utc: Arc<Mutex<SystemTime>>,
+    /// Highest manual-clock slot whose client submissions have been closed.
+    /// Submissions and slot closure share this lock so an accepted request
+    /// cannot race in after the close-slot barrier has started.
+    pub closed_through_slot: Arc<Mutex<i32>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -406,6 +414,7 @@ impl AppState {
             carbon_forecast,
             baseline_slot_counts: Arc::new(Mutex::new(HashMap::new())),
             actual_carbon_intensity: Arc::new(Mutex::new(HashMap::new())),
+            closed_through_slot: Arc::new(Mutex::new(-1)),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }

@@ -52,7 +52,8 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/metrics/error-history",
             get(handlers::get_error_history),
         )
-        .route("/v1/admin/advance-slot", post(handlers::advance_slot));
+        .route("/v1/admin/advance-slot", post(handlers::advance_slot))
+        .route("/v1/admin/close-slot", post(handlers::close_slot));
 
     public_routes
         .merge(caller_routes)

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -84,11 +83,6 @@ class JobQueue:
         self._wakeup = threading.Event()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # True while a job has been dequeued but hasn't finished executing
-        # yet (which can take a while: model download + inference) — a job
-        # in this state is invisible to `_slots`, so `advance_slot()` must
-        # check this separately or it can return before the job is done.
-        self._busy = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -190,7 +184,6 @@ class JobQueue:
             job = jobs.pop(0)
             if not jobs:
                 del self._slots[earliest_slot]
-            self._busy = True
             return job
 
     def _run(self) -> None:
@@ -200,11 +193,7 @@ class JobQueue:
                 self._wakeup.wait(timeout=settings.poll_interval_seconds)
                 self._wakeup.clear()
                 continue
-            try:
-                self._execute(job)
-            finally:
-                with self._lock:
-                    self._busy = False
+            self._execute(job)
 
     def _execute(self, job: Job) -> None:
         job.status = "running"
@@ -275,13 +264,13 @@ class JobQueue:
             logger.warning("callback failed request_id=%s error=%s", job.request_id, exc)
 
     def advance_slot(self, body: Optional[AdvanceSlotPayload] = None) -> dict[str, Any]:
-        """Test-only: bump the virtual clock to the next slot boundary, then
-        block until every job that's now due has actually finished running
-        (not just been dequeued — a job can be mid-execution, e.g. still
-        downloading its model) — mirrors carbonshift's
-        `POST /v1/admin/advance-slot`.
+        """Advance the virtual clock and wake the worker without waiting for
+        due jobs to finish.
+
+        CarbonShift's close-slot barrier waits for the executor callbacks
+        associated with this slot, so waiting here would serialize client
+        submission behind inference and prevent slot-local streaming.
         """
-        
         new_now = self._clock.now()
         # check if this is the first announcement made to synchronize clocks
         if body and body.kind == "announce":
@@ -299,15 +288,6 @@ class JobQueue:
         else:
             new_now = self._clock.advance_to_next_slot()
         self._wakeup.set()
-
-        deadline = time.monotonic() + 120.0
-        while time.monotonic() < deadline:
-            with self._lock:
-                still_due = self._busy or any(slot_time <= new_now for slot_time in self._slots)
-            if not still_due:
-                break
-            time.sleep(0.01)
-
         return {"current_time": new_now.isoformat(), "queue": self.snapshot()}
 
 

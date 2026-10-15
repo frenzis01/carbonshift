@@ -57,9 +57,9 @@ class SendPlanRequest(BaseModel):
     slot_minutes: float = 60.0
     # "realtime": waits for each request's real `start_at` wall-clock time.
     # "emulated": fires each timeslot's requests immediately, then
-    # synchronizes via carbonshift's and the executor's `/admin/advance-slot`
-    # (see README "Emulazione a tempo fittizio") instead of waiting for real
-    # time to pass between slots.
+    # synchronizes each slot through the provider's close/drain/advance
+    # protocol (see README "Emulazione a tempo fittizio") instead of waiting
+    # for real time to pass between slots.
     mode: Literal["realtime", "emulated"] = "realtime"
     executor_url: Optional[str] = None
 

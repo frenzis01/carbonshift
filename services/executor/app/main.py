@@ -127,6 +127,7 @@ async def get_queue() -> dict[str, list[str]]:
 async def advance_slot(
     body: AdvanceSlotPayload = Body(default=AdvanceSlotPayload()),
 ) -> dict:
+    """Advance manual time and wake the worker without waiting for inference."""
     if not settings.manual_clock:
         raise HTTPException(status_code=409, detail="EXECUTOR_MANUAL_CLOCK is not enabled")
     if body and body.slot_minutes is not None and (

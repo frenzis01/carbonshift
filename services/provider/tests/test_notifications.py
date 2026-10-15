@@ -22,15 +22,19 @@ EPOCH = datetime(2020, 1, 1, tzinfo=timezone.utc)
 START = datetime(2024, 5, 1, 12, 0, tzinfo=timezone.utc)
 
 PEERS = [
-    Peer(name="carbonshift", base_url="http://cs:8080", advance_path="/v1/admin/advance-slot", order=10),
-    Peer(name="executor", base_url="http://ex:9000", advance_path="/admin/advance-slot", order=20),
+    Peer(name="carbonshift", base_url="http://cs:8080", path="/v1/admin/advance-slot", order=10),
+    Peer(name="executor", base_url="http://ex:9000", path="/admin/advance-slot", order=20),
 ]
 
 
 class _Resp:
-    def __init__(self, status_code: int) -> None:
+    def __init__(self, status_code: int, body: dict | None = None) -> None:
         self.status_code = status_code
         self.text = ""
+        self.body = body or {}
+
+    def json(self):
+        return self.body
 
 
 class _FakeSettings:
@@ -193,6 +197,30 @@ def test_missing_manual_clock_is_reported_without_pointless_retries():
     assert "manual clock" in (results[0].error or "")
 
 
+def test_slot_acknowledgement_must_match_the_notified_slot():
+    peer = Peer(
+        name="client",
+        base_url="http://client",
+        path="/v1/tick",
+        order=1,
+        role=Role.PRODUCER,
+        ack_slot_field="slot",
+    )
+    results = notify_peers(
+        [peer],
+        {"current_slot": 8},
+        timeout_seconds=1,
+        max_attempts=2,
+        backoff_seconds=0,
+        post=lambda *args, **kwargs: _Resp(200, {"slot": 7, "submitted": 1}),
+        sleep=lambda _: None,
+    )
+
+    assert results[0].ok is False
+    assert results[0].attempts == 2
+    assert "did not confirm slot 8" in (results[0].error or "")
+
+
 def test_network_exception_is_retried_then_reported():
     import requests
 
@@ -273,32 +301,31 @@ def test_rollover_report_distinguishes_ok_from_failed():
 # ─── peer construction ───────────────────────────────────────────────────────
 
 
-def test_client_is_the_first_peer_because_it_produces_the_slot_work():
-    """Ordering is a policy, not an accident: the client supplies slot N's
-    requests, so it must be notified before the scheduler processes slot N."""
+def test_clock_consumers_are_notified_before_the_client_starts_slot_work():
+    """The client starts only after CarbonShift and the executor enter N."""
     peers = sorted(peers_from_settings(_FakeSettings()), key=lambda p: p.order)
-    assert [p.name for p in peers] == ["client", "carbonshift"]
-    assert peers[0].url == "http://localhost:8100/v1/tick"
-    assert peers[0].role is Role.PRODUCER
+    assert [p.name for p in peers] == ["carbonshift", "client"]
+    assert peers[1].url == "http://localhost:8100/v1/tick"
+    assert peers[1].role is Role.PRODUCER
 
 
-def test_all_configured_clients_are_ordered_producers_before_consumers():
+def test_configured_clients_follow_clock_consumers_in_configuration_order():
     configured = peers_from_settings(
         _FakeSettings(client_urls=("http://client-a:8100", "http://client-b:8100"))
     )
     peers = sorted(configured, key=lambda p: p.order)
-    assert [p.name for p in peers] == ["client", "client-2", "carbonshift"]
-    assert [p.url for p in peers[:2]] == [
+    assert [p.name for p in peers] == ["carbonshift", "client", "client-2"]
+    assert [p.url for p in peers[1:]] == [
         "http://client-a:8100/v1/tick",
         "http://client-b:8100/v1/tick",
     ]
-    assert all(peer.role is Role.PRODUCER for peer in peers[:2])
+    assert all(peer.role is Role.PRODUCER for peer in peers[1:])
 
     seen: list[str] = []
 
     def post(url, json=None, timeout=None):
         seen.append(url)
-        return _Resp(200)
+        return _Resp(200, {"slot": json["current_slot"], "submitted": 0})
 
     notify_peers(
         configured,
@@ -317,7 +344,7 @@ def test_no_configured_clients_leaves_only_the_consumer_peers():
     assert [peer.name for peer in peers] == ["carbonshift"]
 
 
-def test_carbonshift_is_a_consumer_and_follows_the_client():
+def test_carbonshift_is_the_first_clock_consumer():
     peers = sorted(peers_from_settings(_FakeSettings()), key=lambda p: p.order)
     carbonshift = next(p for p in peers if p.name == "carbonshift")
     assert carbonshift.role is Role.CONSUMER
@@ -326,14 +353,14 @@ def test_carbonshift_is_a_consumer_and_follows_the_client():
 
 def test_executor_joins_last_when_configured():
     peers = sorted(peers_from_settings(_FakeSettings(executor_url="http://ex:9000")), key=lambda p: p.order)
-    assert [p.name for p in peers] == ["client", "carbonshift", "executor"]
-    assert peers[2].url == "http://ex:9000/admin/advance-slot"
-    assert peers[2].role is Role.CONSUMER
+    assert [p.name for p in peers] == ["carbonshift", "executor", "client"]
+    assert peers[1].url == "http://ex:9000/admin/advance-slot"
+    assert peers[1].role is Role.CONSUMER
 
 
 def test_blank_executor_url_is_treated_as_not_configured():
     names = [p.name for p in peers_from_settings(_FakeSettings(executor_url="   "))]
-    assert names == ["client", "carbonshift"]
+    assert names == ["carbonshift", "client"]
 
 
 def test_plural_client_urls_preserve_order_and_legacy_single_client_fallback(monkeypatch):
@@ -358,7 +385,7 @@ def test_trailing_slash_does_not_double_up_in_urls():
 
 def test_peer_role_defaults_to_consumer():
     """Producers opt in explicitly; the common case needs no ceremony."""
-    assert Peer(name="x", base_url="http://x", advance_path="/p", order=1).role is Role.CONSUMER
+    assert Peer(name="x", base_url="http://x", path="/p", order=1).role is Role.CONSUMER
 
 
 def test_delivery_result_serialises_for_the_http_response():

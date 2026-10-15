@@ -42,7 +42,8 @@ full examples:
                                       scenarios may need more of this budget
                                       than earlier ones)
     admin_timeout_seconds  : float – timeout for each provider advance-slot
-                                      call while draining (default 60)
+                                      call, including the slot-close drain
+                                      (default 180)
     scenarios              : list  – each entry:
         id           : str  – unique label (subfolder + CSV row name)
         task         : "text_generation" | "ner" | "question_answering"
@@ -100,7 +101,7 @@ def _new_items(client_url: str, before_ids: set[str]) -> list[dict[str, Any]]:
 
 
 def _advance_emulated_clock(provider_url: str, admin_timeout: float) -> bool:
-    """Advance one provider-owned slot, including the ordered peer fan-out."""
+    """Advance one provider-owned slot, including client submission and drain."""
     try:
         requests.post(f"{provider_url}/v1/advance-slot", timeout=admin_timeout).raise_for_status()
         return True
@@ -299,7 +300,7 @@ def run_battery(config_path: Path) -> None:
     executor_url = cfg.get("executor_url", "http://localhost:9000")
     poll_interval = float(cfg.get("poll_interval_seconds", 1.0))
     poll_timeout = float(cfg.get("poll_timeout_seconds", 300.0))
-    admin_timeout = float(cfg.get("admin_timeout_seconds", 60.0))
+    admin_timeout = float(cfg.get("admin_timeout_seconds", 180.0))
 
     output_dir = Path(cfg["output_dir"]) if cfg.get("output_dir") else DEFAULT_OUTPUT_DIR
     if not output_dir.is_absolute():
