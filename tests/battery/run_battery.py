@@ -68,7 +68,8 @@ scenarios            : list        – each entry has:
     requests_per_slot    : float
     total_slots          : int
     input_pattern        : str     – "sinusoidal" (default) or "flat"; flat distributes
-                                     the total evenly across slots and keeps sub-slot jitter
+                                     requests nearly evenly with low count jitter, preserves
+                                     the rounded total, and keeps sub-slot jitter
     capacity_tiers       : list    – optional; falls back to scenarios/scenario_config.py defaults
 """
 from __future__ import annotations

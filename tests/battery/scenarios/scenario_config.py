@@ -25,18 +25,20 @@ SLOT_DURATION_SECONDS: float = 10.0
 # override this per scenario; emulation plans are configured independently.
 INPUT_PATTERN: str = "sinusoidal"
 # Target average requests per slot. Sinusoidal scenarios distribute this
-# average across the day/night cycle; flat scenarios distribute it evenly.
+# average across the day/night cycle; flat scenarios keep it nearly constant.
 PREDICTED_REQUESTS_PER_SLOT: float = 60.0
-# Gaussian noise factor: sigma = max(1, mean_rate_for_slot * REQUEST_RATE_STD_FACTOR).
-# See the inline note in scenario_io.generate_scenario_data for tuning guidance.
+# Gaussian noise factor for sinusoidal slot counts and synthetic prehistory:
+# sigma = max(1, mean_rate_for_slot * REQUEST_RATE_STD_FACTOR).
+# Flat slot counts use their own small jitter factor in scenario_io.
 REQUEST_RATE_STD_FACTOR: float = 0.25
 DEADLINE_MIN_SLACK: int = 0
-DEADLINE_MAX_SLACK: int = 8
+# Keep generated request deadlines within the simulation's 14-slot forward horizon.
+DEADLINE_MAX_SLACK: int = 14
 
 # ── error budget / prehistory ────────────────────────────────────────────────
 MAX_ERROR_THRESHOLD: float = 4.0
 ERROR_WINDOW_PAST: int = 12
-ERROR_WINDOW_FUTURE: int = 8
+ERROR_WINDOW_FUTURE: int = 14
 ERROR_WINDOW_PAST_DECAY_SLOTS: int = 0
 PREHISTORY_USE_VIRTUAL_PAST: bool = False
 PREHISTORY_ERROR_RATIO_OF_THRESHOLD: float = 1.0

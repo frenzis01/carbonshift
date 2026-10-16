@@ -8,6 +8,8 @@ import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+FLAT_REQUEST_JITTER_STD_FACTOR = 0.05
+
 
 def _serialize_capacity_tiers(tiers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return a JSON-safe copy of capacity tiers (None max_requests stays null)."""
@@ -244,8 +246,10 @@ def generate_scenario_data(
     - synthetic prehistory slots used by modeled error calculations
 
     ``input_pattern`` controls request arrivals only: ``sinusoidal`` follows
-    the carbon daylight shape, while ``flat`` distributes the target count
-    evenly across slots. Both patterns retain random sub-slot arrival jitter.
+    the carbon daylight shape, while ``flat`` adds small, deterministic
+    Gaussian slot-count jitter (5% of the target rate) and preserves the
+    rounded total request count. Both patterns retain random sub-slot arrival
+    jitter.
     The ``carbon_*`` and ``request_night_floor_ratio`` parameters shape the
     daylight wave (see `generate_carbon_intensity_forecast` /
     `_request_rate_per_slot`). Their defaults match `scenario_config.py`;
@@ -291,14 +295,36 @@ def generate_scenario_data(
             sigma = max(1.0, mean_rate * request_rate_std_factor)
             request_counts.append(max(0, int(round(rng.gauss(mean_rate, sigma)))))
     else:
-        # Keep a flat rate even when the requested average is fractional by
-        # spreading the rounded total evenly across the horizon.
+        # Add low-amplitude count noise, then use largest-remainder allocation
+        # to keep the horizon's rounded request total unchanged.
         rate_per_slot = [requests_per_slot] * total_slots
-        request_counts = [
-            round((slot + 1) * requests_per_slot)
-            - round(slot * requests_per_slot)
-            for slot in range(total_slots)
+        target_total = round(total_slots * requests_per_slot)
+        count_rng = random.Random(seed ^ 0xF1A7_5EED)
+        noisy_rates = [
+            max(
+                0.0,
+                requests_per_slot
+                + count_rng.gauss(
+                    0.0, requests_per_slot * FLAT_REQUEST_JITTER_STD_FACTOR
+                ),
+            )
+            for _ in range(total_slots)
         ]
+        noisy_total = sum(noisy_rates)
+        scaled_counts = (
+            [rate * target_total / noisy_total for rate in noisy_rates]
+            if target_total > 0 and noisy_total > 0.0
+            else [0.0] * total_slots
+        )
+        request_counts = [math.floor(count) for count in scaled_counts]
+        remaining = target_total - sum(request_counts)
+        remainder_order = sorted(
+            range(total_slots),
+            key=lambda slot: scaled_counts[slot] - request_counts[slot],
+            reverse=True,
+        )
+        for slot in remainder_order[:remaining]:
+            request_counts[slot] += 1
 
     for slot, count in enumerate(request_counts):
         for _ in range(count):

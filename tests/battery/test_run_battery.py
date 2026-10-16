@@ -1,10 +1,8 @@
 """Unit tests for the pure/pathless helper functions in run_battery.py.
 
-These cover the run-output packaging logic (folder naming, config.rs scalar
-parsing, and the TOP-3 README tables) added for the per-run results folder
-feature. They do not invoke the Rust binary or generate real scenarios —
-see the module docstring in run_battery.py for the manual end-to-end smoke
-test procedure used to validate the full pipeline.
+These cover run-output packaging logic, scenario metadata wiring, and the
+TOP-3 README tables. They do not invoke the Rust binary — see the module
+docstring in run_battery.py for the manual end-to-end smoke test procedure.
 """
 from __future__ import annotations
 
@@ -19,6 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "scenarios"))
 
 import multiple_runs as mr  # noqa: E402
 import run_battery as rb  # noqa: E402
+
+
+def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path):
+    scenario = rb._generate_scenario(
+        {"id": "window", "seed": 1, "total_slots": 2, "requests_per_slot": 1.0},
+        tmp_path / "window.json",
+    )
+
+    assert scenario["metadata"]["deadline_max_slack"] == 14
+    assert scenario["metadata"]["error_window_future"] == 14
 
 
 # ─── _format_run_folder_name ───────────────────────────────────────────────

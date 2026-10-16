@@ -1,7 +1,7 @@
 {
   "_comment": "CarbonShift solver battery test configuration (Rust nshift binary only).",
   "_phases_comment": "Each phase is independently toggled by leaving its content list(s) empty: DP runs only if both batch_sizes AND infeasibility_modes are non-empty; online runs only if online_strategies is non-empty; offline runs only if additional_strategies is non-empty. See tests/battery/multiple_runs.py for phase-aware parameter grids that avoid redundantly re-running phases a given knob doesn't affect.",
-  "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat spreads the requested average evenly across slots while retaining random sub-slot arrival times. multiple_runs.py sweeps both by default. This does not configure client emulation.",
+  "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat keeps a nearly constant rate with seeded 5%-of-rate slot-count jitter and the same rounded horizon total. Both retain random sub-slot arrival times. multiple_runs.py sweeps both by default. This does not configure client emulation.",
   "battery_id": "cfg_test4_dp_0",
   "batch_sizes": [
     4

@@ -11,9 +11,9 @@ Set `input_pattern` on a scenario in `battery_config.json` to:
 
 - `sinusoidal` (default): request counts follow the configured daylight-shaped
   request-rate curve, with the existing per-slot count variation.
-- `flat`: spreads the rounded total request count as evenly as possible over
-  all slots. If the requested rate is fractional, slot counts differ by at
-  most one so the overall rate is preserved.
+- `flat`: keeps the request rate nearly constant, with deterministic Gaussian
+  slot-count jitter (standard deviation 5% of the requested rate). Counts are
+  rebalanced so the rounded total over the horizon is preserved.
 
 Both patterns retain independently seeded random arrival times within each
 slot. Carbon-intensity generation is unchanged by this setting.
@@ -86,3 +86,17 @@ Run the scenario-pattern and battery-runner unit tests with:
 ```sh
 python -m pytest -q tests/battery/test_scenario_patterns.py
 ```
+
+## Assignment display notebook
+
+`display_assignment.ipynb` provides a searchable run-folder picker. Install its
+optional widget dependency from this directory with:
+
+```sh
+python -m pip install -r requirements-notebook-widgets.txt
+```
+
+Run the folder-picker cell, type part of a battery run folder name, select a
+suggestion, and click **Use folder**. Then run the following cell to choose an
+assignment result set within that folder. **All folders** includes legacy flat
+results.

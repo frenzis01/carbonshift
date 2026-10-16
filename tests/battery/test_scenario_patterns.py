@@ -1,6 +1,7 @@
 """Tests for simulation-only scenario input patterns."""
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -32,16 +33,19 @@ def _generate(pattern: str, *, rate: float = 2.5, slots: int = 24):
     )
 
 
-def test_flat_pattern_spreads_fractional_average_evenly_and_is_repeatable():
-    scenario = _generate("flat", slots=8)
-    repeated = _generate("flat", slots=8)
+def test_flat_pattern_has_seeded_low_count_jitter_and_preserves_total():
+    scenario = _generate("flat", rate=60.5, slots=128)
+    repeated = _generate("flat", rate=60.5, slots=128)
 
-    counts = [0] * 8
+    counts = [0] * 128
     for request in scenario["requests"]:
         counts[request["arrival_slot"]] += 1
 
-    assert counts == [2, 3, 3, 2, 2, 3, 3, 2]
-    assert sum(counts) / len(counts) == 2.5
+    assert sum(counts) == round(60.5 * 128)
+    assert max(counts) > min(counts)
+    mean = sum(counts) / len(counts)
+    stddev = math.sqrt(sum((count - mean) ** 2 for count in counts) / len(counts))
+    assert 2.0 < stddev < 4.0
     assert scenario == repeated
     assert scenario["metadata"]["input_pattern"] == "flat"
     offsets = [
