@@ -15,12 +15,12 @@ runs the Rust solver across three independent, individually-toggleable phases:
   1. DP        – sweeps `batch_sizes` × `infeasibility_modes`. Skipped entirely
                  if either list is empty.
   2. Online    – runs `online_strategies` (e.g. "bandit", "ant_colony",
-                 "greedy_singleton") over `online_batch_sizes` (falls back to
+                 "singleton_best") over `online_batch_sizes` (falls back to
                  `batch_sizes` if absent). Skipped if `online_strategies` is empty.
                  Independent of the DP phase/`batch_sizes` — e.g. set
                  `batch_sizes: []` to sweep online strategies without running DP.
-  3. Offline   – runs `additional_strategies` (e.g. "greedy_cheapest",
-                 "ant_colony", "bandit") once per scenario, with no batch-size
+  3. Offline   – runs `additional_strategies` (e.g. "offline_singleton_best",
+                 "offline_singleton_best_accurate", "random", "ant_colony", "bandit") once per scenario, with no batch-size
                  or rollback dependency. Skipped if `additional_strategies` is
                  empty.
 
@@ -41,13 +41,18 @@ infeasibility_modes  : list[str]   – values of the DP solver's `infeasibility_
                                      the error baseline before the primary DP solve. Infeasibility
                                      always resolves via direct greedy fallback.
 online_strategies    : list[str]   – online strategies to run (e.g. "bandit", "ant_colony",
-                                     "greedy_singleton"); [] skips the online phase.
+                                     "singleton_best"); [] skips the online phase.
 online_batch_sizes   : list[int]   – N sweep for online_strategies; falls back to
-                                     `batch_sizes` when omitted. "greedy_singleton" always
+                                     `batch_sizes` when omitted. "singleton_best" always
                                      forces N=1 regardless of this list.
 additional_strategies: list[str]   – offline strategies to run once per scenario
-                                     (e.g. "greedy_cheapest", "ant_colony", "bandit");
-                                     [] skips the offline phase.
+                                     (e.g. "offline_singleton_best", "offline_singleton_best_accurate",
+                                     "random", "ant_colony", "bandit"); [] skips the
+                                   offline phase.
+                                     "random" selects a feasible slot uniformly and samples
+                                     flavours with probabilities closest to uniform in
+                                     squared distance while targeting the configured mean
+                                     error; it does not guarantee per-run/window QoS.
 flavours             : list        – optional; overrides Config::default()'s 3 built-in
                                      Accurate/Balanced/Fast flavours for every phase/scenario
                                      in this run. Each entry: {"name": str, "error": float
@@ -62,6 +67,8 @@ scenarios            : list        – each entry has:
     seed                 : int     – RNG seed for scenario generation
     requests_per_slot    : float
     total_slots          : int
+    input_pattern        : str     – "sinusoidal" (default) or "flat"; flat distributes
+                                     the total evenly across slots and keeps sub-slot jitter
     capacity_tiers       : list    – optional; falls back to scenarios/scenario_config.py defaults
 """
 from __future__ import annotations
@@ -168,6 +175,7 @@ def _generate_scenario(scenario_def: Dict[str, Any], output_path: Path) -> Dict[
         capacity_tiers=tiers,
         carbon_inverted=bool(scenario_config.CARBON_INVERTED),
         carbon_shifted_phase=bool(scenario_config.CARBON_SHIFTED_PHASE),
+        input_pattern=str(scenario_def.get("input_pattern", scenario_config.INPUT_PATTERN)),
     )
     save_json(output_path, data)
     return data
@@ -483,12 +491,16 @@ def _run_offline_phase(
     _run_rust_binary(rust_binary, tmp_config)
 
     for strategy in additional_strategies:
-        summary_csv = strat_dir / f"strategy_{strategy}" / "summary.csv"
-        per_ts_csv = strat_dir / f"strategy_{strategy}" / "per_timeslot.csv"
+        output_strategy_name = strategy.removeprefix("offline_")
+        strategy_dir = strat_dir / f"strategy_{output_strategy_name}"
+        summary_csv = strategy_dir / "summary.csv"
+        per_ts_csv = strategy_dir / "per_timeslot.csv"
         if not summary_csv.exists():
             print(f"    WARNING: {summary_csv} not found; skipping strategy={strategy}")
             continue
-        mode_label = f"offline_{strategy}"
+        mode_label = (
+            strategy if strategy.startswith("offline_") else f"offline_{strategy}"
+        )
         avg_slot_err = _avg_slot_error_from_csv(per_ts_csv)
         with open(summary_csv, newline="") as f:
             rows_csv = list(csv.DictReader(f))
@@ -501,7 +513,7 @@ def _run_offline_phase(
                 "elapsed_seconds": round(run_elapsed, 3),
             })
             print(
-                f"    [rust/offline_{strategy}]: "
+                f"    [rust/{mode_label}]: "
                 f"carbon={result_row['carbon_cost']:.3f}, "
                 f"error={result_row['final_global_error']:.3f}, "
                 f"saving={result_row['carbon_saving']:.1f}%, "
@@ -599,6 +611,8 @@ def _parse_rust_config_defaults(config_rs_path: Path) -> Dict[str, str]:
 def _row_label(row: Dict[str, Any]) -> str:
     """Human-readable identifier for a results row: 'N=<n>' or an offline/online strategy name."""
     mode = row["infeasibility_mode"]
+    if mode.startswith("offline_singleton_"):
+        return mode
     if mode.startswith("offline_"):
         return mode[len("offline_"):]
     if mode.startswith("online_"):
@@ -673,6 +687,7 @@ def _write_run_readme(
     additional_strategies: List[str],
     online_strategies: List[str],
     online_batch_sizes: Optional[List[int]],
+    input_patterns: List[str],
     all_rows: List[Dict[str, Any]],
     per_n_timing_rows: List[Dict[str, Any]],
     battery_elapsed: float,
@@ -688,6 +703,7 @@ def _write_run_readme(
         f"- Started: {start_dt.isoformat(timespec='seconds')}",
         f"- Total elapsed: {battery_elapsed:.1f}s",
         "- Solver: Rust (nshift)",
+        f"- Simulation input pattern(s): {', '.join(input_patterns)}",
         "",
         "## Run-identifying parameters (also encoded in the folder name)",
         "",
@@ -719,7 +735,7 @@ def _write_run_readme(
         f"- DP solver timeout: {rust_defaults.get('dp_timeout', '?')}s",
         f"- Rollback max consecutive (this run): {rollback_max_consecutive} "
         f"({'disabled' if rollback_max_consecutive == 0 else 'enabled'}; "
-        "affects DP and greedy_singleton only, not bandit/ant_colony)",
+        "affects DP and singleton_best only, not bandit/ant_colony)",
         f"- Infeasibility recovery mode: {rust_defaults.get('infeasibility_recovery_mode', '?')}",
         "",
         "## Enabled phases",
@@ -817,13 +833,18 @@ def run_battery(config_path: Path) -> None:
         seed: int = int(scenario_def.get("seed", 42))
         total_slots: int = int(scenario_def.get("total_slots", 24))
         req_per_slot: float = float(scenario_def.get("requests_per_slot", scenario_config.PREDICTED_REQUESTS_PER_SLOT))
+        input_pattern = str(scenario_def.get("input_pattern", scenario_config.INPUT_PATTERN))
 
         print(f"\n{'='*60}")
-        print(f"Scenario: {sid}  (seed={seed}, slots={total_slots}, req/slot={req_per_slot})")
+        print(
+            f"Scenario: {sid}  (seed={seed}, slots={total_slots}, "
+            f"req/slot={req_per_slot}, pattern={input_pattern})"
+        )
         print("=" * 60)
         if flavours:
             flavour_desc = ", ".join(
-                f"{f['name']}(error={f['error']}%, duration={f['duration']}s)" for f in flavours
+                f"{f['name']}(error={f['error']}%, duration={f['duration_sec']}s)"
+                for f in flavours
             )
             print(f"  Flavours (override): {flavour_desc}")
         else:
@@ -926,6 +947,10 @@ def run_battery(config_path: Path) -> None:
         writer.writeheader()
         writer.writerows(per_n_timing_rows)
 
+    input_patterns = sorted({
+        str(scenario.get("input_pattern", scenario_config.INPUT_PATTERN))
+        for scenario in cfg.get("scenarios", [])
+    })
     _write_run_readme(
         output_dir,
         battery_id,
@@ -940,6 +965,7 @@ def run_battery(config_path: Path) -> None:
         additional_strategies,
         online_strategies,
         online_batch_sizes,
+        input_patterns,
         all_rows,
         per_n_timing_rows,
         battery_elapsed,

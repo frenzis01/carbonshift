@@ -103,6 +103,14 @@ python -m pytest -q
 
 The executor and client defer heavy optional imports so their services and unit tests can run without the full ML or dataset packages when those features are not being exercised.
 
+## Offline simulation battery
+
+The simulation battery supports sinusoidal and flat request patterns and
+offline scheduling baselines, including random assignment and accurate-only
+greedy scheduling. These are simulation-only settings and do not change
+client emulation. See the [simulation battery guide](tests/battery/README.md)
+for configuration, strategy semantics, and test instructions.
+
 ## Documentation
 
 - [Project documentation](carbonshift/notes/PROJECT_DOCUMENTATION.md) — system overview, responsibilities, metrics, and HTTP surfaces.

@@ -42,6 +42,7 @@ def generate_and_save_scenario(
     include_prehistory: Optional[bool] = None,
     carbon_intensity_cycle_slots: Optional[int] = None,
     capacity_tiers: Optional[list] = None,
+    input_pattern: str = cfg.INPUT_PATTERN,
 ) -> Dict[str, Any]:
     if prehistory_mock_influence is None:
         prehistory_mock_influence = float(cfg.PREHISTORY_MOCK_INFLUENCE)
@@ -81,6 +82,7 @@ def generate_and_save_scenario(
         carbon_inverted=bool(cfg.CARBON_INVERTED),
         carbon_shifted_phase=bool(cfg.CARBON_SHIFTED_PHASE),
         request_night_floor_ratio=float(cfg.REQUEST_NIGHT_FLOOR_RATIO),
+        input_pattern=input_pattern,
     )
     save_json(output_path, scenario)
     return scenario
@@ -100,6 +102,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slot-duration-seconds", type=float, default=float(cfg.SLOT_DURATION_SECONDS))
     parser.add_argument("--requests-per-slot", type=float, default=float(cfg.PREDICTED_REQUESTS_PER_SLOT))
     parser.add_argument("--request-rate-std-factor", type=float, default=float(cfg.REQUEST_RATE_STD_FACTOR))
+    parser.add_argument(
+        "--input-pattern",
+        choices=["flat", "sinusoidal"],
+        default=cfg.INPUT_PATTERN,
+        help="Request-count pattern for this simulation scenario; flat retains sub-slot arrival jitter.",
+    )
     parser.add_argument("--deadline-min-slack", type=int, default=int(cfg.DEADLINE_MIN_SLACK))
     parser.add_argument("--deadline-max-slack", type=int, default=int(cfg.DEADLINE_MAX_SLACK))
     parser.add_argument("--error-window-past", type=int, default=int(cfg.ERROR_WINDOW_PAST))
@@ -138,7 +146,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--carbon-intensity-cycle-slots",
         type=int,
         default=int(cfg.CARBON_INTENSITY_CYCLE_SLOTS),
-        help="Period (slots) of the sinusoidal carbon-intensity wave (requests follow the same wave).",
+        help="Period (slots) of the carbon wave; sinusoidal requests follow its daylight shape.",
     )
     return parser
 
@@ -158,6 +166,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Total Slots:                       {args.total_slots}")
     print(f"  Slot Duration (seconds):           {args.slot_duration_seconds}")
     print(f"  Requests per Slot:                 {args.requests_per_slot}")
+    print(f"  Input Pattern:                     {args.input_pattern}")
     print(f"  Request Rate Std Factor:           {args.request_rate_std_factor}")
     print(f"  Deadline Min Slack (slots):        {args.deadline_min_slack}")
     print(f"  Deadline Max Slack (slots):        {args.deadline_max_slack}")
@@ -179,6 +188,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         total_slots=args.total_slots,
         slot_duration_seconds=args.slot_duration_seconds,
         requests_per_slot=args.requests_per_slot,
+        input_pattern=args.input_pattern,
         request_rate_std_factor=args.request_rate_std_factor,
         deadline_min_slack=args.deadline_min_slack,
         deadline_max_slack=args.deadline_max_slack,

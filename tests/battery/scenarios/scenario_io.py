@@ -233,6 +233,7 @@ def generate_scenario_data(
     carbon_inverted: bool = False,
     carbon_shifted_phase: bool = False,
     request_night_floor_ratio: float = 0.40,
+    input_pattern: str = "sinusoidal",
 ) -> Dict[str, Any]:
     """
     Build a deterministic scenario payload.
@@ -242,12 +243,18 @@ def generate_scenario_data(
     - per-slot carbon forecast
     - synthetic prehistory slots used by modeled error calculations
 
+    ``input_pattern`` controls request arrivals only: ``sinusoidal`` follows
+    the carbon daylight shape, while ``flat`` distributes the target count
+    evenly across slots. Both patterns retain random sub-slot arrival jitter.
     The ``carbon_*`` and ``request_night_floor_ratio`` parameters shape the
     daylight wave (see `generate_carbon_intensity_forecast` /
     `_request_rate_per_slot`). Their defaults match `scenario_config.py`;
     callers (e.g. `generate_scenario.py`) should pass explicit values sourced
     from that module rather than relying on these hardcoded fallbacks.
     """
+    if input_pattern not in {"flat", "sinusoidal"}:
+        raise ValueError(f"Unknown input pattern: {input_pattern!r}")
+
     rng = random.Random(seed)
 
     forecast = generate_carbon_intensity_forecast(
@@ -265,36 +272,35 @@ def generate_scenario_data(
         phase_shifted=carbon_shifted_phase,
     )
 
-    # Per-slot mean request rate following the same daylight wave as carbon intensity.
-    # requests_per_slot is the target average across all slots.
-    rate_per_slot = _request_rate_per_slot(
-        total_slots=total_slots,
-        carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
-        requests_per_slot=requests_per_slot,
-        sunrise_fraction=carbon_sunrise_fraction,
-        sunset_fraction=carbon_sunset_fraction,
-        transition_slope=carbon_transition_slope,
-        night_floor_ratio=request_night_floor_ratio,
-    )
-
     requests: List[Dict[str, Any]] = []
     request_id = 0
-    for slot in range(total_slots):
-        mean_rate = rate_per_slot[slot]
-        # NOTE on tuning randomness:
-        # To increase/decrease noise in the request counts, change
-        # `request_rate_std_factor` (CLI: --request-rate-std-factor, default:
-        # scenario_config.REQUEST_RATE_STD_FACTOR) — NOT this sigma formula.
-        # sigma is proportional to mean_rate (sigma = mean_rate * factor), so
-        # busy slots naturally get more absolute noise than quiet slots while
-        # keeping the *relative* spread constant (a Poisson-like scaling).
-        # Typical values: 0.15-0.2 = low noise (counts hug the wave closely),
-        # 0.3 (current default) = moderate noise, 0.5+ = high noise (peaks/
-        # valleys can blur together). The `max(1.0, ...)` floor only prevents
-        # sigma from collapsing to 0 in near-empty slots; it does not
-        # otherwise affect the noise level.
-        sigma = max(1.0, mean_rate * request_rate_std_factor)
-        count = max(0, int(round(rng.gauss(mean_rate, sigma))))
+    if input_pattern == "sinusoidal":
+        # Scale the request rate across slots with the same daylight shape as
+        # carbon intensity, then add the configured per-slot count variation.
+        rate_per_slot = _request_rate_per_slot(
+            total_slots=total_slots,
+            carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
+            requests_per_slot=requests_per_slot,
+            sunrise_fraction=carbon_sunrise_fraction,
+            sunset_fraction=carbon_sunset_fraction,
+            transition_slope=carbon_transition_slope,
+            night_floor_ratio=request_night_floor_ratio,
+        )
+        request_counts = []
+        for mean_rate in rate_per_slot:
+            sigma = max(1.0, mean_rate * request_rate_std_factor)
+            request_counts.append(max(0, int(round(rng.gauss(mean_rate, sigma)))))
+    else:
+        # Keep a flat rate even when the requested average is fractional by
+        # spreading the rounded total evenly across the horizon.
+        rate_per_slot = [requests_per_slot] * total_slots
+        request_counts = [
+            round((slot + 1) * requests_per_slot)
+            - round(slot * requests_per_slot)
+            for slot in range(total_slots)
+        ]
+
+    for slot, count in enumerate(request_counts):
         for _ in range(count):
             slack = rng.randint(deadline_min_slack, deadline_max_slack)
             deadline_slot = min(total_slots - 1, slot + slack)
@@ -340,6 +346,7 @@ def generate_scenario_data(
     return {
         "metadata": {
             "seed": int(seed),
+            "input_pattern": input_pattern,
             "total_slots": int(total_slots),
             "slot_duration_seconds": float(slot_duration_seconds),
             "requests_per_slot": float(requests_per_slot),

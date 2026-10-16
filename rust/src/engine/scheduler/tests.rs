@@ -389,33 +389,26 @@ fn test_advance_to_next_slot_clamped_to_horizon() {
     assert_eq!(new_slot, cfg.total_slots - 1);
 }
 
-// ── greedy_singleton tests ──────────────────────────────────────────────
+// ── singleton_best tests ──────────────────────────────────────────────
 
-fn call_solve_greedy_singleton(
+fn call_solve_singleton_best(
     current_slot: i32,
     pending: &[Request],
     cfg: &Config,
     ss: &SharedState,
 ) -> (Vec<Assignment>, SolveContext) {
     let forecast = flat_forecast(cfg.total_slots, 100.0);
-    run_batch_strategy(
-        "greedy_singleton",
-        current_slot,
-        pending,
-        cfg,
-        ss,
-        &forecast,
-    )
+    run_batch_strategy("singleton_best", current_slot, pending, cfg, ss, &forecast)
 }
 
-fn call_solve_greedy_singleton_with_forecast(
+fn call_solve_singleton_best_with_forecast(
     current_slot: i32,
     pending: &[Request],
     cfg: &Config,
     ss: &SharedState,
     forecast: &[f64],
 ) -> (Vec<Assignment>, SolveContext) {
-    run_batch_strategy("greedy_singleton", current_slot, pending, cfg, ss, forecast)
+    run_batch_strategy("singleton_best", current_slot, pending, cfg, ss, forecast)
 }
 
 #[test]
@@ -427,7 +420,7 @@ fn batch_solver_registry_resolves_trimmed_case_insensitive_names() {
     let shared_state = SharedState::new();
 
     let (assignments, context) = run_batch_strategy(
-        " GREEDY_SINGLETON ",
+        " SINGLETON_BEST ",
         current_slot,
         &pending,
         &cfg,
@@ -436,7 +429,7 @@ fn batch_solver_registry_resolves_trimmed_case_insensitive_names() {
     );
 
     assert_eq!(assignments.len(), 1);
-    assert_eq!(context.mode, "greedy_singleton");
+    assert_eq!(context.mode, "singleton_best");
 }
 
 #[test]
@@ -654,19 +647,19 @@ fn profile_dispatch_round_robins_without_starving_eligible_profiles() {
 }
 
 /// A single request must be scheduled at/after current_slot, tagged with
-/// the "greedy_singleton" solver mode.
+/// the "singleton_best" solver mode.
 #[test]
-fn test_greedy_singleton_schedules_single_request() {
+fn test_singleton_best_schedules_single_request() {
     let cfg = make_config(|_| {});
     let ss = SharedState::new();
     let current_slot = 3;
     let pending = vec![req(0, current_slot, current_slot + 4)];
 
-    let (assignments, ctx) = call_solve_greedy_singleton(current_slot, &pending, &cfg, &ss);
+    let (assignments, ctx) = call_solve_singleton_best(current_slot, &pending, &cfg, &ss);
 
     assert_eq!(assignments.len(), 1);
     assert!(assignments[0].scheduled_slot >= current_slot);
-    assert_eq!(ctx.mode, "greedy_singleton");
+    assert_eq!(ctx.mode, "singleton_best");
     assert_eq!(ctx.status, "ok");
 }
 
@@ -682,7 +675,7 @@ fn test_batch_solvers_never_assign_before_arrival_slot() {
 
     let (dp_assignments, _) =
         call_solve_dp_with_forecast(current_slot, &pending, &cfg, &shared, &forecast);
-    let (greedy_assignments, _) = call_solve_greedy_singleton_with_forecast(
+    let (greedy_assignments, _) = call_solve_singleton_best_with_forecast(
         current_slot,
         &pending,
         &cfg,
@@ -706,7 +699,7 @@ fn test_batch_solvers_never_assign_before_arrival_slot() {
 /// solver's internal (unspecified) tie-breaking order may legitimately
 /// differ (DP iterates a HashMap; greedy scans slots ascending).
 #[test]
-fn test_greedy_singleton_matches_dp_for_single_request() {
+fn test_singleton_best_matches_dp_for_single_request() {
     let cfg = make_config(|_| {});
     let current_slot = 2;
     let pending = vec![req(7, current_slot, current_slot + 5)];
@@ -718,7 +711,7 @@ fn test_greedy_singleton_matches_dp_for_single_request() {
         call_solve_dp_with_forecast(current_slot, &pending, &cfg, &ss_dp, &forecast);
 
     let ss_greedy = SharedState::new();
-    let (greedy_assignments, _) = call_solve_greedy_singleton_with_forecast(
+    let (greedy_assignments, _) = call_solve_singleton_best_with_forecast(
         current_slot,
         &pending,
         &cfg,
@@ -745,7 +738,7 @@ fn test_greedy_singleton_matches_dp_for_single_request() {
 /// greedy scan must read this from live shared state, not start "fresh"
 /// every call.
 #[test]
-fn test_greedy_singleton_respects_existing_slot_load() {
+fn test_singleton_best_respects_existing_slot_load() {
     let mut cfg = make_config(|_| {});
     cfg.capacity_tiers = vec![
         crate::types::CapacityTier {
@@ -775,7 +768,7 @@ fn test_greedy_singleton_respects_existing_slot_load() {
 
     // A request whose only feasible slot is 0 (arrival==deadline==0).
     let pending = vec![req(1, current_slot, current_slot)];
-    let (assignments, _ctx) = call_solve_greedy_singleton(current_slot, &pending, &cfg, &ss);
+    let (assignments, _ctx) = call_solve_singleton_best(current_slot, &pending, &cfg, &ss);
 
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].scheduled_slot, 0);
@@ -800,7 +793,7 @@ fn test_greedy_singleton_respects_existing_slot_load() {
 /// error *before* this request), matching solve_dp's step-function
 /// behaviour, and must never exclude every flavour.
 #[test]
-fn test_greedy_singleton_global_error_constraint_is_retrospective() {
+fn test_singleton_best_global_error_constraint_is_retrospective() {
     let cfg = make_config(|c| {
         c.global_error_constraint_enabled = true;
         c.global_error_constraint_hard = true;
@@ -822,7 +815,7 @@ fn test_greedy_singleton_global_error_constraint_is_retrospective() {
     )]);
 
     let pending = vec![req(2, current_slot, current_slot + 3)];
-    let (assignments, ctx) = call_solve_greedy_singleton(current_slot, &pending, &cfg, &ss);
+    let (assignments, ctx) = call_solve_singleton_best(current_slot, &pending, &cfg, &ss);
 
     assert_eq!(
         assignments.len(),

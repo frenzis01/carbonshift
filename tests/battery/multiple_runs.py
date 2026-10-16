@@ -5,13 +5,14 @@ Run `run_battery.py` across several PHASE-AWARE parameter grids.
 Each phase of the Rust battery harness (see run_battery.py's module docstring)
 is sensitive to a different subset of runtime knobs:
 
-  - DP (min_error_greedy/carryover/forecast) and greedy_singleton (online,
+  - DP (min_error_greedy/carryover/forecast) and singleton_best (online,
     N=1 only): sensitive to `rollback_max_consecutive` and
     `max_batch_solver_parallelism`; NOT sensitive to `online_swarm_mode`.
   - bandit / ant_colony (online, swarm-based): sensitive to
     `online_swarm_mode` and `max_batch_solver_parallelism`; NOT sensitive to
     `rollback_max_consecutive` (the swarm commit path bypasses rollback).
-  - offline strategies (greedy_cheapest, bandit, ant_colony offline variants):
+  - offline strategies (offline_singleton_best, offline_singleton_best_accurate, random,
+    bandit, ant_colony):
     insensitive to all of the above — a single run per scenario suffices.
 
 Sweeping every knob against every phase (the old flat PARAM_GRID behaviour)
@@ -23,13 +24,18 @@ knobs that phase actually depends on.
 
 For every grid point the script:
   1. loads `battery_config.json`
-  2. overwrites it with the phase's content + that grid point's knob values
+  2. overwrites it with the phase's content, input pattern, and knob values
   3. saves it back to `battery_config.json`
   4. invokes `python tests/battery/run_battery.py`
+
+By default, every selected phase is run once for each input pattern:
+`sinusoidal` and `flat`. Pattern IDs are included in scenario and battery
+names to keep their output files separate.
 
 Usage (from the repository root):
     python tests/battery/multiple_runs.py
     python tests/battery/multiple_runs.py --phase dp online offline   # subset
+    python tests/battery/multiple_runs.py --input-pattern flat
 """
 from __future__ import annotations
 
@@ -87,12 +93,12 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "additional_strategies": [],
 }
 
-GREEDY_SINGLETON_CONTENT: Dict[str, Any] = {
+SINGLETON_BEST_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "infeasibility_modes": [],
-    "online_strategies": ["greedy_singleton"],
+    "online_strategies": ["singleton_best"],
     # online_batch_sizes is irrelevant here: main.rs forces N=1 for
-    # greedy_singleton regardless of what's requested.
+    # singleton_best regardless of what's requested.
     "additional_strategies": [],
 }
 
@@ -100,11 +106,19 @@ OFFLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "infeasibility_modes": [],
     "online_strategies": [],
-    "additional_strategies": ["greedy_cheapest", "bandit", "ant_colony"],
+    "additional_strategies": [
+        "offline_singleton_best",
+        "offline_singleton_best_accurate",
+        "random",
+        "bandit",
+        "ant_colony",
+    ],
 }
 
+INPUT_PATTERNS = ("sinusoidal", "flat")
+
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
-# DP + greedy_singleton: rollback x parallelism (swarm_mode is irrelevant to
+# DP + singleton_best: rollback x parallelism (swarm_mode is irrelevant to
 # both, so it is left fixed at whatever battery_config.json already has).
 def build_rollback_parallelism_grid(
     rollbacks: tuple,
@@ -112,7 +126,7 @@ def build_rollback_parallelism_grid(
     thresholds: tuple,
 ) -> List[Dict[str, Any]]:
     """Build the rollback x parallelism x threshold grid for the phases that
-    are sensitive to rollback (dp / greedy_singleton).
+    are sensitive to rollback (dp / singleton_best).
 
     `rollback_max_consecutive > 0` only means something when there's more
     than one parallel batch solver to roll back *among* — with
@@ -175,8 +189,8 @@ _PARALLELISM_X_SWARM_MODE = [
 PHASES: Dict[str, PhaseGrid] = {
     "dp": PhaseGrid("dp", DP_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD),
     "online": PhaseGrid("online", SWARM_ONLINE_CONTENT, _PARALLELISM_X_SWARM_MODE),
-    "greedy_singleton": PhaseGrid(
-        "greedy_singleton", GREEDY_SINGLETON_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD
+    "singleton_best": PhaseGrid(
+        "singleton_best", SINGLETON_BEST_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD
     ),
     # Offline strategies can also be evaluated with different per-scenario error
     # thresholds, even though they don't depend on rollback or swarm knobs.
@@ -188,7 +202,7 @@ PHASES: Dict[str, PhaseGrid] = {
 }
 
 # Which phases to run when `--phase` is not given.
-DEFAULT_PHASES = ["dp", "online", "greedy_singleton", "offline"]
+DEFAULT_PHASES = ["dp", "online", "singleton_best", "offline"]
 
 
 def load_config(path: Path) -> Dict[str, Any]:
@@ -204,6 +218,23 @@ def save_config(path: Path, cfg: Dict[str, Any]) -> None:
         fh.write("\n")
 
 
+def _with_input_pattern(cfg: Dict[str, Any], input_pattern: str) -> Dict[str, Any]:
+    """Return a config copy whose scenarios identify one simulation pattern."""
+    if input_pattern not in INPUT_PATTERNS:
+        raise ValueError(f"Unknown input pattern: {input_pattern!r}")
+
+    patterned_cfg = dict(cfg)
+    patterned_cfg["scenarios"] = [
+        {
+            **scenario,
+            "id": f"{scenario['id']}_{input_pattern}",
+            "input_pattern": input_pattern,
+        }
+        for scenario in cfg.get("scenarios", [])
+    ]
+    return patterned_cfg
+
+
 def run_battery() -> int:
     """Invoke run_battery.py from the repository root."""
     cmd = [sys.executable, str(RUN_BATTERY_SCRIPT.relative_to(REPO_ROOT))]
@@ -211,7 +242,12 @@ def run_battery() -> int:
     return subprocess.call(cmd, cwd=REPO_ROOT)
 
 
-def run_phase(base_cfg: Dict[str, Any], phase: PhaseGrid, battery_id_prefix: str) -> int:
+def run_phase(
+    base_cfg: Dict[str, Any],
+    phase: PhaseGrid,
+    battery_id_prefix: str,
+    input_pattern: str,
+) -> int:
     """Run every grid point of one phase, returning the last non-zero exit
     status seen (0 if all grid points succeeded)."""
     overall_status = 0
@@ -220,6 +256,7 @@ def run_phase(base_cfg: Dict[str, Any], phase: PhaseGrid, battery_id_prefix: str
     for idx, knobs in enumerate(phase.knob_grid, start=1):
         cfg = dict(base_cfg)
         cfg.update(phase.content)
+        cfg = _with_input_pattern(cfg, input_pattern)
 
         # `max_error_threshold` is a per-scenario override in battery_config.json
         # (nested under "scenarios"[i]), not a top-level runtime knob — apply it
@@ -233,10 +270,15 @@ def run_phase(base_cfg: Dict[str, Any], phase: PhaseGrid, battery_id_prefix: str
                 for scenario in cfg.get("scenarios", [])
             ]
 
-        cfg["battery_id"] = f"{battery_id_prefix}_{phase.name}_{idx - 1}"
+        cfg["battery_id"] = (
+            f"{battery_id_prefix}_{input_pattern}_{phase.name}_{idx - 1}"
+        )
 
         print("\n" + "=" * 70)
-        print(f"Phase '{phase.name}' — run {idx}/{total}: knobs={knobs}")
+        print(
+            f"Pattern '{input_pattern}', phase '{phase.name}' — "
+            f"run {idx}/{total}: knobs={knobs}"
+        )
         print("=" * 70)
 
         save_config(CONFIG_PATH, cfg)
@@ -265,7 +307,14 @@ def main(argv: List[str] | None = None) -> int:
         "--battery-id-prefix",
         default="cfg_test12_high1low2CAP",
         help="Prefix used to build each run's battery_id "
-        "(final id is '<prefix>_<phase>_<grid-index>').",
+        "(final id is '<prefix>_<pattern>_<phase>_<grid-index>').",
+    )
+    parser.add_argument(
+        "--input-pattern",
+        nargs="+",
+        choices=INPUT_PATTERNS,
+        default=list(INPUT_PATTERNS),
+        help="Simulation request pattern(s) to sweep (default: sinusoidal and flat).",
     )
     args = parser.parse_args(argv)
 
@@ -276,10 +325,16 @@ def main(argv: List[str] | None = None) -> int:
     base_cfg = load_config(CONFIG_PATH)
     overall_status = 0
     try:
-        for phase_name in args.phase:
-            status = run_phase(base_cfg, PHASES[phase_name], args.battery_id_prefix)
-            if status != 0:
-                overall_status = status
+        for input_pattern in args.input_pattern:
+            for phase_name in args.phase:
+                status = run_phase(
+                    base_cfg,
+                    PHASES[phase_name],
+                    args.battery_id_prefix,
+                    input_pattern,
+                )
+                if status != 0:
+                    overall_status = status
     finally:
         # Always restore the on-disk config to its pre-run state so repeated
         # invocations (or manual edits) aren't clobbered by the last grid
@@ -287,7 +342,10 @@ def main(argv: List[str] | None = None) -> int:
         save_config(CONFIG_PATH, base_cfg)
 
     print("\n" + "=" * 70)
-    print(f"All requested phases ({', '.join(args.phase)}) completed.")
+    print(
+        f"All requested patterns ({', '.join(args.input_pattern)}) and "
+        f"phases ({', '.join(args.phase)}) completed."
+    )
     print("=" * 70)
     return overall_status
 

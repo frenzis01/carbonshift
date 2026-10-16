@@ -49,16 +49,21 @@
 //!   `greedy_fallback` (accurate flavour, cheapest feasible slot). This setting only controls
 //!   whether/how synthetic mock requests dilute the error baseline used by the primary DP solve.
 //! - `online_strategies`: online strategies to run through the scheduler pipeline, e.g.
-//!   `["bandit", "ant_colony", "greedy_singleton"]`. Independent of the DP phase: set the
+//!   `["bandit", "ant_colony", "singleton_best"]`. Independent of the DP phase: set the
 //!   top-level `batch_sizes` to `[]` to skip DP entirely and only run online strategies.
 //! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
 //!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent. Ignored
-//!   for "greedy_singleton", which always forces `[1]` (its only supported batch size) —
+//!   for "singleton_best", which always forces `[1]` (its only supported batch size) —
 //!   `rollback_max_consecutive` still affects it (it shares DP's rollback-checked commit
 //!   path), while `online_swarm_mode` only affects "bandit"/"ant_colony" (the swarm path).
 //! - `additional_strategies`: offline strategies to run once per scenario (no batching or
-//!   concurrency), e.g. `["greedy_cheapest", "ant_colony", "bandit"]`. Fully independent of
-//!   `batch_sizes`/`rollback_max_consecutive`/`max_batch_solver_parallelism`.
+//!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "random"]`. Fully
+//!   independent of `batch_sizes`/`rollback_max_consecutive`/`max_batch_solver_parallelism`.
+//!   `offline_singleton_best` scans all feasible slot/flavour pairs for each request, then commits
+//!   the cheapest choice. `offline_singleton_best_accurate` restricts that search to the most
+//!   accurate flavour. `random` chooses a feasible slot uniformly and samples flavours from the
+//!   closest-to-uniform distribution with expected error equal to the scenario threshold; it is a
+//!   statistical baseline, not a per-run QoS guarantee.
 //! - `flavours`: overrides `Config::flavours` (the 3 built-in Accurate/Balanced/Fast
 //!   defaults) with `[{"name": "...", "error": <f64>, "duration_sec": <f64>}, ...]`.
 //!   Printed at startup alongside the other config knobs so it's clear which flavours
@@ -95,6 +100,8 @@ use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
 use carbonshift_rs::types::{Assignment, CapacityTier, Flavour, get_capacity_multiplier};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -115,7 +122,7 @@ struct BenchmarkConfig {
     infeasibility_recovery_mode: Option<String>,
     /// Max consecutive rollbacks before force-committing (0 = rollback disabled).
     rollback_max_consecutive: usize,
-    /// Additional offline strategies to run (e.g. "greedy_cheapest", "bandit", "ant_colony").
+    /// Additional offline strategies to run (e.g. "offline_singleton_best", "offline_singleton_best_accurate", "random").
     additional_strategies: Vec<String>,
     /// Online strategies to run through the scheduler pipeline (e.g. "bandit", "ant_colony").
     online_strategies: Vec<String>,
@@ -123,7 +130,7 @@ struct BenchmarkConfig {
     /// sweep). Falls back to `batch_sizes` when absent, so existing configs keep working
     /// unchanged. This lets a battery run online strategies (e.g. bandit/ant_colony) without
     /// also running the DP phase (`batch_sizes: []`), or with a different N sweep than DP's.
-    /// Ignored for "greedy_singleton", which always forces `[1]` (its only supported batch size).
+    /// Ignored for "singleton_best", which always forces `[1]` (its only supported batch size).
     online_batch_sizes: Option<Vec<usize>>,
     /// If > 0: flush a partial batch after this many seconds without a new request.
     batch_timeout_secs: f64,
@@ -251,7 +258,7 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
 
     let flavours: Option<Vec<Flavour>> = runner.get("flavours").map(|x| {
         serde_json::from_value(x.clone())
-            .expect("runner.flavours must be an array of {name, error, duration}")
+            .expect("runner.flavours must be an array of {name, error, duration_sec}")
     });
 
     BenchmarkConfig {
@@ -836,22 +843,28 @@ fn run_greedy_baseline(
     (per_req, batch_timings, summary)
 }
 
-// ─── greedy cheapest strategy ─────────────────────────────────────────────────
+// ─── per-request greedy strategies ────────────────────────────────────────────
 
-/// Greedy cheapest: assign each request to the (slot, flavour) pair that
-/// minimises carbon cost while satisfying:
-/// - deadline and assignment_max_future_slots window,
-/// - global error constraint (average error over all assigned requests ≤ threshold),
-/// - window error constraint (average error in [slot−past, slot+future] ≤ threshold).
+#[derive(Clone, Copy)]
+enum OfflineSingletonFlavourSelection {
+    Any,
+    MostAccurate,
+}
+
+/// Scan candidate slot/flavour pairs for each request, then commit the least
+/// carbon-cost feasible pair before considering the next request.
 ///
-/// Falls back to the minimum-error flavour at the arrival slot when no
-/// feasible (slot, flavour) pair exists.
-fn run_greedy_cheapest(
+/// This is a per-request greedy search, not an exhaustive search over complete
+/// schedules. `flavour_selection` narrows the same search for the accurate-only
+/// baseline while keeping slot feasibility and cost calculation identical.
+fn run_offline_singleton(
     scenario: &Scenario,
     assignment: &AssignmentPolicy<'_>,
     slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
+    strategy_name: &str,
+    flavour_selection: OfflineSingletonFlavourSelection,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
     let slot_dur = slot_duration_seconds;
     let carbon = &scenario.carbon_forecast;
@@ -863,18 +876,26 @@ fn run_greedy_cheapest(
     let win_future = assignment.error_window_future;
     let max_err = assignment.max_error_threshold;
 
-    // Sort flavours cheapest-first (shortest duration = lowest carbon cost per slot).
-    let mut sorted_flavours: Vec<&Flavour> = assignment.flavours.iter().collect();
-    sorted_flavours.sort_by(|a, b| a.duration.total_cmp(&b.duration));
-
-    // Fallback flavour = minimum error (for infeasible cases).
-    let fallback_flav = assignment
+    let accurate_flavour = assignment
         .flavours
         .iter()
-        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+        .min_by(|a, b| a.error.total_cmp(&b.error))
         .expect("no flavours");
+    let mut sorted_flavours: Vec<&Flavour> = match flavour_selection {
+        OfflineSingletonFlavourSelection::Any => assignment.flavours.iter().collect(),
+        OfflineSingletonFlavourSelection::MostAccurate => vec![accurate_flavour],
+    };
+    sorted_flavours.sort_by(|a, b| a.duration.total_cmp(&b.duration));
 
-    // Sort requests by (arrival_slot, request_id).
+    // In an infeasible error window, commit the lowest-error eligible flavour
+    // at arrival, matching the existing fallback behavior.
+    let fallback_flav = sorted_flavours
+        .iter()
+        .copied()
+        .min_by(|a, b| a.error.total_cmp(&b.error))
+        .expect("no eligible flavours");
+
+    // Process in arrival order so each decision sees the earlier commits.
     let mut requests: Vec<_> = scenario.requests.iter().collect();
     requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
 
@@ -893,9 +914,8 @@ fn run_greedy_cheapest(
             .min(arrival + max_future)
             .min(total_slots - 1);
 
-        // Global error constraint: retrospective (based on the average error
-        // *before* this request), not a per-candidate forward projection —
-        // mirrors solve_dp's step-function behaviour (Step 4 in solve_dp).
+        // Apply the cumulative hard constraint only after the committed
+        // average has crossed the threshold, matching the prior greedy engine.
         let global_avg = if global_count > 0 {
             global_error_sum / global_count as f64
         } else {
@@ -903,8 +923,6 @@ fn run_greedy_cheapest(
         };
         let global_constraint_active =
             assignment.global_error_constraint_enabled && global_count > 0 && global_avg > max_err;
-        // If the hard constraint would exclude every flavour, fall back to the
-        // full set (safety net identical to solve_dp's "never remove all flavours").
         let allowed_flavours: Vec<&Flavour> =
             if global_constraint_active && assignment.global_error_constraint_hard {
                 let filtered: Vec<&Flavour> = sorted_flavours
@@ -921,7 +939,8 @@ fn run_greedy_cheapest(
                 sorted_flavours.clone()
             };
 
-        // Find the cheapest feasible (slot, flavour) pair with a full scan.
+        // For each feasible slot, price every currently allowed flavour using
+        // that slot's next capacity-tier position and retain the cheapest one.
         let mut best: Option<(f64, i32, &Flavour)> = None;
         for slot in arrival..=deadline {
             let ci = carbon.get(slot as usize).copied().unwrap_or(1.0);
@@ -930,23 +949,16 @@ fn run_greedy_cheapest(
 
             for flav in &allowed_flavours {
                 let cost = ci * mult * flav.duration * scale;
-
-                {
-                    // Error window is anchored to `arrival` (when the request is
-                    // being decided), not to the candidate `slot` being tried —
-                    // mirrors solve_dp, which centers the window on current_slot
-                    // regardless of where the request ends up being placed.
-                    let mut win_sum = flav.error;
-                    let mut win_cnt = 1usize;
-                    for ws in (arrival - win_past)..=(arrival + win_future) {
-                        if let Some(errs) = slot_errors.get(&ws) {
-                            win_sum += errs.iter().sum::<f64>();
-                            win_cnt += errs.len();
-                        }
+                let mut win_sum = flav.error;
+                let mut win_cnt = 1usize;
+                for ws in (arrival - win_past)..=(arrival + win_future) {
+                    if let Some(errs) = slot_errors.get(&ws) {
+                        win_sum += errs.iter().sum::<f64>();
+                        win_cnt += errs.len();
                     }
-                    if win_sum / win_cnt as f64 > max_err {
-                        continue;
-                    }
+                }
+                if win_sum / win_cnt as f64 > max_err {
+                    continue;
                 }
                 if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
                     best = Some((cost, slot, flav));
@@ -954,7 +966,8 @@ fn run_greedy_cheapest(
             }
         }
 
-        // Commit the cheapest feasible pair; fall back if none found.
+        // If no candidate satisfies the window, keep the lowest-error eligible
+        // flavour at arrival rather than leaving the request unassigned.
         let (chosen_cost, chosen_slot, chosen_flav) = best.unwrap_or_else(|| {
             let slot = arrival;
             let ci = carbon.get(slot as usize).copied().unwrap_or(1.0);
@@ -989,7 +1002,7 @@ fn run_greedy_cheapest(
             flavour_name: chosen_flav.name.clone(),
             error: chosen_flav.error,
             carbon_cost: chosen_cost,
-            assignment_solver_mode: "greedy_cheapest".to_string(),
+            assignment_solver_mode: strategy_name.to_string(),
             assignment_solver_status: "ok".to_string(),
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry: false,
@@ -1008,27 +1021,367 @@ fn run_greedy_cheapest(
         });
     }
 
-    let total_requests: usize = scenario.requests.len();
     let summary = compute_summary(
-        "greedy_cheapest",
+        strategy_name,
         0,
         realtime_slots,
         realtime_speed_scale,
         &per_req,
         &batch_timings,
-        total_requests,
+        scenario.requests.len(),
         &fallback_flav.name,
         fallback_flav.duration,
         fallback_flav.error,
         0,
         0,
         0,
-        0,   // peak_concurrent_workers
-        0.0, // avg_concurrent_workers
+        0,
+        0.0,
     );
     (per_req, batch_timings, summary)
 }
 
+fn run_offline_singleton_best(
+    scenario: &Scenario,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    run_offline_singleton(
+        scenario,
+        assignment,
+        slot_duration_seconds,
+        realtime_slots,
+        realtime_speed_scale,
+        "offline_singleton_best",
+        OfflineSingletonFlavourSelection::Any,
+    )
+}
+
+fn run_offline_singleton_best_accurate(
+    scenario: &Scenario,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    run_offline_singleton(
+        scenario,
+        assignment,
+        slot_duration_seconds,
+        realtime_slots,
+        realtime_speed_scale,
+        "offline_singleton_best_accurate",
+        OfflineSingletonFlavourSelection::MostAccurate,
+    )
+}
+
+/// Assign each request a uniformly random feasible slot and a random flavour.
+///
+/// Flavour probabilities are the Euclidean-nearest distribution to uniform
+/// subject to having the configured error threshold as their expected error.
+/// This targets the average over many assignments; it is not a per-run or
+/// per-window QoS guarantee.
+fn run_random(
+    scenario: &Scenario,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    // Calculate the flavour mix once for this run. An unattainable threshold
+    // (outside the configured flavour errors) makes the random baseline invalid.
+    let errors: Vec<f64> = assignment.flavours.iter().map(|f| f.error).collect();
+    let probabilities =
+        closest_to_uniform_flavour_probabilities(&errors, assignment.max_error_threshold)
+            .unwrap_or_else(|error| panic!("Cannot run random strategy: {error}"));
+
+    // Reuse the scenario seed so this baseline is repeatable. The fixed xor
+    // constant gives this strategy its own deterministic RNG stream.
+    let mut rng = ChaCha8Rng::seed_from_u64(scenario.metadata.seed ^ 0xA3F1_95C7_4D2B_6801);
+    let mut requests: Vec<_> = scenario.requests.iter().collect();
+    // A stable processing order makes the seeded result independent of the
+    // request vector's input ordering.
+    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
+
+    // Capacity tiers price requests by their one-based commit position in a
+    // slot, so preserve the occupancy accumulated by earlier random choices.
+    let mut slot_count: HashMap<i32, i32> = HashMap::new();
+    let mut per_req: Vec<PerRequest> = Vec::with_capacity(requests.len());
+    let mut batch_timings: Vec<BatchTiming> = Vec::with_capacity(requests.len());
+
+    for (index, req) in requests.iter().enumerate() {
+        let arrival = req.arrival_slot;
+        // Restrict random slot selection to the request's valid scheduling
+        // window: its deadline, the configured maximum shift, and horizon end.
+        let latest = req
+            .deadline_slot
+            .min(arrival + assignment.assignment_max_future_slots)
+            .min(assignment.total_slots - 1);
+        let slot = rng.gen_range(arrival..=latest);
+
+        // Inverse-CDF sampling turns one uniform draw into the configured
+        // flavour distribution. Initializing to the final flavour also makes
+        // it absorb any tiny floating-point remainder in the probability sum.
+        let random_value = rng.gen_range(0.0..1.0);
+        let mut cumulative_probability = 0.0;
+        let mut chosen_flavour = assignment.flavours.last().expect("no flavours");
+        for (flavour, probability) in assignment.flavours.iter().zip(&probabilities) {
+            cumulative_probability += probability;
+            if random_value < cumulative_probability {
+                chosen_flavour = flavour;
+                break;
+            }
+        }
+
+        // Price this assignment at the slot's next occupancy position, then
+        // commit that occupancy so later requests see the correct tier.
+        let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
+        let multiplier = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
+        let carbon_intensity = scenario
+            .carbon_forecast
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(1.0);
+        let carbon_cost = carbon_intensity
+            * multiplier
+            * chosen_flavour.duration
+            * assignment.carbon_cost_duration_scale;
+        *slot_count.entry(slot).or_insert(0) += 1;
+
+        // Record the same per-request and single-request timing shape used by
+        // the other offline engines; random scheduling itself has no solver
+        // work or batching phase.
+        let wait_slots = (slot - arrival).max(0);
+        let sequence = (index + 1) as u64;
+        per_req.push(PerRequest {
+            request_id: req.request_id,
+            arrival_time: arrival as f64 * slot_duration_seconds,
+            arrival_slot: arrival,
+            deadline_slot: req.deadline_slot,
+            included_in_batch_slot: arrival,
+            batch_sequence: sequence,
+            scheduled_slot: slot,
+            queue_wait_slots: wait_slots,
+            queue_wait_seconds: wait_slots as f64 * slot_duration_seconds,
+            final_wait_slots: wait_slots,
+            final_wait_seconds: wait_slots as f64 * slot_duration_seconds,
+            flavour_name: chosen_flavour.name.clone(),
+            error: chosen_flavour.error,
+            carbon_cost,
+            assignment_solver_mode: "random".to_string(),
+            assignment_solver_status: "ok".to_string(),
+            assigned_with_greedy_fallback: false,
+            assigned_with_relaxed_retry: false,
+            assigned_with_rollback: false,
+            lateness_slots: (slot - req.deadline_slot).max(0),
+        });
+        batch_timings.push(BatchTiming {
+            batch_sequence: sequence,
+            batch_size_n: 0,
+            effective_batch_size: 1,
+            slot: arrival,
+            pending_before: 1,
+            solver_elapsed_ms: 0.0,
+            scheduled: true,
+            flush_partial_batch: false,
+        });
+    }
+
+    // The summary's baseline flavour fields describe the common reference
+    // flavour; they do not imply that random assignments use that flavour.
+    let most_accurate = assignment
+        .flavours
+        .iter()
+        .min_by(|a, b| a.error.total_cmp(&b.error))
+        .expect("no flavours");
+    let summary = compute_summary(
+        "random",
+        0,
+        realtime_slots,
+        realtime_speed_scale,
+        &per_req,
+        &batch_timings,
+        scenario.requests.len(),
+        &most_accurate.name,
+        most_accurate.duration,
+        most_accurate.error,
+        0,
+        0,
+        0,
+        0,
+        0.0,
+    );
+    (per_req, batch_timings, summary)
+}
+
+/// Project equal flavour probabilities onto the non-negative distributions
+/// whose expected error equals `target_error`.
+///
+/// For each slope, the projection has the form `max(0, intercept + slope*e)`.
+/// The intercept is chosen so probabilities sum to one; a bounded bisection
+/// then finds the slope that matches the requested expected error.
+fn closest_to_uniform_flavour_probabilities(
+    errors: &[f64],
+    target_error: f64,
+) -> Result<Vec<f64>, String> {
+    // Validate before calculating a range or normalizing: neither an empty
+    // flavour set nor non-finite values define a usable probability mix.
+    if errors.is_empty() {
+        return Err("at least one flavour is required".to_string());
+    }
+    if !target_error.is_finite() || errors.iter().any(|error| !error.is_finite()) {
+        return Err("flavour errors and target error must be finite".to_string());
+    }
+
+    let min_error = errors.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_error = errors.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // An expected error is a weighted average, so it cannot be below the
+    // lowest flavour error or above the highest one.
+    if target_error < min_error || target_error > max_error {
+        return Err(format!(
+            "target error {target_error} is outside the flavour error range [{min_error}, {max_error}]"
+        ));
+    }
+
+    // If every flavour has the same error, every distribution has that
+    // expectation; equal probabilities are therefore already nearest uniform.
+    if min_error == max_error {
+        return Ok(vec![1.0 / errors.len() as f64; errors.len()]);
+    }
+
+    // At either endpoint only flavours with that exact error can be selected.
+    // Splitting mass evenly among tied endpoint flavours is the closest mix to
+    // uniform among all distributions that attain the endpoint.
+    if target_error == min_error || target_error == max_error {
+        let selected_error = if target_error == min_error {
+            min_error
+        } else {
+            max_error
+        };
+        let matching_count = errors
+            .iter()
+            .filter(|error| **error == selected_error)
+            .count();
+        return Ok(errors
+            .iter()
+            .map(|error| {
+                if *error == selected_error {
+                    1.0 / matching_count as f64
+                } else {
+                    0.0
+                }
+            })
+            .collect());
+    }
+
+    // Work on a [0, 1] error scale so probability calculations and slope
+    // search do not depend on whether errors are represented as fractions or
+    // percentages, or on the magnitude of the configured values.
+    let normalized_errors: Vec<f64> = errors
+        .iter()
+        .map(|error| (error - min_error) / (max_error - min_error))
+        .collect();
+    let normalized_target = (target_error - min_error) / (max_error - min_error);
+    let uniform_mean = normalized_errors.iter().sum::<f64>() / normalized_errors.len() as f64;
+    // Equal probabilities are the closest possible distribution when their
+    // mean already meets the target.
+    if (normalized_target - uniform_mean).abs() <= f64::EPSILON {
+        return Ok(vec![1.0 / errors.len() as f64; errors.len()]);
+    }
+
+    // For a given slope, project equal probabilities onto the non-negative
+    // unit-sum distribution associated with that slope, then measure its mean
+    // error. Increasing the slope shifts probability toward higher errors.
+    let expected_normalized_error = |slope: f64| {
+        let probabilities = project_probabilities_at_slope(&normalized_errors, slope);
+        probabilities
+            .iter()
+            .zip(&normalized_errors)
+            .map(|(probability, error)| probability * error)
+            .sum::<f64>()
+    };
+
+    // Start at slope zero (the equal-probability mix) and expand in the needed
+    // direction until the target is bracketed. Geometric expansion avoids
+    // guessing a slope scale for different numbers of flavours or error gaps.
+    let (mut low, mut high) = if normalized_target > uniform_mean {
+        (0.0, 1.0)
+    } else {
+        (-1.0, 0.0)
+    };
+    let mut bracketed = false;
+    for _ in 0..64 {
+        if expected_normalized_error(low) <= normalized_target
+            && expected_normalized_error(high) >= normalized_target
+        {
+            bracketed = true;
+            break;
+        }
+        if normalized_target > uniform_mean {
+            high *= 2.0;
+        } else {
+            low *= 2.0;
+        }
+    }
+    if !bracketed {
+        return Err(
+            "could not bracket the target error while calculating probabilities".to_string(),
+        );
+    }
+
+    // The expected error is monotone over this bracket. Bisection narrows it
+    // until the projected mix reaches the target to floating-point precision.
+    for _ in 0..100 {
+        let midpoint = low + (high - low) / 2.0;
+        if expected_normalized_error(midpoint) < normalized_target {
+            low = midpoint;
+        } else {
+            high = midpoint;
+        }
+    }
+    Ok(project_probabilities_at_slope(
+        &normalized_errors,
+        low + (high - low) / 2.0,
+    ))
+}
+
+/// Return the non-negative unit-sum projection for one probability slope.
+fn project_probabilities_at_slope(normalized_errors: &[f64], slope: f64) -> Vec<f64> {
+    // The projection has probabilities max(0, intercept + slope*error).
+    // Sorting scores lets us find the active (positive-probability) prefix;
+    // the intercept for each prefix is the value that makes its weights sum
+    // to one.
+    let mut scores: Vec<(usize, f64)> = normalized_errors
+        .iter()
+        .enumerate()
+        .map(|(index, error)| (index, slope * error))
+        .collect();
+    scores.sort_by(|left, right| right.1.total_cmp(&left.1));
+
+    let mut score_sum = 0.0;
+    for active_count in 1..=scores.len() {
+        score_sum += scores[active_count - 1].1;
+        let intercept = (1.0 - score_sum) / active_count as f64;
+        // Once the next score would receive zero or less probability, this
+        // prefix is the complete active set and all remaining flavours stay at
+        // the non-negative boundary.
+        let next_score_is_inactive =
+            active_count == scores.len() || intercept + scores[active_count].1 <= 0.0;
+        if next_score_is_inactive {
+            let mut probabilities = vec![0.0; scores.len()];
+            // Restore the sorted entries to their original flavour order so
+            // callers can zip probabilities with the configured flavours.
+            for (index, score) in scores.iter().take(active_count) {
+                probabilities[*index] = (intercept + score).max(0.0);
+            }
+            return probabilities;
+        }
+    }
+
+    unreachable!("the final active set always normalizes to one")
+}
 // ─── swarm strategy wrappers ──────────────────────────────────────────────────
 
 /// Convert `SwarmAssignment` results into the standard `PerRequest` / summary
@@ -1153,7 +1506,45 @@ fn run_ant_colony_strategy(
     )
 }
 
-/// Dispatch an additional strategy by name.
+type OfflineStrategyRunner = for<'a> fn(
+    &Scenario,
+    &AssignmentPolicy<'a>,
+    f64,
+    bool,
+    f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary);
+
+struct OfflineStrategy {
+    name: &'static str,
+    run: OfflineStrategyRunner,
+}
+
+/// Register each offline engine once. New engines add a runner and descriptor,
+/// without adding another branch to the strategy dispatcher.
+const OFFLINE_STRATEGIES: &[OfflineStrategy] = &[
+    OfflineStrategy {
+        name: "offline_singleton_best",
+        run: run_offline_singleton_best,
+    },
+    OfflineStrategy {
+        name: "offline_singleton_best_accurate",
+        run: run_offline_singleton_best_accurate,
+    },
+    OfflineStrategy {
+        name: "random",
+        run: run_random,
+    },
+    OfflineStrategy {
+        name: "bandit",
+        run: run_bandit_strategy,
+    },
+    OfflineStrategy {
+        name: "ant_colony",
+        run: run_ant_colony_strategy,
+    },
+];
+
+/// Dispatch an additional strategy through the offline engine registry.
 fn run_strategy(
     name: &str,
     scenario: &Scenario,
@@ -1162,30 +1553,18 @@ fn run_strategy(
     realtime_slots: bool,
     realtime_speed_scale: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    match name {
-        "greedy_cheapest" => run_greedy_cheapest(
-            scenario,
-            assignment,
-            slot_duration_seconds,
-            realtime_slots,
-            realtime_speed_scale,
-        ),
-        "bandit" => run_bandit_strategy(
-            scenario,
-            assignment,
-            slot_duration_seconds,
-            realtime_slots,
-            realtime_speed_scale,
-        ),
-        "ant_colony" => run_ant_colony_strategy(
-            scenario,
-            assignment,
-            slot_duration_seconds,
-            realtime_slots,
-            realtime_speed_scale,
-        ),
-        other => panic!("Unknown strategy: '{other}'"),
-    }
+    let strategy = OFFLINE_STRATEGIES
+        .iter()
+        .find(|strategy| strategy.name == name)
+        .unwrap_or_else(|| panic!("Unknown offline strategy: '{name}'"));
+
+    (strategy.run)(
+        scenario,
+        assignment,
+        slot_duration_seconds,
+        realtime_slots,
+        realtime_speed_scale,
+    )
 }
 
 // ─── output helpers ───────────────────────────────────────────────────────────
@@ -1998,7 +2377,7 @@ fn main() {
 
     // ── online strategies (generator + scheduler pipeline) ────────────────
     // Independent batch-size sweep from DP's `batch_sizes`, so a battery run
-    // can enable online strategies (bandit/ant_colony/greedy_singleton)
+    // can enable online strategies (bandit/ant_colony/singleton_best)
     // without also running the DP phase (`batch_sizes: []`), or sweep a
     // different N list for online vs. DP. Falls back to `batch_sizes` when
     // `online_batch_sizes` is absent (keeps old configs behaving unchanged).
@@ -2007,14 +2386,14 @@ fn main() {
         .clone()
         .unwrap_or_else(|| bcfg.batch_sizes.clone());
     for strategy in &bcfg.online_strategies {
-        // greedy_singleton only supports batch_size=1: force it regardless of
+        // singleton_best only supports batch_size=1: force it regardless of
         // the configured batch_sizes list, so a battery sweep across N doesn't
         // redundantly repeat an identical run under a different label.
-        let is_greedy_singleton = strategy.eq_ignore_ascii_case("greedy_singleton");
-        let batch_sizes_for_strategy: Vec<usize> = if is_greedy_singleton {
+        let is_singleton_best = strategy.eq_ignore_ascii_case("singleton_best");
+        let batch_sizes_for_strategy: Vec<usize> = if is_singleton_best {
             if online_batch_sizes_base.as_slice() != [1] {
                 println!(
-                    "[Info] online strategy 'greedy_singleton' only supports batch_size=1; \
+                    "[Info] online strategy 'singleton_best' only supports batch_size=1; \
                      ignoring other configured batch_sizes for this strategy."
                 );
             }
@@ -2092,7 +2471,10 @@ fn main() {
 
     // ── additional strategies ──────────────────────────────────────────────
     for strategy in &bcfg.additional_strategies {
-        let strat_dir = bcfg.output_dir.join(format!("strategy_{strategy}"));
+        let output_strategy_name = strategy.strip_prefix("offline_").unwrap_or(strategy);
+        let strat_dir = bcfg
+            .output_dir
+            .join(format!("strategy_{output_strategy_name}"));
         let strat_t0 = std::time::Instant::now();
         let (per_req, batch_timings, mut summary) = run_strategy(
             strategy,
@@ -2176,7 +2558,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carbonshift_rs::scenario::{ScenarioMetadata, ScenarioRequest};
     use carbonshift_rs::types::CapacityTier;
+
+    fn make_scenario(requests: Vec<ScenarioRequest>, carbon_forecast: Vec<f64>) -> Scenario {
+        Scenario {
+            metadata: ScenarioMetadata {
+                total_slots: carbon_forecast.len() as i32,
+                slot_duration_seconds: 60.0,
+                requests_per_slot: 0.0,
+                request_rate_std_factor: 0.0,
+                deadline_min_slack: 0,
+                deadline_max_slack: 1,
+                max_error_threshold: 7.5,
+                error_window_past: 0,
+                error_window_future: 0,
+                error_window_past_decay_slots: 0,
+                prehistory_enabled: false,
+                prehistory_error_ratio: 0.0,
+                prehistory_mock_influence: 0.0,
+                carbon_intensity_cycle_slots: 2,
+                carbon_random_noise_amplitude: 0.0,
+                seed: 1234,
+                capacity_tiers: None,
+            },
+            carbon_forecast,
+            requests,
+        }
+    }
+
+    fn make_request(id: u64, arrival_slot: i32, deadline_slot: i32) -> ScenarioRequest {
+        ScenarioRequest {
+            request_id: id,
+            arrival_slot,
+            deadline_slot,
+            arrival_time: arrival_slot as f64 * 60.0,
+        }
+    }
 
     fn make_assignment(id: u64, slot: i32, dur: f64) -> Assignment {
         Assignment::new(id, slot, "Balanced".into(), 0.0, 0.0, dur, None, None)
@@ -2346,5 +2764,159 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(bcfg.online_batch_sizes, Some(vec![1, 6, 12]));
         assert!(bcfg.batch_sizes.is_empty());
+    }
+
+    #[test]
+    fn random_flavour_probabilities_match_threshold_with_nearest_uniform_mix() {
+        let probabilities =
+            closest_to_uniform_flavour_probabilities(&[0.0, 5.0, 10.0], 7.5).unwrap();
+
+        assert!((probabilities[0] - 1.0 / 12.0).abs() < 1e-9);
+        assert!((probabilities[1] - 1.0 / 3.0).abs() < 1e-9);
+        assert!((probabilities[2] - 7.0 / 12.0).abs() < 1e-9);
+        let average_error: f64 = probabilities
+            .iter()
+            .zip([0.0, 5.0, 10.0])
+            .map(|(probability, error)| probability * error)
+            .sum();
+        assert!((average_error - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn random_flavour_probabilities_support_boundary_and_interior_targets() {
+        let low_boundary =
+            closest_to_uniform_flavour_probabilities(&[0.0, 0.0, 10.0], 0.0).unwrap();
+        assert_eq!(low_boundary, vec![0.5, 0.5, 0.0]);
+
+        let low_target = closest_to_uniform_flavour_probabilities(&[0.0, 5.0, 10.0], 1.0).unwrap();
+        assert!(low_target.iter().all(|probability| *probability >= 0.0));
+        let average_error: f64 = low_target
+            .iter()
+            .zip([0.0, 5.0, 10.0])
+            .map(|(probability, error)| probability * error)
+            .sum();
+        assert!((average_error - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn random_flavour_probabilities_reject_unattainable_targets() {
+        let error = closest_to_uniform_flavour_probabilities(&[0.0, 5.0, 10.0], 12.0).unwrap_err();
+        assert!(error.contains("outside the flavour error range"));
+    }
+
+    #[test]
+    fn offline_strategy_registry_contains_canonical_singleton_names() {
+        let names: Vec<&str> = OFFLINE_STRATEGIES
+            .iter()
+            .map(|strategy| strategy.name)
+            .collect();
+
+        assert!(names.contains(&"offline_singleton_best"));
+        assert!(names.contains(&"offline_singleton_best_accurate"));
+    }
+
+    #[test]
+    fn offline_singleton_best_accurate_uses_min_error_flavour_and_cheapest_slot() {
+        let scenario = make_scenario(vec![make_request(1, 0, 1)], vec![100.0, 10.0]);
+        let mut config = Config::default();
+        config.total_slots = 2;
+        config.assignment_max_future_slots = 1;
+        config.max_error_threshold = 7.5;
+        config.error_window_past = 0;
+        config.error_window_future = 0;
+        config.global_error_constraint_enabled = false;
+        config.carbon_cost_duration_scale = 1.0;
+        config.capacity_tiers = vec![CapacityTier {
+            max_requests: None,
+            multiplier: 1.0,
+        }];
+        config.flavours = vec![
+            Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 10.0,
+            },
+            Flavour {
+                name: "Fast".to_string(),
+                error: 5.0,
+                duration: 1.0,
+            },
+        ];
+
+        let (assignments, _, summary) = run_offline_singleton_best_accurate(
+            &scenario,
+            &config.assignment_policy(),
+            60.0,
+            false,
+            1.0,
+        );
+
+        assert_eq!(assignments[0].flavour_name, "Accurate");
+        assert_eq!(assignments[0].scheduled_slot, 1);
+        assert_eq!(summary.execution_mode, "offline_singleton_best_accurate");
+
+        let (best_assignments, _, best_summary) = run_strategy(
+            "offline_singleton_best",
+            &scenario,
+            &config.assignment_policy(),
+            60.0,
+            false,
+            1.0,
+        );
+        assert_eq!(best_assignments[0].flavour_name, "Fast");
+        assert_eq!(best_assignments[0].scheduled_slot, 1);
+        assert_eq!(best_summary.execution_mode, "offline_singleton_best");
+    }
+
+    #[test]
+    fn random_strategy_is_seeded_and_targets_threshold_in_expectation() {
+        let requests = (0..20_000).map(|id| make_request(id, 0, 1)).collect();
+        let scenario = make_scenario(requests, vec![100.0, 100.0]);
+        let mut config = Config::default();
+        config.total_slots = 2;
+        config.assignment_max_future_slots = 1;
+        config.max_error_threshold = 7.5;
+        config.global_error_constraint_enabled = false;
+        config.flavours = vec![
+            Flavour {
+                name: "Accurate".to_string(),
+                error: 0.0,
+                duration: 10.0,
+            },
+            Flavour {
+                name: "Balanced".to_string(),
+                error: 5.0,
+                duration: 5.0,
+            },
+            Flavour {
+                name: "Fast".to_string(),
+                error: 10.0,
+                duration: 1.0,
+            },
+        ];
+
+        let (assignments, _, _) =
+            run_random(&scenario, &config.assignment_policy(), 60.0, false, 1.0);
+        let (repeated, _, _) = run_random(&scenario, &config.assignment_policy(), 60.0, false, 1.0);
+        let average_error = assignments
+            .iter()
+            .map(|assignment| assignment.error)
+            .sum::<f64>()
+            / assignments.len() as f64;
+
+        assert!((average_error - 7.5).abs() < 0.15);
+        assert!(
+            assignments
+                .iter()
+                .all(|assignment| (0..=1).contains(&assignment.scheduled_slot))
+        );
+        assert!(
+            assignments
+                .iter()
+                .map(|assignment| (&assignment.flavour_name, assignment.scheduled_slot))
+                .eq(repeated
+                    .iter()
+                    .map(|assignment| (&assignment.flavour_name, assignment.scheduled_slot)))
+        );
     }
 }

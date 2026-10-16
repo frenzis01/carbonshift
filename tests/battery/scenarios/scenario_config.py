@@ -21,8 +21,11 @@ TOTAL_SLOTS: int = 24
 SLOT_DURATION_SECONDS: float = 10.0
 
 # ── request generation ───────────────────────────────────────────────────────
-# Target average requests per slot (see REQUEST_NIGHT_FLOOR_RATIO below for
-# how this average is distributed across the day/night cycle).
+# Supported simulation-only request arrival pattern. The battery runner can
+# override this per scenario; emulation plans are configured independently.
+INPUT_PATTERN: str = "sinusoidal"
+# Target average requests per slot. Sinusoidal scenarios distribute this
+# average across the day/night cycle; flat scenarios distribute it evenly.
 PREDICTED_REQUESTS_PER_SLOT: float = 60.0
 # Gaussian noise factor: sigma = max(1, mean_rate_for_slot * REQUEST_RATE_STD_FACTOR).
 # See the inline note in scenario_io.generate_scenario_data for tuning guidance.

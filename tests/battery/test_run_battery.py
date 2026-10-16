@@ -96,8 +96,13 @@ def test_row_label_online_strategy():
 
 
 def test_row_label_offline_strategy():
-    row = {"infeasibility_mode": "offline_greedy_cheapest", "batch_size": 0}
-    assert rb._row_label(row) == "greedy_cheapest"
+    row = {"infeasibility_mode": "offline_singleton_best", "batch_size": 0}
+    assert rb._row_label(row) == "offline_singleton_best"
+    accurate_row = {
+        "infeasibility_mode": "offline_singleton_best_accurate",
+        "batch_size": 0,
+    }
+    assert rb._row_label(accurate_row) == "offline_singleton_best_accurate"
 
 
 # ─── _top3_markdown_table / _build_top3_section ────────────────────────────
@@ -151,7 +156,7 @@ def test_build_top3_section_groups_by_scenario_and_category():
     all_rows = [
         _make_row("s1", "min_error_greedy", 1, 40.0),
         _make_row("s1", "online_bandit", 1, 35.0),
-        _make_row("s1", "offline_greedy_cheapest", 0, 33.0),
+        _make_row("s1", "offline_singleton_best", 0, 33.0),
         _make_row("s2", "min_error_greedy", 1, 20.0),
     ]
     section = rb._build_top3_section(all_rows, per_n_timing_rows=[])

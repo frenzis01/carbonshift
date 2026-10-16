@@ -1,6 +1,7 @@
 {
   "_comment": "CarbonShift solver battery test configuration (Rust nshift binary only).",
   "_phases_comment": "Each phase is independently toggled by leaving its content list(s) empty: DP runs only if both batch_sizes AND infeasibility_modes are non-empty; online runs only if online_strategies is non-empty; offline runs only if additional_strategies is non-empty. See tests/battery/multiple_runs.py for phase-aware parameter grids that avoid redundantly re-running phases a given knob doesn't affect.",
+  "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat spreads the requested average evenly across slots while retaining random sub-slot arrival times. multiple_runs.py sweeps both by default. This does not configure client emulation.",
   "battery_id": "cfg_test4_dp_0",
   "batch_sizes": [
     4
@@ -9,7 +10,7 @@
     "carryover"
   ],
   "online_strategies": [],
-  "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. greedy_singleton always forces N=1 regardless of this list.",
+  "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. singleton_best always forces N=1 regardless of this list.",
   "online_batch_sizes__": [
     1,
     4,
@@ -36,7 +37,7 @@
   ],
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
-  "_runtime_knobs_comment": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values. rollback_max_consecutive/max_batch_solver_parallelism affect DP and greedy_singleton only; online_swarm_mode affects bandit/ant_colony only (see multiple_runs.py sensitivity matrix).",
+  "_runtime_knobs_comment": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values. rollback_max_consecutive/max_batch_solver_parallelism affect DP and singleton_best only; online_swarm_mode affects bandit/ant_colony only (see multiple_runs.py sensitivity matrix).",
   "max_batch_solver_parallelism": 12,
   "online_swarm_mode": "merge",
   "realtime_slots": false,
@@ -48,6 +49,7 @@
       "seed": 120,
       "requests_per_slot": 2000.0,
       "total_slots": 72,
+      "input_pattern": "sinusoidal",
       "capacity_tiers": [
         {
           "max_requests": 2000,

@@ -316,7 +316,7 @@ impl DpSolver {
         // falling through here fixes that without adding new logic.
 
         // `compute_sequential_solution` picks purely by minimum cost — it has
-        // no notion of `max_error_threshold` at all (unlike `solve_greedy_singleton`
+        // no notion of `max_error_threshold` at all (unlike `solve_singleton_best`
         // and `greedy_fallback`, which both skip/avoid infeasible candidates
         // and only fall back to the most-accurate flavour as a last resort).
         // So `warm_assignments` is *not* guaranteed to respect the constraint,
@@ -557,13 +557,13 @@ impl DpSolver {
     ///                   after each processed request (`len = N+1`).
     /// Sequential (request-by-request) warm-start solution.
     ///
-    /// Unlike a pure cost-greedy scan, this mirrors `solve_greedy_singleton`'s
+    /// Unlike a pure cost-greedy scan, this mirrors `solve_singleton_best`'s
     /// feasibility rule: for each request, only cost-compare (flavour, slot)
     /// candidates that keep the running window-average error within
     /// `max_error_threshold` (checked a priori, before committing), and only
     /// if *no* candidate is feasible does it fall back to the most-accurate
     /// (min-error) flavour at its cheapest slot — the same "guaranteed to
-    /// schedule" last resort `greedy_fallback`/`solve_greedy_singleton` use.
+    /// schedule" last resort `greedy_fallback`/`solve_singleton_best` use.
     /// This makes the resulting `warm_assignments` a real, constraint-respecting
     /// solution whenever one is reachable via request-by-request placement, so
     /// callers that return it directly (DP dead-end, DP timeout) are safe by
@@ -604,7 +604,7 @@ impl DpSolver {
 
             // Most-accurate (min-error) flavour, and its cheapest slot — the
             // last-resort candidate if nothing keeps the window error within
-            // threshold (mirrors `solve_greedy_singleton`'s fallback).
+            // threshold (mirrors `solve_singleton_best`'s fallback).
             let candidate_flavours = self.flavours_for(request.request_id, input.request_flavours);
             let min_error_flavour = candidate_flavours
                 .iter()

@@ -87,7 +87,7 @@ pub(super) trait BatchSolverStrategy: Send + Sync {
 }
 
 struct DpBatchSolver;
-struct GreedySingletonBatchSolver;
+struct SingletonBestBatchSolver;
 
 impl BatchSolverStrategy for DpBatchSolver {
     fn solve(&self, input: BatchSolveContext<'_>) -> BatchSolveResult {
@@ -95,9 +95,9 @@ impl BatchSolverStrategy for DpBatchSolver {
     }
 }
 
-impl BatchSolverStrategy for GreedySingletonBatchSolver {
+impl BatchSolverStrategy for SingletonBestBatchSolver {
     fn solve(&self, input: BatchSolveContext<'_>) -> BatchSolveResult {
-        solve_greedy_singleton(input)
+        solve_singleton_best(input)
     }
 }
 
@@ -111,13 +111,13 @@ fn build_dp_batch_solver() -> Box<dyn BatchSolverStrategy> {
 
 /// Factory for the exhaustive singleton strategy; the scheduler applies the
 /// same worker and commit path used by DP after this solver returns.
-fn build_greedy_singleton_batch_solver() -> Box<dyn BatchSolverStrategy> {
-    Box::new(GreedySingletonBatchSolver)
+fn build_singleton_best_batch_solver() -> Box<dyn BatchSolverStrategy> {
+    Box::new(SingletonBestBatchSolver)
 }
 
 const BATCH_SOLVER_REGISTRY: &[(&str, BatchSolverFactory)] = &[
     ("dp", build_dp_batch_solver),
-    ("greedy_singleton", build_greedy_singleton_batch_solver),
+    ("singleton_best", build_singleton_best_batch_solver),
 ];
 
 /// Resolve the configured strategy once per worker. Unknown names retain the
@@ -133,11 +133,11 @@ pub(super) fn select_batch_solver(name: &str) -> Box<dyn BatchSolverStrategy> {
         .unwrap_or_else(build_dp_batch_solver)
 }
 
-// ─── shared solve preamble (steps 1-4, used by both DP and greedy_singleton) ──
+// ─── shared solve preamble (steps 1-4, used by both DP and singleton_best) ──
 
 /// Everything the "solve" step of a batch worker needs, computed once from a
 /// single consistent snapshot of shared state (Steps 1-4 of the pipeline).
-/// Shared between `solve_dp` and `solve_greedy_singleton` so the snapshotting,
+/// Shared between `solve_dp` and `solve_singleton_best` so the snapshotting,
 /// time-shifting, error-baseline, and global-error-constraint logic is not
 /// duplicated between solver strategies.
 struct PreparedSolve {
@@ -172,7 +172,7 @@ struct PreparedSolve {
 
 /// Capture and derive all shared inputs needed by a single batch solve.
 ///
-/// Both `solve_dp` and `solve_greedy_singleton` call this first, ensuring they
+/// Both `solve_dp` and `solve_singleton_best` call this first, ensuring they
 /// use the same state snapshot, profile-specific error history, movable future
 /// assignments, recovery inputs, and global capacity policy.
 fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
@@ -552,7 +552,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
             assignments: vec![],
             context: SolveContext {
                 status: "infeasible".to_string(),
-                mode: "greedy_singleton".to_string(),
+                mode: "singleton_best".to_string(),
                 ..Default::default()
             },
             baseline_slot_counts: HashMap::new(),
@@ -643,15 +643,15 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
     }
 }
 
-// ─── greedy singleton pipeline (online strategy, batch_size=1 only) ──────────
+// ─── singleton_best pipeline (online strategy, batch_size=1 only) ───────────
 
-/// Online greedy-cheapest strategy, restricted to `batch_size=1`.
+/// Online `singleton_best` strategy, restricted to `batch_size=1`.
 ///
 /// For its one pending request, exhaustively scans every `(slot, flavour)`
 /// pair in `[current_slot, deadline]` and commits the cheapest one that
 /// satisfies the local error window and profile cumulative error constraint — the same
-/// logic as the offline `greedy_cheapest` strategy (see
-/// `bin/nshift/main.rs::run_greedy_cheapest`), but driven through the live
+/// logic as the offline `offline_singleton_best` strategy (see
+/// `bin/nshift/main.rs::run_offline_singleton_best`), but driven through the live
 /// scheduler/`SharedState` instead of a single in-memory pass over a whole
 /// scenario.
 ///
@@ -669,10 +669,10 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
 /// it also shares `batch_worker_entry`'s rollback-checked commit path, since
 /// — like DP — its cost model depends on accurate per-slot request counts
 /// that a concurrent capacity-tier breach could invalidate.
-fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
+fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
     if input.verbose && input.pending.len() > 1 {
         println!(
-            "[Scheduler] ⚠ greedy_singleton received a batch of {} pending requests; \
+            "[Scheduler] ⚠ singleton_best received a batch of {} pending requests; \
              it only supports batch_size=1 — scheduling them sequentially.",
             input.pending.len()
         );
@@ -731,7 +731,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 assignments: vec![],
                 context: SolveContext {
                     status: "infeasible".to_string(),
-                    mode: "greedy_singleton".to_string(),
+                    mode: "singleton_best".to_string(),
                     ..Default::default()
                 },
                 baseline_slot_counts: HashMap::new(),
@@ -781,7 +781,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
         // Commit the cheapest feasible pair; if none is feasible (all
         // flavours/slots violate the error window or global constraint),
         // fall back to the accurate (min-error) flavour at the earliest slot
-        // — this guarantees every request is scheduled, so greedy_singleton
+        // — this guarantees every request is scheduled, so singleton_best
         // never returns "infeasible" to the caller.
         let (chosen_cost, chosen_slot, chosen_flav) = best.unwrap_or_else(|| {
             let ci = carbon_forecast
@@ -805,7 +805,7 @@ fn solve_greedy_singleton(input: BatchSolveContext<'_>) -> BatchSolveResult {
     }
 
     let solve_status = "ok".to_string();
-    let solve_mode = "greedy_singleton".to_string();
+    let solve_mode = "singleton_best".to_string();
 
     // ── Step 6: convert RequestAssignment → Assignment ──────────────────────
     let assignments: Vec<Assignment> = solved

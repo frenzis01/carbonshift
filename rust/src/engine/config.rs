@@ -14,7 +14,7 @@ use crate::types::{CapacityTier, Flavour};
 pub struct SolverConfig {
     /// Number of requests to accumulate before running a solver batch.
     pub batch_size: usize,
-    /// Which solver to use: "dp", "bandit", "ant_colony", or "greedy_singleton".
+    /// Which solver to use: "dp", "bandit", "ant_colony", or "singleton_best".
     pub solver_strategy: String,
     /// DP pruning method: "beam", "kbest", or "none".
     pub dp_pruning_method: String,
