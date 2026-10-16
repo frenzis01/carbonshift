@@ -12,9 +12,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scenarios"))
 
+import multiple_runs as mr  # noqa: E402
 import run_battery as rb  # noqa: E402
 
 
@@ -30,6 +33,51 @@ def test_folder_name_realtime_enabled_strips_dot_from_scale():
     dt = datetime(2026, 7, 9, 11, 23)
     name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.5, True, "serialized", 0)
     assert name == "mybattery_0709_1123_20_roll0_05_T_S"
+
+
+def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
+    tmp_path, monkeypatch
+):
+    output_root = tmp_path / "results"
+    output_root.mkdir()
+    battery_id = "suite_flat_unit_0"
+    previous_run = output_root / f"{battery_id}_previous"
+    previous_run.mkdir()
+    saved_config = {}
+
+    def save_config(_path, config):
+        saved_config.update(config)
+
+    def interrupt_run():
+        active_battery_id = saved_config["battery_id"]
+        incomplete_run = output_root / f"{active_battery_id}_incomplete"
+        incomplete_run.mkdir()
+        completed_run = output_root / f"{active_battery_id}_completed"
+        completed_run.mkdir()
+        for filename in (
+            f"battery_results_{active_battery_id}.csv",
+            f"battery_timings_{active_battery_id}.csv",
+            f"per_n_timings_{active_battery_id}.csv",
+            "README.md",
+        ):
+            (completed_run / filename).touch()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mr, "save_config", save_config)
+    monkeypatch.setattr(mr, "run_battery", interrupt_run)
+    phase = mr.PhaseGrid("unit", {}, [{}])
+
+    with pytest.raises(KeyboardInterrupt):
+        mr.run_phase(
+            {"output_dir": str(output_root), "scenarios": []},
+            phase,
+            "suite",
+            "flat",
+        )
+
+    assert previous_run.is_dir()
+    assert not (output_root / f"{battery_id}_incomplete").exists()
+    assert (output_root / f"{battery_id}_completed").is_dir()
 
 
 def test_folder_name_scale_with_leading_zero():

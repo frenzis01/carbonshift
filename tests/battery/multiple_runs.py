@@ -32,6 +32,10 @@ By default, every selected phase is run once for each input pattern:
 `sinusoidal` and `flat`. Pattern IDs are included in scenario and battery
 names to keep their output files separate.
 
+On Ctrl+C, the newly created folder for the interrupted run is removed unless
+its final result files show that the run completed. Earlier completed folders
+are left untouched.
+
 Usage (from the repository root):
     python tests/battery/multiple_runs.py
     python tests/battery/multiple_runs.py --phase dp online offline   # subset
@@ -41,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -110,8 +115,8 @@ OFFLINE_CONTENT: Dict[str, Any] = {
         "offline_singleton_best",
         "offline_singleton_best_accurate",
         "random",
-        "bandit",
-        "ant_colony",
+        # "bandit",
+        # "ant_colony",
     ],
 }
 
@@ -242,6 +247,64 @@ def run_battery() -> int:
     return subprocess.call(cmd, cwd=REPO_ROOT)
 
 
+def _run_output_root(cfg: Dict[str, Any]) -> Path:
+    output_root = Path(cfg.get("output_dir", "results"))
+    if not output_root.is_absolute():
+        output_root = REPO_ROOT / output_root
+    return output_root.resolve()
+
+
+def _matching_run_directories(
+    output_root: Path, battery_id: str
+) -> set[Path]:
+    prefix = f"{battery_id}_"
+    if not output_root.is_dir():
+        return set()
+    return {
+        run_dir.resolve()
+        for run_dir in output_root.iterdir()
+        if run_dir.name.startswith(prefix)
+        and run_dir.is_dir()
+        and not run_dir.is_symlink()
+    }
+
+
+def _run_folder_is_complete(run_dir: Path, battery_id: str) -> bool:
+    required_files = (
+        f"battery_results_{battery_id}.csv",
+        f"battery_timings_{battery_id}.csv",
+        f"per_n_timings_{battery_id}.csv",
+        "README.md",
+    )
+    return all((run_dir / filename).is_file() for filename in required_files)
+
+
+def _remove_interrupted_run_folder(
+    cfg: Dict[str, Any], existing_run_directories: set[Path]
+) -> None:
+    """Remove newly created incomplete outputs, but preserve earlier or finished runs."""
+    output_root = _run_output_root(cfg)
+    battery_id = str(cfg.get("battery_id", "run"))
+    if not output_root.is_dir():
+        return
+
+    for run_dir in output_root.iterdir():
+        if (
+            not run_dir.name.startswith(f"{battery_id}_")
+            or not run_dir.is_dir()
+            or run_dir.is_symlink()
+            or run_dir.resolve() in existing_run_directories
+            or _run_folder_is_complete(run_dir, battery_id)
+        ):
+            continue
+
+        print(
+            f"Removing incomplete battery run folder after Ctrl+C: {run_dir}",
+            file=sys.stderr,
+        )
+        shutil.rmtree(run_dir)
+
+
 def run_phase(
     base_cfg: Dict[str, Any],
     phase: PhaseGrid,
@@ -282,7 +345,14 @@ def run_phase(
         print("=" * 70)
 
         save_config(CONFIG_PATH, cfg)
-        status = run_battery()
+        existing_run_directories = _matching_run_directories(
+            _run_output_root(cfg), str(cfg.get("battery_id", "run"))
+        )
+        try:
+            status = run_battery()
+        except KeyboardInterrupt:
+            _remove_interrupted_run_folder(cfg, existing_run_directories)
+            raise
         if status != 0:
             print(
                 f"WARNING: run_battery.py exited with status {status} "
@@ -305,7 +375,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="cfg_test12_high1low2CAP",
+        default="cfg_test15",
         help="Prefix used to build each run's battery_id "
         "(final id is '<prefix>_<pattern>_<phase>_<grid-index>').",
     )

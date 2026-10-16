@@ -25,6 +25,10 @@ scenario and battery IDs so results from different patterns do not overwrite
 one another. For a single battery run, set `input_pattern` per scenario in
 the config; omitting it keeps the `sinusoidal` default.
 
+If you interrupt `multiple_runs.py` with Ctrl+C, it removes the newly created
+folder for the active run if that run is incomplete. Earlier completed runs,
+and any run whose final result files were already written, are preserved.
+
 ## Offline strategies
 
 Set `additional_strategies` in `battery_config.json` to run offline engines

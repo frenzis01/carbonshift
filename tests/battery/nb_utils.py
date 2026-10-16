@@ -1,6 +1,8 @@
 """Shared utilities for online2 analysis notebooks."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -11,6 +13,83 @@ FLAVOUR_COLORS: Dict[str, str] = {
     "Balanced": "#2ca02c",
     "Accurate": "#ff7f0e",
 }
+
+
+@dataclass(frozen=True)
+class AssignmentRun:
+    """Describe one assignment result set, regardless of its on-disk layout."""
+
+    assignment_dir: Path
+    scenario_dir: Path
+    run_folder_id: str | None
+    run_type: str
+    mode_label: str
+    batch_sizes: tuple[int, ...] = ()
+
+
+def discover_assignment_runs(
+    results_root: Path, run_folder_filter: str | None = None
+) -> list[AssignmentRun]:
+    """Find batch and offline assignment results in the battery output tree.
+
+    Batch runs store ``per_request.csv`` under ``rust_<mode>/N<batch_size>``;
+    offline strategies store it under ``rust_offline/strategy_<name>``.
+    """
+    results_root = Path(results_root)
+    search_root = results_root / run_folder_filter if run_folder_filter else results_root
+    batch_sizes_by_mode: dict[Path, set[int]] = {}
+    offline_dirs: set[Path] = set()
+
+    for per_request_path in search_root.rglob("per_request.csv"):
+        assignment_dir = per_request_path.parent
+        parent = assignment_dir.parent
+        if (
+            assignment_dir.name.startswith("N")
+            and assignment_dir.name[1:].isdigit()
+            and parent.name.startswith("rust_")
+            and parent.name != "rust_offline"
+        ):
+            batch_sizes_by_mode.setdefault(parent, set()).add(int(assignment_dir.name[1:]))
+        elif (
+            assignment_dir.name.startswith("strategy_")
+            and parent.name == "rust_offline"
+        ):
+            offline_dirs.add(assignment_dir)
+
+    runs = []
+    for mode_dir, batch_sizes in batch_sizes_by_mode.items():
+        scenario_dir = mode_dir.parent
+        relative_parts = scenario_dir.relative_to(results_root).parts
+        runs.append(
+            AssignmentRun(
+                assignment_dir=mode_dir,
+                scenario_dir=scenario_dir,
+                run_folder_id=relative_parts[0] if len(relative_parts) > 1 else None,
+                run_type="batch",
+                mode_label=mode_dir.name.removeprefix("rust_"),
+                batch_sizes=tuple(sorted(batch_sizes)),
+            )
+        )
+
+    for assignment_dir in offline_dirs:
+        scenario_dir = assignment_dir.parent.parent
+        relative_parts = scenario_dir.relative_to(results_root).parts
+        strategy_name = assignment_dir.name.removeprefix("strategy_")
+        runs.append(
+            AssignmentRun(
+                assignment_dir=assignment_dir,
+                scenario_dir=scenario_dir,
+                run_folder_id=relative_parts[0] if len(relative_parts) > 1 else None,
+                run_type="offline",
+                mode_label=f"offline_{strategy_name}",
+            )
+        )
+
+    return sorted(
+        runs,
+        key=lambda run: (run.assignment_dir.stat().st_mtime, str(run.assignment_dir)),
+        reverse=True,
+    )
 
 
 def make_prehistory_by_slot(scenario: dict) -> Dict[int, Dict[str, float]]:
