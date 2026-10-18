@@ -433,6 +433,41 @@ fn batch_solver_registry_resolves_trimmed_case_insensitive_names() {
 }
 
 #[test]
+fn random_batch_strategies_apply_their_requested_random_dimensions() {
+    let cfg = make_config(|cfg| {
+        cfg.assignment_max_future_slots = 3;
+    });
+    let current_slot = 1;
+    let pending = vec![req(1, current_slot, current_slot + 3)];
+    let forecast = flat_forecast(cfg.total_slots, 100.0);
+
+    for (strategy, expected_mode) in [
+        ("random_flavour", "random_flavour"),
+        ("random_slot", "random_slot"),
+        ("random_full", "random_full"),
+    ] {
+        let shared_state = SharedState::new();
+        let (assignments, context) = run_batch_strategy(
+            strategy,
+            current_slot,
+            &pending,
+            &cfg,
+            &shared_state,
+            &forecast,
+        );
+        assert_eq!(context.mode, expected_mode);
+        assert_eq!(assignments.len(), 1);
+        assert!((current_slot..=current_slot + 3).contains(&assignments[0].scheduled_slot));
+        if strategy == "random_flavour" {
+            assert_eq!(assignments[0].scheduled_slot, current_slot);
+        }
+        if strategy == "random_slot" {
+            assert_eq!(assignments[0].flavour_name, "Accurate");
+        }
+    }
+}
+
+#[test]
 fn batch_solver_registry_preserves_dp_fallback_for_unknown_names() {
     let cfg = make_config(|_| {});
     let current_slot = 1;

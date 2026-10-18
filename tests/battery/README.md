@@ -72,6 +72,19 @@ once per scenario:
 - `bandit` and `ant_colony`: existing offline variants, independent of their
   online scheduler counterparts.
 
+## Online random strategies
+
+Set these names in `online_strategies` to run each policy through the online
+scheduler pipeline:
+
+- `random_flavour`: sample a flavour using the configured threshold-matching
+  probability distribution and schedule at the earliest feasible slot.
+- `random_slot`: sample a feasible slot and use the most accurate flavour.
+- `random_full`: sample both the feasible slot and flavour.
+
+Only `ant_colony` uses the `online_batch_sizes` sweep. Every other online
+strategy, including `bandit`, uses batch size 1.
+
 Example:
 
 ```json

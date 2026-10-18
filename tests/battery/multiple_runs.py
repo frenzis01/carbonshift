@@ -5,10 +5,10 @@ Run `run_battery.py` across several PHASE-AWARE parameter grids.
 Each phase of the Rust battery harness (see run_battery.py's module docstring)
 is sensitive to a different subset of runtime knobs:
 
-  - DP (min_error_greedy/carryover/forecast) and singleton_best (online,
-    N=1 only): sensitive to `rollback_max_consecutive` and
+  - DP (min_error_greedy/carryover/forecast), singleton_best, and random
+    selection modes (online, N=1 only): sensitive to `rollback_max_consecutive` and
     `max_batch_solver_parallelism`; NOT sensitive to `online_swarm_mode`.
-  - bandit / ant_colony (online, swarm-based): sensitive to
+  - bandit (online, N=1) and ant_colony (online, batch-size sweep): sensitive to
     `online_swarm_mode` and `max_batch_solver_parallelism`; NOT sensitive to
     `rollback_max_consecutive` (the swarm commit path bypasses rollback).
   - offline strategies (offline_singleton_best, offline_singleton_best_accurate, random,
@@ -98,12 +98,16 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "additional_strategies": [],
 }
 
-SINGLETON_BEST_CONTENT: Dict[str, Any] = {
+PER_REQUEST_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "infeasibility_modes": [],
-    "online_strategies": ["singleton_best"],
-    # online_batch_sizes is irrelevant here: main.rs forces N=1 for
-    # singleton_best regardless of what's requested.
+    "online_strategies": [
+        "singleton_best",
+        "random_flavour",
+        "random_slot",
+        "random_full",
+    ],
+    # The online runner forces N=1 for these request-level policies.
     "additional_strategies": [],
 }
 
@@ -194,8 +198,8 @@ _PARALLELISM_X_SWARM_MODE = [
 PHASES: Dict[str, PhaseGrid] = {
     "dp": PhaseGrid("dp", DP_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD),
     "online": PhaseGrid("online", SWARM_ONLINE_CONTENT, _PARALLELISM_X_SWARM_MODE),
-    "singleton_best": PhaseGrid(
-        "singleton_best", SINGLETON_BEST_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD
+    "per_request": PhaseGrid(
+        "per_request", PER_REQUEST_ONLINE_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD
     ),
     # Offline strategies can also be evaluated with different per-scenario error
     # thresholds, even though they don't depend on rollback or swarm knobs.
@@ -207,7 +211,7 @@ PHASES: Dict[str, PhaseGrid] = {
 }
 
 # Which phases to run when `--phase` is not given.
-DEFAULT_PHASES = ["dp", "online", "singleton_best", "offline"]
+DEFAULT_PHASES = ["dp", "online", "per_request", "offline"]
 
 
 def load_config(path: Path) -> Dict[str, Any]:

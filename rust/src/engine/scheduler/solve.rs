@@ -2,9 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rand::SeedableRng;
+use rand::rngs::SmallRng;
+
 use crate::config::{AssignmentPolicy, InfeasibilityConfig, SimulationConfig, SolverConfig};
 use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput, SolveRequest};
 use crate::engine::qos::QosProfileId;
+use crate::engine::random_selection::{
+    RandomSelectionMode, closest_to_uniform_flavour_probabilities, select_random_assignment,
+};
 use crate::shared_state::{GlobalErrorStats, SharedState};
 use crate::types::{
     Assignment, CapacityTier, Flavour, Request, RequestAssignment, get_capacity_multiplier,
@@ -88,6 +94,7 @@ pub(super) trait BatchSolverStrategy: Send + Sync {
 
 struct DpBatchSolver;
 struct SingletonBestBatchSolver;
+struct RandomBatchSolver(RandomSelectionMode);
 
 impl BatchSolverStrategy for DpBatchSolver {
     fn solve(&self, input: BatchSolveContext<'_>) -> BatchSolveResult {
@@ -98,6 +105,12 @@ impl BatchSolverStrategy for DpBatchSolver {
 impl BatchSolverStrategy for SingletonBestBatchSolver {
     fn solve(&self, input: BatchSolveContext<'_>) -> BatchSolveResult {
         solve_singleton_best(input)
+    }
+}
+
+impl BatchSolverStrategy for RandomBatchSolver {
+    fn solve(&self, input: BatchSolveContext<'_>) -> BatchSolveResult {
+        solve_random(input, self.0)
     }
 }
 
@@ -115,9 +128,24 @@ fn build_singleton_best_batch_solver() -> Box<dyn BatchSolverStrategy> {
     Box::new(SingletonBestBatchSolver)
 }
 
+fn build_random_flavour_batch_solver() -> Box<dyn BatchSolverStrategy> {
+    Box::new(RandomBatchSolver(RandomSelectionMode::Flavour))
+}
+
+fn build_random_slot_batch_solver() -> Box<dyn BatchSolverStrategy> {
+    Box::new(RandomBatchSolver(RandomSelectionMode::Slot))
+}
+
+fn build_random_full_batch_solver() -> Box<dyn BatchSolverStrategy> {
+    Box::new(RandomBatchSolver(RandomSelectionMode::Full))
+}
+
 const BATCH_SOLVER_REGISTRY: &[(&str, BatchSolverFactory)] = &[
     ("dp", build_dp_batch_solver),
     ("singleton_best", build_singleton_best_batch_solver),
+    ("random_flavour", build_random_flavour_batch_solver),
+    ("random_slot", build_random_slot_batch_solver),
+    ("random_full", build_random_full_batch_solver),
 ];
 
 /// Resolve the configured strategy once per worker. Unknown names retain the
@@ -888,6 +916,108 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
     BatchSolveResult {
         assignments,
         context: ctx,
+        baseline_slot_counts: prep.baseline_slot_counts,
+    }
+}
+
+fn solve_random(
+    input: BatchSolveContext<'_>,
+    selection_mode: RandomSelectionMode,
+) -> BatchSolveResult {
+    let prep = prepare_solve(&input);
+    let mode = match selection_mode {
+        RandomSelectionMode::Flavour => "random_flavour",
+        RandomSelectionMode::Slot => "random_slot",
+        RandomSelectionMode::Full => "random_full",
+    };
+    let mut rng = SmallRng::from_entropy();
+    let mut slot_counts = prep.baseline_slot_counts.clone();
+    let mut assignments = Vec::with_capacity(input.pending.len());
+
+    for request in input.pending {
+        let flavours = request
+            .qos_profile
+            .as_ref()
+            .map(|profile| profile.flavours.as_slice())
+            .unwrap_or(input.assignment.flavours);
+        assert!(!flavours.is_empty(), "random strategy requires flavours");
+        let errors: Vec<f64> = flavours.iter().map(|flavour| flavour.error).collect();
+        let probabilities = if selection_mode == RandomSelectionMode::Slot {
+            vec![1.0 / flavours.len() as f64; flavours.len()]
+        } else {
+            closest_to_uniform_flavour_probabilities(&errors, input.assignment.max_error_threshold)
+                .unwrap_or_else(|error| panic!("Cannot run {mode} strategy: {error}"))
+        };
+        let (arrival, deadline) = prep
+            .assignment_metadata
+            .get(&request.id)
+            .copied()
+            .unwrap_or((request.arrival_slot, request.deadline_slot));
+        let earliest_slot = arrival
+            .max(input.current_slot)
+            .min(input.assignment.total_slots - 1);
+        let latest_slot = deadline
+            .max(earliest_slot)
+            .min(arrival + input.assignment.assignment_max_future_slots)
+            .min(input.assignment.total_slots - 1)
+            .max(earliest_slot);
+        let (scheduled_slot, flavour_index) = select_random_assignment(
+            selection_mode,
+            earliest_slot,
+            latest_slot,
+            flavours,
+            &probabilities,
+            &mut rng,
+        )
+        .expect("random assignment input must include a feasible slot and flavour");
+        let flavour = &flavours[flavour_index];
+
+        let position = slot_counts.get(&scheduled_slot).copied().unwrap_or(0) + 1;
+        let capacity_multiplier =
+            get_capacity_multiplier(&prep.effective_capacity_tiers, position as i64);
+        let carbon_intensity = input
+            .carbon_forecast
+            .get(scheduled_slot as usize)
+            .copied()
+            .unwrap_or(1.0);
+        let carbon_cost = carbon_intensity
+            * capacity_multiplier
+            * flavour.duration
+            * input.assignment.carbon_cost_duration_scale;
+        *slot_counts.entry(scheduled_slot).or_insert(0) += 1;
+
+        assignments.push(Assignment::new_for_profile(
+            request.id,
+            scheduled_slot,
+            flavour.name.clone(),
+            carbon_cost,
+            flavour.error,
+            flavour.duration,
+            Some(arrival),
+            Some(deadline),
+            request.qos_profile_id(),
+        ));
+    }
+
+    let context = SolveContext {
+        status: "ok".to_string(),
+        mode: mode.to_string(),
+        new_assignments: assignments.len(),
+        total_assignments: assignments.len(),
+        global_error_before: prep.global_error_stats.avg,
+        global_error_count_before: prep.global_error_stats.count,
+        profile_error_before: prep.profile_error_stats.avg,
+        profile_error_count_before: prep.profile_error_stats.count,
+        profile_error_constraint_active: prep.profile_constraint_active,
+        window_start_slot: prep.window_start,
+        window_end_slot: prep.window_end,
+        recovery_mode: input.recovery_config.recovery_mode.clone(),
+        ..Default::default()
+    };
+
+    BatchSolveResult {
+        assignments,
+        context,
         baseline_slot_counts: prep.baseline_slot_counts,
     }
 }

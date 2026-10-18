@@ -15,8 +15,10 @@ runs the Rust solver across three independent, individually-toggleable phases:
   1. DP        – sweeps `batch_sizes` × `infeasibility_modes`. Skipped entirely
                  if either list is empty.
   2. Online    – runs `online_strategies` (e.g. "bandit", "ant_colony",
-                 "singleton_best") over `online_batch_sizes` (falls back to
-                 `batch_sizes` if absent). Skipped if `online_strategies` is empty.
+                 "singleton_best", "random_flavour", "random_slot", "random_full").
+                 Only ant_colony sweeps `online_batch_sizes` (falls back to
+                 `batch_sizes` if absent); other strategies use batch size 1.
+                 Skipped if `online_strategies` is empty.
                  Independent of the DP phase/`batch_sizes` — e.g. set
                  `batch_sizes: []` to sweep online strategies without running DP.
   3. Offline   – runs `additional_strategies` (e.g. "offline_singleton_best",
@@ -46,10 +48,11 @@ infeasibility_modes  : list[str]   – values of the DP solver's `infeasibility_
                                      the error baseline before the primary DP solve. Infeasibility
                                      always resolves via direct greedy fallback.
 online_strategies    : list[str]   – online strategies to run (e.g. "bandit", "ant_colony",
-                                     "singleton_best"); [] skips the online phase.
+                                     "singleton_best", "random_flavour", "random_slot",
+                                     "random_full"); [] skips the online phase.
 online_batch_sizes   : list[int]   – N sweep for online_strategies; falls back to
-                                     `batch_sizes` when omitted. "singleton_best" always
-                                     forces N=1 regardless of this list.
+                                     `batch_sizes` when omitted. Only "ant_colony" uses
+                                     this sweep; all other online strategies force N=1.
 additional_strategies: list[str]   – offline strategies to run once per scenario
                                      (e.g. "offline_singleton_best", "offline_singleton_best_accurate",
                                      "random", "ant_colony", "bandit"); [] skips the
@@ -1018,7 +1021,7 @@ def _write_run_readme(
         f"- DP solver timeout: {rust_defaults.get('dp_timeout', '?')}s",
         f"- Rollback max consecutive (this run): {rollback_max_consecutive} "
         f"({'disabled' if rollback_max_consecutive == 0 else 'enabled'}; "
-        "affects DP and singleton_best only, not bandit/ant_colony)",
+        "affects DP and request-level strategies, not bandit/ant_colony)",
         f"- Infeasibility recovery mode: {rust_defaults.get('infeasibility_recovery_mode', '?')}",
         "",
         "## Enabled phases",

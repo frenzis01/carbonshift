@@ -24,6 +24,7 @@ pub use engine::dp_solver;
 pub use engine::metrics_logger;
 pub use engine::online_swarm;
 pub use engine::online_swarmerge;
+pub use engine::random_selection;
 pub use engine::scheduler;
 pub use engine::shared_state;
 pub use engine::types;

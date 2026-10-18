@@ -49,13 +49,14 @@
 //!   `greedy_fallback` (accurate flavour, cheapest feasible slot). This setting only controls
 //!   whether/how synthetic mock requests dilute the error baseline used by the primary DP solve.
 //! - `online_strategies`: online strategies to run through the scheduler pipeline, e.g.
-//!   `["bandit", "ant_colony", "singleton_best"]`. Independent of the DP phase: set the
-//!   top-level `batch_sizes` to `[]` to skip DP entirely and only run online strategies.
+//!   `["bandit", "ant_colony", "singleton_best", "random_flavour", "random_slot",
+//!   "random_full"]`. Independent of the DP phase: set the top-level `batch_sizes` to
+//!   `[]` to skip DP entirely and only run online strategies.
 //! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
-//!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent. Ignored
-//!   for "singleton_best", which always forces `[1]` (its only supported batch size) —
-//!   `rollback_max_consecutive` still affects it (it shares DP's rollback-checked commit
-//!   path), while `online_swarm_mode` only affects "bandit"/"ant_colony" (the swarm path).
+//!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent. Only
+//!   "ant_colony" uses the configured sweep; all other online strategies use batch size 1.
+//!   `rollback_max_consecutive` affects `singleton_best` and the random modes because they
+//!   share DP's rollback-checked commit path. `online_swarm_mode` affects bandit/ACO only.
 //! - `additional_strategies`: offline strategies to run once per scenario (no batching or
 //!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "random"]`. Fully
 //!   independent of `batch_sizes`/`rollback_max_consecutive`/`max_batch_solver_parallelism`.
@@ -96,11 +97,15 @@ mod swarm;
 use carbonshift_rs::config::{AssignmentPolicy, Config};
 use carbonshift_rs::generator::{RequestGenerator, RequestGeneratorConfig};
 use carbonshift_rs::metrics_logger::MetricsLogger;
+use carbonshift_rs::random_selection::{
+    RandomSelectionMode, closest_to_uniform_flavour_probabilities as random_flavour_probabilities,
+    select_random_assignment,
+};
 use carbonshift_rs::scenario::Scenario;
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
 use carbonshift_rs::types::{Assignment, CapacityTier, Flavour, get_capacity_multiplier};
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1083,19 +1088,19 @@ fn run_offline_singleton_best_accurate(
 /// subject to having the configured error threshold as their expected error.
 /// This targets the average over many assignments; it is not a per-run or
 /// per-window QoS guarantee.
-fn run_random(
+fn run_random_with_mode(
     scenario: &Scenario,
     assignment: &AssignmentPolicy<'_>,
     slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
+    mode: RandomSelectionMode,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
     // Calculate the flavour mix once for this run. An unattainable threshold
     // (outside the configured flavour errors) makes the random baseline invalid.
     let errors: Vec<f64> = assignment.flavours.iter().map(|f| f.error).collect();
-    let probabilities =
-        closest_to_uniform_flavour_probabilities(&errors, assignment.max_error_threshold)
-            .unwrap_or_else(|error| panic!("Cannot run random strategy: {error}"));
+    let probabilities = random_flavour_probabilities(&errors, assignment.max_error_threshold)
+        .unwrap_or_else(|error| panic!("Cannot run random strategy: {error}"));
 
     // Reuse the scenario seed so this baseline is repeatable. The fixed xor
     // constant gives this strategy its own deterministic RNG stream.
@@ -1119,21 +1124,16 @@ fn run_random(
             .deadline_slot
             .min(arrival + assignment.assignment_max_future_slots)
             .min(assignment.total_slots - 1);
-        let slot = rng.gen_range(arrival..=latest);
-
-        // Inverse-CDF sampling turns one uniform draw into the configured
-        // flavour distribution. Initializing to the final flavour also makes
-        // it absorb any tiny floating-point remainder in the probability sum.
-        let random_value = rng.gen_range(0.0..1.0);
-        let mut cumulative_probability = 0.0;
-        let mut chosen_flavour = assignment.flavours.last().expect("no flavours");
-        for (flavour, probability) in assignment.flavours.iter().zip(&probabilities) {
-            cumulative_probability += probability;
-            if random_value < cumulative_probability {
-                chosen_flavour = flavour;
-                break;
-            }
-        }
+        let (slot, flavour_index) = select_random_assignment(
+            mode,
+            arrival,
+            latest,
+            assignment.flavours,
+            &probabilities,
+            &mut rng,
+        )
+        .expect("scenario request must have a feasible slot and configured flavours");
+        let chosen_flavour = &assignment.flavours[flavour_index];
 
         // Price this assignment at the slot's next occupancy position, then
         // commit that occupancy so later requests see the correct tier.
@@ -1216,12 +1216,38 @@ fn run_random(
     (per_req, batch_timings, summary)
 }
 
+fn run_random(
+    scenario: &Scenario,
+    assignment: &AssignmentPolicy<'_>,
+    slot_duration_seconds: f64,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+    run_random_with_mode(
+        scenario,
+        assignment,
+        slot_duration_seconds,
+        realtime_slots,
+        realtime_speed_scale,
+        RandomSelectionMode::Full,
+    )
+}
+
+fn online_batch_sizes_for_strategy(strategy: &str, configured: &[usize]) -> Vec<usize> {
+    if strategy.eq_ignore_ascii_case("ant_colony") {
+        configured.to_vec()
+    } else {
+        vec![1]
+    }
+}
+
 /// Project equal flavour probabilities onto the non-negative distributions
 /// whose expected error equals `target_error`.
 ///
 /// For each slope, the projection has the form `max(0, intercept + slope*e)`.
 /// The intercept is chosen so probabilities sum to one; a bounded bisection
 /// then finds the slope that matches the requested expected error.
+#[cfg(test)]
 fn closest_to_uniform_flavour_probabilities(
     errors: &[f64],
     target_error: f64,
@@ -1348,6 +1374,7 @@ fn closest_to_uniform_flavour_probabilities(
 }
 
 /// Return the non-negative unit-sum projection for one probability slope.
+#[cfg(test)]
 fn project_probabilities_at_slope(normalized_errors: &[f64], slope: f64) -> Vec<f64> {
     // The projection has probabilities max(0, intercept + slope*error).
     // Sorting scores lets us find the active (positive-probability) prefix;
@@ -2386,21 +2413,17 @@ fn main() {
         .clone()
         .unwrap_or_else(|| bcfg.batch_sizes.clone());
     for strategy in &bcfg.online_strategies {
-        // singleton_best only supports batch_size=1: force it regardless of
-        // the configured batch_sizes list, so a battery sweep across N doesn't
-        // redundantly repeat an identical run under a different label.
-        let is_singleton_best = strategy.eq_ignore_ascii_case("singleton_best");
-        let batch_sizes_for_strategy: Vec<usize> = if is_singleton_best {
-            if online_batch_sizes_base.as_slice() != [1] {
-                println!(
-                    "[Info] online strategy 'singleton_best' only supports batch_size=1; \
-                     ignoring other configured batch_sizes for this strategy."
-                );
-            }
-            vec![1]
-        } else {
-            online_batch_sizes_base.clone()
-        };
+        // Every online strategy except ACO makes one request-level decision at
+        // a time, so only ACO has a meaningful batch-size sweep.
+        let batch_sizes_for_strategy =
+            online_batch_sizes_for_strategy(strategy, &online_batch_sizes_base);
+        if !strategy.eq_ignore_ascii_case("ant_colony") && online_batch_sizes_base.as_slice() != [1]
+        {
+            println!(
+                "[Info] online strategy '{strategy}' processes one request at a time; \
+                 ignoring configured batch_sizes and using batch_size=1."
+            );
+        }
 
         for &batch_size in &batch_sizes_for_strategy {
             let run_dir = bcfg
@@ -2764,6 +2787,27 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(bcfg.online_batch_sizes, Some(vec![1, 6, 12]));
         assert!(bcfg.batch_sizes.is_empty());
+    }
+
+    #[test]
+    fn online_batch_sizes_only_sweep_for_ant_colony() {
+        let configured = [1, 4, 8];
+        for strategy in [
+            "bandit",
+            "singleton_best",
+            "random_flavour",
+            "random_slot",
+            "random_full",
+        ] {
+            assert_eq!(
+                online_batch_sizes_for_strategy(strategy, &configured),
+                vec![1]
+            );
+        }
+        assert_eq!(
+            online_batch_sizes_for_strategy("ant_colony", &configured),
+            configured
+        );
     }
 
     #[test]
