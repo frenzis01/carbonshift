@@ -18,6 +18,27 @@ Set `input_pattern` on a scenario in `battery_config.json` to:
 Both patterns retain independently seeded random arrival times within each
 slot. Carbon-intensity generation is unchanged by this setting.
 
+## Future-slot assignment trimming
+
+Set the top-level `trim_future_assignments` field in `battery_config.json` to
+`true` to reduce end-of-simulation crowding without changing CarbonShift. For a
+scenario with `total_slots: 72`, the runner generates requests only in slots
+0–71, but generates the carbon forecast and planning horizon through slot 85
+(72 + `ERROR_WINDOW_FUTURE` - 1; the current value is 14). Request deadlines
+may extend into these extra slots.
+
+After each `nshift` run, the battery runner keeps only assignments scheduled in
+the original `[0, total_slots)` horizon. It also trims per-request and
+per-timeslot outputs and recomputes request-level summary metrics, including
+carbon cost, error, and carbon saving, from retained assignments. The baseline
+carbon cost is restricted to the same retained request IDs. Solver runtime and
+other execution-level measurements still describe the full extended run.
+
+`requests_in` is the number of requests generated for the scenario;
+`requests_out` is the run-specific number assigned within the original
+horizon. These values can differ across strategy runs. Leaving
+`trim_future_assignments` absent or `false` preserves the existing behavior.
+
 `multiple_runs.py` runs each requested phase for both `sinusoidal` and `flat`
 by default. Use `--input-pattern flat` or
 `--input-pattern sinusoidal flat` to choose a subset. It adds the pattern to
@@ -84,7 +105,7 @@ python tests/battery/multiple_runs.py --phase offline
 Run the scenario-pattern and battery-runner unit tests with:
 
 ```sh
-python -m pytest -q tests/battery/test_scenario_patterns.py
+python -m pytest -q tests/battery/test_scenario_patterns.py tests/battery/test_run_battery.py
 ```
 
 ## Assignment display notebook

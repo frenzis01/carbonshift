@@ -6,6 +6,8 @@ docstring in run_battery.py for the manual end-to-end smoke test procedure.
 """
 from __future__ import annotations
 
+import csv
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -25,8 +27,218 @@ def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path)
         tmp_path / "window.json",
     )
 
+    assert scenario["metadata"]["total_slots"] == 2
     assert scenario["metadata"]["deadline_max_slack"] == 14
     assert scenario["metadata"]["error_window_future"] == 14
+    assert "input_total_slots" not in scenario["metadata"]
+    assert len(scenario["carbon_forecast"]) == 2
+
+
+def test_future_assignment_trimming_extends_horizon_without_extra_arrivals(tmp_path):
+    input_slots = 3
+    scenario_def = {
+        "id": "trim",
+        "seed": 1,
+        "total_slots": input_slots,
+        "requests_per_slot": 20.0,
+    }
+    original = rb._generate_scenario(
+        scenario_def,
+        tmp_path / "original.json",
+    )
+    scenario = rb._generate_scenario(
+        scenario_def,
+        tmp_path / "trim.json",
+        trim_future_assignments=True,
+    )
+
+    assert scenario["metadata"]["total_slots"] == input_slots + 14
+    assert scenario["metadata"]["input_total_slots"] == input_slots
+    assert len(scenario["carbon_forecast"]) == input_slots + 14
+    assert all(0 <= request["arrival_slot"] < input_slots for request in scenario["requests"])
+    assert any(request["deadline_slot"] >= input_slots for request in scenario["requests"])
+    assert scenario["carbon_forecast"][:input_slots] == original["carbon_forecast"]
+    assert [
+        (request["request_id"], request["arrival_slot"], request["arrival_time"])
+        for request in scenario["requests"]
+    ] == [
+        (request["request_id"], request["arrival_slot"], request["arrival_time"])
+        for request in original["requests"]
+    ]
+
+
+def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(tmp_path):
+    output_dir = tmp_path / "rust_carryover"
+    run_dir = output_dir / "N2"
+    run_dir.mkdir(parents=True)
+    request_rows = [
+        {
+            "request_id": "1",
+            "scheduled_slot": "0",
+            "error": "0.0",
+            "carbon_cost": "3.0",
+            "queue_wait_seconds": "2.0",
+            "final_wait_seconds": "4.0",
+            "lateness_slots": "0",
+            "assigned_with_greedy_fallback": "false",
+            "assigned_with_relaxed_retry": "false",
+            "assigned_with_rollback": "false",
+        },
+        {
+            "request_id": "2",
+            "scheduled_slot": "2",
+            "error": "5.0",
+            "carbon_cost": "5.0",
+            "queue_wait_seconds": "3.0",
+            "final_wait_seconds": "5.0",
+            "lateness_slots": "1",
+            "assigned_with_greedy_fallback": "true",
+            "assigned_with_relaxed_retry": "false",
+            "assigned_with_rollback": "true",
+        },
+        {
+            "request_id": "3",
+            "scheduled_slot": "1",
+            "error": "2.0",
+            "carbon_cost": "7.0",
+            "queue_wait_seconds": "6.0",
+            "final_wait_seconds": "8.0",
+            "lateness_slots": "0",
+            "assigned_with_greedy_fallback": "false",
+            "assigned_with_relaxed_retry": "true",
+            "assigned_with_rollback": "false",
+        },
+    ]
+    request_fields = list(request_rows[0])
+    with (run_dir / "per_request.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=request_fields)
+        writer.writeheader()
+        writer.writerows(request_rows)
+    (run_dir / "per_request.json").write_text(
+        json.dumps({"rows": request_rows}),
+        encoding="utf-8",
+    )
+    with (run_dir / "assignments_runtime.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["request_id", "scheduled_slot"])
+        writer.writeheader()
+        writer.writerows(
+            {"request_id": row["request_id"], "scheduled_slot": row["scheduled_slot"]}
+            for row in request_rows
+        )
+
+    summary_fields = [
+        "batch_size",
+        "requests_total",
+        "requests_scheduled",
+        "requests_unscheduled",
+        "requests_late",
+        "max_lateness_slots",
+        "carbon_cost",
+        "global_average_error",
+        "global_average_error_real",
+        "global_average_error_modeled",
+        "requests_assigned_with_greedy_fallback",
+        "requests_assigned_with_relaxed_retry",
+        "requests_assigned_with_rollback",
+        "queue_wait_seconds_min",
+        "queue_wait_seconds_max",
+        "queue_wait_seconds_avg",
+        "final_wait_seconds_min",
+        "final_wait_seconds_max",
+        "final_wait_seconds_avg",
+        "baseline_carbon_cost",
+        "carbon_cost_saving_vs_baseline",
+        "carbon_saving",
+    ]
+    initial_summary = {field: "0" for field in summary_fields}
+    initial_summary.update({"batch_size": "2", "requests_total": "3"})
+    for filename in ("summary.csv",):
+        with (run_dir / filename).open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=summary_fields)
+            writer.writeheader()
+            writer.writerow(initial_summary)
+    (run_dir / "summary.json").write_text(json.dumps(initial_summary), encoding="utf-8")
+    with (output_dir / "summary_by_n.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=summary_fields)
+        writer.writeheader()
+        writer.writerow(initial_summary)
+
+    rb._trim_rust_outputs(
+        output_dir,
+        trim_after_slot=2,
+        error_window_past=0,
+        error_window_future=0,
+        baseline_request_costs={1: 4.0, 2: 6.0, 3: 8.0},
+    )
+
+    _, retained = rb._read_csv(run_dir / "per_request.csv")
+    assert [int(row["request_id"]) for row in retained] == [1, 3]
+    _, runtime_assignments = rb._read_csv(run_dir / "assignments_runtime.csv")
+    assert len(runtime_assignments) == 2
+    _, summary_rows = rb._read_csv(run_dir / "summary.csv")
+    assert int(summary_rows[0]["requests_scheduled"]) == 2
+    assert int(summary_rows[0]["requests_unscheduled"]) == 1
+    assert float(summary_rows[0]["carbon_cost"]) == 10.0
+    assert float(summary_rows[0]["global_average_error"]) == 1.0
+    assert float(summary_rows[0]["baseline_carbon_cost"]) == 12.0
+    assert float(summary_rows[0]["carbon_saving"]) == pytest.approx(100 / 6)
+    _, summary_by_n_rows = rb._read_csv(output_dir / "summary_by_n.csv")
+    assert int(summary_by_n_rows[0]["requests_scheduled"]) == 2
+    _, timeslots = rb._read_csv(run_dir / "per_timeslot.csv")
+    assert len(timeslots) == 2
+    assert int(timeslots[1]["real_request_count"]) == 1
+    assert len(json.loads((run_dir / "per_request.json").read_text())["rows"]) == 2
+    assert json.loads((run_dir / "summary.json").read_text())["requests_scheduled"] == 2
+
+
+def test_rust_invocation_uses_scenario_input_horizon_for_trimming(tmp_path, monkeypatch):
+    scenario_path = tmp_path / "scenario.json"
+    rb._generate_scenario(
+        {"id": "trim", "seed": 1, "total_slots": 3, "requests_per_slot": 1.0},
+        scenario_path,
+        trim_future_assignments=True,
+    )
+    output_dir = tmp_path / "rust_carryover"
+    baseline_request_path = (
+        tmp_path / "rust_baseline" / "baseline_greedy" / "per_request.csv"
+    )
+    baseline_request_path.parent.mkdir(parents=True)
+    baseline_request_path.write_text(
+        "request_id,carbon_cost\n0,1.0\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "runner.json"
+    config_path.write_text(
+        json.dumps({
+            "scenario_path": str(scenario_path),
+            "output_dir": str(output_dir),
+        }),
+        encoding="utf-8",
+    )
+    trimmed = {}
+    monkeypatch.setattr(rb.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        rb,
+        "_trim_rust_outputs",
+        lambda path, cutoff, past, future, costs: trimmed.update({
+            "output_dir": path,
+            "cutoff": cutoff,
+            "past": past,
+            "future": future,
+            "costs": costs,
+        }),
+    )
+
+    rb._run_rust_binary(Path("nshift"), config_path)
+
+    assert trimmed == {
+        "output_dir": output_dir,
+        "cutoff": 3,
+        "past": 12,
+        "future": 14,
+        "costs": {0: 1.0},
+    }
+    assert not config_path.exists()
 
 
 # ─── _format_run_folder_name ───────────────────────────────────────────────

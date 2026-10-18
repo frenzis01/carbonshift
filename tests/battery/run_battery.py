@@ -33,6 +33,11 @@ Usage (from the repository root):
 
 Config fields
 -------------
+trim_future_assignments: bool – optional; when true, extends each scenario's
+                                     planning horizon by ERROR_WINDOW_FUTURE,
+                                     generates requests only in the configured
+                                     total_slots, and trims persisted request
+                                     outcomes back to that original horizon.
 batch_sizes          : list[int]   – DP phase N values to benchmark; [] skips DP.
 infeasibility_modes  : list[str]   – values of the DP solver's `infeasibility_recovery_mode`
                                      knob to benchmark: "min_error_greedy" | "carryover" | "forecast".
@@ -120,6 +125,7 @@ RESULT_COLUMNS = [
     "final_global_error",
     "avg_global_error_per_slot",
     "requests_in",
+    "requests_out",
     "requests_assigned_with_greedy_fallback",
     "requests_assigned_with_relaxed_retry",
     "total_rollbacks",
@@ -151,12 +157,22 @@ def _avg_slot_error_from_csv(csv_path: Path) -> float:
     return sum(errors) / len(errors) if errors else 0.0
 
 
-def _generate_scenario(scenario_def: Dict[str, Any], output_path: Path) -> Dict[str, Any]:
-    """Generate a deterministic scenario JSON and return the loaded dict."""
+def _generate_scenario(
+    scenario_def: Dict[str, Any],
+    output_path: Path,
+    trim_future_assignments: bool = False,
+) -> Dict[str, Any]:
+    """Generate a deterministic scenario, optionally separating input and planning horizons."""
     tiers = scenario_def.get("capacity_tiers", list(scenario_config.CAPACITY_TIERS))
+    input_slots = int(scenario_def.get("total_slots", scenario_config.TOTAL_SLOTS))
+    total_slots = input_slots
+    if trim_future_assignments:
+        total_slots += int(scenario_config.ERROR_WINDOW_FUTURE)
+
     data = generate_scenario_data(
         seed=int(scenario_def.get("seed", 42)),
-        total_slots=int(scenario_def.get("total_slots", scenario_config.TOTAL_SLOTS)),
+        total_slots=total_slots,
+        request_slots=input_slots if trim_future_assignments else None,
         slot_duration_seconds=float(
             scenario_def.get("slot_duration_seconds", scenario_config.SLOT_DURATION_SECONDS)
         ),
@@ -242,11 +258,256 @@ def _write_rust_config(
 
 
 def _run_rust_binary(rust_binary: Path, tmp_config: Path) -> None:
-    """Invoke the nshift binary with a temporary config, always cleaning it up."""
+    """Run nshift and normalize outputs when the scenario records a trim horizon."""
     try:
+        with open(tmp_config, encoding="utf-8") as f:
+            run_config = json.load(f)
         subprocess.run([str(rust_binary), "--config", str(tmp_config)], check=True)
+        scenario = load_json(Path(run_config["scenario_path"]))
+        metadata = scenario["metadata"]
+        trim_after_slot = metadata.get("input_total_slots")
+        if trim_after_slot is not None:
+            output_dir = Path(run_config["output_dir"])
+            baseline_dir = (
+                output_dir
+                if output_dir.name == "rust_baseline"
+                else output_dir.parent / "rust_baseline"
+            )
+            baseline_request_path = baseline_dir / "baseline_greedy" / "per_request.csv"
+            baseline_request_costs = _read_request_costs(baseline_request_path)
+            _trim_rust_outputs(
+                output_dir,
+                int(trim_after_slot),
+                int(metadata["error_window_past"]),
+                int(metadata["error_window_future"]),
+                baseline_request_costs,
+            )
     finally:
         tmp_config.unlink(missing_ok=True)
+
+
+def _read_csv(path: Path) -> tuple[List[str], List[Dict[str, str]]]:
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header: {path}")
+        return reader.fieldnames, list(reader)
+
+
+def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _read_request_costs(path: Path) -> Dict[int, float]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Baseline per-request costs are required for horizon trimming: {path}")
+    _, rows = _read_csv(path)
+    return {
+        int(row["request_id"]): float(row["carbon_cost"])
+        for row in rows
+    }
+
+
+def _is_true(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true"}
+
+
+def _average(values: List[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _request_summary_metrics(
+    rows: List[Dict[str, str]],
+    summary: Dict[str, str],
+    baseline_request_costs: Dict[int, float],
+) -> Dict[str, Any]:
+    request_ids = [int(row["request_id"]) for row in rows]
+    if len(request_ids) != len(set(request_ids)):
+        raise ValueError("Per-request output contains duplicate request IDs")
+    missing_baselines = set(request_ids) - baseline_request_costs.keys()
+    if missing_baselines:
+        raise ValueError(
+            f"Baseline per-request output is missing retained request IDs: "
+            f"{sorted(missing_baselines)[:10]}"
+        )
+
+    count = len(rows)
+    costs = [float(row["carbon_cost"]) for row in rows]
+    errors = [float(row["error"]) for row in rows]
+    queue_waits = [float(row["queue_wait_seconds"]) for row in rows]
+    final_waits = [float(row["final_wait_seconds"]) for row in rows]
+    lateness = [int(row["lateness_slots"]) for row in rows]
+    carbon_cost = sum(costs)
+    baseline_cost = sum(baseline_request_costs[request_id] for request_id in request_ids)
+
+    def wait_metrics(name: str, values: List[float]) -> Dict[str, float]:
+        return {
+            f"{name}_min": min(values) if values else 0.0,
+            f"{name}_max": max(values) if values else 0.0,
+            f"{name}_avg": _average(values),
+        }
+
+    return {
+        "requests_scheduled": count,
+        "requests_unscheduled": max(0, int(summary["requests_total"]) - count),
+        "requests_late": sum(value > 0 for value in lateness),
+        "max_lateness_slots": max(lateness, default=0),
+        "carbon_cost": carbon_cost,
+        "global_average_error": _average(errors),
+        "global_average_error_real": _average(errors),
+        "global_average_error_modeled": _average(errors),
+        "requests_assigned_with_greedy_fallback": sum(
+            _is_true(row["assigned_with_greedy_fallback"]) for row in rows
+        ),
+        "requests_assigned_with_relaxed_retry": sum(
+            _is_true(row["assigned_with_relaxed_retry"]) for row in rows
+        ),
+        "requests_assigned_with_rollback": sum(
+            _is_true(row["assigned_with_rollback"]) for row in rows
+        ),
+        **wait_metrics("queue_wait_seconds", queue_waits),
+        **wait_metrics("final_wait_seconds", final_waits),
+        "baseline_carbon_cost": baseline_cost,
+        "carbon_cost_saving_vs_baseline": baseline_cost - carbon_cost,
+        "carbon_saving": (
+            (baseline_cost - carbon_cost) / baseline_cost * 100.0
+            if baseline_cost > 0.0
+            else 0.0
+        ),
+    }
+
+
+def _write_summary(path: Path, metrics: Dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        summary.update(metrics)
+        path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        return
+
+    fieldnames, rows = _read_csv(path)
+    for row in rows:
+        row.update({key: str(value) for key, value in metrics.items() if key in fieldnames})
+    _write_csv(path, fieldnames, rows)
+
+
+def _trim_rust_outputs(
+    output_dir: Path,
+    trim_after_slot: int,
+    error_window_past: int,
+    error_window_future: int,
+    baseline_request_costs: Dict[int, float],
+) -> None:
+    """Keep request outcomes and derived metrics within the original input horizon."""
+    for request_path in output_dir.rglob("per_request.csv"):
+        run_dir = request_path.parent
+        _, request_rows = _read_csv(request_path)
+        kept_rows = [
+            row for row in request_rows
+            if 0 <= int(row["scheduled_slot"]) < trim_after_slot
+        ]
+        summary_path = run_dir / "summary.csv"
+        _, summary_rows = _read_csv(summary_path)
+        if len(summary_rows) != 1:
+            raise ValueError(f"Expected one summary row in {summary_path}")
+        metrics = _request_summary_metrics(
+            kept_rows,
+            summary_rows[0],
+            baseline_request_costs,
+        )
+        request_fields, _ = _read_csv(request_path)
+        _write_csv(request_path, request_fields, kept_rows)
+
+        request_json_path = run_dir / "per_request.json"
+        request_json = json.loads(request_json_path.read_text(encoding="utf-8"))
+        request_json["rows"] = [
+            row for row in request_json["rows"]
+            if 0 <= int(row["scheduled_slot"]) < trim_after_slot
+        ]
+        if len(request_json["rows"]) != len(kept_rows):
+            raise ValueError(f"CSV/JSON per-request outputs disagree in {run_dir}")
+        request_json_path.write_text(
+            json.dumps(request_json, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        for assignment_path in run_dir.glob("assignments_runtime.csv"):
+            assignment_fields, assignment_rows = _read_csv(assignment_path)
+            _write_csv(
+                assignment_path,
+                assignment_fields,
+                [
+                    row for row in assignment_rows
+                    if 0 <= int(row["scheduled_slot"]) < trim_after_slot
+                ],
+            )
+
+        errors_by_slot: Dict[int, List[float]] = {}
+        for row in kept_rows:
+            errors_by_slot.setdefault(int(row["scheduled_slot"]), []).append(float(row["error"]))
+        per_timeslot_rows = []
+        for slot in range(trim_after_slot):
+            window_start = slot - error_window_past
+            window_end = slot + error_window_future
+            window_errors = [
+                error
+                for scheduled_slot, errors in errors_by_slot.items()
+                if window_start <= scheduled_slot <= window_end
+                for error in errors
+            ]
+            average_error = _average(window_errors)
+            per_timeslot_rows.append({
+                "timeslot": slot,
+                "window_start": window_start,
+                "window_end": window_end,
+                "real_request_count": len(window_errors),
+                "modeled_request_count": len(window_errors),
+                "window_avg_error_real": average_error,
+                "window_avg_error_modeled": average_error,
+            })
+        per_timeslot_fields = [
+            "timeslot",
+            "window_start",
+            "window_end",
+            "real_request_count",
+            "modeled_request_count",
+            "window_avg_error_real",
+            "window_avg_error_modeled",
+        ]
+        _write_csv(run_dir / "per_timeslot.csv", per_timeslot_fields, per_timeslot_rows)
+        (run_dir / "per_timeslot.json").write_text(
+            json.dumps({"rows": per_timeslot_rows}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        _write_summary(summary_path, metrics, json_output=False)
+        _write_summary(run_dir / "summary.json", metrics, json_output=True)
+
+    for summary_path in output_dir.rglob("summary_by_n.csv"):
+        fieldnames, rows = _read_csv(summary_path)
+        for row in rows:
+            n_summary_path = summary_path.parent / f"N{int(row['batch_size'])}" / "summary.csv"
+            _, n_rows = _read_csv(n_summary_path)
+            if len(n_rows) != 1:
+                raise ValueError(f"Expected one summary row in {n_summary_path}")
+            row.update({key: n_rows[0][key] for key in fieldnames if key in n_rows[0]})
+        _write_csv(summary_path, fieldnames, rows)
+
+    baseline_summary_path = output_dir / "baseline_summary.csv"
+    baseline_run_dir = output_dir / "baseline_greedy"
+    if baseline_summary_path.is_file() and (baseline_run_dir / "summary.csv").is_file():
+        fieldnames, rows = _read_csv(baseline_summary_path)
+        _, source_rows = _read_csv(baseline_run_dir / "summary.csv")
+        if len(source_rows) != 1:
+            raise ValueError(f"Expected one summary row in {baseline_run_dir / 'summary.csv'}")
+        for row in rows:
+            row.update({key: source_rows[0][key] for key in fieldnames if key in source_rows[0]})
+        _write_csv(baseline_summary_path, fieldnames, rows)
+        (output_dir / "baseline_summary.json").write_text(
+            (baseline_run_dir / "summary.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
 
 
 def _make_result_row(
@@ -264,7 +525,17 @@ def _make_result_row(
     summaries (e.g. no rollback/concurrency stats for offline runs) default to 0.
     """
     carbon = float(row.get("carbon_cost", 0.0))
-    savings_pct = (baseline_cost - carbon) / baseline_cost * 100.0 if baseline_cost > 0.0 else 0.0
+    baseline_value = row.get("baseline_carbon_cost")
+    row_baseline_cost = (
+        float(baseline_value)
+        if baseline_value not in (None, "")
+        else baseline_cost
+    )
+    savings_pct = (
+        (row_baseline_cost - carbon) / row_baseline_cost * 100.0
+        if row_baseline_cost > 0.0
+        else 0.0
+    )
     return {
         "scenario_id": scenario_id,
         "batch_size": batch_size,
@@ -274,6 +545,7 @@ def _make_result_row(
         "final_global_error": float(row.get("global_average_error", 0.0)),
         "avg_global_error_per_slot": avg_slot_err,
         "requests_in": int(row.get("requests_total", 0)),
+        "requests_out": int(row.get("requests_scheduled", row.get("requests_total", 0))),
         "requests_assigned_with_greedy_fallback": int(
             row.get("requests_assigned_with_greedy_fallback", 0)
         ),
@@ -282,7 +554,7 @@ def _make_result_row(
         ),
         "total_rollbacks": int(row.get("total_rollbacks", 0)),
         "peak_consecutive_rollbacks": int(row.get("peak_consecutive_rollbacks", 0)),
-        "baseline_carbon_cost": baseline_cost,
+        "baseline_carbon_cost": row_baseline_cost,
         "carbon_saving": savings_pct,
         "peak_concurrent_workers": int(row.get("peak_concurrent_workers", 0)),
         "avg_concurrent_workers": float(row.get("avg_concurrent_workers", 0.0)),
@@ -693,6 +965,7 @@ def _write_run_readme(
     per_n_timing_rows: List[Dict[str, Any]],
     battery_elapsed: float,
     online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
+    trim_future_assignments: bool = False,
 ) -> None:
     rust_defaults = _parse_rust_config_defaults(RUST_CONFIG_RS)
     decay_slots = rust_defaults.get("error_window_past_decay_slots", "0")
@@ -711,6 +984,15 @@ def _write_run_readme(
         f"- Battery id: `{battery_id}`",
         f"- Start date: {start_dt.strftime('%Y-%m-%d')}",
         f"- Start time: {start_dt.strftime('%H:%M')}",
+        (
+            f"- Future-slot trimming: enabled; planning horizon extended by "
+            f"{scenario_config.ERROR_WINDOW_FUTURE} slots, with request outcomes "
+            "and request-level metrics retained only for assignments in the original horizon."
+            if trim_future_assignments
+            else "- Future-slot trimming: disabled (scenario planning horizon unchanged)."
+        ),
+        "- `requests_in` is the input request count; `requests_out` is the count assigned "
+        "within the original horizon.",
         f"- Max batch solver parallelism (max concurrent DP workers): {max_batch_solver_parallelism}",
         (
             f"- Realtime slot pacing: enabled, speed scale={realtime_speed_scale}"
@@ -795,6 +1077,7 @@ def run_battery(config_path: Path) -> None:
         cfg.get("rollback_max_consecutive", DEFAULT_ROLLBACK_MAX_CONSECUTIVE)
     )
     online_swarm_mode = str(cfg.get("online_swarm_mode", DEFAULT_ONLINE_SWARM_MODE))
+    trim_future_assignments = bool(cfg.get("trim_future_assignments", False))
     alt_strategies_enabled = run_online or run_offline
 
     # Optional override of Config::default()'s 3 built-in flavours (Accurate/
@@ -835,10 +1118,13 @@ def run_battery(config_path: Path) -> None:
         total_slots: int = int(scenario_def.get("total_slots", 24))
         req_per_slot: float = float(scenario_def.get("requests_per_slot", scenario_config.PREDICTED_REQUESTS_PER_SLOT))
         input_pattern = str(scenario_def.get("input_pattern", scenario_config.INPUT_PATTERN))
+        planning_slots = total_slots + (
+            int(scenario_config.ERROR_WINDOW_FUTURE) if trim_future_assignments else 0
+        )
 
         print(f"\n{'='*60}")
         print(
-            f"Scenario: {sid}  (seed={seed}, slots={total_slots}, "
+            f"Scenario: {sid}  (seed={seed}, slots={total_slots}, planning_slots={planning_slots}, "
             f"req/slot={req_per_slot}, pattern={input_pattern})"
         )
         print("=" * 60)
@@ -858,7 +1144,11 @@ def run_battery(config_path: Path) -> None:
         scenario_dir.mkdir(parents=True, exist_ok=True)
         SCENARIOS_JSON_DIR.mkdir(parents=True, exist_ok=True)
         scenario_path = SCENARIOS_JSON_DIR / f"{sid}.json"
-        scenario_data = _generate_scenario(scenario_def, scenario_path)
+        scenario_data = _generate_scenario(
+            scenario_def,
+            scenario_path,
+            trim_future_assignments=trim_future_assignments,
+        )
         save_json(scenario_dir / f"{sid}.json", scenario_data)
 
         if not (run_dp or run_online or run_offline):
@@ -971,6 +1261,7 @@ def run_battery(config_path: Path) -> None:
         per_n_timing_rows,
         battery_elapsed,
         online_swarm_mode,
+        trim_future_assignments,
     )
 
     print(f"\n{'='*60}")

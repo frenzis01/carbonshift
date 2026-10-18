@@ -940,7 +940,7 @@ fn batch_worker_entry(
                         .average;
 
                     // TODO: remove this debug print
-                    println!("[Scheduler] Newly assigned IDs in this run: {:?}", new_ids);
+                    // println!("[Scheduler] Newly assigned IDs in this run: {:?}", new_ids);
 
                     let mut run_row: HashMap<String, String> = HashMap::new();
                     run_row.insert("run_sequence".into(), run_sequence.to_string());

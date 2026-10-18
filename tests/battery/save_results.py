@@ -96,6 +96,13 @@ def load_run(run_dir: Path) -> pd.DataFrame:
         totals = _scenario_requests_total(run_dir)
         df.loc[missing_requests_in, "requests_in"] = df.loc[missing_requests_in, "scenario_id"].map(totals)
 
+    if "requests_out" not in df.columns:
+        # Older results predate horizon trimming; their output horizon matched
+        # the input horizon, so retain the historical input-count behavior.
+        df["requests_out"] = df["requests_in"]
+    else:
+        df["requests_out"] = df["requests_out"].fillna(df["requests_in"])
+
     # Join with per_n_timings (elapsed_seconds per scenario/mode/batch_size)
     timing_files = list(run_dir.glob("per_n_timings_*.csv"))
     if timing_files:
@@ -158,6 +165,7 @@ def aggregate_and_save(run_dirs=None, prefix_regex=r"^(cfg)_test(1|2|3|4|5|6|7|8
         'run_id',
         'scenario_id',
         'requests_in',
+        'requests_out',
         'batch_size',
         'infeasibility_mode',
         'parallelism',
@@ -191,4 +199,3 @@ def aggregate_and_save(run_dirs=None, prefix_regex=r"^(cfg)_test(1|2|3|4|5|6|7|8
     output_csv = RESULTS_DIR / "aggregated_battery_results.csv"
     df_all.to_csv(output_csv, index=False)
     print(f"Salvato in: {output_csv}")
-

@@ -19,6 +19,7 @@ snapshots/
 tests/battery/EvaluationTest.md
 tests/battery/battery_config_*.json
 tests/battery/TEST_structure*.md
+tests/battery/multi_analysis_B.ipynb
 
 rust/src/bin/nshift.rs
 rust/src/bin/run_nshift_speed.rs

@@ -210,6 +210,7 @@ def generate_scenario_data(
     *,
     seed: int,
     total_slots: int,
+    request_slots: Optional[int] = None,
     slot_duration_seconds: float,
     requests_per_slot: float,
     request_rate_std_factor: float,
@@ -245,6 +246,10 @@ def generate_scenario_data(
     - per-slot carbon forecast
     - synthetic prehistory slots used by modeled error calculations
 
+    ``request_slots`` can limit arrivals to the leading slots while
+    ``total_slots`` retains the full planning and forecast horizon. Generated
+    deadlines may use that full horizon.
+
     ``input_pattern`` controls request arrivals only: ``sinusoidal`` follows
     the carbon daylight shape, while ``flat`` adds small, deterministic
     Gaussian slot-count jitter (5% of the target rate) and preserves the
@@ -258,6 +263,12 @@ def generate_scenario_data(
     """
     if input_pattern not in {"flat", "sinusoidal"}:
         raise ValueError(f"Unknown input pattern: {input_pattern!r}")
+
+    input_slots = total_slots if request_slots is None else int(request_slots)
+    if not 1 <= input_slots <= total_slots:
+        raise ValueError(
+            f"request_slots must be between 1 and total_slots ({total_slots}), got {input_slots}"
+        )
 
     rng = random.Random(seed)
 
@@ -282,7 +293,7 @@ def generate_scenario_data(
         # Scale the request rate across slots with the same daylight shape as
         # carbon intensity, then add the configured per-slot count variation.
         rate_per_slot = _request_rate_per_slot(
-            total_slots=total_slots,
+            total_slots=input_slots,
             carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
             requests_per_slot=requests_per_slot,
             sunrise_fraction=carbon_sunrise_fraction,
@@ -296,9 +307,9 @@ def generate_scenario_data(
             request_counts.append(max(0, int(round(rng.gauss(mean_rate, sigma)))))
     else:
         # Add low-amplitude count noise, then use largest-remainder allocation
-        # to keep the horizon's rounded request total unchanged.
-        rate_per_slot = [requests_per_slot] * total_slots
-        target_total = round(total_slots * requests_per_slot)
+        # to keep the input horizon's rounded request total unchanged.
+        rate_per_slot = [requests_per_slot] * input_slots
+        target_total = round(input_slots * requests_per_slot)
         count_rng = random.Random(seed ^ 0xF1A7_5EED)
         noisy_rates = [
             max(
@@ -308,18 +319,18 @@ def generate_scenario_data(
                     0.0, requests_per_slot * FLAT_REQUEST_JITTER_STD_FACTOR
                 ),
             )
-            for _ in range(total_slots)
+            for _ in range(input_slots)
         ]
         noisy_total = sum(noisy_rates)
         scaled_counts = (
             [rate * target_total / noisy_total for rate in noisy_rates]
             if target_total > 0 and noisy_total > 0.0
-            else [0.0] * total_slots
+            else [0.0] * input_slots
         )
         request_counts = [math.floor(count) for count in scaled_counts]
         remaining = target_total - sum(request_counts)
         remainder_order = sorted(
-            range(total_slots),
+            range(input_slots),
             key=lambda slot: scaled_counts[slot] - request_counts[slot],
             reverse=True,
         )
@@ -353,7 +364,7 @@ def generate_scenario_data(
     prehistory_influence = max(0.0, min(1.0, float(prehistory_mock_influence)))
     if include_prehistory:
         for slot in range(-error_window_past, 0):
-            mean_rate = rate_per_slot[slot % total_slots]
+            mean_rate = rate_per_slot[slot % input_slots]
             sigma = max(1.0, mean_rate * request_rate_std_factor)
             raw_count = max(0, int(round(rng.gauss(mean_rate, sigma))))
             count = int(round(raw_count * prehistory_influence))
@@ -374,6 +385,7 @@ def generate_scenario_data(
             "seed": int(seed),
             "input_pattern": input_pattern,
             "total_slots": int(total_slots),
+            **({"input_total_slots": input_slots} if input_slots < total_slots else {}),
             "slot_duration_seconds": float(slot_duration_seconds),
             "requests_per_slot": float(requests_per_slot),
             "request_rate_std_factor": float(request_rate_std_factor),

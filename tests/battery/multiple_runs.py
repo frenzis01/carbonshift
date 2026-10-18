@@ -83,9 +83,9 @@ DP_CONTENT: Dict[str, Any] = {
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
     # "batch_sizes": [8,10,22],
     # "batch_sizes": [1,4,6,8,22],
-    "batch_sizes": [4],
+    "batch_sizes": [4,],
     # "infeasibility_modes": ["min_error_greedy", "carryover"],
-    "infeasibility_modes": ["carryover"],
+    "infeasibility_modes": ["min_error_greedy","carryover"],
     "online_strategies": [],
     "additional_strategies": [],
 }
@@ -94,7 +94,7 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "infeasibility_modes": [],
     "online_strategies": ["bandit", "ant_colony"],
-    "online_batch_sizes": [1,8,22,48,96],
+    "online_batch_sizes": [1,8,22,48,96,1024],
     "additional_strategies": [],
 }
 
@@ -115,12 +115,12 @@ OFFLINE_CONTENT: Dict[str, Any] = {
         "offline_singleton_best",
         "offline_singleton_best_accurate",
         "random",
-        # "bandit",
-        # "ant_colony",
+        "bandit",
+        "ant_colony",
     ],
 }
 
-INPUT_PATTERNS = ("sinusoidal", "flat")
+INPUT_PATTERNS = ("flat",)
 
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
 # DP + singleton_best: rollback x parallelism (swarm_mode is irrelevant to
@@ -171,7 +171,7 @@ def build_rollback_parallelism_grid(
 # for parallelism in (1, 8, 20)
 # for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
 _ROLLBACK_X_PARALLELISM_X_THRESHOLD = build_rollback_parallelism_grid(
-    rollbacks=(0, 5),
+    rollbacks=(0,),
     parallelisms=(12,),
     thresholds=(4.0,),
 )
