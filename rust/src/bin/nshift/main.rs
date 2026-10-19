@@ -298,6 +298,7 @@ struct SolverRunRow {
     solver_elapsed_ms: f64,
     solver_status: String,
     solver_mode: String,
+    mock_recovery_injected_count: i32,
 }
 
 #[derive(Clone)]
@@ -334,6 +335,8 @@ struct PerRequest {
     assignment_solver_status: String,
     assigned_with_greedy_fallback: bool,
     assigned_with_relaxed_retry: bool,
+    /// The request's assigning solve had a nonempty mock recovery pool.
+    assigned_with_injection: bool,
     assigned_with_rollback: bool,
     /// Slots past deadline at scheduling time (0 = on time or early).
     lateness_slots: i32,
@@ -426,6 +429,7 @@ fn read_solver_runs(path: &Path) -> Vec<SolverRunRow> {
     let i_ms = idx("solver_elapsed_ms");
     let i_status = idx("solver_status");
     let i_mode = idx("solver_mode");
+    let i_mock_recovery_injected = idx("mock_recovery_injected_count");
 
     let mut rows = Vec::new();
     for result in rdr.records() {
@@ -442,6 +446,7 @@ fn read_solver_runs(path: &Path) -> Vec<SolverRunRow> {
             solver_elapsed_ms: gf(i_ms),
             solver_status: g(i_status),
             solver_mode: g(i_mode),
+            mock_recovery_injected_count: gi(i_mock_recovery_injected) as i32,
         });
     }
     rows
@@ -508,6 +513,9 @@ fn compute_per_request(
             let solver_mode = run.map(|r| r.solver_mode.clone()).unwrap_or_default();
             let assigned_with_relaxed = solver_mode.contains("relaxed");
             let assigned_with_greedy = solver_mode.contains("greedy_after_infeasible");
+            let assigned_with_injection = run
+                .map(|r| r.mock_recovery_injected_count > 0)
+                .unwrap_or(false);
             let assigned_with_rollback = rolled_back_ids.contains(&a.request_id);
             let queue_wait_slots = (a.current_slot - a.arrival_slot).max(0);
             let final_wait_slots = (a.scheduled_slot - a.arrival_slot).max(0);
@@ -530,6 +538,7 @@ fn compute_per_request(
                 assignment_solver_status: solver_status,
                 assigned_with_greedy_fallback: assigned_with_greedy,
                 assigned_with_relaxed_retry: assigned_with_relaxed,
+                assigned_with_injection,
                 assigned_with_rollback,
                 lateness_slots: (a.scheduled_slot - a.deadline_slot).max(0),
             }
@@ -811,6 +820,7 @@ fn run_greedy_baseline(
                 assignment_solver_status: "ok".to_string(),
                 assigned_with_greedy_fallback: false,
                 assigned_with_relaxed_retry: false,
+                assigned_with_injection: false,
                 assigned_with_rollback: false,
                 lateness_slots: 0,
             });
@@ -1011,6 +1021,7 @@ fn run_offline_singleton(
             assignment_solver_status: "ok".to_string(),
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry: false,
+            assigned_with_injection: false,
             assigned_with_rollback: false,
             lateness_slots: (chosen_slot - req.deadline_slot).max(0),
         });
@@ -1174,6 +1185,7 @@ fn run_random_with_mode(
             assignment_solver_status: "ok".to_string(),
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry: false,
+            assigned_with_injection: false,
             assigned_with_rollback: false,
             lateness_slots: (slot - req.deadline_slot).max(0),
         });
@@ -1454,6 +1466,7 @@ fn convert_swarm_to_outputs(
             assignment_solver_status: "ok".to_string(),
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry: false,
+            assigned_with_injection: false,
             assigned_with_rollback: false,
             lateness_slots: 0,
         });
@@ -1769,6 +1782,7 @@ fn write_run_outputs(
             "assignment_solver_status",
             "assigned_with_greedy_fallback",
             "assigned_with_relaxed_retry",
+            "assigned_with_injection",
             "assigned_with_rollback",
             "lateness_slots",
         ];
@@ -1795,6 +1809,7 @@ fn write_run_outputs(
                 r.assignment_solver_status.clone(),
                 r.assigned_with_greedy_fallback.to_string(),
                 r.assigned_with_relaxed_retry.to_string(),
+                r.assigned_with_injection.to_string(),
                 r.assigned_with_rollback.to_string(),
                 r.lateness_slots.to_string(),
             ])
@@ -1813,6 +1828,7 @@ fn write_run_outputs(
                 "assignment_solver_status":r.assignment_solver_status.clone(),
                 "assigned_with_greedy_fallback":r.assigned_with_greedy_fallback,
                 "assigned_with_relaxed_retry":r.assigned_with_relaxed_retry,
+                "assigned_with_injection":r.assigned_with_injection,
                 "assigned_with_rollback":r.assigned_with_rollback,
                 "lateness_slots":r.lateness_slots,
             }));
@@ -2014,6 +2030,7 @@ fn schedule_late_requests(
             assignment_solver_status: "late".to_string(),
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry: false,
+            assigned_with_injection: false,
             assigned_with_rollback: false,
             lateness_slots: lateness,
         });
@@ -2643,9 +2660,64 @@ mod tests {
             assignment_solver_status: "ok".into(),
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry: false,
+            assigned_with_injection: false,
             assigned_with_rollback: false,
             lateness_slots: 0,
         }
+    }
+
+    #[test]
+    fn compute_per_request_marks_assignments_with_injected_mock_pool() {
+        let run_rows = vec![
+            SolverRunRow {
+                run_id: "injected".into(),
+                run_sequence: 1,
+                current_slot: 0,
+                pending_batch_size: 1,
+                new_assignments: 1,
+                solver_elapsed_ms: 0.0,
+                solver_status: "ok".into(),
+                solver_mode: "dp_none".into(),
+                mock_recovery_injected_count: 2,
+            },
+            SolverRunRow {
+                run_id: "plain".into(),
+                run_sequence: 2,
+                current_slot: 0,
+                pending_batch_size: 1,
+                new_assignments: 1,
+                solver_elapsed_ms: 0.0,
+                solver_status: "ok".into(),
+                solver_mode: "dp_none".into(),
+                mock_recovery_injected_count: 0,
+            },
+        ];
+        let runs_by_id = run_rows
+            .iter()
+            .map(|run| (run.run_id.clone(), run))
+            .collect::<HashMap<_, _>>();
+        let assignments = ["injected", "plain"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, run_id)| AssignmentRow {
+                run_id: run_id.into(),
+                request_id: i as u64 + 1,
+                current_slot: 0,
+                is_new_assignment_in_run: true,
+                scheduled_slot: 0,
+                flavour_name: "Accurate".into(),
+                error: 0.0,
+                carbon_cost: 0.0,
+                arrival_slot: 0,
+                deadline_slot: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let rows = compute_per_request(&assignments, &runs_by_id, 60.0, &HashSet::new());
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].assigned_with_injection);
+        assert!(!rows[1].assigned_with_injection);
     }
 
     /// Single tier (mult=1.0 up to 20): all 10 requests pay the same.

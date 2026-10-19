@@ -951,6 +951,10 @@ fn batch_worker_entry(
                     run_row.insert("replanned_assignments".into(), replanned.to_string());
                     run_row.insert("solver_status".into(), ctx.status.clone());
                     run_row.insert("solver_mode".into(), ctx.mode.clone());
+                    run_row.insert(
+                        "mock_recovery_injected_count".into(),
+                        ctx.mock_recovery_injected_count.to_string(),
+                    );
                     run_row.insert("qos_profile_id".into(), profile_id.to_string());
                     run_row.insert(
                         "consecutive_rollbacks".into(),
@@ -1316,6 +1320,7 @@ fn finish_swarm_batch(
         run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
         run_row.insert("total_carbon_cost".into(), total_cost.to_string());
         run_row.insert("solver_mode".into(), solver_strategy.to_string());
+        run_row.insert("mock_recovery_injected_count".into(), "0".into());
         run_row.insert("solver_status".into(), "ok".into());
         ml.log_solver_run(&run_row, &assignment_rows, &[]);
     }

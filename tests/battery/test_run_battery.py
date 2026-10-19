@@ -82,6 +82,7 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
             "lateness_slots": "0",
             "assigned_with_greedy_fallback": "false",
             "assigned_with_relaxed_retry": "false",
+            "assigned_with_injection": "true",
             "assigned_with_rollback": "false",
         },
         {
@@ -94,6 +95,7 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
             "lateness_slots": "1",
             "assigned_with_greedy_fallback": "true",
             "assigned_with_relaxed_retry": "false",
+            "assigned_with_injection": "false",
             "assigned_with_rollback": "true",
         },
         {
@@ -106,6 +108,7 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
             "lateness_slots": "0",
             "assigned_with_greedy_fallback": "false",
             "assigned_with_relaxed_retry": "true",
+            "assigned_with_injection": "true",
             "assigned_with_rollback": "false",
         },
     ]
@@ -173,6 +176,7 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
 
     _, retained = rb._read_csv(run_dir / "per_request.csv")
     assert [int(row["request_id"]) for row in retained] == [1, 3]
+    assert [row["assigned_with_injection"] for row in retained] == ["true", "true"]
     _, runtime_assignments = rb._read_csv(run_dir / "assignments_runtime.csv")
     assert len(runtime_assignments) == 2
     _, summary_rows = rb._read_csv(run_dir / "summary.csv")
@@ -187,7 +191,9 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
     _, timeslots = rb._read_csv(run_dir / "per_timeslot.csv")
     assert len(timeslots) == 2
     assert int(timeslots[1]["real_request_count"]) == 1
-    assert len(json.loads((run_dir / "per_request.json").read_text())["rows"]) == 2
+    retained_json = json.loads((run_dir / "per_request.json").read_text())["rows"]
+    assert len(retained_json) == 2
+    assert [row["assigned_with_injection"] for row in retained_json] == ["true", "true"]
     assert json.loads((run_dir / "summary.json").read_text())["requests_scheduled"] == 2
 
 

@@ -85,7 +85,7 @@ DP_CONTENT: Dict[str, Any] = {
     # "batch_sizes": [1,4,6,8,22],
     "batch_sizes": [4,],
     # "infeasibility_modes": ["min_error_greedy", "carryover"],
-    "infeasibility_modes": ["min_error_greedy","carryover"],
+    "infeasibility_modes": ["carryover"],
     "online_strategies": [],
     "additional_strategies": [],
 }
@@ -94,7 +94,7 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "infeasibility_modes": [],
     "online_strategies": ["bandit", "ant_colony"],
-    "online_batch_sizes": [1,8,22,48,96,1024],
+    "online_batch_sizes": [8,96,256,1024],
     "additional_strategies": [],
 }
 
@@ -124,7 +124,7 @@ OFFLINE_CONTENT: Dict[str, Any] = {
     ],
 }
 
-INPUT_PATTERNS = ("flat",)
+INPUT_PATTERNS = ("sinusoidal",)
 
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
 # DP + singleton_best: rollback x parallelism (swarm_mode is irrelevant to

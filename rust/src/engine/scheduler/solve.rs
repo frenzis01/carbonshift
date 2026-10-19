@@ -50,6 +50,8 @@ pub struct SolveContext {
     pub window_start_slot: i32,
     /// Inclusive last slot used in the local error-window calculation.
     pub window_end_slot: i32,
+    /// Number of synthetic recovery requests injected into this solve's baseline.
+    pub mock_recovery_injected_count: i32,
     /// Number of synthetic recovery requests consumed by this solve.
     pub mock_recovery_consumed: i32,
     /// Configured recovery policy used to form the baseline.
@@ -659,6 +661,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         },
         window_start_slot: window_start,
         window_end_slot: window_end,
+        mock_recovery_injected_count: mock_pool_input.initial_count,
         mock_recovery_consumed: mock_consumed,
         recovery_mode: recovery_config.recovery_mode.clone(),
         solver_elapsed_ms: 0.0, // filled by the caller
@@ -908,6 +911,7 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
         },
         window_start_slot: prep.window_start,
         window_end_slot: prep.window_end,
+        mock_recovery_injected_count: prep.mock_pool_input.initial_count,
         mock_recovery_consumed: mock_consumed,
         recovery_mode: recovery_config.recovery_mode.clone(),
         solver_elapsed_ms: 0.0, // filled by the caller

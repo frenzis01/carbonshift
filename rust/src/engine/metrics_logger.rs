@@ -24,6 +24,7 @@ const RUN_FIELDS: &[&str] = &[
     "replanned_assignments",
     "solver_status",
     "solver_mode",
+    "mock_recovery_injected_count",
     "lock_future_assignments",
     "solver_start_ts",
     "solver_end_ts",
