@@ -124,7 +124,7 @@ OFFLINE_CONTENT: Dict[str, Any] = {
     ],
 }
 
-INPUT_PATTERNS = ("sinusoidal",)
+INPUT_PATTERNS = ("flat",)
 
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
 # DP + singleton_best: rollback x parallelism (swarm_mode is irrelevant to
@@ -379,7 +379,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="cfg_test15",
+        default="cfg_test16",
         help="Prefix used to build each run's battery_id "
         "(final id is '<prefix>_<pattern>_<phase>_<grid-index>').",
     )
