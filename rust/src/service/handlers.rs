@@ -442,19 +442,19 @@ fn resolve_request_profile(
     // Without an explicit ID, choose the deterministic default profile for
     // the resolved task kind.
     let profile = match selected_profile {
-        Some(profile) => profile,
-        None => state
-            .qos_profiles
-            .default_for_task_kind(&task_kind)
-            .ok_or_else(|| {
-                api_error(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "task kind {task_kind} has no default profile; register and select a QoS profile"
-                    ),
-                )
-            })?,
-    };
+      Some(profile) => profile,
+      None => state
+         .qos_profiles
+         .default_for_task_kind(&task_kind)
+         .ok_or_else(|| {
+            api_error(
+               StatusCode::BAD_REQUEST,
+               format!(
+                  "task kind {task_kind} has no default profile; register and select a QoS profile"
+               ),
+            )
+         })?,
+   };
     if profile.task_kind != task_kind {
         return Err(api_error(
             StatusCode::BAD_REQUEST,

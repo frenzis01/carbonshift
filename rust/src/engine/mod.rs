@@ -16,5 +16,6 @@ pub mod qos;
 pub mod random_selection;
 pub mod scheduler;
 pub mod shared_state;
-pub mod types;
 pub mod solver;
+pub mod solver_algorithms;
+pub mod types;

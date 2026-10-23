@@ -212,14 +212,14 @@ async fn zero_deadline_for_future_arrival_keeps_the_minimum_one_slot_deadline() 
     assert_eq!(announce.status(), StatusCode::OK);
 
     let response = app
-        .clone()
-        .oneshot(json_request(
-            "POST",
-            "/v1/requests",
-            r#"{"deadline_seconds":0,"payload":{"task":"text_generation"},"arrival_slot_global":103}"#,
-        ))
-        .await
-        .unwrap();
+      .clone()
+      .oneshot(json_request(
+         "POST",
+         "/v1/requests",
+         r#"{"deadline_seconds":0,"payload":{"task":"text_generation"},"arrival_slot_global":103}"#,
+      ))
+      .await
+      .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(json_body(response).await["status"], "pending");
 

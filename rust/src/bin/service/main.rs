@@ -121,9 +121,11 @@ async fn main() {
 
     match &executor_url {
         Some(url) => tracing::info!(executor_url = %url, "executor dispatch enabled"),
-        None => tracing::warn!(
-            "EXECUTOR_URL not set — running in dry-run mode (no dispatch will be sent)"
-        ),
+        None => {
+            tracing::warn!(
+                "EXECUTOR_URL not set — running in dry-run mode (no dispatch will be sent)"
+            )
+        }
     }
     if manual_clock {
         tracing::warn!(

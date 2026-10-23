@@ -6,11 +6,12 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::config::{AssignmentPolicy, InfeasibilityConfig, SimulationConfig, SolverConfig};
-use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput, SolveRequest};
+use crate::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::engine::qos::QosProfileId;
 use crate::engine::random_selection::{
     RandomSelectionMode, closest_to_uniform_flavour_probabilities, select_random_assignment,
 };
+use crate::engine::solver::{ErrorWindowInput, SolveInput, SolveRequest, SolverError};
 use crate::shared_state::{GlobalErrorStats, SharedState};
 use crate::types::{
     Assignment, CapacityTier, Flavour, Request, RequestAssignment, get_capacity_multiplier,
@@ -251,7 +252,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         .iter()
         .map(|r| SolveRequest {
             request_id: r.id,
-            earliest_slot: r.arrival_slot.max(current_slot),
+            arrival_slot: r.arrival_slot,
             deadline_slot: cap_deadline(r.deadline_slot),
         })
         .collect();
@@ -276,12 +277,13 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
                 .deadline_slot
                 .unwrap_or_else(|| a.scheduled_slot.max(current_slot));
             let capped = cap_deadline(deadline);
+            let arrival_slot = a.arrival_slot.unwrap_or(current_slot);
             solve_requests.push(SolveRequest {
                 request_id: a.request_id,
-                earliest_slot: a.arrival_slot.unwrap_or(current_slot).max(current_slot),
+                arrival_slot,
                 deadline_slot: capped,
             });
-            assignment_metadata.insert(a.request_id, (a.arrival_slot.unwrap_or(0), capped));
+            assignment_metadata.insert(a.request_id, (arrival_slot, capped));
         }
     }
 
@@ -420,6 +422,34 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     }
 }
 
+fn project_solver_input(
+    context: &BatchSolveContext<'_>,
+    prepared: &PreparedSolve,
+) -> Result<SolveInput, SolverError> {
+    Ok(SolveInput {
+        current_slot: context.current_slot,
+        total_slots: context.assignment.total_slots,
+        requests: prepared.solve_requests.clone(),
+        default_flavours: prepared.solver_flavours.clone(),
+        request_flavours: prepared.request_flavours.clone(),
+        carbon_forecast: context.carbon_forecast.to_vec(),
+        capacity_tiers: prepared.effective_capacity_tiers.clone(),
+        baseline_slot_counts: prepared.baseline_slot_counts.clone(),
+        carbon_cost_duration_scale: context.assignment.carbon_cost_duration_scale,
+        assignment_max_future_slots: context.assignment.assignment_max_future_slots,
+        assignment_max_slot: Some(prepared.assignment_cap),
+        cumulative_error_constraint_active: prepared.profile_constraint_active
+            && context.assignment.global_error_constraint_hard,
+        error_window: ErrorWindowInput {
+            baseline_error_sum: prepared.error_baseline.error_sum,
+            baseline_request_count: prepared.error_baseline.request_count,
+            max_average_error: prepared.effective_error_threshold,
+            past_slots: context.assignment.error_window_past,
+            future_slots: context.assignment.error_window_future,
+        },
+    })
+}
+
 // ─── core DP pipeline ─────────────────────────────────────────────────────────
 
 /// Run the rolling-window DP pipeline for one profile batch.
@@ -527,7 +557,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
             .filter(|r| !scheduled_pending_ids.contains(&r.id))
             .map(|r| SolveRequest {
                 request_id: r.id,
-                earliest_slot: r.arrival_slot.max(current_slot),
+                arrival_slot: r.arrival_slot,
                 deadline_slot: cap_deadline(r.deadline_slot),
             })
             .collect();
@@ -756,7 +786,7 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
             .get(&request_id)
             .copied()
             .unwrap_or((current_slot, deadline));
-        let start_slot = request.earliest_slot.max(current_slot);
+        let start_slot = request.arrival_slot.max(current_slot);
         if start_slot > deadline {
             return BatchSolveResult {
                 assignments: vec![],

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::{AssignmentPolicy, SolverConfig};
+pub use crate::engine::solver::SolveRequest;
 use crate::types::{CapacityTier, Flavour, RequestAssignment, get_capacity_multiplier};
 
 /// Shared, `'static` empty map used as the default `request_flavours` when a
@@ -84,17 +85,6 @@ impl DpStateKey {
 }
 
 // ─── solver ───────────────────────────────────────────────────────────────────
-
-/// One request's slot bounds for a batch solve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SolveRequest {
-    /// Stable request key used to select a per-request flavour override.
-    pub request_id: u64,
-    /// Earliest local slot the solver is allowed to use.
-    pub earliest_slot: i32,
-    /// Latest local slot the solver is allowed to use.
-    pub deadline_slot: i32,
-}
 
 /// Configurable input for a single batch solve call.
 pub struct SolveBatchInput<'a> {
@@ -263,7 +253,7 @@ impl DpSolver {
             .requests
             .iter()
             .zip(&deadlines)
-            .any(|(request, deadline)| request.earliest_slot.max(input.current_slot) > *deadline)
+            .any(|(request, deadline)| request.arrival_slot.max(input.current_slot) > *deadline)
         {
             // At least one request has no legal slot, so expanding a partial
             // batch would only produce assignments that the caller cannot use.
@@ -351,7 +341,7 @@ impl DpSolver {
         // legal slot, then merges paths that reach the same accounting state.
         for (req_idx, request) in input.requests.iter().enumerate() {
             let deadline = deadlines[req_idx];
-            let earliest_slot = request.earliest_slot.max(input.current_slot);
+            let earliest_slot = request.arrival_slot.max(input.current_slot);
             let mut dp_curr: HashMap<DpStateKey, (f64, Vec<RequestAssignment>)> = HashMap::new();
 
             for (state_key, (prev_cost, prev_assignments)) in &dp_prev {
@@ -599,7 +589,7 @@ impl DpSolver {
 
         for (req_idx, request) in input.requests.iter().enumerate() {
             let deadline = deadlines[req_idx];
-            let earliest_slot = request.earliest_slot.max(input.current_slot);
+            let earliest_slot = request.arrival_slot.max(input.current_slot);
             let mut best: Option<(f64, &Flavour, i32)> = None;
 
             // Most-accurate (min-error) flavour, and its cheapest slot — the
@@ -732,7 +722,7 @@ impl DpSolver {
         for request in requests {
             // Keep the request's arrival as a lower bound, and never extend
             // beyond the finite horizon even if its supplied deadline does.
-            let earliest_slot = request.earliest_slot.max(current_slot);
+            let earliest_slot = request.arrival_slot.max(current_slot);
             let deadline = request
                 .deadline_slot
                 .max(current_slot)
@@ -878,7 +868,7 @@ mod tests {
         };
         let requests = vec![SolveRequest {
             request_id: 1,
-            earliest_slot: 0,
+            arrival_slot: 0,
             deadline_slot: 4,
         }];
         let tiers = no_tiers();
@@ -905,7 +895,7 @@ mod tests {
         };
         let requests = vec![SolveRequest {
             request_id: 1,
-            earliest_slot: 2,
+            arrival_slot: 2,
             deadline_slot: 4,
         }];
         let tiers = no_tiers();
@@ -915,6 +905,35 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].slot, 2);
+    }
+
+    #[test]
+    fn request_that_arrived_before_current_slot_is_not_scheduled_in_the_past() {
+        let solver = DpSolver {
+            flavours: vec![Flavour {
+                name: "A".to_string(),
+                error: 0.0,
+                duration: 60.0,
+            }],
+            window_size: 5,
+            carbon_forecast: vec![1.0, 100.0, 10.0, 20.0, 30.0],
+            pruning: "none".to_string(),
+            pruning_k: 100,
+            timeout: 5.0,
+            carbon_cost_scale: 1.0 / 3600.0,
+        };
+        let requests = vec![SolveRequest {
+            request_id: 1,
+            arrival_slot: 0,
+            deadline_slot: 4,
+        }];
+        let tiers = no_tiers();
+        let counts = HashMap::new();
+
+        let result = solver.solve_batch(make_input(&requests, 3, &tiers, &counts));
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].slot >= 3);
     }
 
     #[test]
@@ -934,7 +953,7 @@ mod tests {
         };
         let requests = vec![SolveRequest {
             request_id: 1,
-            earliest_slot: 2,
+            arrival_slot: 2,
             deadline_slot: 4,
         }];
         let tiers = no_tiers();
@@ -1078,7 +1097,7 @@ mod tests {
         };
         let requests = vec![SolveRequest {
             request_id: 1,
-            earliest_slot: 0,
+            arrival_slot: 0,
             deadline_slot: 2,
         }];
         let tiers = no_tiers();
@@ -1109,7 +1128,7 @@ mod tests {
         };
         let requests = vec![SolveRequest {
             request_id: 1,
-            earliest_slot: 0,
+            arrival_slot: 0,
             deadline_slot: 2,
         }];
         let tiers = no_tiers();
@@ -1149,7 +1168,7 @@ mod tests {
         };
         let requests = vec![SolveRequest {
             request_id: 1,
-            earliest_slot: 0,
+            arrival_slot: 0,
             deadline_slot: 0,
         }];
         let tiers = no_tiers();
@@ -1208,7 +1227,7 @@ mod tests {
         let requests: Vec<SolveRequest> = (1..=5)
             .map(|i| SolveRequest {
                 request_id: i,
-                earliest_slot: 0,
+                arrival_slot: 0,
                 deadline_slot: 23,
             })
             .collect();
@@ -1250,17 +1269,17 @@ mod tests {
         let requests = vec![
             SolveRequest {
                 request_id: 1,
-                earliest_slot: 0,
+                arrival_slot: 0,
                 deadline_slot: 0,
             },
             SolveRequest {
                 request_id: 2,
-                earliest_slot: 0,
+                arrival_slot: 0,
                 deadline_slot: 1,
             },
             SolveRequest {
                 request_id: 3,
-                earliest_slot: 0,
+                arrival_slot: 0,
                 deadline_slot: 2,
             },
         ];
@@ -1297,7 +1316,7 @@ mod tests {
         let tiers = no_tiers();
         let requests = vec![SolveRequest {
             request_id: 1,
-            earliest_slot: 0,
+            arrival_slot: 0,
             deadline_slot: 4,
         }];
         let counts = HashMap::new();
