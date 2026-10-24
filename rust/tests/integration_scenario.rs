@@ -1,7 +1,9 @@
 use carbonshift_rs::config::{
     AssignmentPolicy, Config, InfeasibilityConfig, LoggingConfig, SimulationConfig, SolverConfig,
 };
-use carbonshift_rs::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
+use carbonshift_rs::dp_solver::{
+    DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput, SolveRequest,
+};
 use carbonshift_rs::shared_state::SharedState;
 use carbonshift_rs::types::{Assignment, Request};
 /// Integration test: full slot-by-slot scheduling of the canonical scenario.
@@ -113,14 +115,12 @@ fn drain_pending_with_dp(
             break;
         }
 
-        let requests: Vec<(u64, i32)> = batch
+        let requests: Vec<SolveRequest> = batch
             .iter()
-            .map(|r| {
-                let capped = r
-                    .deadline_slot
-                    .max(current_slot)
-                    .min(assignment.total_slots - 1);
-                (r.id, capped)
+            .map(|request| SolveRequest {
+                request_id: request.id,
+                arrival_slot: request.arrival_slot,
+                deadline_slot: request.deadline_slot,
             })
             .collect();
 
@@ -156,25 +156,21 @@ fn drain_pending_with_dp(
             error_window_future: assignment.error_window_future,
             assignment_max_slot: Some(window_end),
             dynamic_mock_pool: MockPool::default(),
-            request_flavours: &HashMap::new(),
         };
 
         let dp_result = solver.solve_batch(input);
 
         if dp_result.is_empty() {
             // Infeasible batch: greedy fallback.
-            let deadlines: Vec<i32> = requests.iter().map(|(_, d)| *d).collect();
             let base_counts_arr: Vec<i32> = (0..assignment.total_slots)
                 .map(|s| base_counts.get(&s).copied().unwrap_or(0))
                 .collect();
 
             let greedy = solver.greedy_fallback(
                 &requests,
-                &deadlines,
                 current_slot,
                 assignment.capacity_tiers,
                 &base_counts_arr,
-                &HashMap::new(),
             );
 
             let assignments: Vec<Assignment> = greedy
@@ -192,7 +188,7 @@ fn drain_pending_with_dp(
                             .iter()
                             .find(|f| f.name == ra.flavour_name)
                             .map(|f| f.duration)
-                            .unwrap_or(0),
+                            .unwrap_or(0.0),
                         Some(req.arrival_slot),
                         Some(req.deadline_slot),
                     )
@@ -205,7 +201,7 @@ fn drain_pending_with_dp(
                 .iter()
                 .map(|r| (r.id, (r.arrival_slot, r.deadline_slot)))
                 .collect();
-            let dur_by_name: HashMap<String, i32> = assignment
+            let dur_by_name: HashMap<String, f64> = assignment
                 .flavours
                 .iter()
                 .map(|f| (f.name.clone(), f.duration))
@@ -222,7 +218,7 @@ fn drain_pending_with_dp(
                         ra.flavour_name.clone(),
                         ra.carbon_cost,
                         ra.error,
-                        dur_by_name.get(&ra.flavour_name).copied().unwrap_or(0),
+                        dur_by_name.get(&ra.flavour_name).copied().unwrap_or(0.0),
                         Some(arrival),
                         Some(deadline),
                     )

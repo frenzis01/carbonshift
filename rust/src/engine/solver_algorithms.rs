@@ -1,8 +1,9 @@
 //! Stateless scheduling algorithms adapted to the common solver contract.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
@@ -11,8 +12,8 @@ use crate::engine::random_selection::{
     RandomSelectionMode, closest_to_uniform_flavour_probabilities, select_random_assignment,
 };
 use crate::engine::solver::{
-    CommitReport, ProposedPlacement, SolveInput, SolverAlgorithm, SolverError, SolverProposal,
-    SolverRegistry, SolverScope,
+    CommitReport, ProposedPlacement, SolveInput, SolveRequest, SolverAlgorithm, SolverError,
+    SolverProposal, SolverRegistry, SolverScope,
 };
 use crate::types::{Flavour, get_capacity_multiplier};
 
@@ -46,75 +47,6 @@ impl DpAlgorithm {
     }
 }
 
-fn validate_solve_input(input: &SolveInput) -> Result<(), SolverError> {
-    let horizon = usize::try_from(input.total_slots)
-        .map_err(|_| SolverError::Algorithm("planning horizon must be positive".to_owned()))?;
-    if horizon == 0 {
-        return Err(SolverError::Algorithm(
-            "planning horizon must be positive".to_owned(),
-        ));
-    }
-    if input.carbon_forecast.len() != horizon {
-        return Err(SolverError::Algorithm(format!(
-            "forecast length {} does not match planning horizon {horizon}",
-            input.carbon_forecast.len()
-        )));
-    }
-    if !input.error_window.max_average_error.is_finite() {
-        return Err(SolverError::Algorithm(
-            "sliding-window error threshold must be finite".to_owned(),
-        ));
-    }
-    if !input.error_window.baseline_error_sum.is_finite()
-        || !input.error_window.baseline_request_count.is_finite()
-        || input.error_window.baseline_request_count < 0.0
-    {
-        return Err(SolverError::Algorithm(
-            "error-window baseline must have a finite sum and non-negative finite count".to_owned(),
-        ));
-    }
-    if input.baseline_slot_counts.values().any(|count| *count < 0) {
-        return Err(SolverError::Algorithm(
-            "baseline slot counts cannot be negative".to_owned(),
-        ));
-    }
-
-    for request in &input.requests {
-        let flavours = flavours_for_request(input, request.request_id)?;
-        if flavours.iter().any(|flavour| {
-            !flavour.error.is_finite() || !flavour.duration.is_finite() || flavour.duration < 0.0
-        }) {
-            return Err(SolverError::Algorithm(format!(
-                "request {} has a flavour with invalid error or duration",
-                request.request_id
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn request_slot_bounds(input: &SolveInput, arrival: i32, deadline: i32) -> (i32, i32) {
-    (
-        arrival.max(input.current_slot),
-        deadline
-            .min(input.assignment_max_slot.unwrap_or(input.total_slots - 1))
-            .min(input.total_slots - 1),
-    )
-}
-
-fn flavours_for_request(input: &SolveInput, request_id: u64) -> Result<&[Flavour], SolverError> {
-    let flavours = input
-        .request_flavours
-        .get(&request_id)
-        .map(Vec::as_slice)
-        .unwrap_or(&input.default_flavours);
-    if flavours.is_empty() {
-        return Err(SolverError::Algorithm(format!(
-            "request {request_id} has no available flavours"
-        )));
-    }
-    Ok(flavours)
-}
 
 impl SolverAlgorithm for DpAlgorithm {
     type State = ();
@@ -131,19 +63,100 @@ impl SolverAlgorithm for DpAlgorithm {
             return Ok((SolverProposal::default(), ()));
         }
         validate_solve_input(input)?;
-        for request in &input.requests {
-            let (earliest, deadline) =
-                request_slot_bounds(input, request.arrival_slot, request.deadline_slot);
-            if earliest > deadline {
-                return Err(SolverError::Algorithm(format!(
-                    "request {} has no feasible slot within the planning horizon",
-                    request.request_id
-                )));
+
+        // Initialize placement vector to be returned
+        let mut placements = Vec::with_capacity(input.requests.len());
+        // Initialize per-slot counts with already assigned requests
+        let mut solver_baseline_counts = input.baseline_slot_counts.clone();
+        let mut cumulative_count = input.qos.cumulative_error_count;
+        let mut cumulative_sum = input.qos.cumulative_error_sum;
+        let mut window_count = input.qos.error_window.baseline_request_count;
+        let mut window_sum = input.qos.error_window.baseline_error_sum;
+        // Mark late requests
+        // i.e. requests such that current_slot > deadline_slot
+        // These should be a few and the result of late arrivals mostly
+        let late_request_ids: HashSet<u64> = input
+            .requests
+            .iter()
+            .filter(|request| input.current_slot > request.deadline_slot)
+            .map(|request| request.request_id)
+            .collect();
+
+        // BIZ_RULE: Assign late requests first to current slot
+        // with the cheapest feasible flavour
+        for request in input
+            .requests
+            .iter()
+            .filter(|request| late_request_ids.contains(&request.request_id))
+        {
+            let flavour = cheapest_feasible_flavour(
+                &input.qos.flavours,
+                input.qos.max_average_error,
+                input.qos.cumulative_error_constraint_active,
+                cumulative_count,
+                cumulative_sum,
+                window_count,
+                window_sum,
+            )?;
+            let count = solver_baseline_counts
+                .entry(input.current_slot)
+                .or_insert(0);
+            *count = count.checked_add(1).ok_or_else(|| {
+                SolverError::Algorithm("current-slot occupancy overflowed i32".to_owned())
+            })?;
+            cumulative_count = cumulative_count.checked_add(1).ok_or_else(|| {
+                SolverError::Algorithm("cumulative error count overflowed i64".to_owned())
+            })?;
+            cumulative_sum += flavour.error;
+            window_count += 1.0;
+            window_sum += flavour.error;
+            placements.push(ProposedPlacement::late(
+                request.request_id,
+                input.current_slot,
+                flavour.name.clone(),
+            ));
+        }
+
+        // Filter out late requests for DP
+        let on_time_requests: Vec<_> = input
+            .requests
+            .iter()
+            .filter(|request| !late_request_ids.contains(&request.request_id))
+            .map(|request| {
+                let (_, deadline_slot) = request_slot_bounds(input, request)?;
+                Ok(SolveRequest {
+                    deadline_slot,
+                    ..*request
+                })
+            })
+            .collect::<Result<_, SolverError>>()?;
+
+        // Return early if no on-time requests
+        if on_time_requests.is_empty() {
+            return Ok((SolverProposal { placements }, ()));
+        }
+
+        let cumulative_average = if cumulative_count > 0 {
+            cumulative_sum / cumulative_count as f64
+        } else {
+            0.0
+        };
+        let mut flavours = input.qos.flavours.clone();
+        if input.qos.cumulative_error_constraint_active
+            && cumulative_average > input.qos.max_average_error
+        {
+            let allowed: Vec<Flavour> = flavours
+                .iter()
+                .filter(|flavour| flavour.error <= input.qos.max_average_error)
+                .cloned()
+                .collect();
+            if !allowed.is_empty() {
+                flavours = allowed;
             }
         }
 
         let solver = DpSolver {
-            flavours: input.default_flavours.clone(),
+            flavours,
             carbon_forecast: input.carbon_forecast.clone(),
             window_size: input.total_slots,
             pruning: self.effective_pruning(input.requests.len()),
@@ -151,32 +164,30 @@ impl SolverAlgorithm for DpAlgorithm {
             timeout: self.config.timeout_secs,
             carbon_cost_scale: input.carbon_cost_duration_scale,
         };
-        // Keep the legacy DP kernel input here: it is also used by the existing
-        // scheduler path, and its mock-pool field is DP/recovery-specific.
+        // Keep the DP-specific solve input here; the common input supplies one
+        // flavour set for this homogeneous QoS-profile batch.
         let mut assignments = solver.solve_batch(SolveBatchInput {
-            requests: &input.requests,
+            requests: &on_time_requests,
             current_slot: input.current_slot,
             capacity_multiplier: 1.0,
             capacity_tiers: &input.capacity_tiers,
-            baseline_slot_counts: &input.baseline_slot_counts,
+            baseline_slot_counts: &solver_baseline_counts,
             error_window_baseline: ErrorWindowBaseline {
-                error_sum: input.error_window.baseline_error_sum,
-                request_count: input.error_window.baseline_request_count,
+                error_sum: window_sum,
+                request_count: window_count,
             },
-            max_error_threshold: Some(input.error_window.max_average_error),
-            error_window_past: input.error_window.past_slots,
-            error_window_future: input.error_window.future_slots,
-            assignment_max_slot: input.assignment_max_slot,
+            max_error_threshold: Some(input.qos.max_average_error),
+            error_window_past: input.qos.error_window.past_slots,
+            error_window_future: input.qos.error_window.future_slots,
+            assignment_max_slot: Some(latest_forecast_slot(input)),
             dynamic_mock_pool: MockPool::default(),
-            request_flavours: &input.request_flavours,
         });
 
         let scheduled_ids: HashSet<u64> = assignments
             .iter()
             .map(|assignment| assignment.request_id)
             .collect();
-        let unscheduled: Vec<_> = input
-            .requests
+        let unscheduled: Vec<_> = on_time_requests
             .iter()
             .filter(|request| !scheduled_ids.contains(&request.request_id))
             .copied()
@@ -184,22 +195,10 @@ impl SolverAlgorithm for DpAlgorithm {
 
         if !unscheduled.is_empty() {
             let mut fallback_counts: Vec<i32> = (0..input.total_slots)
-                .map(|slot| input.baseline_slot_counts.get(&slot).copied().unwrap_or(0))
+                .map(|slot| solver_baseline_counts.get(&slot).copied().unwrap_or(0))
                 .collect();
             for assignment in &assignments {
-                let index = usize::try_from(assignment.slot).map_err(|_| {
-                    SolverError::Algorithm(format!(
-                        "DP returned invalid negative slot {}",
-                        assignment.slot
-                    ))
-                })?;
-                let count = fallback_counts.get_mut(index).ok_or_else(|| {
-                    SolverError::Algorithm(format!(
-                        "DP returned slot {} outside the planning horizon",
-                        assignment.slot
-                    ))
-                })?;
-                *count += 1;
+                fallback_counts[assignment.slot as usize] += 1;
             }
 
             assignments.extend(solver.greedy_fallback(
@@ -207,22 +206,17 @@ impl SolverAlgorithm for DpAlgorithm {
                 input.current_slot,
                 &input.capacity_tiers,
                 &fallback_counts,
-                &input.request_flavours,
             ));
         }
 
-        let proposal = SolverProposal {
-            placements: assignments
-                .into_iter()
-                .map(|assignment| ProposedPlacement {
-                    req_id: assignment.request_id,
-                    scheduled_slot: assignment.slot,
-                    flavour_name: assignment.flavour_name,
-                })
-                .collect(),
-        };
-
-        Ok((proposal, ()))
+        placements.extend(assignments.into_iter().map(|assignment| {
+            ProposedPlacement::new(
+                assignment.request_id,
+                assignment.slot,
+                assignment.flavour_name,
+            )
+        }));
+        Ok((SolverProposal { placements }, ()))
     }
 
     fn merge(&self, _state: &mut (), _delta: (), _committed: &CommitReport) {}
@@ -247,60 +241,78 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
         }
         validate_solve_input(input)?;
 
+        // Initialize placements and counts
         let mut placements = Vec::with_capacity(input.requests.len());
-        let mut slot_count: HashMap<i32, i64> = input
-            .baseline_slot_counts
-            .iter()
-            .map(|(&slot, &count)| (slot, i64::from(count)))
-            .collect();
+        let mut slot_count = input.baseline_slot_counts.clone();
         let mut solved_errors = Vec::with_capacity(input.requests.len());
+        let mut cumulative_count = input.qos.cumulative_error_count;
+        let mut cumulative_sum = input.qos.cumulative_error_sum;
+        let mut window_count = input.qos.error_window.baseline_request_count;
+        let mut window_sum = input.qos.error_window.baseline_error_sum;
 
         for request in &input.requests {
-            let flavours = flavours_for_request(input, request.request_id)?;
-            let (start_slot, deadline) =
-                request_slot_bounds(input, request.arrival_slot, request.deadline_slot);
-            if start_slot > deadline {
-                return Err(SolverError::Algorithm(format!(
-                    "request {} has no feasible slot: earliest {start_slot}, deadline {deadline}",
-                    request.request_id
-                )));
+            // If request is late, mark it as such and go on
+            if input.current_slot > request.deadline_slot {
+                let flavour = cheapest_feasible_flavour(
+                    &input.qos.flavours,
+                    input.qos.max_average_error,
+                    input.qos.cumulative_error_constraint_active,
+                    cumulative_count,
+                    cumulative_sum,
+                    window_count,
+                    window_sum,
+                )?;
+                *slot_count.entry(input.current_slot).or_insert(0) += 1;
+                solved_errors.push((input.current_slot, flavour.error));
+                cumulative_count = cumulative_count.checked_add(1).ok_or_else(|| {
+                    SolverError::Algorithm("cumulative error count overflowed i64".to_owned())
+                })?;
+                cumulative_sum += flavour.error;
+                window_count += 1.0;
+                window_sum += flavour.error;
+                placements.push(ProposedPlacement::late(
+                    request.request_id,
+                    input.current_slot,
+                    flavour.name.clone(),
+                ));
+                continue;
             }
 
-            let mut sorted_flavours: Vec<&Flavour> = flavours.iter().collect();
+            // Find best slot and feasible flavour
+            let (start_slot, deadline) = request_slot_bounds(input, request)?;
+            let mut sorted_flavours: Vec<&Flavour> = input.qos.flavours.iter().collect();
             sorted_flavours.sort_by(|left, right| left.duration.total_cmp(&right.duration));
 
             let mut best: Option<(f64, i32, &Flavour)> = None;
 
             for slot in start_slot..=deadline {
-                // The current slot's observed value is already folded into the
-                // effective forecast before the runner creates SolveInput.
-                let slot_index = usize::try_from(slot)
-                    .map_err(|_| SolverError::Algorithm(format!("invalid negative slot {slot}")))?;
-                let carbon_intensity = *input.carbon_forecast.get(slot_index).ok_or_else(|| {
-                    SolverError::Algorithm(format!("slot {slot} is outside the carbon forecast"))
-                })?;
-                let position = next_slot_position(&slot_count, slot)?;
+                // Input validation and deadline capping guarantee this index
+                // is inside the forecast; the current value is the observed CI.
+                let carbon_intensity = input.carbon_forecast[slot as usize];
+                let position = i64::from(*slot_count.get(&slot).unwrap_or(&0)) + 1;
                 let multiplier = get_capacity_multiplier(&input.capacity_tiers, position);
 
                 for flav in &sorted_flavours {
-                    if input.cumulative_error_constraint_active
-                        && flav.error > input.error_window.max_average_error
+                    let cumulative_average = if cumulative_count > 0 {
+                        cumulative_sum / cumulative_count as f64
+                    } else {
+                        0.0
+                    };
+                    if input.qos.cumulative_error_constraint_active
+                        && cumulative_average > input.qos.max_average_error
+                        && flav.error > input.qos.max_average_error
                     {
                         continue;
                     }
 
                     // Match the existing policy: the local window is anchored
                     // to this request's arrival slot.
-                    let win_start = request
-                        .arrival_slot
-                        .saturating_sub(input.error_window.past_slots)
-                        .max(0);
-                    let win_end = request
-                        .arrival_slot
-                        .saturating_add(input.error_window.future_slots)
+                    let win_start =
+                        (request.arrival_slot - input.qos.error_window.past_slots).max(0);
+                    let win_end = (request.arrival_slot + input.qos.error_window.future_slots)
                         .min(input.total_slots - 1);
-                    let mut win_sum = input.error_window.baseline_error_sum + flav.error;
-                    let mut win_count = input.error_window.baseline_request_count + 1.0;
+                    let mut win_sum = input.qos.error_window.baseline_error_sum + flav.error;
+                    let mut win_count = input.qos.error_window.baseline_request_count + 1.0;
                     for &(placed_slot, placed_error) in &solved_errors {
                         if (win_start..=win_end).contains(&placed_slot) {
                             win_sum += placed_error;
@@ -310,8 +322,7 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
 
                     // Reject this candidate if it would violate the window
                     // budget; another flavour or slot may still be feasible.
-                    if win_count > 0.0 && win_sum / win_count > input.error_window.max_average_error
-                    {
+                    if win_count > 0.0 && win_sum / win_count > input.qos.max_average_error {
                         continue;
                     }
 
@@ -330,20 +341,26 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
             let (chosen_slot, chosen_flavour) = if let Some((_, slot, flavour)) = best {
                 (slot, flavour)
             } else {
-                // Preserve the existing best-effort fallback: use the most
-                // accurate flavour at the earliest legal slot. This fallback
+                // BIZ_RULE: most accurate as fallback
+                // Use the most accurate flavour at the earliest legal slot. This fallback
                 // can exceed the error threshold when no feasible candidate
                 // exists; it does not change the threshold used above.
-                (start_slot, get_fallback_flav(flavours)?)
+                (start_slot, get_fallback_flav(&input.qos.flavours)?)
             };
 
-            increment_slot_count(&mut slot_count, chosen_slot)?;
+            *slot_count.entry(chosen_slot).or_insert(0) += 1;
             solved_errors.push((chosen_slot, chosen_flavour.error));
-            placements.push(ProposedPlacement {
-                req_id: request.request_id,
-                scheduled_slot: chosen_slot,
-                flavour_name: chosen_flavour.name.clone(),
-            });
+            cumulative_count = cumulative_count.checked_add(1).ok_or_else(|| {
+                SolverError::Algorithm("cumulative error count overflowed i64".to_owned())
+            })?;
+            cumulative_sum += chosen_flavour.error;
+            window_count += 1.0;
+            window_sum += chosen_flavour.error;
+            placements.push(ProposedPlacement::new(
+                request.request_id,
+                chosen_slot,
+                chosen_flavour.name.clone(),
+            ));
         }
         Ok((SolverProposal { placements }, ()))
     }
@@ -363,21 +380,30 @@ fn get_fallback_flav(flavours: &[Flavour]) -> Result<&Flavour, SolverError> {
         .ok_or_else(|| SolverError::Algorithm("no fallback flavour is available".to_owned()))
 }
 
-fn next_slot_position(slot_count: &HashMap<i32, i64>, slot: i32) -> Result<i64, SolverError> {
-    slot_count
-        .get(&slot)
-        .copied()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| SolverError::Algorithm(format!("slot {slot} occupancy overflowed i64")))
-}
-
-fn increment_slot_count(slot_count: &mut HashMap<i32, i64>, slot: i32) -> Result<(), SolverError> {
-    let count = slot_count.entry(slot).or_insert(0);
-    *count = count
-        .checked_add(1)
-        .ok_or_else(|| SolverError::Algorithm(format!("slot {slot} occupancy overflowed i64")))?;
-    Ok(())
+fn cheapest_feasible_flavour(
+    flavours: &[Flavour],
+    threshold: f64,
+    cumulative_constraint_active: bool,
+    cumulative_count: i64,
+    cumulative_sum: f64,
+    window_count: f64,
+    window_sum: f64,
+) -> Result<&Flavour, SolverError> {
+    flavours
+        .iter()
+        .filter(|flavour| {
+            let cumulative_ok = !cumulative_constraint_active
+                || (cumulative_sum + flavour.error) / (cumulative_count as f64 + 1.0) <= threshold;
+            let window_ok = (window_sum + flavour.error) / (window_count + 1.0) <= threshold;
+            cumulative_ok && window_ok
+        })
+        .min_by(|left, right| left.duration.total_cmp(&right.duration))
+        .ok_or_else(|| {
+            SolverError::Algorithm(
+                "no flavour satisfies the cumulative and window error limits for late work"
+                    .to_owned(),
+            )
+        })
 }
 
 /// Random slot/flavour strategy with independent streams for concurrent solves.
@@ -426,74 +452,96 @@ impl SolverAlgorithm for RandomAlgorithm {
             })?;
         let mut rng = SmallRng::seed_from_u64(self.seed ^ stream);
         let mut placements = Vec::with_capacity(input.requests.len());
+        let mut cumulative_count = input.qos.cumulative_error_count;
+        let mut cumulative_sum = input.qos.cumulative_error_sum;
+        let mut window_count = input.qos.error_window.baseline_request_count;
+        let mut window_sum = input.qos.error_window.baseline_error_sum;
 
         for request in &input.requests {
-            let available_flavours = flavours_for_request(input, request.request_id)?;
-            let filtered_flavours: Vec<Flavour> = if input.cumulative_error_constraint_active {
-                available_flavours
-                    .iter()
-                    .filter(|flavour| flavour.error <= input.error_window.max_average_error)
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let flavours = if input.cumulative_error_constraint_active {
-                filtered_flavours.as_slice()
-            } else {
-                available_flavours
-            };
-            if flavours.is_empty() {
-                return Err(SolverError::Algorithm(format!(
-                    "request {} has no flavour within the active cumulative error limit",
-                    request.request_id
-                )));
-            }
-            let (earliest, deadline) =
-                request_slot_bounds(input, request.arrival_slot, request.deadline_slot);
-            let latest = deadline.min(
-                request
-                    .arrival_slot
-                    .saturating_add(input.assignment_max_future_slots),
-            );
-            if earliest > latest {
-                return Err(SolverError::Algorithm(format!(
-                    "request {} has no feasible random-selection slot",
-                    request.request_id
-                )));
+            if input.current_slot > request.deadline_slot {
+                let flavour = cheapest_feasible_flavour(
+                    &input.qos.flavours,
+                    input.qos.max_average_error,
+                    input.qos.cumulative_error_constraint_active,
+                    cumulative_count,
+                    cumulative_sum,
+                    window_count,
+                    window_sum,
+                )?;
+                placements.push(ProposedPlacement::late(
+                    request.request_id,
+                    input.current_slot,
+                    flavour.name.clone(),
+                ));
+                cumulative_count = cumulative_count.checked_add(1).ok_or_else(|| {
+                    SolverError::Algorithm("cumulative error count overflowed i64".to_owned())
+                })?;
+                cumulative_sum += flavour.error;
+                window_count += 1.0;
+                window_sum += flavour.error;
+                continue;
             }
 
-            let probabilities = if self.mode == RandomSelectionMode::Slot {
-                vec![1.0 / flavours.len() as f64; flavours.len()]
+            let (earliest, deadline) = request_slot_bounds(input, request)?;
+            let latest = deadline.min(request.arrival_slot + input.assignment_max_future_slots);
+            let (slot, flavour) = if earliest > latest {
+                // A random shift cannot fit in the configured assignment
+                // window, so use the singleton strategy's accurate fallback.
+                (earliest, get_fallback_flav(&input.qos.flavours)?)
             } else {
-                let errors: Vec<f64> = flavours.iter().map(|flavour| flavour.error).collect();
-                closest_to_uniform_flavour_probabilities(
-                    &errors,
-                    input.error_window.max_average_error,
+                random_assignment_for_request(
+                    self.mode,
+                    earliest,
+                    latest,
+                    &input.qos.flavours,
+                    input.qos.max_average_error,
+                    &mut rng,
                 )
                 .map_err(SolverError::Algorithm)?
             };
-            let (slot, flavour_index) = select_random_assignment(
-                self.mode,
-                earliest,
-                latest,
-                flavours,
-                &probabilities,
-                &mut rng,
-            )
-            .map_err(SolverError::Algorithm)?;
 
-            placements.push(ProposedPlacement {
-                req_id: request.request_id,
-                scheduled_slot: slot,
-                flavour_name: flavours[flavour_index].name.clone(),
-            });
+            placements.push(ProposedPlacement::new(
+                request.request_id,
+                slot,
+                flavour.name.clone(),
+            ));
+            cumulative_count = cumulative_count.checked_add(1).ok_or_else(|| {
+                SolverError::Algorithm("cumulative error count overflowed i64".to_owned())
+            })?;
+            cumulative_sum += flavour.error;
+            window_count += 1.0;
+            window_sum += flavour.error;
         }
 
         Ok((SolverProposal { placements }, ()))
     }
 
     fn merge(&self, _state: &mut (), _delta: (), _committed: &CommitReport) {}
+}
+
+fn random_assignment_for_request<'a, R: Rng + ?Sized>(
+    mode: RandomSelectionMode,
+    earliest_slot: i32,
+    latest_slot: i32,
+    flavours: &'a [Flavour],
+    target_error: f64,
+    rng: &mut R,
+) -> Result<(i32, &'a Flavour), String> {
+    let probabilities = if mode == RandomSelectionMode::Slot {
+        vec![1.0 / flavours.len() as f64; flavours.len()]
+    } else {
+        let errors: Vec<f64> = flavours.iter().map(|flavour| flavour.error).collect();
+        closest_to_uniform_flavour_probabilities(&errors, target_error)?
+    };
+    let (slot, flavour_index) = select_random_assignment(
+        mode,
+        earliest_slot,
+        latest_slot,
+        flavours,
+        &probabilities,
+        rng,
+    )?;
+    Ok((slot, &flavours[flavour_index]))
 }
 
 /// Register the stateless strategies without adding solver-specific branches
@@ -524,14 +572,149 @@ pub fn register_stateless_solvers(
     Ok(())
 }
 
+// Helper functions 
+
+
+fn validate_solve_input(input: &SolveInput) -> Result<(), SolverError> {
+    let horizon = usize::try_from(input.total_slots)
+        .map_err(|_| SolverError::Algorithm("planning horizon must be positive".to_owned()))?;
+    if horizon == 0 {
+        return Err(SolverError::Algorithm(
+            "planning horizon must be positive".to_owned(),
+        ));
+    }
+    if input.carbon_forecast.len() != horizon {
+        return Err(SolverError::Algorithm(format!(
+            "forecast length {} does not match planning horizon {horizon}",
+            input.carbon_forecast.len()
+        )));
+    }
+    if input.current_slot < 0 || input.current_slot >= input.total_slots {
+        return Err(SolverError::Algorithm(format!(
+            "current slot {} is outside the planning horizon",
+            input.current_slot
+        )));
+    }
+    if input.qos.error_window.past_slots < 0 || input.qos.error_window.future_slots < 0 {
+        return Err(SolverError::Algorithm(
+            "error-window slot counts cannot be negative".to_owned(),
+        ));
+    }
+    if input.assignment_max_future_slots < 0 {
+        return Err(SolverError::Algorithm(
+            "maximum assignment shift cannot be negative".to_owned(),
+        ));
+    }
+    if input
+        .assignment_max_slot
+        .is_some_and(|max_slot| max_slot < input.current_slot)
+    {
+        return Err(SolverError::Algorithm(
+            "assignment cap is earlier than the current slot".to_owned(),
+        ));
+    }
+    if !input.carbon_cost_duration_scale.is_finite()
+        || input.carbon_cost_duration_scale < 0.0
+        || input.carbon_forecast.iter().any(|value| !value.is_finite())
+    {
+        return Err(SolverError::Algorithm(
+            "carbon forecast and duration scale must be finite and non-negative".to_owned(),
+        ));
+    }
+    if !input.qos.max_average_error.is_finite() {
+        return Err(SolverError::Algorithm(
+            "sliding-window error threshold must be finite".to_owned(),
+        ));
+    }
+    if input.qos.cumulative_error_count < 0
+        || !input.qos.cumulative_error_sum.is_finite()
+        || !input.qos.error_window.baseline_error_sum.is_finite()
+        || !input.qos.error_window.baseline_request_count.is_finite()
+        || input.qos.error_window.baseline_request_count < 0.0
+    {
+        return Err(SolverError::Algorithm(
+            "QoS error sums must be finite and error counts non-negative".to_owned(),
+        ));
+    }
+    if input.baseline_slot_counts.values().any(|count| *count < 0) {
+        return Err(SolverError::Algorithm(
+            "baseline slot counts cannot be negative".to_owned(),
+        ));
+    }
+
+    if !input.requests.is_empty() && input.qos.flavours.is_empty() {
+        return Err(SolverError::Algorithm(
+            "the QoS profile has no available flavours".to_owned(),
+        ));
+    }
+    if input.qos.flavours.iter().any(|flavour| {
+        !flavour.error.is_finite() || !flavour.duration.is_finite() || flavour.duration < 0.0
+    }) {
+        return Err(SolverError::Algorithm(
+            "QoS profile contains a flavour with invalid error or duration".to_owned(),
+        ));
+    }
+
+    for request in &input.requests {
+        request_slot_bounds(input, request)?;
+    }
+    Ok(())
+}
+
+/// Cap a request's deadline to slots for which this solve has forecast data
+/// or for whose future assignment horizon is valid.
+/// Already-expired work is retained at the current slot so the algorithm can
+/// mark it late and choose its explicit late-work fallback.
+fn cap_deadline_inside_forecast(
+    input: &SolveInput,
+    request: &SolveRequest,
+) -> Result<i32, SolverError> {
+    if input.current_slot > request.deadline_slot {
+        return Ok(input.current_slot);
+    }
+
+    let cap = request.deadline_slot.min(latest_forecast_slot(input));
+    let earliest = request.arrival_slot.max(input.current_slot);
+    if cap < earliest {
+        return Err(SolverError::Algorithm(format!(
+            "request {} starts at slot {earliest}, beyond forecast-covered deadline {cap}",
+            request.request_id
+        )));
+    }
+    Ok(cap)
+}
+
+fn request_slot_bounds(
+    input: &SolveInput,
+    request: &SolveRequest,
+) -> Result<(i32, i32), SolverError> {
+    Ok((
+        request.arrival_slot.max(input.current_slot),
+        cap_deadline_inside_forecast(input, request)?,
+    ))
+}
+
+fn latest_forecast_slot(input: &SolveInput) -> i32 {
+    (input.total_slots - 1)
+        .min(input.current_slot + input.qos.error_window.future_slots)
+        .min(input.assignment_max_slot.unwrap_or(input.total_slots - 1))
+}
+
+
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// ---------------------------------TESTS--------------------------------------
+
+
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
 
     use crate::engine::qos::QosProfileId;
     use crate::engine::solver::{
-        ErrorWindowInput, PendingProposal, SolveInput, SolveRequest, SolverRegistry, SolverRuntime,
-        SolverScope,
+        ErrorWindowInput, PendingProposal, QoSProfileInput, SolveInput, SolveRequest,
+        SolverRegistry, SolverRuntime, SolverScope,
     };
     use crate::types::{CapacityTier, Flavour};
 
@@ -562,12 +745,6 @@ mod tests {
                     deadline_slot: 3,
                 },
             ],
-            default_flavours: vec![Flavour {
-                name: "Default".to_owned(),
-                error: 0.0,
-                duration: 10.0,
-            }],
-            request_flavours: HashMap::new(),
             carbon_forecast: vec![20.0, 10.0, 5.0, 1.0],
             capacity_tiers: vec![CapacityTier {
                 max_requests: None,
@@ -577,13 +754,23 @@ mod tests {
             carbon_cost_duration_scale: 1.0,
             assignment_max_future_slots: 2,
             assignment_max_slot: Some(3),
-            cumulative_error_constraint_active: false,
-            error_window: ErrorWindowInput {
-                baseline_error_sum: 0.0,
-                baseline_request_count: 0.0,
+            qos: QoSProfileInput {
+                profile_id: QosProfileId::default_profile(),
+                flavours: vec![Flavour {
+                    name: "Default".to_owned(),
+                    error: 0.0,
+                    duration: 10.0,
+                }],
+                cumulative_error_constraint_active: false,
+                cumulative_error_count: 0,
+                cumulative_error_sum: 0.0,
                 max_average_error: 4.0,
-                past_slots: 0,
-                future_slots: 0,
+                error_window: ErrorWindowInput {
+                    baseline_error_sum: 0.0,
+                    baseline_request_count: 0.0,
+                    past_slots: 0,
+                    future_slots: 3,
+                },
             },
         }
     }
@@ -637,47 +824,44 @@ mod tests {
     }
 
     #[test]
-    fn dp_uses_request_specific_flavours() {
+    fn dp_uses_the_profile_flavour_set_for_the_whole_batch() {
         let runtime = runtime();
         let mut solve_input = input();
-        solve_input.request_flavours.insert(
-            10,
-            vec![Flavour {
-                name: "TaskSpecific".to_owned(),
-                error: 0.0,
-                duration: 1.0,
-            }],
-        );
+        solve_input.qos.flavours = vec![Flavour {
+            name: "ProfileFlavour".to_owned(),
+            error: 0.0,
+            duration: 1.0,
+        }];
 
         let pending = propose(&*runtime, &solve_input);
-        let placement = pending
-            .proposal
-            .placements
-            .iter()
-            .find(|placement| placement.req_id == 10)
-            .unwrap();
 
-        assert_eq!(placement.flavour_name, "TaskSpecific");
+        assert!(
+            pending
+                .proposal
+                .placements
+                .iter()
+                .all(|placement| placement.flavour_name == "ProfileFlavour")
+        );
         runtime.discard(pending.id).unwrap();
     }
 
     #[test]
-    fn singleton_best_uses_request_specific_flavours() {
+    fn singleton_best_uses_the_profile_flavour_set_for_every_request() {
         let mut solve_input = input();
-        solve_input.requests.truncate(1);
-        solve_input.request_flavours.insert(
-            10,
-            vec![Flavour {
-                name: "TaskSpecific".to_owned(),
-                error: 0.0,
-                duration: 1.0,
-            }],
-        );
+        solve_input.qos.flavours = vec![Flavour {
+            name: "ProfileFlavour".to_owned(),
+            error: 0.0,
+            duration: 1.0,
+        }];
 
         let placements = placements_for("singleton_best", &solve_input);
 
-        assert_eq!(placements.len(), 1);
-        assert_eq!(placements[0].flavour_name, "TaskSpecific");
+        assert_eq!(placements.len(), solve_input.requests.len());
+        assert!(
+            placements
+                .iter()
+                .all(|placement| placement.flavour_name == "ProfileFlavour")
+        );
     }
 
     #[test]
@@ -697,7 +881,7 @@ mod tests {
                 deadline_slot: 1,
             },
         ];
-        solve_input.default_flavours = vec![Flavour {
+        solve_input.qos.flavours = vec![Flavour {
             name: "One".to_owned(),
             error: 0.0,
             duration: 1.0,
@@ -723,14 +907,14 @@ mod tests {
     }
 
     #[test]
-    fn singleton_best_uses_i64_for_capacity_positions() {
+    fn singleton_best_calculates_the_tier_position_in_i64() {
         let mut solve_input = input();
         solve_input.current_slot = 0;
         solve_input.total_slots = 2;
         solve_input.requests.truncate(1);
         solve_input.requests[0].arrival_slot = 0;
         solve_input.requests[0].deadline_slot = 1;
-        solve_input.default_flavours = vec![Flavour {
+        solve_input.qos.flavours = vec![Flavour {
             name: "One".to_owned(),
             error: 0.0,
             duration: 1.0,
@@ -771,7 +955,7 @@ mod tests {
                 deadline_slot: 1,
             },
         ];
-        solve_input.default_flavours = vec![
+        solve_input.qos.flavours = vec![
             Flavour {
                 name: "Accurate".to_owned(),
                 error: 0.0,
@@ -784,8 +968,8 @@ mod tests {
             },
         ];
         solve_input.carbon_forecast = vec![1.0; 4];
-        solve_input.error_window.max_average_error = 2.0;
-        solve_input.error_window.future_slots = 1;
+        solve_input.qos.max_average_error = 2.0;
+        solve_input.qos.error_window.future_slots = 1;
 
         let placements = placements_for("singleton_best", &solve_input);
 
@@ -794,48 +978,46 @@ mod tests {
     }
 
     #[test]
-    fn singleton_best_reports_infeasible_requests_instead_of_dropping_them() {
+    fn expired_requests_use_the_cheapest_flavour_feasible_for_profile_budgets() {
         let mut solve_input = input();
         solve_input.current_slot = 2;
         solve_input.requests.truncate(1);
         solve_input.requests[0].arrival_slot = 0;
         solve_input.requests[0].deadline_slot = 1;
-
-        let runtime = runtime_for("singleton_best");
-
-        assert!(runtime.propose(&solve_input).is_err());
-    }
-
-    #[test]
-    fn singleton_best_falls_back_to_the_lowest_error_flavour() {
-        let mut solve_input = input();
-        solve_input.current_slot = 0;
-        solve_input.requests.truncate(1);
-        solve_input.default_flavours = vec![
+        solve_input.qos.flavours = vec![
             Flavour {
-                name: "Fast".to_owned(),
-                error: 4.0,
+                name: "Cheap".to_owned(),
+                error: 8.0,
                 duration: 1.0,
             },
             Flavour {
-                name: "Accurate".to_owned(),
+                name: "Safe".to_owned(),
                 error: 2.0,
-                duration: 3.0,
+                duration: 5.0,
             },
         ];
-        solve_input.error_window.max_average_error = 1.0;
+        solve_input.qos.cumulative_error_constraint_active = true;
+        solve_input.qos.cumulative_error_count = 1;
+        solve_input.qos.cumulative_error_sum = 5.0;
+        solve_input.qos.error_window.baseline_request_count = 1.0;
+        solve_input.qos.error_window.baseline_error_sum = 1.0;
 
-        let placements = placements_for("singleton_best", &solve_input);
-
-        assert_eq!(placements[0].flavour_name, "Accurate");
-        assert_eq!(placements[0].scheduled_slot, 0);
+        for name in ["dp", "singleton_best", "random_full"] {
+            let placements = placements_for(name, &solve_input);
+            assert_eq!(placements.len(), 1);
+            assert_eq!(placements[0].scheduled_slot, solve_input.current_slot);
+            assert_eq!(placements[0].flavour_name, "Safe");
+            assert!(placements[0].late);
+        }
     }
 
     #[test]
-    fn registered_random_modes_produce_valid_placements_and_use_overrides() {
+    fn all_algorithms_cap_on_time_deadlines_to_forecast_availability() {
         let mut solve_input = input();
         solve_input.current_slot = 0;
-        solve_input.default_flavours = vec![
+        solve_input.qos.error_window.future_slots = 1;
+        solve_input.assignment_max_future_slots = 3;
+        solve_input.qos.flavours = vec![
             Flavour {
                 name: "Accurate".to_owned(),
                 error: 0.0,
@@ -847,19 +1029,65 @@ mod tests {
                 duration: 1.0,
             },
         ];
-        solve_input.request_flavours.insert(
-            10,
-            vec![Flavour {
-                name: "TaskSpecific".to_owned(),
+        solve_input.requests[0].arrival_slot = 0;
+        solve_input.requests[0].deadline_slot = 3;
+        solve_input.requests.truncate(1);
+
+        for name in ["dp", "singleton_best", "random_full"] {
+            let placements = placements_for(name, &solve_input);
+            assert_eq!(placements.len(), 1);
+            assert!(placements[0].scheduled_slot <= 1);
+            assert!(!placements[0].late);
+        }
+    }
+
+    #[test]
+    fn singleton_best_falls_back_to_the_lowest_error_flavour() {
+        let mut solve_input = input();
+        solve_input.current_slot = 0;
+        solve_input.requests.truncate(1);
+        solve_input.qos.flavours = vec![
+            Flavour {
+                name: "Fast".to_owned(),
                 error: 4.0,
-                duration: 2.0,
-            }],
-        );
+                duration: 1.0,
+            },
+            Flavour {
+                name: "Accurate".to_owned(),
+                error: 2.0,
+                duration: 3.0,
+            },
+        ];
+        solve_input.qos.max_average_error = 1.0;
+
+        let placements = placements_for("singleton_best", &solve_input);
+
+        assert_eq!(placements[0].flavour_name, "Accurate");
+        assert_eq!(placements[0].scheduled_slot, 0);
+    }
+
+    #[test]
+    fn registered_random_modes_produce_valid_profile_flavour_placements() {
+        let mut solve_input = input();
+        solve_input.current_slot = 0;
+        solve_input.qos.flavours = vec![
+            Flavour {
+                name: "Accurate".to_owned(),
+                error: 0.0,
+                duration: 10.0,
+            },
+            Flavour {
+                name: "Fast".to_owned(),
+                error: 8.0,
+                duration: 1.0,
+            },
+        ];
+        solve_input.qos.error_window.future_slots = 3;
+        solve_input.qos.cumulative_error_constraint_active = true;
 
         for name in ["random_flavour", "random_slot", "random_full"] {
             let placements = placements_for(name, &solve_input);
             assert_eq!(placements.len(), solve_input.requests.len());
-            assert_eq!(placements[0].flavour_name, "TaskSpecific");
             for placement in placements {
                 let request = solve_input
                     .requests
@@ -874,6 +1102,8 @@ mod tests {
                     (request.arrival_slot.max(solve_input.current_slot)..=latest)
                         .contains(&placement.scheduled_slot)
                 );
+                assert!(["Accurate", "Fast"].contains(&placement.flavour_name.as_str()));
+                assert!(!placement.late);
             }
         }
     }
@@ -886,7 +1116,7 @@ mod tests {
         solve_input.requests.truncate(1);
         solve_input.requests[0].arrival_slot = 0;
         solve_input.requests[0].deadline_slot = 0;
-        solve_input.default_flavours = vec![
+        solve_input.qos.flavours = vec![
             Flavour {
                 name: "Accurate".to_owned(),
                 error: 0.0,
@@ -906,6 +1136,35 @@ mod tests {
 
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].scheduled_slot, 0);
+    }
+
+    #[test]
+    fn random_strategy_uses_singleton_fallback_when_shift_window_is_unavailable() {
+        let mut solve_input = input();
+        solve_input.current_slot = 2;
+        solve_input.requests.truncate(1);
+        solve_input.requests[0].arrival_slot = 0;
+        solve_input.requests[0].deadline_slot = 3;
+        solve_input.assignment_max_future_slots = 1;
+        solve_input.qos.flavours = vec![
+            Flavour {
+                name: "Accurate".to_owned(),
+                error: 0.0,
+                duration: 10.0,
+            },
+            Flavour {
+                name: "Fast".to_owned(),
+                error: 4.0,
+                duration: 1.0,
+            },
+        ];
+
+        let placements = placements_for("random_full", &solve_input);
+
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].scheduled_slot, 2);
+        assert_eq!(placements[0].flavour_name, "Accurate");
+        assert!(!placements[0].late);
     }
 
     #[test]

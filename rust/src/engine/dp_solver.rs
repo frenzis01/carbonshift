@@ -30,16 +30,6 @@ use crate::config::{AssignmentPolicy, SolverConfig};
 pub use crate::engine::solver::SolveRequest;
 use crate::types::{CapacityTier, Flavour, RequestAssignment, get_capacity_multiplier};
 
-/// Shared, `'static` empty map used as the default `request_flavours` when a
-/// caller has no per-request (task-specific) flavour overrides — avoids
-/// forcing every call site to construct/own one.
-#[cfg(test)]
-fn empty_request_flavours() -> &'static HashMap<u64, Vec<Flavour>> {
-    use std::sync::OnceLock;
-    static MAP: OnceLock<HashMap<u64, Vec<Flavour>>> = OnceLock::new();
-    MAP.get_or_init(HashMap::new)
-}
-
 // ─── DP state key ─────────────────────────────────────────────────────────────
 
 /// Per-state key for the DP hash map.
@@ -110,10 +100,6 @@ pub struct SolveBatchInput<'a> {
     pub assignment_max_slot: Option<i32>,
     /// Optional synthetic mock pool for infeasibility recovery.
     pub dynamic_mock_pool: MockPool,
-    /// Per-request flavour overrides (request_id → flavours available for
-    /// its task). A request absent from this map uses `DpSolver::flavours`
-    /// (the predefined default task) instead.
-    pub request_flavours: &'a HashMap<u64, Vec<Flavour>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -138,7 +124,7 @@ pub struct MockPool {
 /// batch, supplies the current forecast, and receives proposed assignments;
 /// the scheduler separately validates and commits those proposals.
 pub struct DpSolver {
-    /// Default candidate strategies when no request-level flavour override exists.
+    /// Candidate strategies supplied by the request batch's QoS profile.
     pub flavours: Vec<Flavour>,
     /// Carbon-intensity estimate indexed by local planning slot.
     pub carbon_forecast: Vec<f64>,
@@ -169,22 +155,6 @@ impl DpSolver {
             timeout: solver.dp_timeout,
             carbon_cost_scale: assignment.carbon_cost_duration_scale,
         }
-    }
-
-    /// Return the strategy choices for one request.
-    ///
-    /// Service requests carry profile/task-specific flavours in `overrides`;
-    /// CLI and simulation requests, or requests without an override, use the
-    /// solver's configured default list.
-    fn flavours_for<'b>(
-        &'b self,
-        req_id: u64,
-        overrides: &'b HashMap<u64, Vec<Flavour>>,
-    ) -> &'b [Flavour] {
-        overrides
-            .get(&req_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&self.flavours)
     }
 
     pub fn with_carbon_forecast(mut self, forecast: Vec<f64>) -> Self {
@@ -347,7 +317,7 @@ impl DpSolver {
             for (state_key, (prev_cost, prev_assignments)) in &dp_prev {
                 let inc_counts = state_key.inc_counts.clone();
 
-                for flavour in self.flavours_for(request.request_id, input.request_flavours) {
+                for flavour in &self.flavours {
                     let f_error_bp = (flavour.error * 100.0).round() as i64;
                     let f_duration = flavour.duration;
 
@@ -595,7 +565,7 @@ impl DpSolver {
             // Most-accurate (min-error) flavour, and its cheapest slot — the
             // last-resort candidate if nothing keeps the window error within
             // threshold (mirrors `solve_singleton_best`'s fallback).
-            let candidate_flavours = self.flavours_for(request.request_id, input.request_flavours);
+            let candidate_flavours = &self.flavours;
             let min_error_flavour = candidate_flavours
                 .iter()
                 .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
@@ -714,7 +684,6 @@ impl DpSolver {
         current_slot: i32,
         capacity_tiers: &[CapacityTier],
         base_counts: &[i32],
-        request_flavours: &HashMap<u64, Vec<Flavour>>,
     ) -> Vec<RequestAssignment> {
         let mut inc_counts = base_counts.to_vec();
         let mut assignments = Vec::new();
@@ -727,10 +696,9 @@ impl DpSolver {
                 .deadline_slot
                 .max(current_slot)
                 .min(self.window_size - 1);
-            // Most accurate = longest duration, among this request's own
-            // (task-specific, or default) candidate flavours.
+            // The caller provides one flavour set for the whole QoS-profile batch.
             let fallback_flavour = self
-                .flavours_for(request.request_id, request_flavours)
+                .flavours
                 .iter()
                 .max_by(|a, b| a.duration.total_cmp(&b.duration))
                 .expect("at least one flavour");
@@ -836,7 +804,6 @@ mod tests {
             error_window_future: 2,
             assignment_max_slot: None,
             dynamic_mock_pool: MockPool::default(),
-            request_flavours: empty_request_flavours(),
         }
     }
 
@@ -959,7 +926,7 @@ mod tests {
         let tiers = no_tiers();
         let base = vec![0; 5];
 
-        let result = solver.greedy_fallback(&requests, 0, &tiers, &base, empty_request_flavours());
+        let result = solver.greedy_fallback(&requests, 0, &tiers, &base);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].slot, 2);
@@ -1111,83 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn per_request_flavour_override_is_used_over_default() {
-        // Solver's own (default-task) flavour list only has "Accurate".
-        let solver = DpSolver {
-            flavours: vec![Flavour {
-                name: "Accurate".to_string(),
-                error: 0.0,
-                duration: 60.0,
-            }],
-            window_size: 5,
-            carbon_forecast: flat_forecast(5, 40.0),
-            pruning: "none".to_string(),
-            pruning_k: 1000,
-            timeout: 5.0,
-            carbon_cost_scale: 1.0 / 3600.0,
-        };
-        let requests = vec![SolveRequest {
-            request_id: 1,
-            arrival_slot: 0,
-            deadline_slot: 2,
-        }];
-        let tiers = no_tiers();
-        let counts = HashMap::new();
-        let mut overrides: HashMap<u64, Vec<Flavour>> = HashMap::new();
-        overrides.insert(
-            1,
-            vec![Flavour {
-                name: "TaskOnly".to_string(),
-                error: 1.0,
-                duration: 5.0,
-            }],
-        );
-        let result = solver.solve_batch(SolveBatchInput {
-            request_flavours: &overrides,
-            ..make_input(&requests, 0, &tiers, &counts)
-        });
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].flavour_name, "TaskOnly");
-        assert_eq!(result[0].error, 1.0);
-    }
-
-    #[test]
-    fn greedy_fallback_uses_per_request_flavour_override() {
-        let solver = DpSolver {
-            flavours: vec![Flavour {
-                name: "Accurate".to_string(),
-                error: 0.0,
-                duration: 60.0,
-            }],
-            window_size: 5,
-            carbon_forecast: flat_forecast(5, 40.0),
-            pruning: "none".to_string(),
-            pruning_k: 1000,
-            timeout: 5.0,
-            carbon_cost_scale: 1.0 / 3600.0,
-        };
-        let requests = vec![SolveRequest {
-            request_id: 1,
-            arrival_slot: 0,
-            deadline_slot: 0,
-        }];
-        let tiers = no_tiers();
-        let base = vec![0i32; 5];
-        let mut overrides: HashMap<u64, Vec<Flavour>> = HashMap::new();
-        overrides.insert(
-            1,
-            vec![Flavour {
-                name: "TaskOnly".to_string(),
-                error: 1.0,
-                duration: 45.0,
-            }],
-        );
-        let result = solver.greedy_fallback(&requests, 0, &tiers, &base, &overrides);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].flavour_name, "TaskOnly");
-    }
-
-    #[test]
     fn beam_pruning_still_finds_feasible_solution() {
         // Forecast: slots 0-2 (in window) are expensive, slots 3+ are cheap.
         // Beam pruning will keep cheapest states → assigns to slots 3+, outside
@@ -1285,7 +1175,7 @@ mod tests {
         ];
         let tiers = no_tiers();
         let base = vec![0i32; 5];
-        let result = solver.greedy_fallback(&requests, 0, &tiers, &base, empty_request_flavours());
+        let result = solver.greedy_fallback(&requests, 0, &tiers, &base);
         assert_eq!(result.len(), 3);
     }
 

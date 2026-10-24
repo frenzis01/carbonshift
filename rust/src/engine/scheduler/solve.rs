@@ -11,7 +11,9 @@ use crate::engine::qos::QosProfileId;
 use crate::engine::random_selection::{
     RandomSelectionMode, closest_to_uniform_flavour_probabilities, select_random_assignment,
 };
-use crate::engine::solver::{ErrorWindowInput, SolveInput, SolveRequest, SolverError};
+use crate::engine::solver::{
+    ErrorWindowInput, QoSProfileInput, SolveInput, SolveRequest, SolverError,
+};
 use crate::shared_state::{GlobalErrorStats, SharedState};
 use crate::types::{
     Assignment, CapacityTier, Flavour, Request, RequestAssignment, get_capacity_multiplier,
@@ -191,13 +193,9 @@ struct PreparedSolve {
     profile_constraint_active: bool,
     /// Flavours allowed by this profile's cumulative error constraint.
     solver_flavours: Vec<Flavour>,
-    /// Per-request (per-task) flavour overrides — see `prepare_solve`.
-    request_flavours: HashMap<u64, Vec<Flavour>>,
     /// Local/window feasibility threshold (%) for this batch — see `prepare_solve`.
     effective_error_threshold: f64,
-    /// Capacity tiers used for this batch solve; if a task-specific override was
-    /// registered for any request in the batch, use that override; otherwise the
-    /// global default from `Config` is used.
+    /// Global capacity tiers used for every profile in this batch.
     effective_capacity_tiers: Vec<CapacityTier>,
 }
 
@@ -283,7 +281,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
                 arrival_slot,
                 deadline_slot: capped,
             });
-            assignment_metadata.insert(a.request_id, (arrival_slot, capped));
+            assignment_metadata.insert(a.request_id, (arrival_slot, deadline));
         }
     }
 
@@ -367,31 +365,6 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         profile_constraint_active = false;
     }
 
-    // Profile-backed requests carry the only request-specific flavour policy.
-    // Unprofiled offline requests are absent from this map and use the
-    // scheduler's default flavour list.
-    let mut request_flavours: HashMap<u64, Vec<Flavour>> = pending
-        .iter()
-        .filter_map(|request| {
-            request
-                .qos_profile
-                .as_ref()
-                .map(|profile| (request.id, profile.flavours.clone()))
-        })
-        .collect();
-    if profile_constraint_active && assignment.global_error_constraint_hard {
-        for flavours in request_flavours.values_mut() {
-            let filtered: Vec<Flavour> = flavours
-                .iter()
-                .cloned()
-                .filter(|f| f.error <= assignment.max_error_threshold)
-                .collect();
-            if !filtered.is_empty() {
-                *flavours = filtered;
-            } // else: never remove all flavours for a request (same safety rule as solver_flavours).
-        }
-    }
-
     // This is the local sliding-window limit. The fleet-wide error value
     // captured above is telemetry only and never substitutes for this
     // profile's threshold.
@@ -416,7 +389,6 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         profile_error_stats,
         profile_constraint_active,
         solver_flavours,
-        request_flavours,
         effective_error_threshold,
         effective_capacity_tiers,
     }
@@ -426,26 +398,56 @@ fn project_solver_input(
     context: &BatchSolveContext<'_>,
     prepared: &PreparedSolve,
 ) -> Result<SolveInput, SolverError> {
+    let cumulative_error_count =
+        i64::try_from(prepared.profile_error_stats.count).map_err(|_| {
+            SolverError::Algorithm("profile cumulative error count exceeds i64".to_owned())
+        })?;
+    let requests = prepared
+        .solve_requests
+        .iter()
+        .map(|request| {
+            let (arrival_slot, deadline_slot) = prepared
+                .assignment_metadata
+                .get(&request.request_id)
+                .copied()
+                .ok_or_else(|| {
+                    SolverError::Algorithm(format!(
+                        "missing request metadata for {}",
+                        request.request_id
+                    ))
+                })?;
+            Ok(crate::engine::solver::SolveRequest {
+                request_id: request.request_id,
+                arrival_slot,
+                deadline_slot,
+            })
+        })
+        .collect::<Result<Vec<_>, SolverError>>()?;
+
     Ok(SolveInput {
         current_slot: context.current_slot,
         total_slots: context.assignment.total_slots,
-        requests: prepared.solve_requests.clone(),
-        default_flavours: prepared.solver_flavours.clone(),
-        request_flavours: prepared.request_flavours.clone(),
+        requests,
         carbon_forecast: context.carbon_forecast.to_vec(),
         capacity_tiers: prepared.effective_capacity_tiers.clone(),
         baseline_slot_counts: prepared.baseline_slot_counts.clone(),
         carbon_cost_duration_scale: context.assignment.carbon_cost_duration_scale,
         assignment_max_future_slots: context.assignment.assignment_max_future_slots,
         assignment_max_slot: Some(prepared.assignment_cap),
-        cumulative_error_constraint_active: prepared.profile_constraint_active
-            && context.assignment.global_error_constraint_hard,
-        error_window: ErrorWindowInput {
-            baseline_error_sum: prepared.error_baseline.error_sum,
-            baseline_request_count: prepared.error_baseline.request_count,
+        qos: QoSProfileInput {
+            profile_id: prepared.profile_id.clone(),
+            flavours: context.assignment.flavours.to_vec(),
+            cumulative_error_constraint_active: prepared.profile_constraint_active
+                && context.assignment.global_error_constraint_hard,
+            cumulative_error_count,
+            cumulative_error_sum: prepared.profile_error_stats.error_sum,
             max_average_error: prepared.effective_error_threshold,
-            past_slots: context.assignment.error_window_past,
-            future_slots: context.assignment.error_window_future,
+            error_window: ErrorWindowInput {
+                baseline_error_sum: prepared.error_baseline.error_sum,
+                baseline_request_count: prepared.error_baseline.request_count,
+                past_slots: context.assignment.error_window_past,
+                future_slots: context.assignment.error_window_future,
+            },
         },
     })
 }
@@ -474,7 +476,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         profile_error_stats,
         profile_constraint_active,
         solver_flavours,
-        request_flavours,
         effective_error_threshold,
         effective_capacity_tiers,
     } = prepare_solve(&input);
@@ -522,7 +523,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         error_window_future: assignment.error_window_future,
         assignment_max_slot: Some(assignment_cap),
         dynamic_mock_pool: mock_pool_input.clone(),
-        request_flavours: &request_flavours,
     });
 
     let scheduled_pending_ids: HashSet<u64> = dp_result
@@ -579,7 +579,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         }
 
         let greedy_solver = build_solver(
-            assignment.flavours,
+            &solver_flavours,
             carbon_forecast,
             assignment,
             solver_config,
@@ -590,7 +590,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
             current_slot,
             assignment.capacity_tiers,
             &fallback_base_counts,
-            &request_flavours,
         );
         dp_assignments.extend(greedy);
         solve_status = "ok_greedy_after_infeasible".to_string();
@@ -627,11 +626,13 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .get(&dp_a.request_id)
                 .copied()
                 .unwrap_or((0, 0));
-            let dur = request_flavours
-                .get(&dp_a.request_id)
-                .and_then(|flavours| flavours.iter().find(|f| f.name == dp_a.flavour_name))
-                .map(|f| f.duration)
-                .unwrap_or_else(|| fdb.get(&dp_a.flavour_name).copied().unwrap_or(0.0));
+            let dur = assignment
+                .flavours
+                .iter()
+                .find(|flavour| flavour.name == dp_a.flavour_name)
+                .map(|flavour| flavour.duration)
+                .or_else(|| fdb.get(&dp_a.flavour_name).copied())
+                .unwrap_or(0.0);
             Assignment::new_for_profile(
                 dp_a.request_id,
                 dp_a.slot,
@@ -877,12 +878,13 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .get(&ra.request_id)
                 .copied()
                 .unwrap_or((0, 0));
-            let dur = prep
-                .request_flavours
-                .get(&ra.request_id)
-                .and_then(|flavours| flavours.iter().find(|f| f.name == ra.flavour_name))
-                .map(|f| f.duration)
-                .unwrap_or_else(|| fdb.get(&ra.flavour_name).copied().unwrap_or(0.0));
+            let dur = assignment
+                .flavours
+                .iter()
+                .find(|flavour| flavour.name == ra.flavour_name)
+                .map(|flavour| flavour.duration)
+                .or_else(|| fdb.get(&ra.flavour_name).copied())
+                .unwrap_or(0.0);
             Assignment::new_for_profile(
                 ra.request_id,
                 ra.slot,
@@ -969,11 +971,7 @@ fn solve_random(
     let mut assignments = Vec::with_capacity(input.pending.len());
 
     for request in input.pending {
-        let flavours = request
-            .qos_profile
-            .as_ref()
-            .map(|profile| profile.flavours.as_slice())
-            .unwrap_or(input.assignment.flavours);
+        let flavours = input.assignment.flavours;
         assert!(!flavours.is_empty(), "random strategy requires flavours");
         let errors: Vec<f64> = flavours.iter().map(|flavour| flavour.error).collect();
         let probabilities = if selection_mode == RandomSelectionMode::Slot {

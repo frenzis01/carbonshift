@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::engine::qos::QosProfileId;
 use crate::engine::types::{Assignment, CapacityTier, Flavour};
 
-/// A request's arrival time and legal scheduling window.
+/// A request's original arrival and deadline slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveRequest {
     pub request_id: u64,
@@ -19,9 +19,20 @@ pub struct SolveRequest {
 pub struct ErrorWindowInput {
     pub baseline_error_sum: f64,
     pub baseline_request_count: f64,
-    pub max_average_error: f64,
     pub past_slots: i32,
     pub future_slots: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct QoSProfileInput {
+    pub profile_id: QosProfileId,
+    /// Candidate flavours from the single QoS profile shared by this batch.
+    pub flavours: Vec<Flavour>,
+    pub cumulative_error_constraint_active: bool,
+    pub cumulative_error_count: i64,
+    pub cumulative_error_sum: f64,
+    pub max_average_error: f64,
+    pub error_window: ErrorWindowInput,
 }
 
 // Input data shared by solver algorithms
@@ -31,10 +42,7 @@ pub struct SolveInput {
     pub total_slots: i32,
     pub requests: Vec<SolveRequest>,
 
-    /// Default flavour candidates used when a request has no per-request override.
-    pub default_flavours: Vec<Flavour>,
-    /// Task/profile-specific flavour candidates, keyed by request ID.
-    pub request_flavours: HashMap<u64, Vec<Flavour>>,
+    // pub flavours: Vec<Flavour>,
     pub carbon_forecast: Vec<f64>,
     pub capacity_tiers: Vec<CapacityTier>,
     pub baseline_slot_counts: HashMap<i32, i32>,
@@ -42,8 +50,7 @@ pub struct SolveInput {
     pub carbon_cost_duration_scale: f64,
     pub assignment_max_future_slots: i32,
     pub assignment_max_slot: Option<i32>,
-    pub cumulative_error_constraint_active: bool,
-    pub error_window: ErrorWindowInput,
+    pub qos: QoSProfileInput,
 }
 
 // Identifies the profile scope for one runtime instance
@@ -58,6 +65,30 @@ pub struct ProposedPlacement {
     pub req_id: u64,
     pub scheduled_slot: i32,
     pub flavour_name: String,
+    /// True when the solver had to place this request after its deadline.
+    pub late: bool,
+}
+
+impl ProposedPlacement {
+    /// Build an on-time placement without requiring callers to set `late`.
+    pub fn new(req_id: u64, scheduled_slot: i32, flavour_name: String) -> Self {
+        Self {
+            req_id,
+            scheduled_slot,
+            flavour_name,
+            late: false,
+        }
+    }
+
+    /// Build a placement for work whose deadline has already passed.
+    pub fn late(req_id: u64, scheduled_slot: i32, flavour_name: String) -> Self {
+        Self {
+            req_id,
+            scheduled_slot,
+            flavour_name,
+            late: true,
+        }
+    }
 }
 
 //  The algorithm's common, price-independent output
@@ -303,10 +334,12 @@ mod tests {
             let placements = input
                 .requests
                 .iter()
-                .map(|request| ProposedPlacement {
-                    req_id: request.request_id,
-                    scheduled_slot: request.arrival_slot.max(input.current_slot),
-                    flavour_name: "test".to_owned(),
+                .map(|request| {
+                    ProposedPlacement::new(
+                        request.request_id,
+                        request.arrival_slot.max(input.current_slot),
+                        "test".to_owned(),
+                    )
                 })
                 .collect();
 
@@ -339,10 +372,12 @@ mod tests {
             let placements = input
                 .requests
                 .iter()
-                .map(|request| ProposedPlacement {
-                    req_id: request.request_id,
-                    scheduled_slot: request.arrival_slot.max(input.current_slot),
-                    flavour_name: snapshot.0.to_string(),
+                .map(|request| {
+                    ProposedPlacement::new(
+                        request.request_id,
+                        request.arrival_slot.max(input.current_slot),
+                        snapshot.0.to_string(),
+                    )
                 })
                 .collect();
 
@@ -365,12 +400,6 @@ mod tests {
                 arrival_slot: 1,
                 deadline_slot: 3,
             }],
-            default_flavours: vec![Flavour {
-                name: "test".to_owned(),
-                error: 0.0,
-                duration: 1.0,
-            }],
-            request_flavours: HashMap::new(),
             carbon_forecast: vec![1.0; 4],
             capacity_tiers: vec![CapacityTier {
                 max_requests: None,
@@ -380,13 +409,23 @@ mod tests {
             carbon_cost_duration_scale: 1.0,
             assignment_max_future_slots: 3,
             assignment_max_slot: Some(3),
-            cumulative_error_constraint_active: false,
-            error_window: ErrorWindowInput {
-                baseline_error_sum: 0.0,
-                baseline_request_count: 0.0,
+            qos: QoSProfileInput {
+                profile_id: QosProfileId::default_profile(),
+                flavours: vec![Flavour {
+                    name: "test".to_owned(),
+                    error: 0.0,
+                    duration: 1.0,
+                }],
+                cumulative_error_constraint_active: false,
+                cumulative_error_count: 0,
+                cumulative_error_sum: 0.0,
                 max_average_error: 4.0,
-                past_slots: 0,
-                future_slots: 3,
+                error_window: ErrorWindowInput {
+                    baseline_error_sum: 0.0,
+                    baseline_request_count: 0.0,
+                    past_slots: 0,
+                    future_slots: 3,
+                },
             },
         }
     }
