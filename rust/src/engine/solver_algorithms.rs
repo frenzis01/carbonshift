@@ -1,5 +1,6 @@
 //! Stateless scheduling algorithms adapted to the common solver contract.
 
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -47,7 +48,6 @@ impl DpAlgorithm {
     }
 }
 
-
 impl SolverAlgorithm for DpAlgorithm {
     type State = ();
     type Delta = ();
@@ -57,21 +57,22 @@ impl SolverAlgorithm for DpAlgorithm {
     fn solve(
         &self,
         _snapshot: &(),
+        scope: &SolverScope,
         input: &SolveInput,
     ) -> Result<(SolverProposal, ()), SolverError> {
         if input.requests.is_empty() {
             return Ok((SolverProposal::default(), ()));
         }
-        validate_solve_input(input)?;
+        validate_solve_input(input, scope)?;
 
         // Initialize placement vector to be returned
         let mut placements = Vec::with_capacity(input.requests.len());
         // Initialize per-slot counts with already assigned requests
         let mut solver_baseline_counts = input.baseline_slot_counts.clone();
-        let mut cumulative_count = input.qos.cumulative_error_count;
-        let mut cumulative_sum = input.qos.cumulative_error_sum;
-        let mut window_count = input.qos.error_window.baseline_request_count;
-        let mut window_sum = input.qos.error_window.baseline_error_sum;
+        let mut cumulative_count = input.qos.cumulative_err.count as i64;
+        let mut cumulative_sum = input.qos.cumulative_err.sum;
+        let mut window_count = input.qos.error_window.baseline_err.count;
+        let mut window_sum = input.qos.error_window.baseline_err.sum;
         // Mark late requests
         // i.e. requests such that current_slot > deadline_slot
         // These should be a few and the result of late arrivals mostly
@@ -123,7 +124,7 @@ impl SolverAlgorithm for DpAlgorithm {
             .iter()
             .filter(|request| !late_request_ids.contains(&request.request_id))
             .map(|request| {
-                let (_, deadline_slot) = request_slot_bounds(input, request)?;
+                let (_, deadline_slot) = request_slot_bounds(input, request, scope)?;
                 Ok(SolveRequest {
                     deadline_slot,
                     ..*request
@@ -158,7 +159,7 @@ impl SolverAlgorithm for DpAlgorithm {
         let solver = DpSolver {
             flavours,
             carbon_forecast: input.carbon_forecast.clone(),
-            window_size: input.total_slots,
+            window_size: scope.total_slots,
             pruning: self.effective_pruning(input.requests.len()),
             pruning_k: self.config.pruning_k,
             timeout: self.config.timeout_secs,
@@ -179,7 +180,7 @@ impl SolverAlgorithm for DpAlgorithm {
             max_error_threshold: Some(input.qos.max_average_error),
             error_window_past: input.qos.error_window.past_slots,
             error_window_future: input.qos.error_window.future_slots,
-            assignment_max_slot: Some(latest_forecast_slot(input)),
+            assignment_max_slot: Some(latest_forecast_slot(input, scope)),
             dynamic_mock_pool: MockPool::default(),
         });
 
@@ -194,7 +195,7 @@ impl SolverAlgorithm for DpAlgorithm {
             .collect();
 
         if !unscheduled.is_empty() {
-            let mut fallback_counts: Vec<i32> = (0..input.total_slots)
+            let mut fallback_counts: Vec<i32> = (0..scope.total_slots)
                 .map(|slot| solver_baseline_counts.get(&slot).copied().unwrap_or(0))
                 .collect();
             for assignment in &assignments {
@@ -234,21 +235,22 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
     fn solve(
         &self,
         _snapshot: &(),
+        scope: &SolverScope,
         input: &SolveInput,
     ) -> Result<(SolverProposal, ()), SolverError> {
         if input.requests.is_empty() {
             return Ok((SolverProposal::default(), ()));
         }
-        validate_solve_input(input)?;
+        validate_solve_input(input, scope)?;
 
         // Initialize placements and counts
         let mut placements = Vec::with_capacity(input.requests.len());
         let mut slot_count = input.baseline_slot_counts.clone();
         let mut solved_errors = Vec::with_capacity(input.requests.len());
-        let mut cumulative_count = input.qos.cumulative_error_count;
-        let mut cumulative_sum = input.qos.cumulative_error_sum;
-        let mut window_count = input.qos.error_window.baseline_request_count;
-        let mut window_sum = input.qos.error_window.baseline_error_sum;
+        let mut cumulative_count = input.qos.cumulative_err.count as i64;
+        let mut cumulative_sum = input.qos.cumulative_err.sum;
+        let mut window_count = input.qos.error_window.baseline_err.count;
+        let mut window_sum = input.qos.error_window.baseline_err.sum;
 
         for request in &input.requests {
             // If request is late, mark it as such and go on
@@ -279,7 +281,7 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
             }
 
             // Find best slot and feasible flavour
-            let (start_slot, deadline) = request_slot_bounds(input, request)?;
+            let (start_slot, deadline) = request_slot_bounds(input, request, scope)?;
             let mut sorted_flavours: Vec<&Flavour> = input.qos.flavours.iter().collect();
             sorted_flavours.sort_by(|left, right| left.duration.total_cmp(&right.duration));
 
@@ -310,9 +312,9 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
                     let win_start =
                         (request.arrival_slot - input.qos.error_window.past_slots).max(0);
                     let win_end = (request.arrival_slot + input.qos.error_window.future_slots)
-                        .min(input.total_slots - 1);
-                    let mut win_sum = input.qos.error_window.baseline_error_sum + flav.error;
-                    let mut win_count = input.qos.error_window.baseline_request_count + 1.0;
+                        .min(scope.total_slots - 1);
+                    let mut win_sum = input.qos.error_window.baseline_err.sum + flav.error;
+                    let mut win_count = input.qos.error_window.baseline_err.count + 1.0;
                     for &(placed_slot, placed_error) in &solved_errors {
                         if (win_start..=win_end).contains(&placed_slot) {
                             win_sum += placed_error;
@@ -433,12 +435,13 @@ impl SolverAlgorithm for RandomAlgorithm {
     fn solve(
         &self,
         _snapshot: &(),
+        scope: &SolverScope,
         input: &SolveInput,
     ) -> Result<(SolverProposal, ()), SolverError> {
         if input.requests.is_empty() {
             return Ok((SolverProposal::default(), ()));
         }
-        validate_solve_input(input)?;
+        validate_solve_input(input, scope)?;
 
         // Each solve gets a separate deterministic stream, so concurrent
         // batches do not need to hold a shared RNG lock while selecting.
@@ -452,10 +455,10 @@ impl SolverAlgorithm for RandomAlgorithm {
             })?;
         let mut rng = SmallRng::seed_from_u64(self.seed ^ stream);
         let mut placements = Vec::with_capacity(input.requests.len());
-        let mut cumulative_count = input.qos.cumulative_error_count;
-        let mut cumulative_sum = input.qos.cumulative_error_sum;
-        let mut window_count = input.qos.error_window.baseline_request_count;
-        let mut window_sum = input.qos.error_window.baseline_error_sum;
+        let mut cumulative_count = input.qos.cumulative_err.count as i64;
+        let mut cumulative_sum = input.qos.cumulative_err.sum;
+        let mut window_count = input.qos.error_window.baseline_err.count;
+        let mut window_sum = input.qos.error_window.baseline_err.sum;
 
         for request in &input.requests {
             if input.current_slot > request.deadline_slot {
@@ -482,7 +485,7 @@ impl SolverAlgorithm for RandomAlgorithm {
                 continue;
             }
 
-            let (earliest, deadline) = request_slot_bounds(input, request)?;
+            let (earliest, deadline) = request_slot_bounds(input, request, scope)?;
             let latest = deadline.min(request.arrival_slot + input.assignment_max_future_slots);
             let (slot, flavour) = if earliest > latest {
                 // A random shift cannot fit in the configured assignment
@@ -572,11 +575,10 @@ pub fn register_stateless_solvers(
     Ok(())
 }
 
-// Helper functions 
+// Helper functions
 
-
-fn validate_solve_input(input: &SolveInput) -> Result<(), SolverError> {
-    let horizon = usize::try_from(input.total_slots)
+fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), SolverError> {
+    let horizon = usize::try_from(scope.total_slots)
         .map_err(|_| SolverError::Algorithm("planning horizon must be positive".to_owned()))?;
     if horizon == 0 {
         return Err(SolverError::Algorithm(
@@ -589,7 +591,7 @@ fn validate_solve_input(input: &SolveInput) -> Result<(), SolverError> {
             input.carbon_forecast.len()
         )));
     }
-    if input.current_slot < 0 || input.current_slot >= input.total_slots {
+    if input.current_slot < 0 || input.current_slot >= scope.total_slots {
         return Err(SolverError::Algorithm(format!(
             "current slot {} is outside the planning horizon",
             input.current_slot
@@ -626,11 +628,14 @@ fn validate_solve_input(input: &SolveInput) -> Result<(), SolverError> {
             "sliding-window error threshold must be finite".to_owned(),
         ));
     }
-    if input.qos.cumulative_error_count < 0
-        || !input.qos.cumulative_error_sum.is_finite()
-        || !input.qos.error_window.baseline_error_sum.is_finite()
-        || !input.qos.error_window.baseline_request_count.is_finite()
-        || input.qos.error_window.baseline_request_count < 0.0
+    if !input.qos.cumulative_err.count.is_finite()
+        || input.qos.cumulative_err.count < 0.0
+        || input.qos.cumulative_err.count.fract() != 0.0
+        || input.qos.cumulative_err.count > (i64::MAX as f64)
+        || !input.qos.cumulative_err.sum.is_finite()
+        || !input.qos.error_window.baseline_err.sum.is_finite()
+        || !input.qos.error_window.baseline_err.count.is_finite()
+        || input.qos.error_window.baseline_err.count < 0.0
     {
         return Err(SolverError::Algorithm(
             "QoS error sums must be finite and error counts non-negative".to_owned(),
@@ -656,7 +661,7 @@ fn validate_solve_input(input: &SolveInput) -> Result<(), SolverError> {
     }
 
     for request in &input.requests {
-        request_slot_bounds(input, request)?;
+        request_slot_bounds(input, request, scope)?;
     }
     Ok(())
 }
@@ -668,12 +673,15 @@ fn validate_solve_input(input: &SolveInput) -> Result<(), SolverError> {
 fn cap_deadline_inside_forecast(
     input: &SolveInput,
     request: &SolveRequest,
+    scope: &SolverScope,
 ) -> Result<i32, SolverError> {
     if input.current_slot > request.deadline_slot {
         return Ok(input.current_slot);
     }
 
-    let cap = request.deadline_slot.min(latest_forecast_slot(input));
+    let cap = request
+        .deadline_slot
+        .min(latest_forecast_slot(input, scope));
     let earliest = request.arrival_slot.max(input.current_slot);
     if cap < earliest {
         return Err(SolverError::Algorithm(format!(
@@ -687,25 +695,23 @@ fn cap_deadline_inside_forecast(
 fn request_slot_bounds(
     input: &SolveInput,
     request: &SolveRequest,
+    scope: &SolverScope,
 ) -> Result<(i32, i32), SolverError> {
     Ok((
         request.arrival_slot.max(input.current_slot),
-        cap_deadline_inside_forecast(input, request)?,
+        cap_deadline_inside_forecast(input, request, scope)?,
     ))
 }
 
-fn latest_forecast_slot(input: &SolveInput) -> i32 {
-    (input.total_slots - 1)
+fn latest_forecast_slot(input: &SolveInput, scope: &SolverScope) -> i32 {
+    (scope.total_slots - 1)
         .min(input.current_slot + input.qos.error_window.future_slots)
-        .min(input.assignment_max_slot.unwrap_or(input.total_slots - 1))
+        .min(input.assignment_max_slot.unwrap_or(scope.total_slots - 1))
 }
-
 
 // ----------------------------------------------------------------------------
 // ----------------------------------------------------------------------------
 // ---------------------------------TESTS--------------------------------------
-
-
 
 #[cfg(test)]
 mod tests {
@@ -713,7 +719,7 @@ mod tests {
 
     use crate::engine::qos::QosProfileId;
     use crate::engine::solver::{
-        ErrorWindowInput, PendingProposal, QoSProfileInput, SolveInput, SolveRequest,
+        ErrorTotals, ErrorWindowInput, PendingProposal, QoSProfileInput, SolveInput, SolveRequest,
         SolverRegistry, SolverRuntime, SolverScope,
     };
     use crate::types::{CapacityTier, Flavour};
@@ -732,7 +738,6 @@ mod tests {
     fn input() -> SolveInput {
         SolveInput {
             current_slot: 1,
-            total_slots: 4,
             requests: vec![
                 SolveRequest {
                     request_id: 10,
@@ -762,12 +767,17 @@ mod tests {
                     duration: 10.0,
                 }],
                 cumulative_error_constraint_active: false,
-                cumulative_error_count: 0,
-                cumulative_error_sum: 0.0,
+                cumulative_err: ErrorTotals {
+                    count: 0.0,
+                    sum: 0.0,
+                },
+                err_by_slot: HashMap::new(),
                 max_average_error: 4.0,
                 error_window: ErrorWindowInput {
-                    baseline_error_sum: 0.0,
-                    baseline_request_count: 0.0,
+                    baseline_err: ErrorTotals {
+                        count: 0.0,
+                        sum: 0.0,
+                    },
                     past_slots: 0,
                     future_slots: 3,
                 },
@@ -776,14 +786,23 @@ mod tests {
     }
 
     fn runtime_for(name: &str) -> Box<dyn SolverRuntime> {
+        runtime_for_scope(name, scope())
+    }
+
+    fn runtime_for_scope(name: &str, solver_scope: SolverScope) -> Box<dyn SolverRuntime> {
         let mut registry = SolverRegistry::default();
         register_stateless_solvers(&mut registry, config(), 42).unwrap();
-        registry.create(name, scope()).unwrap()
+        registry.create(name, solver_scope).unwrap()
     }
 
     fn scope() -> SolverScope {
+        scope_with_total_slots(4)
+    }
+
+    fn scope_with_total_slots(total_slots: i32) -> SolverScope {
         SolverScope {
             profile_id: QosProfileId::default_profile(),
+            total_slots,
         }
     }
 
@@ -796,7 +815,15 @@ mod tests {
     }
 
     fn placements_for(name: &str, solve_input: &SolveInput) -> Vec<super::ProposedPlacement> {
-        let runtime = runtime_for(name);
+        placements_for_scope(name, solve_input, scope())
+    }
+
+    fn placements_for_scope(
+        name: &str,
+        solve_input: &SolveInput,
+        solver_scope: SolverScope,
+    ) -> Vec<super::ProposedPlacement> {
+        let runtime = runtime_for_scope(name, solver_scope);
         let pending = propose(&*runtime, solve_input);
         let placements = pending.proposal.placements.clone();
         runtime.discard(pending.id).unwrap();
@@ -868,7 +895,6 @@ mod tests {
     fn singleton_best_updates_slot_occupancy_after_each_request() {
         let mut solve_input = input();
         solve_input.current_slot = 0;
-        solve_input.total_slots = 2;
         solve_input.requests = vec![
             SolveRequest {
                 request_id: 1,
@@ -900,7 +926,8 @@ mod tests {
         solve_input.assignment_max_future_slots = 1;
         solve_input.assignment_max_slot = Some(1);
 
-        let placements = placements_for("singleton_best", &solve_input);
+        let placements =
+            placements_for_scope("singleton_best", &solve_input, scope_with_total_slots(2));
 
         assert_eq!(placements[0].scheduled_slot, 0);
         assert_eq!(placements[1].scheduled_slot, 1);
@@ -910,7 +937,6 @@ mod tests {
     fn singleton_best_calculates_the_tier_position_in_i64() {
         let mut solve_input = input();
         solve_input.current_slot = 0;
-        solve_input.total_slots = 2;
         solve_input.requests.truncate(1);
         solve_input.requests[0].arrival_slot = 0;
         solve_input.requests[0].deadline_slot = 1;
@@ -934,7 +960,8 @@ mod tests {
         solve_input.assignment_max_future_slots = 1;
         solve_input.assignment_max_slot = Some(1);
 
-        let placements = placements_for("singleton_best", &solve_input);
+        let placements =
+            placements_for_scope("singleton_best", &solve_input, scope_with_total_slots(2));
 
         assert_eq!(placements[0].scheduled_slot, 1);
     }
@@ -978,6 +1005,33 @@ mod tests {
     }
 
     #[test]
+    fn singleton_best_preserves_fractional_weighted_error_counts() {
+        let mut solve_input = input();
+        solve_input.requests.truncate(1);
+        solve_input.qos.flavours = vec![
+            Flavour {
+                name: "Accurate".to_owned(),
+                error: 0.0,
+                duration: 10.0,
+            },
+            Flavour {
+                name: "Fast".to_owned(),
+                error: 4.0,
+                duration: 1.0,
+            },
+        ];
+        solve_input.qos.max_average_error = 2.0;
+        solve_input.qos.error_window.baseline_err = ErrorTotals {
+            count: 1.5,
+            sum: 1.0,
+        };
+
+        let placements = placements_for("singleton_best", &solve_input);
+
+        assert_eq!(placements[0].flavour_name, "Fast");
+    }
+
+    #[test]
     fn expired_requests_use_the_cheapest_flavour_feasible_for_profile_budgets() {
         let mut solve_input = input();
         solve_input.current_slot = 2;
@@ -997,10 +1051,10 @@ mod tests {
             },
         ];
         solve_input.qos.cumulative_error_constraint_active = true;
-        solve_input.qos.cumulative_error_count = 1;
-        solve_input.qos.cumulative_error_sum = 5.0;
-        solve_input.qos.error_window.baseline_request_count = 1.0;
-        solve_input.qos.error_window.baseline_error_sum = 1.0;
+        solve_input.qos.cumulative_err.count = 1.0;
+        solve_input.qos.cumulative_err.sum = 5.0;
+        solve_input.qos.error_window.baseline_err.count = 1.0;
+        solve_input.qos.error_window.baseline_err.sum = 1.0;
 
         for name in ["dp", "singleton_best", "random_full"] {
             let placements = placements_for(name, &solve_input);
@@ -1112,7 +1166,6 @@ mod tests {
     fn random_full_accepts_a_request_with_only_one_legal_slot() {
         let mut solve_input = input();
         solve_input.current_slot = 0;
-        solve_input.total_slots = 1;
         solve_input.requests.truncate(1);
         solve_input.requests[0].arrival_slot = 0;
         solve_input.requests[0].deadline_slot = 0;
@@ -1132,7 +1185,8 @@ mod tests {
         solve_input.assignment_max_future_slots = 0;
         solve_input.assignment_max_slot = Some(0);
 
-        let placements = placements_for("random_full", &solve_input);
+        let placements =
+            placements_for_scope("random_full", &solve_input, scope_with_total_slots(1));
 
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].scheduled_slot, 0);

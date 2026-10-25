@@ -17,10 +17,17 @@ pub struct SolveRequest {
 
 #[derive(Debug, Clone)]
 pub struct ErrorWindowInput {
-    pub baseline_error_sum: f64,
-    pub baseline_request_count: f64,
+    // pub baseline_error_sum: f64,
+    // pub baseline_request_count: f64,
+    pub baseline_err: ErrorTotals,
     pub past_slots: i32,
     pub future_slots: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ErrorTotals {
+    pub sum: f64,   // error sum
+    pub count: f64, // request count, which may be fractional for weighted history
 }
 
 #[derive(Debug, Clone)]
@@ -29,8 +36,10 @@ pub struct QoSProfileInput {
     /// Candidate flavours from the single QoS profile shared by this batch.
     pub flavours: Vec<Flavour>,
     pub cumulative_error_constraint_active: bool,
-    pub cumulative_error_count: i64,
-    pub cumulative_error_sum: f64,
+    // pub cumulative_error_count: i64,
+    // pub cumulative_error_sum: f64,
+    pub cumulative_err: ErrorTotals,
+    pub err_by_slot: HashMap<i32, ErrorTotals>,
     pub max_average_error: f64,
     pub error_window: ErrorWindowInput,
 }
@@ -39,7 +48,6 @@ pub struct QoSProfileInput {
 #[derive(Debug, Clone)]
 pub struct SolveInput {
     pub current_slot: i32,
-    pub total_slots: i32,
     pub requests: Vec<SolveRequest>,
 
     // pub flavours: Vec<Flavour>,
@@ -53,10 +61,11 @@ pub struct SolveInput {
     pub qos: QoSProfileInput,
 }
 
-// Identifies the profile scope for one runtime instance
+// Identifies the profile and planning horizon for one runtime instance
 #[derive(Debug, Clone)]
 pub struct SolverScope {
     pub profile_id: QosProfileId,
+    pub total_slots: i32,
 }
 
 //  A proposed request-to-slot-and-flavour decision; it has no final price yet
@@ -155,6 +164,7 @@ pub trait SolverAlgorithm: Send + Sync {
     fn solve(
         &self,
         snapshot: &Self::State,
+        scope: &SolverScope,
         input: &SolveInput,
     ) -> Result<(SolverProposal, Self::Delta), SolverError>;
     fn merge(&self, state: &mut Self::State, delta: Self::Delta, committed: &CommitReport);
@@ -175,6 +185,7 @@ struct RuntimeData<S, D> {
 /// Holds typed state behind an object-safe runtime boundary
 pub struct TypedSolverRuntime<A: SolverAlgorithm> {
     algorithm: A,
+    scope: SolverScope,
     data: Mutex<RuntimeData<A::State, A::Delta>>,
     next_id: AtomicU64,
 }
@@ -184,6 +195,7 @@ impl<A: SolverAlgorithm> TypedSolverRuntime<A> {
         let state = algorithm.initial_state(scope);
         Self {
             algorithm,
+            scope: scope.clone(),
             data: Mutex::new(RuntimeData {
                 state,
                 pending_deltas: HashMap::new(),
@@ -205,7 +217,7 @@ impl<A: SolverAlgorithm> SolverRuntime for TypedSolverRuntime<A> {
         };
         // Block is closed, lock is released
 
-        let (proposal, delta) = self.algorithm.solve(&snapshot, input)?;
+        let (proposal, delta) = self.algorithm.solve(&snapshot, &self.scope, input)?;
         // Here we do not use fetch_add because it wraps on overflow
         // u64::MAX + 1 == 0
         // So we prefer fetch_update + checked_add
@@ -329,6 +341,7 @@ mod tests {
         fn solve(
             &self,
             _snapshot: &(),
+            _scope: &SolverScope,
             input: &SolveInput,
         ) -> Result<(SolverProposal, ()), SolverError> {
             let placements = input
@@ -367,6 +380,7 @@ mod tests {
         fn solve(
             &self,
             snapshot: &CounterState,
+            _scope: &SolverScope,
             input: &SolveInput,
         ) -> Result<(SolverProposal, CounterDelta), SolverError> {
             let placements = input
@@ -394,7 +408,6 @@ mod tests {
     fn input() -> SolveInput {
         SolveInput {
             current_slot: 1,
-            total_slots: 4,
             requests: vec![SolveRequest {
                 request_id: 7,
                 arrival_slot: 1,
@@ -417,12 +430,17 @@ mod tests {
                     duration: 1.0,
                 }],
                 cumulative_error_constraint_active: false,
-                cumulative_error_count: 0,
-                cumulative_error_sum: 0.0,
+                cumulative_err: ErrorTotals {
+                    count: 0.0,
+                    sum: 0.0,
+                },
+                err_by_slot: HashMap::new(),
                 max_average_error: 4.0,
                 error_window: ErrorWindowInput {
-                    baseline_error_sum: 0.0,
-                    baseline_request_count: 0.0,
+                    baseline_err: ErrorTotals {
+                        count: 0.0,
+                        sum: 0.0,
+                    },
                     past_slots: 0,
                     future_slots: 3,
                 },
@@ -433,6 +451,7 @@ mod tests {
     fn scope() -> SolverScope {
         SolverScope {
             profile_id: QosProfileId::default_profile(),
+            total_slots: 4,
         }
     }
 

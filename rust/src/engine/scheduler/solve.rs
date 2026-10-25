@@ -12,7 +12,7 @@ use crate::engine::random_selection::{
     RandomSelectionMode, closest_to_uniform_flavour_probabilities, select_random_assignment,
 };
 use crate::engine::solver::{
-    ErrorWindowInput, QoSProfileInput, SolveInput, SolveRequest, SolverError,
+    ErrorTotals, ErrorWindowInput, QoSProfileInput, SolveInput, SolveRequest, SolverError,
 };
 use crate::shared_state::{GlobalErrorStats, SharedState};
 use crate::types::{
@@ -426,7 +426,6 @@ fn project_solver_input(
 
     Ok(SolveInput {
         current_slot: context.current_slot,
-        total_slots: context.assignment.total_slots,
         requests,
         carbon_forecast: context.carbon_forecast.to_vec(),
         capacity_tiers: prepared.effective_capacity_tiers.clone(),
@@ -439,12 +438,17 @@ fn project_solver_input(
             flavours: context.assignment.flavours.to_vec(),
             cumulative_error_constraint_active: prepared.profile_constraint_active
                 && context.assignment.global_error_constraint_hard,
-            cumulative_error_count,
-            cumulative_error_sum: prepared.profile_error_stats.error_sum,
+            cumulative_err: ErrorTotals {
+                count: cumulative_error_count as f64,
+                sum: prepared.profile_error_stats.error_sum,
+            },
+            err_by_slot: HashMap::new(),
             max_average_error: prepared.effective_error_threshold,
             error_window: ErrorWindowInput {
-                baseline_error_sum: prepared.error_baseline.error_sum,
-                baseline_request_count: prepared.error_baseline.request_count,
+                baseline_err: ErrorTotals {
+                    count: prepared.error_baseline.request_count,
+                    sum: prepared.error_baseline.error_sum,
+                },
                 past_slots: context.assignment.error_window_past,
                 future_slots: context.assignment.error_window_future,
             },
