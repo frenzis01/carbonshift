@@ -1,7 +1,9 @@
 //! Stateless scheduling algorithms adapted to the common solver contract.
+pub mod aco;
+pub mod bandit;
+mod shared;
 
-
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::Rng;
@@ -16,7 +18,7 @@ use crate::engine::solver::{
     CommitReport, ProposedPlacement, SolveInput, SolveRequest, SolverAlgorithm, SolverError,
     SolverProposal, SolverRegistry, SolverScope,
 };
-use crate::types::{Flavour, get_capacity_multiplier};
+use crate::types::{CapacityTier, Flavour, get_capacity_multiplier};
 
 /// DP-specific search settings, kept separate from the application config.
 #[derive(Debug, Clone)]
@@ -159,7 +161,7 @@ impl SolverAlgorithm for DpAlgorithm {
         let solver = DpSolver {
             flavours,
             carbon_forecast: input.carbon_forecast.clone(),
-            window_size: scope.total_slots,
+            window_size: scope.total_slots as i32,
             pruning: self.effective_pruning(input.requests.len()),
             pruning_k: self.config.pruning_k,
             timeout: self.config.timeout_secs,
@@ -195,8 +197,13 @@ impl SolverAlgorithm for DpAlgorithm {
             .collect();
 
         if !unscheduled.is_empty() {
-            let mut fallback_counts: Vec<i32> = (0..scope.total_slots)
-                .map(|slot| solver_baseline_counts.get(&slot).copied().unwrap_or(0))
+            let mut fallback_counts: Vec<i64> = (0..scope.total_slots)
+                .map(|slot| {
+                    solver_baseline_counts
+                        .get(&(slot as i32))
+                        .copied()
+                        .unwrap_or(0)
+                })
                 .collect();
             for assignment in &assignments {
                 fallback_counts[assignment.slot as usize] += 1;
@@ -291,7 +298,7 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
                 // Input validation and deadline capping guarantee this index
                 // is inside the forecast; the current value is the observed CI.
                 let carbon_intensity = input.carbon_forecast[slot as usize];
-                let position = i64::from(*slot_count.get(&slot).unwrap_or(&0)) + 1;
+                let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
                 let multiplier = get_capacity_multiplier(&input.capacity_tiers, position);
 
                 for flav in &sorted_flavours {
@@ -312,7 +319,7 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
                     let win_start =
                         (request.arrival_slot - input.qos.error_window.past_slots).max(0);
                     let win_end = (request.arrival_slot + input.qos.error_window.future_slots)
-                        .min(scope.total_slots - 1);
+                        .min(scope.total_slots as i32 - 1);
                     let mut win_sum = input.qos.error_window.baseline_err.sum + flav.error;
                     let mut win_count = input.qos.error_window.baseline_err.count + 1.0;
                     for &(placed_slot, placed_error) in &solved_errors {
@@ -375,9 +382,25 @@ fn compute_cost(ci: f64, mult: f64, dur: f64, scale: f64) -> f64 {
     ci * mult * dur * scale
 }
 
+fn get_slot_cost(
+    slot: i32,
+    flav: &Flavour,
+    carbon_forecast: &[f64],
+    tiers: &[CapacityTier],
+    slot_count: &HashMap<i32, i64>,
+    scale: f64,
+) -> f64 {
+    let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
+    let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
+    let mult = get_capacity_multiplier(tiers, position);
+    ci * mult * flav.duration * scale
+}
+
+/// Yields the flavour with minimum error
 fn get_fallback_flav(flavours: &[Flavour]) -> Result<&Flavour, SolverError> {
     flavours
         .iter()
+        // BIZ_RULE: fallback flavour is the one minimizing error
         .min_by(|left, right| left.error.total_cmp(&right.error))
         .ok_or_else(|| SolverError::Algorithm("no fallback flavour is available".to_owned()))
 }
@@ -591,7 +614,13 @@ fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), S
             input.carbon_forecast.len()
         )));
     }
-    if input.current_slot < 0 || input.current_slot >= scope.total_slots {
+
+    // TODO: Actually carbon_forecast might get updated with the next 24 slots at each slot advance,
+    // I'm unsure whether the above is correct.
+    // The important thing is to check that the amount of future forecast slots (should be 24 in our emulations but it's not mandatory)
+    // is greater or equal to input.qos.error_window.future_slots !
+
+    if input.current_slot < 0 || input.current_slot >= scope.total_slots as i32 {
         return Err(SolverError::Algorithm(format!(
             "current slot {} is outside the planning horizon",
             input.current_slot
@@ -652,6 +681,11 @@ fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), S
             "the QoS profile has no available flavours".to_owned(),
         ));
     }
+
+    if input.qos.flavours.is_empty() {
+        return Err(SolverError::EmptyFlavours);
+    }
+
     if input.qos.flavours.iter().any(|flavour| {
         !flavour.error.is_finite() || !flavour.duration.is_finite() || flavour.duration < 0.0
     }) {
@@ -704,9 +738,10 @@ fn request_slot_bounds(
 }
 
 fn latest_forecast_slot(input: &SolveInput, scope: &SolverScope) -> i32 {
-    (scope.total_slots - 1)
+    let total_slots: i32 = scope.total_slots as i32;
+    (total_slots - 1)
         .min(input.current_slot + input.qos.error_window.future_slots)
-        .min(input.assignment_max_slot.unwrap_or(scope.total_slots - 1))
+        .min(input.assignment_max_slot.unwrap_or(total_slots - 1))
 }
 
 // ----------------------------------------------------------------------------
@@ -799,7 +834,7 @@ mod tests {
         scope_with_total_slots(4)
     }
 
-    fn scope_with_total_slots(total_slots: i32) -> SolverScope {
+    fn scope_with_total_slots(total_slots: usize) -> SolverScope {
         SolverScope {
             profile_id: QosProfileId::default_profile(),
             total_slots,
@@ -934,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_best_calculates_the_tier_position_in_i64() {
+    fn singleton_best_handles_occupancy_above_i32_max() {
         let mut solve_input = input();
         solve_input.current_slot = 0;
         solve_input.requests.truncate(1);
@@ -956,7 +991,9 @@ mod tests {
                 multiplier: 10.0,
             },
         ];
-        solve_input.baseline_slot_counts.insert(0, i32::MAX);
+        solve_input
+            .baseline_slot_counts
+            .insert(0, i64::from(i32::MAX) + 1);
         solve_input.assignment_max_future_slots = 1;
         solve_input.assignment_max_slot = Some(1);
 

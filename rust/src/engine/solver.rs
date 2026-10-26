@@ -129,6 +129,7 @@ pub enum SolverError {
     ProposalIdExhausted,
     LockPoisoned,
     Algorithm(String),
+    EmptyFlavours,
 }
 
 impl std::fmt::Display for SolverError {
