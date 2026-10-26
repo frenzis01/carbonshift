@@ -86,7 +86,7 @@ pub(super) struct BatchSolveContext<'a> {
 pub(super) struct BatchSolveResult {
     pub(super) assignments: Vec<Assignment>,
     pub(super) context: SolveContext,
-    pub(super) baseline_slot_counts: HashMap<i32, i32>,
+    pub(super) baseline_slot_counts: HashMap<i32, i64>,
 }
 
 /// Solver strategy interface. New stateless batch algorithms can implement
@@ -185,7 +185,7 @@ struct PreparedSolve {
     /// request_id → (arrival_slot, capped_deadline), for converting solver
     /// results back into `Assignment`s.
     assignment_metadata: HashMap<u64, (i32, i32)>,
-    baseline_slot_counts: HashMap<i32, i32>,
+    baseline_slot_counts: HashMap<i32, i64>,
     error_baseline: ErrorBaseline,
     mock_pool_input: MockPool,
     global_error_stats: GlobalErrorStats,
@@ -286,7 +286,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     }
 
     // Baseline counts from pinned future assignments.
-    let mut baseline_slot_counts: HashMap<i32, i32> = HashMap::new();
+    let mut baseline_slot_counts: HashMap<i32, i64> = HashMap::new();
     for a in &fixed_future {
         *baseline_slot_counts.entry(a.scheduled_slot).or_insert(0) += 1;
     }
@@ -508,7 +508,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         &effective_pruning,
     );
 
-    let base_counts_arr: Vec<i32> = (0..assignment.total_slots)
+    let base_counts_arr: Vec<i64> = (0..assignment.total_slots)
         .map(|s| baseline_slot_counts.get(&s).copied().unwrap_or(0))
         .collect();
 
@@ -780,7 +780,7 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
     // Local mutable slot counts, seeded from the baseline (pinned future
     // assignments) and updated as each request in `solve_requests` is
     // placed — for the common batch_size=1 case this loop runs once.
-    let mut slot_count: HashMap<i32, i32> = prep.baseline_slot_counts.clone();
+    let mut slot_count: HashMap<i32, i64> = prep.baseline_slot_counts.clone();
     let mut solved: Vec<RequestAssignment> = Vec::new();
 
     for request in &prep.solve_requests {
@@ -807,8 +807,8 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
         let mut best: Option<(f64, i32, &Flavour)> = None;
         for slot in start_slot..=deadline {
             let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
-            let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-            let mult = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
+            let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+            let mult = get_capacity_multiplier(assignment.capacity_tiers, position);
 
             for flav in &sorted_flavours {
                 // Profile cumulative constraint: retrospective (average error
@@ -854,8 +854,8 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 .get(start_slot as usize)
                 .copied()
                 .unwrap_or(1.0);
-            let position = *slot_count.get(&start_slot).unwrap_or(&0) + 1;
-            let mult = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
+            let position = slot_count.get(&start_slot).copied().unwrap_or(0) + 1;
+            let mult = get_capacity_multiplier(assignment.capacity_tiers, position);
             let cost = ci * mult * fallback_flav.duration * assignment.carbon_cost_duration_scale;
             (cost, start_slot, fallback_flav)
         });
@@ -1009,8 +1009,7 @@ fn solve_random(
         let flavour = &flavours[flavour_index];
 
         let position = slot_counts.get(&scheduled_slot).copied().unwrap_or(0) + 1;
-        let capacity_multiplier =
-            get_capacity_multiplier(&prep.effective_capacity_tiers, position as i64);
+        let capacity_multiplier = get_capacity_multiplier(&prep.effective_capacity_tiers, position);
         let carbon_intensity = input
             .carbon_forecast
             .get(scheduled_slot as usize)

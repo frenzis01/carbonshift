@@ -71,7 +71,7 @@ fn pick_feasible_flavour<'a>(
     slot: i32,
     carbon_forecast: &[f64],
     tiers: &[CapacityTier],
-    slot_count: &HashMap<i32, i32>,
+    slot_count: &HashMap<i32, i64>,
     slot_errors: &HashMap<i32, Vec<f64>>,
     global_error_sum: f64,
     global_count: usize,
@@ -83,8 +83,8 @@ fn pick_feasible_flavour<'a>(
     global_constraint_enabled: bool,
 ) -> Option<(&'a Flavour, f64)> {
     let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
-    let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-    let mult = capacity_mult(tiers, position as i64);
+    let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+    let mult = capacity_mult(tiers, position);
 
     for &flav in sorted_flavours {
         if global_constraint_enabled {
@@ -118,12 +118,12 @@ fn slot_cost(
     flav: &Flavour,
     carbon_forecast: &[f64],
     tiers: &[CapacityTier],
-    slot_count: &HashMap<i32, i32>,
+    slot_count: &HashMap<i32, i64>,
     scale: f64,
 ) -> f64 {
     let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
-    let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-    let mult = capacity_mult(tiers, position as i64);
+    let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+    let mult = capacity_mult(tiers, position);
     ci * mult * flav.duration * scale
 }
 
@@ -184,7 +184,7 @@ pub fn run_bandit(
     // Q[s] = running-mean carbon cost achieved at slot s; n[s] = sample count.
     let mut q: Vec<f64> = vec![params.initial_q; total_slots as usize];
     let mut n: Vec<u64> = vec![0; total_slots as usize];
-    let mut slot_count: HashMap<i32, i32> = HashMap::new();
+    let mut slot_count: HashMap<i32, i64> = HashMap::new();
     let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
     let mut global_error_sum: f64 = 0.0;
     let mut global_count: usize = 0;
@@ -360,7 +360,7 @@ pub fn run_ant_colony(
 
         for _ant in 0..params.n_ants {
             // Each ant tracks its own error state.
-            let mut slot_count: HashMap<i32, i32> = HashMap::new();
+            let mut slot_count: HashMap<i32, i64> = HashMap::new();
             let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
             let mut global_error_sum: f64 = 0.0;
             let mut global_count: usize = 0;

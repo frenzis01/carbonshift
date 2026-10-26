@@ -17,8 +17,6 @@ pub struct SolveRequest {
 
 #[derive(Debug, Clone)]
 pub struct ErrorWindowInput {
-    // pub baseline_error_sum: f64,
-    // pub baseline_request_count: f64,
     pub baseline_err: ErrorTotals,
     pub past_slots: i32,
     pub future_slots: i32,
@@ -36,8 +34,6 @@ pub struct QoSProfileInput {
     /// Candidate flavours from the single QoS profile shared by this batch.
     pub flavours: Vec<Flavour>,
     pub cumulative_error_constraint_active: bool,
-    // pub cumulative_error_count: i64,
-    // pub cumulative_error_sum: f64,
     pub cumulative_err: ErrorTotals,
     pub err_by_slot: HashMap<i32, ErrorTotals>,
     pub max_average_error: f64,
@@ -53,7 +49,7 @@ pub struct SolveInput {
     // pub flavours: Vec<Flavour>,
     pub carbon_forecast: Vec<f64>,
     pub capacity_tiers: Vec<CapacityTier>,
-    pub baseline_slot_counts: HashMap<i32, i32>,
+    pub baseline_slot_counts: HashMap<i32, i64>,
 
     pub carbon_cost_duration_scale: f64,
     pub assignment_max_future_slots: i32,
@@ -65,7 +61,7 @@ pub struct SolveInput {
 #[derive(Debug, Clone)]
 pub struct SolverScope {
     pub profile_id: QosProfileId,
-    pub total_slots: i32,
+    pub total_slots: usize,
 }
 
 //  A proposed request-to-slot-and-flavour decision; it has no final price yet
@@ -191,9 +187,9 @@ pub struct TypedSolverRuntime<A: SolverAlgorithm> {
 }
 
 impl<A: SolverAlgorithm> TypedSolverRuntime<A> {
-    pub fn new(algorithm: A, scope: &SolverScope) -> Self {
+    pub fn new(algorithm: A, scope: &SolverScope) -> Result<Self, SolverError> {
         let state = algorithm.initial_state(scope);
-        Self {
+        Ok(Self {
             algorithm,
             scope: scope.clone(),
             data: Mutex::new(RuntimeData {
@@ -201,7 +197,7 @@ impl<A: SolverAlgorithm> TypedSolverRuntime<A> {
                 pending_deltas: HashMap::new(),
             }),
             next_id: AtomicU64::new(0),
-        }
+        })
     }
 }
 
@@ -258,7 +254,8 @@ impl<A: SolverAlgorithm> SolverRuntime for TypedSolverRuntime<A> {
     }
 }
 
-type RuntimeFactory = Arc<dyn Fn(SolverScope) -> Box<dyn SolverRuntime> + Send + Sync>;
+type RuntimeFactory =
+    Arc<dyn Fn(SolverScope) -> Result<Box<dyn SolverRuntime>, SolverError> + Send + Sync>;
 
 #[derive(Default)]
 pub struct SolverRegistry {
@@ -297,7 +294,8 @@ impl SolverRegistry {
         self.factories.insert(
             name,
             Arc::new(move |scope| {
-                Box::new(TypedSolverRuntime::new(build(), &scope)) as Box<dyn SolverRuntime>
+                let runtime = TypedSolverRuntime::new(build(), &scope)?;
+                Ok(Box::new(runtime) as Box<dyn SolverRuntime>)
             }),
         );
         Ok(())
@@ -314,7 +312,7 @@ impl SolverRegistry {
             .get(&key)
             .ok_or_else(|| SolverError::UnknownEngine(name.to_owned()))?;
 
-        Ok(factory(scope))
+        factory(scope)
     }
 }
 
@@ -373,7 +371,7 @@ mod tests {
         type State = CounterState;
         type Delta = CounterDelta;
 
-        fn initial_state(&self, _scope: &SolverScope) -> CounterState {
+        fn initial_state(&self, _scope: &SolverScope) -> Self::State {
             CounterState(0)
         }
 

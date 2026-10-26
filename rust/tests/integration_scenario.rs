@@ -126,7 +126,7 @@ fn drain_pending_with_dp(
 
         // Compute baseline from already-placed assignments.
         let current_assignments = ss.get_current_assignments();
-        let mut base_counts: HashMap<i32, i32> = HashMap::new();
+        let mut base_counts: HashMap<i32, i64> = HashMap::new();
         for a in current_assignments.values() {
             *base_counts.entry(a.scheduled_slot).or_insert(0) += 1;
         }
@@ -162,7 +162,7 @@ fn drain_pending_with_dp(
 
         if dp_result.is_empty() {
             // Infeasible batch: greedy fallback.
-            let base_counts_arr: Vec<i32> = (0..assignment.total_slots)
+            let base_counts_arr: Vec<i64> = (0..assignment.total_slots)
                 .map(|s| base_counts.get(&s).copied().unwrap_or(0))
                 .collect();
 

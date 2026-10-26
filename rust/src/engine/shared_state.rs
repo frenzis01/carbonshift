@@ -539,7 +539,7 @@ impl SharedState {
         profile_id: Option<&QosProfileId>,
     ) -> SwarmContext {
         let g = self.inner.lock().unwrap();
-        let mut slot_count: HashMap<i32, i32> = HashMap::new();
+        let mut slot_count: HashMap<i32, i64> = HashMap::new();
         let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
         for a in g.assignments.values() {
             *slot_count.entry(a.scheduled_slot).or_insert(0) += 1;
@@ -834,7 +834,7 @@ impl SharedState {
     pub fn try_add_assignments_checked(
         &self,
         assignments: &[Assignment],
-        expected_per_slot: &HashMap<i32, i32>,
+        expected_per_slot: &HashMap<i32, i64>,
         tiers: &[CapacityTier],
         force_commit: bool,
         consecutive_before: usize,
@@ -847,11 +847,11 @@ impl SharedState {
                     .assignments
                     .values()
                     .filter(|a| a.scheduled_slot == slot)
-                    .count() as i32;
+                    .count() as i64;
                 let batch_adds = assignments
                     .iter()
                     .filter(|a| a.scheduled_slot == slot)
-                    .count() as i32;
+                    .count() as i64;
                 let actual_after = current_before + batch_adds;
 
                 if actual_after > expected {
@@ -911,11 +911,11 @@ impl Default for SharedState {
 
 // ─── capacity-tier helper (mirrors DpSolver::get_capacity_multiplier) ─────────
 
-fn capacity_multiplier_for_count(count: i32, tiers: &[CapacityTier]) -> f64 {
+fn capacity_multiplier_for_count(count: i64, tiers: &[CapacityTier]) -> f64 {
     for tier in tiers {
         match tier.max_requests {
             None => return tier.multiplier,
-            Some(max) if (count as i64) <= max => return tier.multiplier,
+            Some(max) if count <= max => return tier.multiplier,
             _ => {}
         }
     }
@@ -1459,7 +1459,7 @@ mod tests {
         let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
         // expected = baseline(25) + batch_adds(5) = 30
         let mut expected = HashMap::new();
-        expected.insert(5i32, 30i32);
+        expected.insert(5i32, 30i64);
 
         let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
         assert_eq!(outcome, CommitOutcome::Committed);
@@ -1479,7 +1479,7 @@ mod tests {
         let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
         // expected = baseline(31) + batch_adds(5) = 36
         let mut expected = HashMap::new();
-        expected.insert(5i32, 36i32);
+        expected.insert(5i32, 36i64);
 
         // actual_after = 34 + 5 = 39; expected = 36
         // Both in tier 1.5 (31-50) => same tier => Committed.
@@ -1503,7 +1503,7 @@ mod tests {
         // actual_after = 33 + 5 = 38 → capacity_multiplier(38) = 1.5
         // 1.5 > 1.0 => RolledBack
         let mut expected = HashMap::new();
-        expected.insert(5i32, 30i32);
+        expected.insert(5i32, 30i64);
 
         let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
         assert_eq!(outcome, CommitOutcome::RolledBack);
@@ -1522,7 +1522,7 @@ mod tests {
 
         let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
         let mut expected = HashMap::new();
-        expected.insert(5i32, 30i32); // same breach scenario as above
+        expected.insert(5i32, 30i64); // same breach scenario as above
 
         let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, true, 0);
         assert_eq!(outcome, CommitOutcome::Committed);
@@ -1539,7 +1539,7 @@ mod tests {
 
         let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
         let mut expected = HashMap::new();
-        expected.insert(5i32, 30i32);
+        expected.insert(5i32, 30i64);
 
         // First rollback (consecutive_before = 0)
         let _ = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
@@ -1568,7 +1568,7 @@ mod tests {
         // actual_after = 33 + 3 = 36 → capacity_multiplier(36) = 2.0
         // Same tier → Committed (race didn't push to a NEW tier).
         let mut expected = HashMap::new();
-        expected.insert(5i32, 31i32);
+        expected.insert(5i32, 31i64);
         let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
         assert_eq!(
             outcome,
@@ -1582,7 +1582,7 @@ mod tests {
         // expected = baseline(28) + batch(3) = 31, but we choose baseline=27 batch=3 → expected=30
         // expected=30 → tier 1.5 (30<=30); actual_after=36 → tier 2.0 (36>30, 36<=50) → BREACH
         let mut expected2 = HashMap::new();
-        expected2.insert(5i32, 30i32); // baseline=27, batch=3
+        expected2.insert(5i32, 30i64); // baseline=27, batch=3
         let batch2: Vec<Assignment> = (3..6u64).map(|i| make_assignment(i, 5, 0.0)).collect();
         let outcome2 = state2.try_add_assignments_checked(&batch2, &expected2, &tiers, false, 0);
         assert_eq!(

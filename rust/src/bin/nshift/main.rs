@@ -914,7 +914,7 @@ fn run_offline_singleton(
     let mut requests: Vec<_> = scenario.requests.iter().collect();
     requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
 
-    let mut slot_count: HashMap<i32, i32> = HashMap::new();
+    let mut slot_count: HashMap<i32, i64> = HashMap::new();
     let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
     let mut global_error_sum: f64 = 0.0;
     let mut global_count: usize = 0;
@@ -959,8 +959,8 @@ fn run_offline_singleton(
         let mut best: Option<(f64, i32, &Flavour)> = None;
         for slot in arrival..=deadline {
             let ci = carbon.get(slot as usize).copied().unwrap_or(1.0);
-            let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-            let mult = get_capacity_multiplier(tiers, position as i64);
+            let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+            let mult = get_capacity_multiplier(tiers, position);
 
             for flav in &allowed_flavours {
                 let cost = ci * mult * flav.duration * scale;
@@ -986,8 +986,8 @@ fn run_offline_singleton(
         let (chosen_cost, chosen_slot, chosen_flav) = best.unwrap_or_else(|| {
             let slot = arrival;
             let ci = carbon.get(slot as usize).copied().unwrap_or(1.0);
-            let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-            let mult = get_capacity_multiplier(tiers, position as i64);
+            let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+            let mult = get_capacity_multiplier(tiers, position);
             let cost = ci * mult * fallback_flav.duration * scale;
             (cost, slot, fallback_flav)
         });
@@ -1123,7 +1123,7 @@ fn run_random_with_mode(
 
     // Capacity tiers price requests by their one-based commit position in a
     // slot, so preserve the occupancy accumulated by earlier random choices.
-    let mut slot_count: HashMap<i32, i32> = HashMap::new();
+    let mut slot_count: HashMap<i32, i64> = HashMap::new();
     let mut per_req: Vec<PerRequest> = Vec::with_capacity(requests.len());
     let mut batch_timings: Vec<BatchTiming> = Vec::with_capacity(requests.len());
 
@@ -1148,8 +1148,8 @@ fn run_random_with_mode(
 
         // Price this assignment at the slot's next occupancy position, then
         // commit that occupancy so later requests see the correct tier.
-        let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-        let multiplier = get_capacity_multiplier(assignment.capacity_tiers, position as i64);
+        let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+        let multiplier = get_capacity_multiplier(assignment.capacity_tiers, position);
         let carbon_intensity = scenario
             .carbon_forecast
             .get(slot as usize)
@@ -1988,7 +1988,7 @@ fn schedule_late_requests(
         .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
         .expect("no flavours");
 
-    let mut slot_count: HashMap<i32, i32> = HashMap::new();
+    let mut slot_count: HashMap<i32, i64> = HashMap::new();
     let mut out = Vec::with_capacity(remaining.len());
 
     let mut sorted = remaining;
@@ -1996,12 +1996,12 @@ fn schedule_late_requests(
 
     for req in sorted {
         let sched_slot = req.deadline_slot.max(req.arrival_slot).min(total_slots - 1);
-        let position = *slot_count.get(&sched_slot).unwrap_or(&0) + 1;
+        let position = slot_count.get(&sched_slot).copied().unwrap_or(0) + 1;
         let ci = carbon_forecast
             .get(sched_slot as usize)
             .copied()
             .unwrap_or(1.0);
-        let mult = get_capacity_multiplier(tiers, position as i64);
+        let mult = get_capacity_multiplier(tiers, position);
         let cost = ci * mult * fallback_flav.duration * scale;
         // Lateness = how many slots past the deadline the request sat unprocessed.
         // We measure from the end of the run (total_slots-1), not from sched_slot,

@@ -51,14 +51,14 @@ struct DpStateKey {
     error_sum_bp: i64,
     error_count_milli: i64, // error_count × 1000, rounded
     mock_remaining: i32,
-    inc_counts: Vec<i32>,
+    inc_counts: Vec<i64>,
 }
 
 impl DpStateKey {
     /// Build a hashable description of the solver's accumulated error and
     /// per-slot load. Floating-point request counts are quantized because
     /// `HashMap` keys must support exact equality and hashing.
-    fn new(error_sum_bp: i64, error_count: f64, mock_remaining: i32, inc_counts: Vec<i32>) -> Self {
+    fn new(error_sum_bp: i64, error_count: f64, mock_remaining: i32, inc_counts: Vec<i64>) -> Self {
         Self {
             error_sum_bp,
             error_count_milli: (error_count * 1000.0).round() as i64,
@@ -87,7 +87,7 @@ pub struct SolveBatchInput<'a> {
     /// Capacity tiers for slot repricing.
     pub capacity_tiers: &'a [CapacityTier],
     /// Per-slot baseline request counts from already-fixed assignments.
-    pub baseline_slot_counts: &'a HashMap<i32, i32>,
+    pub baseline_slot_counts: &'a HashMap<i32, i64>,
     /// Pre-computed error baseline for the window.
     pub error_window_baseline: ErrorWindowBaseline,
     /// Maximum allowed average window error (None = no constraint).
@@ -232,7 +232,7 @@ impl DpSolver {
 
         // Copy fixed assignments into an indexed array; state transitions can
         // then price each candidate slot without repeatedly looking up a map.
-        let mut base_counts = vec![0i32; t];
+        let mut base_counts = vec![0i64; t];
         for (&slot, &cnt) in input.baseline_slot_counts {
             if slot >= 0 && (slot as usize) < t {
                 base_counts[slot as usize] = cnt;
@@ -300,7 +300,7 @@ impl DpSolver {
             initial_error_sum_bp,
             initial_error_count,
             initial_mock_count,
-            vec![0i32; t],
+            vec![0i64; t],
         );
         let mut dp_prev: HashMap<DpStateKey, (f64, Vec<RequestAssignment>)> = HashMap::new();
         dp_prev.insert(init_key, (0.0, vec![]));
@@ -537,7 +537,7 @@ impl DpSolver {
         &self,
         input: &SolveBatchInput<'_>,
         deadlines: &[i32],
-        base_counts: &[i32],
+        base_counts: &[i64],
         tiers: &[CapacityTier],
         initial_error_sum_bp: i64,
         initial_error_count: f64,
@@ -552,7 +552,7 @@ impl DpSolver {
             initial_error_sum_bp,
             initial_error_count,
             initial_mock_count,
-            vec![0i32; t],
+            vec![0i64; t],
         );
         let mut keys = vec![key.clone()];
         let mut assignments = Vec::new();
@@ -683,7 +683,7 @@ impl DpSolver {
         requests: &[SolveRequest],
         current_slot: i32,
         capacity_tiers: &[CapacityTier],
-        base_counts: &[i32],
+        base_counts: &[i64],
     ) -> Vec<RequestAssignment> {
         let mut inc_counts = base_counts.to_vec();
         let mut assignments = Vec::new();
@@ -703,7 +703,7 @@ impl DpSolver {
                 .max_by(|a, b| a.duration.total_cmp(&b.duration))
                 .expect("at least one flavour");
             let mut best: Option<(f64, i32)> = None;
-            let empty_base = vec![0i32; self.window_size as usize];
+            let empty_base = vec![0i64; self.window_size as usize];
 
             for slot in earliest_slot..=deadline {
                 let cost = self.incremental_carbon_cost(
@@ -750,12 +750,12 @@ impl DpSolver {
         &self,
         slot: i32,
         add_duration: f64,
-        base_counts: &[i32],
-        inc_counts: &[i32],
+        base_counts: &[i64],
+        inc_counts: &[i64],
         tiers: &[CapacityTier],
     ) -> f64 {
         let s = slot as usize;
-        let position = (base_counts[s] + inc_counts[s]) as i64 + 1; // 1-indexed position of this request
+        let position = base_counts[s] + inc_counts[s] + 1; // 1-indexed position of this request
         let mult = get_capacity_multiplier(tiers, position);
         let carbon = self.carbon_forecast[s];
         carbon * mult * add_duration * self.carbon_cost_scale
@@ -790,7 +790,7 @@ mod tests {
         requests: &'a [SolveRequest],
         current_slot: i32,
         tiers: &'a [CapacityTier],
-        counts: &'a HashMap<i32, i32>,
+        counts: &'a HashMap<i32, i64>,
     ) -> SolveBatchInput<'a> {
         SolveBatchInput {
             requests,
@@ -811,7 +811,7 @@ mod tests {
         requests: &'a [SolveRequest],
         current_slot: i32,
         tiers: &'a [CapacityTier],
-        counts: &'a HashMap<i32, i32>,
+        counts: &'a HashMap<i32, i64>,
     ) -> SolveBatchInput<'a> {
         make_input_with_maps(requests, current_slot, tiers, counts)
     }
@@ -1026,8 +1026,8 @@ mod tests {
             60.0 * 5.0 * 30.0 * scale, // position 5 (crosses tier)
         ];
         for (i, &expected) in expected_costs.iter().enumerate() {
-            let mut inc_counts = vec![0i32; 5];
-            inc_counts[0] = i as i32; // i requests already placed at slot 0
+            let mut inc_counts = vec![0i64; 5];
+            inc_counts[0] = i as i64; // i requests already placed at slot 0
             let cost = solver.incremental_carbon_cost(0, 30.0, &vec![0; 5], &inc_counts, &tiers);
             assert!(
                 (cost - expected).abs() < 1e-9,
@@ -1174,7 +1174,7 @@ mod tests {
             },
         ];
         let tiers = no_tiers();
-        let base = vec![0i32; 5];
+        let base = vec![0i64; 5];
         let result = solver.greedy_fallback(&requests, 0, &tiers, &base);
         assert_eq!(result.len(), 3);
     }

@@ -91,7 +91,7 @@ fn pick_feasible_flavour<'a>(
     slot: i32,
     carbon_forecast: &[f64],
     tiers: &[CapacityTier],
-    slot_count: &HashMap<i32, i32>,
+    slot_count: &HashMap<i32, i64>,
     slot_errors: &HashMap<i32, Vec<f64>>,
     global_error_sum: f64,
     global_count: usize,
@@ -103,8 +103,8 @@ fn pick_feasible_flavour<'a>(
     global_constraint_enabled: bool,
 ) -> Option<(&'a Flavour, f64)> {
     let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
-    let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-    let mult = capacity_mult(tiers, position as i64);
+    let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+    let mult = capacity_mult(tiers, position);
     for &flav in sorted_flavours {
         if global_constraint_enabled {
             let new_avg = (global_error_sum + flav.error) / (global_count as f64 + 1.0);
@@ -134,12 +134,12 @@ fn slot_cost(
     flav: &Flavour,
     carbon_forecast: &[f64],
     tiers: &[CapacityTier],
-    slot_count: &HashMap<i32, i32>,
+    slot_count: &HashMap<i32, i64>,
     scale: f64,
 ) -> f64 {
     let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
-    let position = *slot_count.get(&slot).unwrap_or(&0) + 1;
-    let mult = capacity_mult(tiers, position as i64);
+    let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+    let mult = capacity_mult(tiers, position);
     ci * mult * flav.duration * scale
 }
 

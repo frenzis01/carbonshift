@@ -1242,7 +1242,7 @@ fn batch_worker_entry_swarm_merge(
 /// checked commit detects other workers that changed those slots meanwhile.
 fn try_commit_swarm_batch(
     assignments: &[Assignment],
-    baseline_slot_counts: &HashMap<i32, i32>,
+    baseline_slot_counts: &HashMap<i32, i64>,
     shared_state: &SharedState,
     capacity_tiers: &[crate::types::CapacityTier],
     force_commit: bool,
