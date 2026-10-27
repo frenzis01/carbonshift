@@ -186,6 +186,8 @@ struct PreparedSolve {
     /// results back into `Assignment`s.
     assignment_metadata: HashMap<u64, (i32, i32)>,
     baseline_slot_counts: HashMap<i32, i64>,
+    /// Committed errors for this QoS profile, grouped by execution slot.
+    err_by_slot: HashMap<i32, ErrorTotals>,
     error_baseline: ErrorBaseline,
     mock_pool_input: MockPool,
     global_error_stats: GlobalErrorStats,
@@ -291,6 +293,21 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         *baseline_slot_counts.entry(a.scheduled_slot).or_insert(0) += 1;
     }
 
+    // Reuse the same coherent snapshot used for the window and cumulative
+    // statistics. Movable future assignments are excluded because this solve
+    // will account for their proposed replacements instead.
+    let mut err_by_slot: HashMap<i32, ErrorTotals> = HashMap::new();
+    for assignment_snapshot in snapshot.assignments.values().filter(|assignment| {
+        assignment.qos_profile_id == profile_id
+            && !movable_future_ids.contains(&assignment.request_id)
+    }) {
+        let totals = err_by_slot
+            .entry(assignment_snapshot.scheduled_slot)
+            .or_default();
+        totals.sum += assignment_snapshot.error;
+        totals.count += 1.0;
+    }
+
     // ── Step 3: assemble this profile's error baseline ──────────────────────
     // 3a. Real window error from snapshot.
     let ws = snapshot.get_profile_window_error_stats(
@@ -383,6 +400,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         solve_requests,
         assignment_metadata,
         baseline_slot_counts,
+        err_by_slot,
         error_baseline,
         mock_pool_input,
         global_error_stats,
@@ -442,7 +460,7 @@ fn project_solver_input(
                 count: cumulative_error_count as f64,
                 sum: prepared.profile_error_stats.error_sum,
             },
-            err_by_slot: HashMap::new(),
+            err_by_slot: prepared.err_by_slot.clone(),
             max_average_error: prepared.effective_error_threshold,
             error_window: ErrorWindowInput {
                 baseline_err: ErrorTotals {
@@ -474,6 +492,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         solve_requests: dp_requests,
         assignment_metadata,
         baseline_slot_counts,
+        err_by_slot: _,
         error_baseline,
         mock_pool_input,
         global_error_stats,
