@@ -144,6 +144,7 @@ impl std::fmt::Display for SolverError {
             Self::ProposalIdExhausted => write!(f, "Proposal ID space exhausted"),
             Self::LockPoisoned => write!(f, "Solver runtime lock was poisoned"),
             Self::Algorithm(msg) => write!(f, "Algorithm error: {msg}"),
+            Self::EmptyFlavours => write!(f, "QoS profile has no flavours"),
         }
     }
 }

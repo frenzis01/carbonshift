@@ -10,6 +10,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
+use crate::engine::config::SwarmConfig;
 use crate::engine::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
 use crate::engine::random_selection::{
     RandomSelectionMode, closest_to_uniform_flavour_probabilities, select_random_assignment,
@@ -598,6 +599,38 @@ pub fn register_stateless_solvers(
     Ok(())
 }
 
+/// Register the persistent online solvers without exposing their concrete
+/// state or delta types to either runner.
+pub fn register_stateful_solvers(
+    registry: &mut SolverRegistry,
+    config: &SwarmConfig,
+) -> Result<(), SolverError> {
+    let bandit_config = bandit::BanditConfig {
+        epsilon: config.bandit_epsilon,
+        initial_q: config.bandit_initial_q,
+        seed: config.bandit_seed,
+    };
+    registry.register("bandit", move || {
+        bandit::BanditAlgorithm::new(bandit_config.clone())
+    })?;
+
+    let aco_config = aco::AcoConfig {
+        n_ants: config.aco_n_ants,
+        n_iterations: config.aco_n_iterations,
+        alpha: config.aco_alpha,
+        beta: config.aco_beta,
+        rho: config.aco_rho,
+        q_deposit: config.aco_q,
+        initial_pheromone: config.aco_tau0,
+        seed: config.aco_seed,
+    };
+    registry.register("ant_colony", move || {
+        aco::AcoAlgorithm::new(aco_config.clone())
+    })?;
+
+    Ok(())
+}
+
 // Helper functions
 
 fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), SolverError> {
@@ -615,10 +648,10 @@ fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), S
         )));
     }
 
-    // TODO: Actually carbon_forecast might get updated with the next 24 slots at each slot advance,
-    // I'm unsure whether the above is correct.
-    // The important thing is to check that the amount of future forecast slots (should be 24 in our emulations but it's not mandatory)
-    // is greater or equal to input.qos.error_window.future_slots !
+    // The forecast vector is indexed by absolute solver slots, so it must
+    // cover the configured local horizon. A rolling provider window is
+    // represented separately by `assignment_max_slot`; request deadlines are
+    // capped to that slot and to the QoS future-window boundary below.
 
     if input.current_slot < 0 || input.current_slot >= scope.total_slots as i32 {
         return Err(SolverError::Algorithm(format!(
