@@ -64,27 +64,20 @@ enum SwarmBackend {
 }
 
 impl SwarmBackend {
-    /// Construct the configured online strategy with the same profile policy
-    /// and forecast used by the scheduler worker that owns it.
+    /// Construct the configured online strategy for one QoS profile. Forecast
+    /// values are supplied per solve so ACO heuristics can follow updates.
     fn from_config(
         solver: &SolverConfig,
         swarm: &SwarmConfig,
         assignment: &AssignmentPolicy<'_>,
-        carbon_forecast: &Arc<RwLock<Vec<f64>>>,
     ) -> Self {
         if swarm.mode == "merge" {
             Self::Merge(crate::online_swarmerge::OnlineSwarmState::from_config(
-                solver,
-                swarm,
-                assignment,
-                carbon_forecast,
+                solver, swarm, assignment,
             ))
         } else {
             Self::Serialized(crate::online_swarm::OnlineSwarmState::from_config(
-                solver,
-                swarm,
-                assignment,
-                carbon_forecast,
+                solver, swarm, assignment,
             ))
         }
     }
@@ -1114,10 +1107,10 @@ fn batch_worker_entry_swarm_serialized(
 
     let mut assignments = {
         let mut g = mutable.lock().unwrap();
-        let swarm_state = g.swarm_states.entry(profile_id.clone()).or_insert_with(|| {
-            let forecast = Arc::new(RwLock::new(carbon_forecast.to_vec()));
-            SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment, &forecast)
-        });
+        let swarm_state = g
+            .swarm_states
+            .entry(profile_id.clone())
+            .or_insert_with(|| SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment));
         let SwarmBackend::Serialized(swarm) = swarm_state else {
             unreachable!("batch_worker_entry_swarm dispatched Serialized mode");
         };
@@ -1178,10 +1171,10 @@ fn batch_worker_entry_swarm_merge(
         // Snapshot committed state and clone this profile's swarm state.
         let (swarm_snapshot, ctx) = {
             let mut g = mutable.lock().unwrap();
-            let swarm_state = g.swarm_states.entry(profile_id.clone()).or_insert_with(|| {
-                let forecast = Arc::new(RwLock::new(carbon_forecast.to_vec()));
-                SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment, &forecast)
-            });
+            let swarm_state = g
+                .swarm_states
+                .entry(profile_id.clone())
+                .or_insert_with(|| SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment));
             let SwarmBackend::Merge(swarm) = swarm_state else {
                 unreachable!("batch_worker_entry_swarm dispatched Merge mode");
             };

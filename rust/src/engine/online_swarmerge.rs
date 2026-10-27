@@ -40,7 +40,6 @@
 //! update is ever discarded, and full parallelism is preserved.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -67,6 +66,27 @@ fn capacity_mult(tiers: &[CapacityTier], count: i64) -> f64 {
         }
     }
     tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
+}
+
+fn slot_eta(
+    slot: i32,
+    carbon_forecast: &[f64],
+    tiers: &[CapacityTier],
+    slot_count: &HashMap<i32, i64>,
+    cheapest_duration: f64,
+    carbon_cost_duration_scale: f64,
+) -> f64 {
+    // Heuristic desirability is marginal cost at solve time: forecasts and
+    // global slot occupancy can both change after the ACO state is created.
+    let intensity = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
+    let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
+    let estimated_cost =
+        intensity * capacity_mult(tiers, position) * cheapest_duration * carbon_cost_duration_scale;
+    if estimated_cost > 0.0 {
+        1.0 / estimated_cost
+    } else {
+        1e9
+    }
 }
 
 /// Return the sorted list of valid target slots for a request:
@@ -362,8 +382,6 @@ impl OnlineBanditState {
 pub struct OnlineAcoState {
     /// Per-slot pheromone levels (updated after each batch).
     pub tau: Vec<f64>,
-    /// Per-slot static heuristic (1/estimated_base_cost).
-    pub eta: Vec<f64>,
     pub rng: SmallRng,
     pub n_ants: usize,
     /// Number of ACO iterations per batch (default 1 is fine for online use
@@ -398,9 +416,6 @@ impl OnlineAcoState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         total_slots: usize,
-        carbon_forecast: Arc<RwLock<Vec<f64>>>,
-        flavours: &[Flavour],
-        carbon_cost_duration_scale: f64,
         n_ants: usize,
         n_iterations: usize,
         alpha: f64,
@@ -410,26 +425,8 @@ impl OnlineAcoState {
         tau0: f64,
         seed: u64,
     ) -> Self {
-        let cheapest = flavours
-            .iter()
-            .min_by(|a, b| a.duration.total_cmp(&b.duration))
-            .expect("at least one flavour");
-        let eta: Vec<f64> = (0..total_slots)
-            .map(|s| {
-                // TODO: is it ok to unwrap here? Technically carbon_forecast gets updated as we go on...
-                let ci = carbon_forecast
-                    .read()
-                    .unwrap()
-                    .get(s)
-                    .copied()
-                    .unwrap_or(1.0);
-                let base = ci * cheapest.duration * carbon_cost_duration_scale;
-                if base > 0.0 { 1.0 / base } else { 1e9 }
-            })
-            .collect();
         Self {
             tau: vec![tau0; total_slots],
-            eta,
             rng: SmallRng::seed_from_u64(seed),
             n_ants,
             n_iterations,
@@ -461,6 +458,10 @@ impl OnlineAcoState {
         let win_past = assignment.error_window_past;
         let win_future_cfg = assignment.error_window_future;
         let max_err = assignment.max_error_threshold;
+        let cheapest_duration = sorted_flavours
+            .first()
+            .expect("ACO requires at least one flavour")
+            .duration;
 
         let mut best_cost = f64::INFINITY;
         let mut best_solution: Vec<Assignment> = Vec::new();
@@ -497,7 +498,14 @@ impl OnlineAcoState {
                         .iter()
                         .map(|&s| {
                             let t = tau.get(s as usize).copied().unwrap_or(1e-12).max(1e-12);
-                            let e = self.eta.get(s as usize).copied().unwrap_or(1e-12);
+                            let e = slot_eta(
+                                s,
+                                carbon_forecast,
+                                tiers,
+                                &slot_count,
+                                cheapest_duration,
+                                scale,
+                            );
                             t.powf(self.alpha) * e.powf(self.beta)
                         })
                         .collect();
@@ -641,15 +649,11 @@ pub enum SwarmDelta {
 
 impl OnlineSwarmState {
     /// Build the appropriate state from `cfg.solver.solver_strategy`.
-    /// `carbon_forecast` is required for computing ACO's static heuristic.
     pub fn from_config(
         solver: &SolverConfig,
         swarm: &SwarmConfig,
         assignment: &AssignmentPolicy<'_>,
-        carbon_forecast: &Arc<RwLock<Vec<f64>>>,
     ) -> Self {
-        // Clone internally carbon_forecast
-        let carbon_forecast = Arc::clone(carbon_forecast);
         match solver.solver_strategy.as_str() {
             "bandit" => Self::Bandit(OnlineBanditState::new(
                 assignment.total_slots as usize,
@@ -659,9 +663,6 @@ impl OnlineSwarmState {
             )),
             "ant_colony" => Self::Aco(OnlineAcoState::new(
                 assignment.total_slots as usize,
-                carbon_forecast,
-                assignment.flavours,
-                assignment.carbon_cost_duration_scale,
                 swarm.aco_n_ants,
                 swarm.aco_n_iterations,
                 swarm.aco_alpha,
@@ -751,6 +752,32 @@ mod tests {
 
     fn make_request(id: u64, arrival: i32, deadline: i32) -> Request {
         Request::new(id, arrival, deadline)
+    }
+
+    #[test]
+    fn aco_eta_uses_the_current_forecast_and_slot_occupancy() {
+        let forecast = [2.0, 4.0, 8.0];
+        let tiers = [
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 3.0,
+            },
+        ];
+
+        let eta = slot_eta(1, &forecast, &tiers, &HashMap::new(), 2.0, 1.0);
+        assert!((eta - 0.125).abs() < 1e-12);
+
+        let updated_forecast = [2.0, 2.0, 8.0];
+        let updated_eta = slot_eta(1, &updated_forecast, &tiers, &HashMap::new(), 2.0, 1.0);
+        assert!((updated_eta - 0.25).abs() < 1e-12);
+
+        let occupied = HashMap::from([(1, 1)]);
+        let capacity_adjusted_eta = slot_eta(1, &forecast, &tiers, &occupied, 2.0, 1.0);
+        assert!((capacity_adjusted_eta - (1.0 / 24.0)).abs() < 1e-12);
     }
 
     /// Merging two batches touching **disjoint forced slots** (each request's
@@ -846,58 +873,19 @@ mod tests {
         let assignment = cfg.assignment_policy();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
-        let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
         let requests = vec![
             make_request(1, 0, 5),
             make_request(2, 0, 5),
             make_request(3, 0, 5),
         ];
 
-        let mut legacy = crate::online_swarm::OnlineAcoState::new(
-            6,
-            shared_forecast.clone(),
-            &cfg.flavours,
-            cfg.carbon_cost_duration_scale,
-            4,
-            3,
-            1.0,
-            2.0,
-            0.3,
-            1.0,
-            1.0,
-            7,
-        );
+        let mut legacy =
+            crate::online_swarm::OnlineAcoState::new(6, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
         legacy.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
 
-        let baseline = OnlineAcoState::new(
-            6,
-            shared_forecast.clone(),
-            &cfg.flavours,
-            cfg.carbon_cost_duration_scale,
-            4,
-            3,
-            1.0,
-            2.0,
-            0.3,
-            1.0,
-            1.0,
-            7,
-        );
+        let baseline = OnlineAcoState::new(6, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
         let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
-        let mut merged = OnlineAcoState::new(
-            6,
-            shared_forecast,
-            &cfg.flavours,
-            cfg.carbon_cost_duration_scale,
-            4,
-            3,
-            1.0,
-            2.0,
-            0.3,
-            1.0,
-            1.0,
-            7,
-        );
+        let mut merged = OnlineAcoState::new(6, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
         merged.merge_delta(delta);
 
         for i in 0..6 {
@@ -918,43 +906,16 @@ mod tests {
         let assignment = cfg.assignment_policy();
         let ctx = empty_ctx();
         let carbon_forecast = vec![1.0, 2.0, 1.5, 1.0, 2.0, 1.0];
-        let shared_forecast = Arc::new(RwLock::new(carbon_forecast.clone()));
         let requests = vec![
             make_request(1, 0, 5),
             make_request(2, 0, 5),
             make_request(3, 0, 5),
         ];
 
-        let baseline = OnlineAcoState::new(
-            6,
-            shared_forecast.clone(),
-            &cfg.flavours,
-            cfg.carbon_cost_duration_scale,
-            4,
-            3,
-            1.0,
-            2.0,
-            0.3,
-            1.0,
-            1.0,
-            7,
-        );
+        let baseline = OnlineAcoState::new(6, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
 
         let (_, delta) = baseline.solve_batch(&requests, &carbon_forecast, &ctx, &assignment);
-        let mut merged = OnlineAcoState::new(
-            6,
-            shared_forecast,
-            &cfg.flavours,
-            cfg.carbon_cost_duration_scale,
-            4,
-            3,
-            1.0,
-            2.0,
-            0.3,
-            1.0,
-            1.0,
-            7,
-        );
+        let mut merged = OnlineAcoState::new(6, 4, 3, 1.0, 2.0, 0.3, 1.0, 1.0, 7);
         merged.merge_delta(delta);
 
         // The merged tau must differ from the untouched baseline tau0 vector
