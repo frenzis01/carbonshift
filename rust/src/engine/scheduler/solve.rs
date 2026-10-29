@@ -14,14 +14,14 @@ use crate::engine::random_selection::{
 use crate::engine::solver::{
     ErrorTotals, ErrorWindowInput, QoSProfileInput, SolveInput, SolveRequest, SolverError,
 };
-use crate::shared_state::{GlobalErrorStats, SharedState};
+use crate::shared_state::{GlobalErrorStats, SolverSnapshot};
 use crate::types::{
     Assignment, CapacityTier, Flavour, Request, RequestAssignment, get_capacity_multiplier,
 };
 
 use super::recovery::{
     ErrorBaseline, apply_infeasibility_recovery, augment_with_decayed_past,
-    augment_with_virtual_prehistory, consume_mock_pool,
+    augment_with_virtual_prehistory,
 };
 
 use super::recovery::RecoveryState;
@@ -71,7 +71,7 @@ pub struct SolveContext {
 pub(super) struct BatchSolveContext<'a> {
     pub(super) current_slot: i32,
     pub(super) pending: &'a [Request],
-    pub(super) shared_state: &'a SharedState,
+    pub(super) snapshot: &'a SolverSnapshot,
     pub(super) assignment: &'a AssignmentPolicy<'a>,
     pub(super) solver_config: &'a SolverConfig,
     pub(super) simulation_config: &'a SimulationConfig,
@@ -82,18 +82,17 @@ pub(super) struct BatchSolveContext<'a> {
     pub(super) flavour_duration_by_name: &'a HashMap<String, f64>,
 }
 
-/// Common result contract consumed by the worker commit/rollback coordinator.
+/// Common result contract consumed by the worker's proposal materializer.
 pub(super) struct BatchSolveResult {
     pub(super) assignments: Vec<Assignment>,
     pub(super) context: SolveContext,
-    pub(super) baseline_slot_counts: HashMap<i32, i64>,
 }
 
 /// Solver strategy interface. New stateless batch algorithms can implement
 /// this contract and register a factory without changing worker dispatch.
 pub(super) trait BatchSolverStrategy: Send + Sync {
-    /// Return proposed assignments and diagnostic context for one claimed
-    /// batch. The worker owns commit/rollback after this method returns.
+    /// Return candidate assignments and diagnostic context for one claimed
+    /// batch. The worker drops their estimated prices before final commit.
     fn solve(&self, input: BatchSolveContext<'_>) -> BatchSolveResult;
 }
 
@@ -209,7 +208,7 @@ struct PreparedSolve {
 fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     let current_slot = input.current_slot;
     let pending = input.pending;
-    let shared_state = input.shared_state;
+    let snapshot = input.snapshot;
     let assignment = input.assignment;
     let solver = input.solver_config;
     let simulation = input.simulation_config;
@@ -235,11 +234,9 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
             .min(assignment.total_slots - 1)
     };
 
-    // ── Step 1 (pre-solve): capture a consistent snapshot of shared state ────
-    // All reads from shared state happen here, under a single lock acquisition.
-    // The lock is released before the solver runs.
-    let snapshot = shared_state.snapshot_for_solver();
-
+    // ── Step 1 (pre-solve): use the claim-time shared-state snapshot ─────────
+    // Queue removal and snapshot capture happened together before this worker
+    // was launched. No live shared-state reads occur while solving.
     // ── Step 2: decide which future work can move with this batch ────────────
     // If DP_LOCK_FUTURE_ASSIGNMENTS=True, future assignments are pinned as
     // baseline load.  If False, they join the pool for joint re-planning.
@@ -506,12 +503,12 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
     let BatchSolveContext {
         current_slot,
         pending,
-        shared_state: _,
+        snapshot: _,
         assignment,
         solver_config,
         simulation_config: _,
         recovery_config,
-        recovery_state,
+        recovery_state: _,
         verbose,
         carbon_forecast,
         flavour_duration_by_name: fdb,
@@ -637,7 +634,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
                 mode: "singleton_best".to_string(),
                 ..Default::default()
             },
-            baseline_slot_counts: HashMap::new(),
         };
     }
 
@@ -689,15 +685,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         }
     }
     let mock_consumed = (mock_pool_input.initial_count - mock_remaining).max(0);
-    consume_mock_pool(
-        current_slot,
-        &solve_mode,
-        mock_consumed,
-        &profile_id,
-        &recovery_config.recovery_mode,
-        recovery_state,
-    );
-
     let ctx = SolveContext {
         status: solve_status,
         mode: solve_mode,
@@ -724,7 +711,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
     BatchSolveResult {
         assignments,
         context: ctx,
-        baseline_slot_counts,
     }
 }
 
@@ -767,12 +753,12 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
     let BatchSolveContext {
         current_slot,
         pending: _,
-        shared_state: _,
+        snapshot: _,
         assignment,
         solver_config: _,
         simulation_config: _,
         recovery_config,
-        recovery_state,
+        recovery_state: _,
         verbose: _,
         carbon_forecast,
         flavour_duration_by_name: fdb,
@@ -819,7 +805,6 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
                     mode: "singleton_best".to_string(),
                     ..Default::default()
                 },
-                baseline_slot_counts: HashMap::new(),
             };
         }
 
@@ -940,14 +925,6 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
         }
     }
     let mock_consumed = (prep.mock_pool_input.initial_count - mock_remaining).max(0);
-    consume_mock_pool(
-        current_slot,
-        &solve_mode,
-        mock_consumed,
-        &prep.profile_id,
-        &recovery_config.recovery_mode,
-        recovery_state,
-    );
 
     let ctx = SolveContext {
         status: solve_status,
@@ -975,7 +952,6 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
     BatchSolveResult {
         assignments,
         context: ctx,
-        baseline_slot_counts: prep.baseline_slot_counts,
     }
 }
 
@@ -1072,7 +1048,6 @@ fn solve_random(
     BatchSolveResult {
         assignments,
         context,
-        baseline_slot_counts: prep.baseline_slot_counts,
     }
 }
 

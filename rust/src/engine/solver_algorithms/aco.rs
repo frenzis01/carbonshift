@@ -1,7 +1,7 @@
 /// ACO algorithm wrap up for slot assignment
 ///  
 /// Every ant chooses slots balancing estimated cost and pheromone deposited by previous best solutions.
-///     - tau represents the pheromone deposit for each slot, and gets updated 
+///     - tau represents the pheromone deposit for each slot, and gets updated
 ///         - locally at every iteration
 ///         - globally after commit (n_iterations)
 ///     - eta represents the heuristic desirability of a slot, and is re-computed at each request assignment choice.
@@ -12,7 +12,6 @@
 /// 4. Each placement in that best solution adds a deposit of Q / L to its slot, where Q is q_deposit.
 /// This is repeated each iteration.
 /// Local changes are applied per iteration, not globally. Only the committed best solution globally updates pheromone.
-
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -207,7 +206,7 @@ impl SolverAlgorithm for AcoAlgorithm {
             ));
         }
 
-        // Filter on-time requests to exclude 
+        // Filter on-time requests to exclude
         let on_time_requests: Vec<_> = input
             .requests
             .iter()
@@ -425,7 +424,6 @@ impl SolverAlgorithm for AcoAlgorithm {
         }
     }
 }
-
 
 /// Chooses a slot based on pheromone and counts
 /// Returns the chosen slot or an error if none are available

@@ -21,6 +21,22 @@ import multiple_runs as mr  # noqa: E402
 import run_battery as rb  # noqa: E402
 
 
+def test_battery_runner_defaults_online_swarm_to_parallel_merge(tmp_path):
+    config_path = rb._write_rust_config(
+        tmp_path / "scenario.json",
+        [],
+        tmp_path / "output",
+        "carryover",
+        False,
+    )
+    try:
+        config = json.loads(config_path.read_text())
+    finally:
+        config_path.unlink(missing_ok=True)
+
+    assert config["runner"]["online_swarm_mode"] == "merge"
+
+
 def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path):
     scenario = rb._generate_scenario(
         {"id": "window", "seed": 1, "total_slots": 2, "requests_per_slot": 1.0},

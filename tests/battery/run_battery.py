@@ -115,9 +115,12 @@ from scenario_io import generate_scenario_data, load_json, save_json  # noqa: E4
 DEFAULT_MAX_BATCH_SOLVER_PARALLELISM = 20
 DEFAULT_REALTIME_SLOTS = False
 DEFAULT_REALTIME_SPEED_SCALE = 0.05
+# Retained in output/config files for compatibility; proposal commits now price
+# against live occupancy and do not roll back or re-solve.
 DEFAULT_ROLLBACK_MAX_CONSECUTIVE = 0
-# Mirrors rust/src/config.rs's Config::online_swarm_mode default ("serialized").
-DEFAULT_ONLINE_SWARM_MODE = "serialized"
+# Use the merge backend by default so online swarm runs can use the configured
+# batch-worker parallelism. Select "serialized" explicitly for reproducibility.
+DEFAULT_ONLINE_SWARM_MODE = "merge"
 
 RESULT_COLUMNS = [
     "scenario_id",
@@ -815,10 +818,10 @@ def _format_run_folder_name(
     Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_roll<X>_<realtime_scale>_<altstratT|F>_<S|M>
     - realtime_scale is "0" when realtime_slots is disabled, otherwise the
       configured speed scale with its decimal point stripped (0.5 -> "05").
-    - rollX is the configured rollback_max_consecutive (0 = rollback disabled).
+    - rollX preserves the configured legacy rollback_max_consecutive value.
     - altstrat is "T" if any online/additional alternative strategy is enabled.
-    - the trailing token is "S" for online_swarm_mode="serialized" (default)
-      or "M" for "merge" — see Config::online_swarm_mode in rust/src/config.rs.
+    - the trailing token is "S" for online_swarm_mode="serialized" or "M" for
+      "merge" (the battery runner's default) — see Config::swarm.mode.
     """
     mmdd = start_dt.strftime("%m%d")
     hhmm = start_dt.strftime("%H%M")
@@ -1019,9 +1022,9 @@ def _write_run_readme(
         f"- DP pruning min batch size: {rust_defaults.get('dp_pruning_min_batch_size', '?')}",
         f"- Max error threshold: {rust_defaults.get('max_error_threshold', '?')}%",
         f"- DP solver timeout: {rust_defaults.get('dp_timeout', '?')}s",
-        f"- Rollback max consecutive (this run): {rollback_max_consecutive} "
-        f"({'disabled' if rollback_max_consecutive == 0 else 'enabled'}; "
-        "affects DP and request-level strategies, not bandit/ant_colony)",
+        f"- Legacy rollback max consecutive: {rollback_max_consecutive} "
+        "(retained for config compatibility; proposal commits are materialized "
+        "against live occupancy and are not rolled back or re-solved)",
         f"- Infeasibility recovery mode: {rust_defaults.get('infeasibility_recovery_mode', '?')}",
         "",
         "## Enabled phases",

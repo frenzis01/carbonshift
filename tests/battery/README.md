@@ -18,6 +18,22 @@ Set `input_pattern` on a scenario in `battery_config.json` to:
 Both patterns retain independently seeded random arrival times within each
 slot. Carbon-intensity generation is unchanged by this setting.
 
+## Batch-worker parallelism
+
+`max_batch_solver_parallelism` is an upper bound on concurrent scheduler
+workers, not a promise that workers stay busy when there are too few pending
+batches or a run is starting or draining. DP and online scheduler runs may
+claim multiple batches from the same QoS profile at once. Each worker solves
+from the snapshot taken when its requests are claimed. Commit recalculates
+carbon prices using current slot occupancy, but does not revalidate the
+profile's error threshold against concurrent commits; a burst can temporarily
+exceed it, and later batches see the committed errors. The battery runner uses
+the online swarm `merge` backend by default so bandit and ant-colony batches
+can use this worker cap. Set `online_swarm_mode` to `serialized` to run those
+strategies with one worker instead. `avg_concurrent_workers` is time-weighted
+over intervals with at least one batch worker active, excluding no-work
+startup and drain time.
+
 ## Future-slot assignment trimming
 
 Set the top-level `trim_future_assignments` field in `battery_config.json` to

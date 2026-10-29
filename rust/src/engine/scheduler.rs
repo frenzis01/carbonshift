@@ -21,8 +21,9 @@ use std::sync::RwLock;
 
 use crate::config::{AssignmentPolicy, Config, SolverConfig, SwarmConfig};
 use crate::engine::qos::QosProfileId;
+use crate::engine::solver::{ProposedPlacement, SolverProposal};
 use crate::metrics_logger::MetricsLogger;
-use crate::shared_state::{CommitOutcome, SharedState};
+use crate::shared_state::{ClaimedRequestBatch, SharedState, SolverSnapshot};
 use crate::types::{Assignment, Request};
 
 mod forecast;
@@ -49,7 +50,85 @@ struct SchedulerStats {
     solver_total_requests: u64,
     last_solver_elapsed_ms: f64,
     peak_concurrent_workers: usize,
-    sum_active_workers_at_dispatch: u64,
+    /// Integral of active worker count over scheduler wall time, in worker-seconds.
+    worker_time_area_secs: f64,
+    /// Wall time during which at least one batch worker was active.
+    worker_busy_time_secs: f64,
+    started_at: Option<Instant>,
+    last_worker_count_change: Option<Instant>,
+    worker_busy_started_at: Option<Instant>,
+    finished_at: Option<Instant>,
+}
+
+impl SchedulerStats {
+    fn start(&mut self, now: Instant) {
+        self.started_at = Some(now);
+        self.last_worker_count_change = Some(now);
+        self.worker_busy_started_at = None;
+        self.finished_at = None;
+        self.worker_time_area_secs = 0.0;
+        self.worker_busy_time_secs = 0.0;
+    }
+
+    fn record_worker_count_change(
+        &mut self,
+        active_workers_before: usize,
+        active_workers_after: usize,
+        now: Instant,
+    ) {
+        let Some(last_change) = self.last_worker_count_change else {
+            return;
+        };
+        self.worker_time_area_secs +=
+            active_workers_before as f64 * now.duration_since(last_change).as_secs_f64();
+        if active_workers_before == 0 && active_workers_after > 0 {
+            self.worker_busy_started_at = Some(now);
+        } else if active_workers_before > 0 && active_workers_after == 0 {
+            if let Some(started_at) = self.worker_busy_started_at.take() {
+                self.worker_busy_time_secs += now.duration_since(started_at).as_secs_f64();
+            }
+        }
+        self.last_worker_count_change = Some(now);
+    }
+
+    fn finish(&mut self, active_workers: usize, now: Instant) {
+        self.record_worker_count_change(active_workers, active_workers, now);
+        if active_workers == 0 {
+            self.finished_at = Some(now);
+        }
+    }
+
+    fn average_concurrent_workers(&self, active_workers: usize, now: Instant) -> f64 {
+        let Some(_) = self.started_at else {
+            return 0.0;
+        };
+        let busy_time_secs = self.worker_busy_time_secs
+            + if active_workers > 0 {
+                self.worker_busy_started_at
+                    .map(|started_at| now.duration_since(started_at).as_secs_f64())
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+        if busy_time_secs <= 0.0 {
+            return 0.0;
+        }
+        let current_worker_time = if self.finished_at.is_none() {
+            self.last_worker_count_change
+                .map(|last_change| {
+                    active_workers as f64 * now.duration_since(last_change).as_secs_f64()
+                })
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        (self.worker_time_area_secs + current_worker_time) / busy_time_secs
+    }
+}
+
+enum BatchWorkerOutcome {
+    Committed,
+    Infeasible,
 }
 
 /// Wraps the two selectable online-swarm concurrency backends (see
@@ -98,8 +177,7 @@ struct SchedulerMutableState {
     active_workers: usize,
     /// Revision of the global tiers used by the cached online-solvers.
     capacity_tier_revision: u64,
-    /// Only one solve may be in flight for a profile so its next batch sees
-    /// the previous batch's committed error-budget contribution.
+    /// Used when a caller opts to serialize batches for each QoS profile.
     active_profiles: HashSet<QosProfileId>,
     /// Anti-storm guard scoped to a profile's pending queue.
     last_infeasible: HashMap<QosProfileId, (i32, usize)>,
@@ -135,7 +213,7 @@ pub struct SchedulerStatistics {
     pub max_batch_parallelism: usize,
     /// Highest number of simultaneous workers observed since startup.
     pub peak_concurrent_workers: usize,
-    /// Mean active-worker count at each worker dispatch.
+    /// Time-weighted average worker count while at least one batch worker is active.
     pub avg_concurrent_workers: f64,
 }
 
@@ -150,6 +228,8 @@ pub struct BatchScheduler {
     flavour_duration_by_name: Arc<HashMap<String, f64>>,
     running: Arc<AtomicBool>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
+    /// Whether multiple batches for one QoS profile may solve concurrently.
+    allow_same_profile_parallelism: bool,
     pub metrics_logger: Arc<MetricsLogger>,
     main_thread: Option<JoinHandle<()>>,
 }
@@ -163,6 +243,33 @@ impl BatchScheduler {
         cfg: Arc<Config>,
         metrics_logger: Arc<MetricsLogger>,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
+    ) -> Self {
+        Self::new_inner(shared_state, cfg, metrics_logger, carbon_forecast, false)
+    }
+
+    /// Create a scheduler that may solve multiple batches from one QoS profile
+    /// concurrently. Each worker uses the state snapshot captured atomically
+    /// with its queue claim; proposals are committed as-is, with carbon costs
+    /// recalculated against live slot occupancy.
+    ///
+    /// The `nshift` DP and online benchmark phases use this constructor to
+    /// exercise the configured worker cap. The default constructor retains
+    /// the live service's one-worker-per-profile behavior.
+    pub fn new_with_parallel_profile_batches(
+        shared_state: SharedState,
+        cfg: Arc<Config>,
+        metrics_logger: Arc<MetricsLogger>,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
+    ) -> Self {
+        Self::new_inner(shared_state, cfg, metrics_logger, carbon_forecast, true)
+    }
+
+    fn new_inner(
+        shared_state: SharedState,
+        cfg: Arc<Config>,
+        metrics_logger: Arc<MetricsLogger>,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
+        allow_same_profile_parallelism: bool,
     ) -> Self {
         // Offline schedulers have no REST AppState to initialize the runtime
         // policy. For the live service this is idempotent with AppState::new.
@@ -190,6 +297,7 @@ impl BatchScheduler {
                 recovery: Arc::new(RecoveryState::new()),
                 swarm_states: HashMap::new(),
             })),
+            allow_same_profile_parallelism,
             metrics_logger,
             main_thread: None,
         }
@@ -201,6 +309,8 @@ impl BatchScheduler {
             return;
         }
 
+        self.mutable.lock().unwrap().stats.start(Instant::now());
+
         let running = self.running.clone();
         let ss = self.shared_state.clone();
         let cfg = self.cfg.clone();
@@ -208,6 +318,7 @@ impl BatchScheduler {
         let fdb = self.flavour_duration_by_name.clone();
         let mutable = self.mutable.clone();
         let ml = self.metrics_logger.clone();
+        let allow_same_profile_parallelism = self.allow_same_profile_parallelism;
 
         if cfg.logging.verbose {
             println!(
@@ -217,7 +328,16 @@ impl BatchScheduler {
         }
 
         self.main_thread = Some(std::thread::spawn(move || {
-            main_loop(running, ss, cfg, forecast, fdb, mutable, ml);
+            main_loop(
+                running,
+                ss,
+                cfg,
+                forecast,
+                fdb,
+                mutable,
+                ml,
+                allow_same_profile_parallelism,
+            );
         }));
     }
 
@@ -235,6 +355,12 @@ impl BatchScheduler {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        {
+            let mut mutable = self.mutable.lock().unwrap();
+            let now = Instant::now();
+            let active_workers = mutable.active_workers;
+            mutable.stats.finish(active_workers, now);
+        }
         if self.cfg.logging.verbose {
             let batches = self.mutable.lock().unwrap().stats.batches_processed;
             println!("[Scheduler] Stopped (processed {batches} batches)");
@@ -243,14 +369,13 @@ impl BatchScheduler {
 
     /// Return a consistent snapshot of counters and worker concurrency.
     ///
-    /// Averages are computed from accumulated solver time and batch/request
-    /// totals; they are zero until the corresponding denominator is nonzero.
+    /// Solver averages use accumulated solver time and batch/request totals;
+    /// worker concurrency is averaged over elapsed scheduler wall time.
     pub fn get_statistics(&self) -> SchedulerStatistics {
         let m = self.mutable.lock().unwrap();
         let runs = m.stats.solver_runs;
         let time_ms = m.stats.solver_total_time_ms;
         let reqs = m.stats.solver_total_requests;
-        let dispatches = m.stats.solver_runs; // one dispatch per solver run
         // Derive averages from accumulated totals rather than maintaining
         // counters on every worker completion; zero-run cases have no average.
         SchedulerStatistics {
@@ -263,11 +388,9 @@ impl BatchScheduler {
             active_batch_workers: m.active_workers,
             max_batch_parallelism: self.cfg.solver.max_batch_solver_parallelism,
             peak_concurrent_workers: m.stats.peak_concurrent_workers,
-            avg_concurrent_workers: if dispatches > 0 {
-                m.stats.sum_active_workers_at_dispatch as f64 / dispatches as f64
-            } else {
-                0.0
-            },
+            avg_concurrent_workers: m
+                .stats
+                .average_concurrent_workers(m.active_workers, Instant::now()),
         }
     }
 
@@ -285,7 +408,7 @@ impl BatchScheduler {
 ///
 /// This runs on the background thread created by [`BatchScheduler::start`].
 /// Batch work itself runs on worker threads so the loop can continue updating
-/// time, observing queue state, and admitting other profile batches.
+/// time, observing queue state, and admitting additional batches.
 fn main_loop(
     running: Arc<AtomicBool>,
     shared_state: SharedState,
@@ -294,8 +417,10 @@ fn main_loop(
     fdb: Arc<HashMap<String, f64>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
     ml: Arc<MetricsLogger>,
+    allow_same_profile_parallelism: bool,
 ) {
     let wall_start = Instant::now();
+    let scheduler_thread = std::thread::current();
     let slot_ms = (cfg.effective_slot_duration_secs() * 1000.0) as u64;
     let eff_slot_dur = cfg.effective_slot_duration_secs();
     let mut last_flush_slot: i32 = -1;
@@ -365,9 +490,6 @@ fn main_loop(
         let mut did_something = false;
         let close_slot_flush = shared_state.pending_flush_requested(current_slot);
 
-        // unwrap carbon_forecast here so that we get a consistent snapshot for this batch.
-        let cf = Arc::new(carbon_forecast.read().unwrap().clone());
-
         let has_full_profile_batch = shared_state
             .pending_profile_counts()
             .iter()
@@ -384,12 +506,14 @@ fn main_loop(
                 current_slot,
                 &shared_state,
                 &cfg,
-                &cf,
+                &carbon_forecast,
                 &fdb,
                 &mutable,
                 &ml,
                 &running,
                 false,
+                allow_same_profile_parallelism,
+                &scheduler_thread,
             );
         } else if pending_count > 0
             && active_workers < cfg.solver.max_batch_solver_parallelism
@@ -404,12 +528,14 @@ fn main_loop(
                 current_slot,
                 &shared_state,
                 &cfg,
-                &cf,
+                &carbon_forecast,
                 &fdb,
                 &mutable,
                 &ml,
                 &running,
                 true,
+                allow_same_profile_parallelism,
+                &scheduler_thread,
             );
             last_flush_slot = current_slot;
             flush_backlog = has_retryable_profile_pending(&shared_state, &mutable, current_slot);
@@ -432,12 +558,14 @@ fn main_loop(
                         current_slot,
                         &shared_state,
                         &cfg,
-                        &cf,
+                        &carbon_forecast,
                         &fdb,
                         &mutable,
                         &ml,
                         &running,
                         true,
+                        allow_same_profile_parallelism,
+                        &scheduler_thread,
                     );
                     flush_backlog =
                         has_retryable_profile_pending(&shared_state, &mutable, current_slot);
@@ -478,7 +606,7 @@ fn main_loop(
         } else {
             10
         };
-        std::thread::sleep(Duration::from_millis(sleep_ms));
+        std::thread::park_timeout(Duration::from_millis(sleep_ms));
 
         // Progress display (skipped in verbose mode to avoid mixing with debug lines).
         if !cfg.logging.verbose && cfg.logging.enable_progress_display {
@@ -522,18 +650,20 @@ fn next_profile_to_dispatch(
     pending_by_profile: &[(QosProfileId, usize)],
     last_dispatched: Option<&QosProfileId>,
     active_profiles: &HashSet<QosProfileId>,
+    allow_same_profile_parallelism: bool,
     last_infeasible: &HashMap<QosProfileId, (i32, usize)>,
     slot: i32,
     min_pending: usize,
 ) -> Option<(QosProfileId, usize)> {
-    // A profile is eligible only when it has enough work, no solve is already
-    // active for it, and this exact infeasible queue was not just retried.
+    // When enabled, same-profile batches solve concurrently from independent
+    // snapshots. Otherwise, an active profile is serialized. Only an
+    // unchanged infeasible queue is held back.
     // Sorting before applying the cursor makes round-robin order deterministic.
     let mut eligible: Vec<_> = pending_by_profile
         .iter()
         .filter(|(profile_id, count)| {
             *count >= min_pending
-                && !active_profiles.contains(profile_id)
+                && (allow_same_profile_parallelism || !active_profiles.contains(profile_id))
                 && last_infeasible.get(profile_id) != Some(&(slot, *count))
         })
         .map(|(profile_id, count)| (profile_id.clone(), *count))
@@ -569,29 +699,59 @@ fn has_retryable_profile_pending(
     })
 }
 
-/// Claim eligible profile-homogeneous batches and launch one worker per batch.
-///
-/// During a normal pass, a complete configured batch is required. A flush
-/// relaxes that minimum to one so stragglers are not stranded until another
-/// request arrives. The return value tells the main loop whether it launched
-/// any workers during this pass.
+/// Claim the next eligible batch while the caller owns the scheduler mutex.
+fn claim_next_profile_batch(
+    slot: i32,
+    min_pending: usize,
+    allow_same_profile_parallelism: bool,
+    shared_state: &SharedState,
+    cfg: &Config,
+    scheduler_state: &mut SchedulerMutableState,
+) -> Option<(QosProfileId, ClaimedRequestBatch)> {
+    let (profile_id, pending_count) = next_profile_to_dispatch(
+        &shared_state.pending_profile_counts(),
+        scheduler_state.last_dispatched_profile.as_ref(),
+        &scheduler_state.active_profiles,
+        allow_same_profile_parallelism,
+        &scheduler_state.last_infeasible,
+        slot,
+        min_pending,
+    )?;
+    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
+        &profile_id,
+        pending_count.min(cfg.solver.batch_size),
+    );
+    if claimed.requests.len() < min_pending {
+        shared_state.requeue_pending_requests_front(claimed.requests);
+        return None;
+    }
+
+    scheduler_state.last_dispatched_profile = Some(profile_id.clone());
+    scheduler_state.active_profiles.insert(profile_id.clone());
+    Some((profile_id, claimed))
+}
+
+/// Fill the configured worker pool with independent, profile-homogeneous work.
+/// Each worker keeps its slot and immediately claims another eligible batch
+/// when one is available, avoiding a thread teardown/spawn gap between batches.
 fn dispatch_batch_workers(
     slot: i32,
     shared_state: &SharedState,
     cfg: &Arc<Config>,
-    carbon_forecast: &Arc<Vec<f64>>,
+    carbon_forecast: &Arc<RwLock<Vec<f64>>>,
     fdb: &Arc<HashMap<String, f64>>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &Arc<MetricsLogger>,
     running: &Arc<AtomicBool>,
     flush: bool,
+    allow_same_profile_parallelism: bool,
+    scheduler_thread: &std::thread::Thread,
 ) -> bool {
     let mut dispatched = false;
     let min_pending = if flush { 1 } else { cfg.solver.batch_size };
-    // Serialized swarm solvers update their persistent state in place. Keep
-    // those solves one-at-a-time so a rollback cannot occur after their
-    // strategy state has already been mutated. Every worker also holds the
-    // shared capacity-tier read guard through solve and commit.
+    // Serialized swarm state mutates in place, so only that backend is
+    // restricted to one worker. Stateless strategies and merge-mode swarm
+    // workers can use the configured cap.
     let max_workers =
         if is_online_swarm_strategy(&cfg.solver.solver_strategy) && cfg.swarm.mode != "merge" {
             1
@@ -604,98 +764,179 @@ fn dispatch_batch_workers(
             return dispatched;
         }
 
-        let (profile_id, profile_pending_count, pending) = {
+        let (profile_id, claimed) = {
             let mut g = mutable.lock().unwrap();
             if g.active_workers >= max_workers {
                 return dispatched;
             }
-            let Some((profile_id, profile_pending_count)) = next_profile_to_dispatch(
-                &shared_state.pending_profile_counts(),
-                g.last_dispatched_profile.as_ref(),
-                &g.active_profiles,
-                &g.last_infeasible,
+            let Some(claimed) = claim_next_profile_batch(
                 slot,
                 min_pending,
+                allow_same_profile_parallelism,
+                shared_state,
+                cfg,
+                &mut g,
             ) else {
                 return dispatched;
             };
-            let claim_count = profile_pending_count.min(cfg.solver.batch_size);
-            let pending = shared_state.claim_pending_requests_for_profile(&profile_id, claim_count);
-            if pending.is_empty() {
-                return dispatched;
-            }
-            if pending.len() < min_pending {
-                // A queue can shrink between counting and claiming. Put this
-                // undersized claim back before releasing the profile as active.
-                shared_state.requeue_pending_requests_front(pending);
-                return dispatched;
-            }
-
-            // Reserve the profile and worker slot before spawning, so another
-            // pass cannot claim a second batch for the same QoS budget.
-            g.last_dispatched_profile = Some(profile_id.clone());
-            g.active_profiles.insert(profile_id.clone());
+            let now = Instant::now();
+            let active_workers = g.active_workers;
+            g.stats
+                .record_worker_count_change(active_workers, active_workers + 1, now);
             g.active_workers += 1;
-            let new_count = g.active_workers;
-            if new_count > g.stats.peak_concurrent_workers {
-                g.stats.peak_concurrent_workers = new_count;
-            }
-            g.stats.sum_active_workers_at_dispatch += new_count as u64;
-            (profile_id, profile_pending_count, pending)
+            g.stats.peak_concurrent_workers = g.stats.peak_concurrent_workers.max(g.active_workers);
+            claimed
         };
 
-        if pending.is_empty() {
-            return dispatched;
-        }
-
-        let ss = shared_state.clone();
-        let cfg2 = cfg.clone();
-        let forecast = carbon_forecast.clone();
-        let fdb2 = fdb.clone();
-        let mut2 = mutable.clone();
-        let ml2 = ml.clone();
-
+        let shared_state = shared_state.clone();
+        let cfg = cfg.clone();
+        let carbon_forecast = carbon_forecast.clone();
+        let fdb = fdb.clone();
+        let mutable = mutable.clone();
+        let ml = ml.clone();
+        let running = running.clone();
+        let scheduler_thread = scheduler_thread.clone();
         std::thread::spawn(move || {
-            let scheduled =
-                batch_worker_entry(slot, pending, &ss, &cfg2, &forecast, &fdb2, &mut2, &ml2);
-            // Release reservations on both success and infeasibility. Remember
-            // an unchanged failed queue so the main loop can retry it later,
-            // rather than spinning immediately on the same input.
-            let mut g = mut2.lock().unwrap();
-            g.active_workers -= 1;
-            g.active_profiles.remove(&profile_id);
-            if scheduled {
-                g.last_infeasible.remove(&profile_id);
-            } else {
-                g.last_infeasible
-                    .insert(profile_id, (slot, profile_pending_count));
-            }
+            batch_worker_loop(
+                slot,
+                profile_id,
+                claimed,
+                min_pending,
+                allow_same_profile_parallelism,
+                shared_state,
+                cfg,
+                carbon_forecast,
+                fdb,
+                mutable,
+                ml,
+                running,
+                scheduler_thread,
+            );
         });
         dispatched = true;
     }
 }
 
+fn batch_worker_loop(
+    mut slot: i32,
+    mut profile_id: QosProfileId,
+    mut claimed: ClaimedRequestBatch,
+    min_pending: usize,
+    allow_same_profile_parallelism: bool,
+    shared_state: SharedState,
+    cfg: Arc<Config>,
+    carbon_forecast: Arc<RwLock<Vec<f64>>>,
+    fdb: Arc<HashMap<String, f64>>,
+    mutable: Arc<Mutex<SchedulerMutableState>>,
+    ml: Arc<MetricsLogger>,
+    running: Arc<AtomicBool>,
+    scheduler_thread: std::thread::Thread,
+) {
+    loop {
+        let profile_pending_count = claimed.profile_pending_count;
+        let forecast = carbon_forecast.read().unwrap().clone();
+        let outcome = batch_worker_entry(
+            slot,
+            claimed.requests,
+            claimed.snapshot,
+            &shared_state,
+            &cfg,
+            &forecast,
+            &fdb,
+            &mutable,
+            &ml,
+        );
+
+        let mut g = mutable.lock().unwrap();
+        match outcome {
+            BatchWorkerOutcome::Committed => {
+                g.last_infeasible.remove(&profile_id);
+            }
+            BatchWorkerOutcome::Infeasible => {
+                g.last_infeasible
+                    .insert(profile_id.clone(), (slot, profile_pending_count));
+            }
+        }
+        g.active_profiles.remove(&profile_id);
+
+        let next_slot = shared_state.get_current_slot();
+        let next_batch = if running.load(Ordering::Relaxed) {
+            claim_next_profile_batch(
+                next_slot,
+                min_pending,
+                allow_same_profile_parallelism,
+                &shared_state,
+                &cfg,
+                &mut g,
+            )
+        } else {
+            None
+        };
+        if let Some((next_profile_id, next_claimed)) = next_batch {
+            profile_id = next_profile_id;
+            claimed = next_claimed;
+            slot = next_slot;
+            drop(g);
+            continue;
+        }
+
+        let now = Instant::now();
+        let active_workers = g.active_workers;
+        g.stats
+            .record_worker_count_change(active_workers, active_workers - 1, now);
+        g.active_workers -= 1;
+        if !running.load(Ordering::Relaxed) && g.active_workers == 0 {
+            g.stats.finish(0, now);
+        }
+        drop(g);
+        scheduler_thread.unpark();
+        return;
+    }
+}
+
 // ─── worker entry ─────────────────────────────────────────────────────────────
 
-/// Solve and commit one already-claimed, single-profile batch.
-///
-/// The worker snapshots the capacity-tier policy, builds the profile-specific
-/// assignment policy, invokes the selected solver, then performs an atomic
-/// capacity check. If another worker changed occupancy after this solve's
-/// snapshot, the batch is solved again against fresh state.
+fn assignments_to_solver_proposal(assignments: &[Assignment]) -> SolverProposal {
+    // The legacy batch solvers price candidates against their snapshot while
+    // optimizing. Keep only the placement decision here; the shared-state
+    // commit recalculates every final price using current occupancy.
+    SolverProposal {
+        placements: assignments
+            .iter()
+            .map(|assignment| {
+                if assignment
+                    .deadline_slot
+                    .is_some_and(|deadline| assignment.scheduled_slot > deadline)
+                {
+                    ProposedPlacement::late(
+                        assignment.request_id,
+                        assignment.scheduled_slot,
+                        assignment.flavour_name.clone(),
+                    )
+                } else {
+                    ProposedPlacement::new(
+                        assignment.request_id,
+                        assignment.scheduled_slot,
+                        assignment.flavour_name.clone(),
+                    )
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Solve and commit one already-claimed, single-profile batch using its claim-time snapshot.
 fn batch_worker_entry(
     slot: i32,
     pending: Vec<Request>,
+    snapshot: SolverSnapshot,
     shared_state: &SharedState,
     cfg: &Config,
     carbon_forecast: &[f64],
     fdb: &HashMap<String, f64>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
-) -> bool {
-    // Keep a read guard for this whole worker: the capacity setter takes the
-    // corresponding write lock, so a running batch finishes its solve and
-    // commit with the same tier ladder before a replacement becomes visible.
+) -> BatchWorkerOutcome {
     let capacity_tiers_guard = shared_state.capacity_tiers_guard();
     let capacity_tiers = capacity_tiers_guard
         .as_deref()
@@ -704,11 +945,6 @@ fn batch_worker_entry(
     {
         let mut scheduler_state = mutable.lock().unwrap();
         if scheduler_state.capacity_tier_revision != capacity_tier_revision {
-            // Online bandit/ACO estimates are measured in carbon cost. They
-            // cannot be compared to new costs after a tier switch, so discard
-            // those learned estimates when this worker first sees the new
-            // ladder. The tier read guard ensures no setter can race this
-            // reset, solve, or the eventual commit.
             scheduler_state.swarm_states.clear();
             scheduler_state.capacity_tier_revision = capacity_tier_revision;
         }
@@ -733,11 +969,11 @@ fn batch_worker_entry(
         "batch_worker_entry requires a homogeneous QoS profile batch"
     );
 
-    // Fork: swarm strategies bypass the DP solver entirely.
     if is_online_swarm_strategy(&cfg.solver.solver_strategy) {
         return batch_worker_entry_swarm(
             slot,
             pending,
+            &snapshot,
             shared_state,
             cfg,
             &assignment,
@@ -757,276 +993,231 @@ fn batch_worker_entry(
 
     let recovery_state = Arc::clone(&mutable.lock().unwrap().recovery);
     let batch_solver = select_batch_solver(&cfg.solver.solver_strategy);
-    let mut consecutive_rollbacks: usize = 0;
+    let t0 = Instant::now();
+    let wall_start = unix_now_f64();
+    let solve_result = batch_solver.solve(BatchSolveContext {
+        current_slot: slot,
+        pending: &pending,
+        snapshot: &snapshot,
+        assignment: &assignment,
+        solver_config: &cfg.solver,
+        simulation_config: &cfg.simulation,
+        recovery_config: &cfg.infeasibility,
+        recovery_state: &recovery_state,
+        verbose: cfg.logging.verbose,
+        carbon_forecast,
+        flavour_duration_by_name: fdb,
+    });
+    let proposed_assignments = solve_result.assignments;
+    let ctx = solve_result.context;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let wall_end = unix_now_f64();
 
-    loop {
-        let t0 = Instant::now();
-        let wall_start = unix_now_f64();
+    if proposed_assignments.is_empty() {
+        shared_state.requeue_pending_requests_front(pending);
+        return BatchWorkerOutcome::Infeasible;
+    }
 
-        // Solvers read a consistent snapshot and return proposals; they do not
-        // mutate committed assignments. This separation lets the following
-        // commit check detect races and safely request a fresh solve.
-        let solve_result = batch_solver.solve(BatchSolveContext {
-            current_slot: slot,
-            pending: &pending,
-            shared_state,
-            assignment: &assignment,
-            solver_config: &cfg.solver,
-            simulation_config: &cfg.simulation,
-            recovery_config: &cfg.infeasibility,
-            recovery_state: &recovery_state,
-            verbose: cfg.logging.verbose,
-            carbon_forecast,
-            flavour_duration_by_name: fdb,
-        });
-        let assignments = solve_result.assignments;
-        let ctx = solve_result.context;
-        let baseline_slot_counts = solve_result.baseline_slot_counts;
-
-        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let wall_end = unix_now_f64();
-
-        if assignments.is_empty() {
-            // Infeasible: return pending to the front of the queue.
+    let proposal = assignments_to_solver_proposal(&proposed_assignments);
+    let assignments = match shared_state.materialize_and_commit_proposal(
+        &proposal,
+        &pending,
+        &snapshot,
+        &profile_id,
+        slot,
+        assignment.flavours,
+        carbon_forecast,
+        assignment.capacity_tiers,
+        assignment.carbon_cost_duration_scale,
+    ) {
+        Ok(assignments) => assignments,
+        Err(error) => {
+            eprintln!(
+                "[Scheduler] Could not materialize proposal for profile {profile_id}: {error}"
+            );
             shared_state.requeue_pending_requests_front(pending);
-            return false;
+            return BatchWorkerOutcome::Infeasible;
         }
+    };
+    recovery::consume_mock_pool(
+        slot,
+        &ctx.mode,
+        ctx.mock_recovery_consumed,
+        &profile_id,
+        &cfg.infeasibility.recovery_mode,
+        &recovery_state,
+    );
 
-        // Compute the per-slot counts the solver assumed (baseline + batch).
-        let mut expected_per_slot = baseline_slot_counts.clone();
-        for a in &assignments {
-            *expected_per_slot.entry(a.scheduled_slot).or_insert(0) += 1;
-        }
+    let new_count = pending.len();
+    let total_count = assignments.len();
+    let replanned = total_count.saturating_sub(new_count);
+    let total_cost: f64 = assignments.iter().map(|a| a.carbon_cost).sum();
 
-        // TODO verify if this is okay
-        // Limit expected_per_slot to only include the slots to which we are assigning requests in this batch.
-        expected_per_slot.retain(|slot, _| assignments.iter().any(|a| a.scheduled_slot == *slot));
+    // Update stats and get run_sequence for logging.
+    let (run_sequence, batches_processed, total_scheduled) = {
+        let mut g = mutable.lock().unwrap();
+        g.stats.solver_runs += 1;
+        g.stats.batches_processed += 1;
+        g.stats.total_scheduled += new_count as u64;
+        g.stats.solver_total_time_ms += elapsed_ms;
+        g.stats.solver_total_requests += new_count as u64;
+        g.stats.last_solver_elapsed_ms = elapsed_ms;
+        (
+            g.stats.solver_runs,
+            g.stats.batches_processed,
+            g.stats.total_scheduled,
+        )
+    };
 
-        // The solver priced each request using this expected occupancy.
-        // Commit rechecks it against global state because other profile workers
-        // may have committed into the same slots in the meantime.
-        let force_commit = cfg.solver.rollback_max_consecutive == 0
-            || consecutive_rollbacks >= cfg.solver.rollback_max_consecutive;
+    if cfg.logging.verbose {
+        let avg_error: f64 =
+            assignments.iter().map(|a| a.error).sum::<f64>() / assignments.len() as f64;
+        println!(
+            "[Scheduler] ✓ Scheduled {} new requests{} \
+                         (cost={total_cost:.2}, error={avg_error:.2}%, solver={elapsed_ms:.2}ms)",
+            new_count,
+            if replanned > 0 {
+                format!(" + {replanned} re-planned")
+            } else {
+                String::new()
+            },
+        );
+    }
 
-        let outcome = shared_state.try_add_assignments_checked(
+    // Build and emit metrics log row.
+    let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
+    let pending_ids_str: HashSet<u64> = new_ids.clone();
+    if ml.enabled {
+        // Only log the NEW assignments from this batch — not all existing
+        // assignments.  The old code fetched get_current_assignments() here
+        // (all-time O(N) entries) and iterated every batch, producing
+        // O(N²) total rows and memory pressure.
+        let assignment_rows = build_assignment_rows(
             &assignments,
-            &expected_per_slot,
-            assignment.capacity_tiers,
-            force_commit,
-            consecutive_rollbacks,
+            &new_ids,
+            &pending_ids_str,
+            slot,
+            wall_start,
+            wall_end,
         );
 
-        match outcome {
-            CommitOutcome::RolledBack => {
-                consecutive_rollbacks += 1;
-                if cfg.logging.verbose {
-                    println!(
-                        "[Scheduler] ↩ Rollback #{consecutive_rollbacks} for slot={slot} \
-                         (unintended capacity-tier breach); re-solving...",
-                    );
-                }
-                // Wait a bit before retrying to avoid hot loop if the state is very contended
-                // Generate random backoff between 10-90 ms to reduce thundering herd risk if many workers are contending
-                // TODO:
-                // let backoff_ms = 10 + rand::thread_rng().gen_range(0..80);
-                // std::thread::sleep(Duration::from_millis(backoff_ms));
+        let avg_ms_per_new = if new_count > 0 {
+            elapsed_ms / new_count as f64
+        } else {
+            0.0
+        };
+        let avg_ms_per_total = if total_count > 0 {
+            elapsed_ms / total_count as f64
+        } else {
+            0.0
+        };
+        let avg_cost_per_new = if new_count > 0 {
+            total_cost / new_count as f64
+        } else {
+            0.0
+        };
+        let avg_cost_per_total = if total_count > 0 {
+            total_cost / total_count as f64
+        } else {
+            0.0
+        };
+        let modeled_avg = ctx.modeled_window_avg_after;
+        let real_avg = shared_state
+            .get_profile_window_error_stats(
+                &profile_id,
+                slot,
+                assignment.error_window_past,
+                assignment.error_window_future,
+                &HashSet::new(),
+            )
+            .average;
 
-                // Keep the claimed requests intact and recompute their prices
-                // from a new shared-state snapshot on the next loop iteration.
-                continue;
-            }
-            CommitOutcome::Committed => {
-                // If this batch went through rollbacks, flag the committed requests.
-                if consecutive_rollbacks > 0 {
-                    let req_ids: Vec<u64> = pending.iter().map(|r| r.id).collect();
-                    shared_state.mark_requests_rolled_back(&req_ids);
-                }
 
-                let new_count = pending.len();
-                let total_count = assignments.len();
-                let replanned = total_count.saturating_sub(new_count);
-                let total_cost: f64 = assignments.iter().map(|a| a.carbon_cost).sum();
+        let mut run_row: HashMap<String, String> = HashMap::new();
+        run_row.insert("run_sequence".into(), run_sequence.to_string());
+        run_row.insert("current_slot".into(), slot.to_string());
+        run_row.insert("pending_batch_size".into(), new_count.to_string());
+        run_row.insert("total_assignments".into(), total_count.to_string());
+        run_row.insert("new_assignments".into(), new_count.to_string());
+        run_row.insert("replanned_assignments".into(), replanned.to_string());
+        run_row.insert("solver_status".into(), ctx.status.clone());
+        run_row.insert("solver_mode".into(), ctx.mode.clone());
+        run_row.insert(
+            "mock_recovery_injected_count".into(),
+            ctx.mock_recovery_injected_count.to_string(),
+        );
+        run_row.insert("qos_profile_id".into(), profile_id.to_string());
+        run_row.insert("consecutive_rollbacks".into(), "0".into());
+        run_row.insert(
+            "lock_future_assignments".into(),
+            cfg.solver.dp_lock_future_assignments.to_string(),
+        );
+        run_row.insert("solver_start_ts".into(), wall_start.to_string());
+        run_row.insert("solver_end_ts".into(), wall_end.to_string());
+        run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
+        run_row.insert("avg_ms_per_new_request".into(), avg_ms_per_new.to_string());
+        run_row.insert("avg_ms_per_assignment".into(), avg_ms_per_total.to_string());
+        run_row.insert("total_carbon_cost".into(), total_cost.to_string());
+        run_row.insert(
+            "carbon_cost_per_new_request".into(),
+            avg_cost_per_new.to_string(),
+        );
+        run_row.insert(
+            "carbon_cost_per_assignment".into(),
+            avg_cost_per_total.to_string(),
+        );
+        run_row.insert("error_window_avg_after".into(), modeled_avg.to_string());
+        run_row.insert("error_window_avg_after_real".into(), real_avg.to_string());
+        run_row.insert(
+            "error_window_start_slot".into(),
+            ctx.window_start_slot.to_string(),
+        );
+        run_row.insert(
+            "error_window_end_slot".into(),
+            ctx.window_end_slot.to_string(),
+        );
+        run_row.insert(
+            "error_window_threshold".into(),
+            assignment.max_error_threshold.to_string(),
+        );
+        run_row.insert(
+            "error_window_violated_after".into(),
+            (modeled_avg > assignment.max_error_threshold).to_string(),
+        );
+        run_row.insert(
+            "error_window_violated_after_real".into(),
+            (real_avg > assignment.max_error_threshold).to_string(),
+        );
+        run_row.insert(
+            "batches_processed_after".into(),
+            batches_processed.to_string(),
+        );
+        run_row.insert("total_scheduled_after".into(), total_scheduled.to_string());
+        run_row.insert(
+            "global_error_before".into(),
+            ctx.global_error_before.to_string(),
+        );
+        run_row.insert(
+            "global_error_count_before".into(),
+            ctx.global_error_count_before.to_string(),
+        );
+        run_row.insert(
+            "profile_error_before".into(),
+            ctx.profile_error_before.to_string(),
+        );
+        run_row.insert(
+            "profile_error_count_before".into(),
+            ctx.profile_error_count_before.to_string(),
+        );
+        run_row.insert("global_error_constraint_active".into(), "false".to_string());
+        run_row.insert(
+            "profile_error_constraint_active".into(),
+            ctx.profile_error_constraint_active.to_string(),
+        );
 
-                // Update stats and get run_sequence for logging.
-                let (run_sequence, batches_processed, total_scheduled) = {
-                    let mut g = mutable.lock().unwrap();
-                    g.stats.solver_runs += 1;
-                    g.stats.batches_processed += 1;
-                    g.stats.total_scheduled += new_count as u64;
-                    g.stats.solver_total_time_ms += elapsed_ms;
-                    g.stats.solver_total_requests += new_count as u64;
-                    g.stats.last_solver_elapsed_ms = elapsed_ms;
-                    (
-                        g.stats.solver_runs,
-                        g.stats.batches_processed,
-                        g.stats.total_scheduled,
-                    )
-                };
-
-                if cfg.logging.verbose {
-                    let avg_error: f64 =
-                        assignments.iter().map(|a| a.error).sum::<f64>() / assignments.len() as f64;
-                    let rollback_note = if consecutive_rollbacks > 0 {
-                        format!(" [after {consecutive_rollbacks} rollback(s)]")
-                    } else {
-                        String::new()
-                    };
-                    println!(
-                        "[Scheduler] ✓ Scheduled {} new requests{}{} \
-                         (cost={total_cost:.2}, error={avg_error:.2}%, solver={elapsed_ms:.2}ms)",
-                        new_count,
-                        if replanned > 0 {
-                            format!(" + {replanned} re-planned")
-                        } else {
-                            String::new()
-                        },
-                        rollback_note,
-                    );
-                }
-
-                // Build and emit metrics log row.
-                let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
-                let pending_ids_str: HashSet<u64> = new_ids.clone();
-                if ml.enabled {
-                    // Only log the NEW assignments from this batch — not all existing
-                    // assignments.  The old code fetched get_current_assignments() here
-                    // (all-time O(N) entries) and iterated every batch, producing
-                    // O(N²) total rows and memory pressure.
-                    let assignment_rows = build_assignment_rows(
-                        &assignments,
-                        &new_ids,
-                        &pending_ids_str,
-                        slot,
-                        wall_start,
-                        wall_end,
-                    );
-
-                    let avg_ms_per_new = if new_count > 0 {
-                        elapsed_ms / new_count as f64
-                    } else {
-                        0.0
-                    };
-                    let avg_ms_per_total = if total_count > 0 {
-                        elapsed_ms / total_count as f64
-                    } else {
-                        0.0
-                    };
-                    let avg_cost_per_new = if new_count > 0 {
-                        total_cost / new_count as f64
-                    } else {
-                        0.0
-                    };
-                    let avg_cost_per_total = if total_count > 0 {
-                        total_cost / total_count as f64
-                    } else {
-                        0.0
-                    };
-                    let modeled_avg = ctx.modeled_window_avg_after;
-                    let real_avg = shared_state
-                        .get_profile_window_error_stats(
-                            &profile_id,
-                            slot,
-                            assignment.error_window_past,
-                            assignment.error_window_future,
-                            &HashSet::new(),
-                        )
-                        .average;
-
-                    // TODO: remove this debug print
-                    // println!("[Scheduler] Newly assigned IDs in this run: {:?}", new_ids);
-
-                    let mut run_row: HashMap<String, String> = HashMap::new();
-                    run_row.insert("run_sequence".into(), run_sequence.to_string());
-                    run_row.insert("current_slot".into(), slot.to_string());
-                    run_row.insert("pending_batch_size".into(), new_count.to_string());
-                    run_row.insert("total_assignments".into(), total_count.to_string());
-                    run_row.insert("new_assignments".into(), new_count.to_string());
-                    run_row.insert("replanned_assignments".into(), replanned.to_string());
-                    run_row.insert("solver_status".into(), ctx.status.clone());
-                    run_row.insert("solver_mode".into(), ctx.mode.clone());
-                    run_row.insert(
-                        "mock_recovery_injected_count".into(),
-                        ctx.mock_recovery_injected_count.to_string(),
-                    );
-                    run_row.insert("qos_profile_id".into(), profile_id.to_string());
-                    run_row.insert(
-                        "consecutive_rollbacks".into(),
-                        consecutive_rollbacks.to_string(),
-                    );
-                    run_row.insert(
-                        "lock_future_assignments".into(),
-                        cfg.solver.dp_lock_future_assignments.to_string(),
-                    );
-                    run_row.insert("solver_start_ts".into(), wall_start.to_string());
-                    run_row.insert("solver_end_ts".into(), wall_end.to_string());
-                    run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
-                    run_row.insert("avg_ms_per_new_request".into(), avg_ms_per_new.to_string());
-                    run_row.insert("avg_ms_per_assignment".into(), avg_ms_per_total.to_string());
-                    run_row.insert("total_carbon_cost".into(), total_cost.to_string());
-                    run_row.insert(
-                        "carbon_cost_per_new_request".into(),
-                        avg_cost_per_new.to_string(),
-                    );
-                    run_row.insert(
-                        "carbon_cost_per_assignment".into(),
-                        avg_cost_per_total.to_string(),
-                    );
-                    run_row.insert("error_window_avg_after".into(), modeled_avg.to_string());
-                    run_row.insert("error_window_avg_after_real".into(), real_avg.to_string());
-                    run_row.insert(
-                        "error_window_start_slot".into(),
-                        ctx.window_start_slot.to_string(),
-                    );
-                    run_row.insert(
-                        "error_window_end_slot".into(),
-                        ctx.window_end_slot.to_string(),
-                    );
-                    run_row.insert(
-                        "error_window_threshold".into(),
-                        assignment.max_error_threshold.to_string(),
-                    );
-                    run_row.insert(
-                        "error_window_violated_after".into(),
-                        (modeled_avg > assignment.max_error_threshold).to_string(),
-                    );
-                    run_row.insert(
-                        "error_window_violated_after_real".into(),
-                        (real_avg > assignment.max_error_threshold).to_string(),
-                    );
-                    run_row.insert(
-                        "batches_processed_after".into(),
-                        batches_processed.to_string(),
-                    );
-                    run_row.insert("total_scheduled_after".into(), total_scheduled.to_string());
-                    run_row.insert(
-                        "global_error_before".into(),
-                        ctx.global_error_before.to_string(),
-                    );
-                    run_row.insert(
-                        "global_error_count_before".into(),
-                        ctx.global_error_count_before.to_string(),
-                    );
-                    run_row.insert(
-                        "profile_error_before".into(),
-                        ctx.profile_error_before.to_string(),
-                    );
-                    run_row.insert(
-                        "profile_error_count_before".into(),
-                        ctx.profile_error_count_before.to_string(),
-                    );
-                    run_row.insert("global_error_constraint_active".into(), "false".to_string());
-                    run_row.insert(
-                        "profile_error_constraint_active".into(),
-                        ctx.profile_error_constraint_active.to_string(),
-                    );
-
-                    ml.log_solver_run(&run_row, &assignment_rows, &[]);
-                }
-
-                return true;
-            }
-        }
+        ml.log_solver_run(&run_row, &assignment_rows, &[]);
     }
+    BatchWorkerOutcome::Committed
 }
 
 // ─── online swarm batch worker ────────────────────────────────────────────────
@@ -1044,12 +1235,12 @@ fn is_online_swarm_strategy(strategy: &str) -> bool {
     )
 }
 
-/// Executes one batch of requests using an online swarm strategy (bandit or
-/// ACO). Dispatches to one of two concurrency-safe implementations based on
-/// `Config::swarm.mode` (see `SwarmBackend`).
+/// Solve one online swarm batch from its claim-time snapshot and commit its
+/// price-free proposal against current global occupancy.
 fn batch_worker_entry_swarm(
     slot: i32,
     pending: Vec<Request>,
+    snapshot: &SolverSnapshot,
     shared_state: &SharedState,
     cfg: &Config,
     assignment: &AssignmentPolicy<'_>,
@@ -1057,119 +1248,13 @@ fn batch_worker_entry_swarm(
     carbon_forecast: &[f64],
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
-) -> bool {
+) -> BatchWorkerOutcome {
+    let t0 = Instant::now();
+    let ctx = snapshot.swarm_context_for_profile(Some(profile_id));
     let is_merge = cfg.swarm.mode == "merge";
-    if is_merge {
-        batch_worker_entry_swarm_merge(
-            slot,
-            pending,
-            shared_state,
-            cfg,
-            assignment,
-            profile_id,
-            carbon_forecast,
-            mutable,
-            ml,
-        )
-    } else {
-        batch_worker_entry_swarm_serialized(
-            slot,
-            pending,
-            shared_state,
-            cfg,
-            assignment,
-            profile_id,
-            carbon_forecast,
-            mutable,
-            ml,
-        )
-    }
-}
 
-/// Serialized backend: solves while holding the scheduler mutex for the
-/// whole call, so concurrent swarm workers never race on the same state —
-/// correct and reproducible, at the cost of limiting swarm batches to one in
-/// flight at a time (irrelevant to DP batches, since `solver_strategy` is
-/// global to the run: DP and swarm never execute concurrently).
-fn batch_worker_entry_swarm_serialized(
-    slot: i32,
-    pending: Vec<Request>,
-    shared_state: &SharedState,
-    cfg: &Config,
-    assignment: &AssignmentPolicy<'_>,
-    profile_id: &QosProfileId,
-    carbon_forecast: &[f64],
-    mutable: &Arc<Mutex<SchedulerMutableState>>,
-    ml: &MetricsLogger,
-) -> bool {
-    let t0 = Instant::now();
-    let ctx = shared_state.swarm_context_snapshot_for_profile(Some(profile_id));
-
-    let mut assignments = {
-        let mut g = mutable.lock().unwrap();
-        let swarm_state = g
-            .swarm_states
-            .entry(profile_id.clone())
-            .or_insert_with(|| SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment));
-        let SwarmBackend::Serialized(swarm) = swarm_state else {
-            unreachable!("batch_worker_entry_swarm dispatched Serialized mode");
-        };
-        swarm.solve_batch(&pending, slot, carbon_forecast, &ctx, assignment)
-    };
-    for assignment in &mut assignments {
-        assignment.qos_profile_id = profile_id.clone();
-    }
-
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    if assignments.is_empty() {
-        shared_state.requeue_pending_requests_front(pending);
-        return false;
-    }
-
-    if try_commit_swarm_batch(
-        &assignments,
-        &ctx.slot_count,
-        shared_state,
-        assignment.capacity_tiers,
-        cfg.solver.rollback_max_consecutive == 0,
-        0,
-    ) == CommitOutcome::RolledBack
-    {
-        shared_state.requeue_pending_requests_front(pending);
-        return false;
-    }
-
-    finish_swarm_batch(
-        slot,
-        &pending,
-        assignments,
-        elapsed_ms,
-        &cfg.solver.solver_strategy,
-        mutable,
-        ml,
-    )
-}
-
-/// Merge backend: clones the swarm state, solves lock-free against the
-/// clone (preserving full parallelism, like DP batches), then additively
-/// merges its own contribution back — see `online_swarmerge.rs` for why this
-/// never discards concurrent workers' updates, unlike a plain overwrite.
-fn batch_worker_entry_swarm_merge(
-    slot: i32,
-    pending: Vec<Request>,
-    shared_state: &SharedState,
-    cfg: &Config,
-    assignment: &AssignmentPolicy<'_>,
-    profile_id: &QosProfileId,
-    carbon_forecast: &[f64],
-    mutable: &Arc<Mutex<SchedulerMutableState>>,
-    ml: &MetricsLogger,
-) -> bool {
-    let t0 = Instant::now();
-    let mut consecutive_rollbacks = 0;
-    let assignments = loop {
-        // Snapshot committed state and clone this profile's swarm state.
-        let (swarm_snapshot, ctx) = {
+    let (mut proposed_assignments, merge_delta) = if is_merge {
+        let swarm_snapshot = {
             let mut g = mutable.lock().unwrap();
             let swarm_state = g
                 .swarm_states
@@ -1178,45 +1263,63 @@ fn batch_worker_entry_swarm_merge(
             let SwarmBackend::Merge(swarm) = swarm_state else {
                 unreachable!("batch_worker_entry_swarm dispatched Merge mode");
             };
-            (
-                swarm.clone(),
-                shared_state.swarm_context_snapshot_for_profile(Some(profile_id)),
-            )
+            swarm.clone()
         };
-
-        // Solve lock-free and keep the delta local until global-capacity commit.
-        let (mut assignments, delta) =
+        let (assignments, delta) =
             swarm_snapshot.solve_batch(&pending, slot, carbon_forecast, &ctx, assignment);
-        if assignments.is_empty() {
-            shared_state.requeue_pending_requests_front(pending);
-            return false;
-        }
-        for assignment in &mut assignments {
-            assignment.qos_profile_id = profile_id.clone();
-        }
+        (assignments, Some(delta))
+    } else {
+        let mut g = mutable.lock().unwrap();
+        let swarm_state = g
+            .swarm_states
+            .entry(profile_id.clone())
+            .or_insert_with(|| SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment));
+        let SwarmBackend::Serialized(swarm) = swarm_state else {
+            unreachable!("batch_worker_entry_swarm dispatched Serialized mode");
+        };
+        (
+            swarm.solve_batch(&pending, slot, carbon_forecast, &ctx, assignment),
+            None,
+        )
+    };
 
-        let force_commit = cfg.solver.rollback_max_consecutive == 0
-            || consecutive_rollbacks >= cfg.solver.rollback_max_consecutive;
-        match try_commit_swarm_batch(
-            &assignments,
-            &ctx.slot_count,
-            shared_state,
-            assignment.capacity_tiers,
-            force_commit,
-            consecutive_rollbacks,
-        ) {
-            CommitOutcome::RolledBack => consecutive_rollbacks += 1,
-            CommitOutcome::Committed => {
-                // A rolled-back candidate must not train the online strategy.
-                let mut g = mutable.lock().unwrap();
-                if let Some(SwarmBackend::Merge(swarm)) = g.swarm_states.get_mut(profile_id) {
-                    swarm.merge_delta(delta);
-                }
-                break assignments;
-            }
+    if proposed_assignments.is_empty() {
+        shared_state.requeue_pending_requests_front(pending);
+        return BatchWorkerOutcome::Infeasible;
+    }
+    for assignment in &mut proposed_assignments {
+        assignment.qos_profile_id = profile_id.clone();
+    }
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let proposal = assignments_to_solver_proposal(&proposed_assignments);
+    let assignments = match shared_state.materialize_and_commit_proposal(
+        &proposal,
+        &pending,
+        snapshot,
+        profile_id,
+        slot,
+        assignment.flavours,
+        carbon_forecast,
+        assignment.capacity_tiers,
+        assignment.carbon_cost_duration_scale,
+    ) {
+        Ok(assignments) => assignments,
+        Err(error) => {
+            eprintln!(
+                "[Scheduler] Could not materialize online proposal for profile {profile_id}: {error}"
+            );
+            shared_state.requeue_pending_requests_front(pending);
+            return BatchWorkerOutcome::Infeasible;
         }
     };
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    if let Some(delta) = merge_delta {
+        let mut g = mutable.lock().unwrap();
+        if let Some(SwarmBackend::Merge(swarm)) = g.swarm_states.get_mut(profile_id) {
+            swarm.merge_delta(delta);
+        }
+    }
 
     finish_swarm_batch(
         slot,
@@ -1229,43 +1332,7 @@ fn batch_worker_entry_swarm_merge(
     )
 }
 
-/// Atomically validate a swarm proposal against global per-slot occupancy.
-///
-/// `baseline_slot_counts` is the occupancy snapshot used during solving; the
-/// checked commit detects other workers that changed those slots meanwhile.
-fn try_commit_swarm_batch(
-    assignments: &[Assignment],
-    baseline_slot_counts: &HashMap<i32, i64>,
-    shared_state: &SharedState,
-    capacity_tiers: &[crate::types::CapacityTier],
-    force_commit: bool,
-    consecutive_rollbacks: usize,
-) -> CommitOutcome {
-    // Reconstruct the occupancy the swarm solver priced against: fixed
-    // baseline requests plus each proposed assignment in this batch. The
-    // shared-state commit checks this expectation atomically against all
-    // profiles, since capacity tiers describe global slot occupancy.
-    let mut expected_per_slot = baseline_slot_counts.clone();
-    for assignment in assignments {
-        *expected_per_slot
-            .entry(assignment.scheduled_slot)
-            .or_default() += 1;
-    }
-    expected_per_slot.retain(|slot, _| assignments.iter().any(|a| a.scheduled_slot == *slot));
-
-    shared_state.try_add_assignments_checked(
-        assignments,
-        &expected_per_slot,
-        capacity_tiers,
-        force_commit,
-        consecutive_rollbacks,
-    )
-}
-
-/// Shared tail after a profile-aware swarm commit: update stats and log metrics.
-///
-/// The caller invokes this only after assignments are committed; failed or
-/// rolled-back proposals must not appear in success metrics.
+/// Shared tail after proposal materialization and commit: update stats and log metrics.
 fn finish_swarm_batch(
     slot: i32,
     pending: &[Request],
@@ -1274,7 +1341,7 @@ fn finish_swarm_batch(
     solver_strategy: &str,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
-) -> bool {
+) -> BatchWorkerOutcome {
     let new_count = assignments.len();
 
     // NOTE: active_workers is decremented by the outer dispatch_batch_workers closure —
@@ -1318,7 +1385,7 @@ fn finish_swarm_batch(
         ml.log_solver_run(&run_row, &assignment_rows, &[]);
     }
 
-    true
+    BatchWorkerOutcome::Committed
 }
 
 /// Convert committed assignment records into the row shape expected by the

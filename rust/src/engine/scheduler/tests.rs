@@ -105,11 +105,12 @@ fn run_batch_strategy(
         .map(|profile| cfg.assignment_policy_for_profile(profile))
         .unwrap_or_else(|| cfg.assignment_policy());
     let recovery_state = make_recovery_state(cfg);
+    let snapshot = shared_state.snapshot_for_solver();
     let strategy = select_batch_solver(strategy_name);
     let result = strategy.solve(BatchSolveContext {
         current_slot,
         pending,
-        shared_state,
+        snapshot: &snapshot,
         assignment: &assignment,
         solver_config: &cfg.solver,
         simulation_config: &cfg.simulation,
@@ -655,29 +656,117 @@ fn profile_solve_prices_capacity_using_global_cross_profile_occupancy() {
 }
 
 #[test]
-fn profile_dispatch_round_robins_without_starving_eligible_profiles() {
+fn profile_dispatch_round_robins_and_allows_same_profile_batches() {
     let qa = QosProfileId::parse("qa-standard-v1").unwrap();
     let ner = QosProfileId::parse("ner-standard-v1").unwrap();
     let pending = vec![(qa.clone(), 5), (ner.clone(), 5)];
-    let active = HashSet::new();
+    let active_profiles = HashSet::new();
     let infeasible = HashMap::new();
 
     assert_eq!(
-        next_profile_to_dispatch(&pending, None, &active, &infeasible, 3, 2),
+        next_profile_to_dispatch(&pending, None, &active_profiles, true, &infeasible, 3, 2,),
         Some((ner.clone(), 5))
     );
     assert_eq!(
-        next_profile_to_dispatch(&pending, Some(&ner), &active, &infeasible, 3, 2),
+        next_profile_to_dispatch(
+            &pending,
+            Some(&ner),
+            &active_profiles,
+            true,
+            &infeasible,
+            3,
+            2,
+        ),
         Some((qa.clone(), 5))
     );
     assert_eq!(
-        next_profile_to_dispatch(&pending, Some(&qa), &active, &infeasible, 3, 2),
+        next_profile_to_dispatch(
+            &pending,
+            Some(&qa),
+            &active_profiles,
+            true,
+            &infeasible,
+            3,
+            2,
+        ),
         Some((ner.clone(), 5))
     );
-    let active = HashSet::from([qa.clone()]);
+
+    let single_profile = vec![(qa.clone(), 10)];
+    let active_profiles = HashSet::from([qa.clone()]);
     assert_eq!(
-        next_profile_to_dispatch(&pending, None, &active, &infeasible, 3, 2),
-        Some((ner, 5))
+        next_profile_to_dispatch(
+            &single_profile,
+            Some(&qa),
+            &active_profiles,
+            true,
+            &infeasible,
+            3,
+            2,
+        ),
+        Some((qa.clone(), 10)),
+        "an active batch must not prevent another same-profile batch from being claimed"
+    );
+    assert_eq!(
+        next_profile_to_dispatch(
+            &single_profile,
+            None,
+            &active_profiles,
+            false,
+            &infeasible,
+            3,
+            2,
+        ),
+        None,
+        "the default service constructor keeps same-profile batch serialization"
+    );
+
+    let mut last_infeasible = HashMap::new();
+    last_infeasible.insert(qa.clone(), (3, 10));
+    assert_eq!(
+        next_profile_to_dispatch(
+            &single_profile,
+            None,
+            &active_profiles,
+            true,
+            &last_infeasible,
+            3,
+            2,
+        ),
+        None
+    );
+    let larger_queue = vec![(qa.clone(), 11)];
+    assert_eq!(
+        next_profile_to_dispatch(
+            &larger_queue,
+            None,
+            &active_profiles,
+            true,
+            &last_infeasible,
+            3,
+            2,
+        ),
+        Some((qa, 11)),
+        "a changed queue should make a previously infeasible profile retryable"
+    );
+}
+
+#[test]
+fn average_worker_concurrency_uses_worker_busy_time() {
+    let start = std::time::Instant::now();
+    let mut stats = SchedulerStats::default();
+    stats.start(start);
+    stats.record_worker_count_change(0, 0, start);
+    let two_seconds = start + std::time::Duration::from_secs(2);
+    stats.record_worker_count_change(0, 2, two_seconds);
+    let five_seconds_later = two_seconds + std::time::Duration::from_secs(3);
+    stats.record_worker_count_change(2, 0, five_seconds_later);
+    let end = five_seconds_later + std::time::Duration::from_secs(5);
+    stats.finish(0, end);
+
+    assert!(
+        (stats.average_concurrent_workers(0, end) - 2.0).abs() < 1e-9,
+        "idle scheduler time should not dilute average active-worker concurrency"
     );
 }
 

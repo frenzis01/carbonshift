@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use crate::engine::qos::QosProfileId;
+use crate::engine::solver::SolverProposal;
 use crate::online_swarm::SwarmContext;
-use crate::types::{Assignment, CapacityTier, Request};
+use crate::types::{Assignment, CapacityTier, Flavour, Request, get_capacity_multiplier};
 
 // ─── solver snapshot ─────────────────────────────────────────────────────────
 
@@ -162,6 +163,42 @@ impl SolverSnapshot {
             })
             .collect()
     }
+
+    /// Build the swarm solver's view from this exact state snapshot.
+    pub fn swarm_context_for_profile(&self, profile_id: Option<&QosProfileId>) -> SwarmContext {
+        let mut slot_count: HashMap<i32, i64> = HashMap::new();
+        let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
+        for assignment in self.assignments.values() {
+            *slot_count.entry(assignment.scheduled_slot).or_insert(0) += 1;
+            if profile_id.map_or(true, |id| assignment.qos_profile_id == *id) {
+                slot_errors
+                    .entry(assignment.scheduled_slot)
+                    .or_default()
+                    .push(assignment.error);
+            }
+        }
+        let (global_error_sum, global_count) = match profile_id {
+            Some(id) => self
+                .profile_error_stats
+                .get(id)
+                .map(|stats| (stats.error_sum, stats.count as usize))
+                .unwrap_or((0.0, 0)),
+            None => (self.global_error_sum, self.global_assignment_count as usize),
+        };
+        SwarmContext {
+            slot_count,
+            slot_errors,
+            global_error_sum,
+            global_count,
+        }
+    }
+}
+
+/// Requests claimed by a worker together with their atomic shared-state snapshot.
+pub struct ClaimedRequestBatch {
+    pub requests: Vec<Request>,
+    pub profile_pending_count: usize,
+    pub snapshot: SolverSnapshot,
 }
 
 // ─── inner (lock-guarded) data ────────────────────────────────────────────────
@@ -199,7 +236,19 @@ impl Inner {
             // A request's budget identity is immutable after its first
             // commitment; replanning changes its live assignment, not which
             // historical/profile aggregate it belongs to.
-            assignment.qos_profile_id = previous.qos_profile_id;
+            assignment.qos_profile_id = previous.qos_profile_id.clone();
+            let error_delta = assignment.error - previous.error;
+            self.global_error_sum += error_delta;
+            let stats = self
+                .profile_error_stats
+                .entry(assignment.qos_profile_id.clone())
+                .or_default();
+            stats.error_sum += error_delta;
+            stats.avg = if stats.count > 0 {
+                stats.error_sum / stats.count as f64
+            } else {
+                0.0
+            };
         } else {
             self.total_scheduled += 1;
             self.global_error_sum += assignment.error;
@@ -211,9 +260,10 @@ impl Inner {
             stats.error_sum += assignment.error;
             stats.count += 1;
         }
+        let profile_id = assignment.qos_profile_id.clone();
         let stats = self
             .profile_error_stats
-            .get_mut(&assignment.qos_profile_id)
+            .get_mut(&profile_id)
             .expect("record_assignment initializes profile error totals");
         stats.avg = if stats.count > 0 {
             stats.error_sum / stats.count as f64
@@ -457,6 +507,42 @@ impl SharedState {
         claimed
     }
 
+    /// Atomically claim one profile-homogeneous batch and capture the exact
+    /// committed-state snapshot that its worker must use.
+    pub fn claim_pending_requests_for_profile_with_snapshot(
+        &self,
+        profile_id: &QosProfileId,
+        count: usize,
+    ) -> ClaimedRequestBatch {
+        let mut g = self.inner.lock().unwrap();
+        let profile_pending_count = g
+            .pending
+            .iter()
+            .filter(|request| request.qos_profile_id() == *profile_id)
+            .count();
+        let mut requests = Vec::with_capacity(count.min(profile_pending_count));
+        let mut remaining = Vec::with_capacity(g.pending.len());
+        for request in g.pending.drain(..) {
+            if request.qos_profile_id() == *profile_id && requests.len() < count {
+                requests.push(request);
+            } else {
+                remaining.push(request);
+            }
+        }
+        g.pending = remaining;
+        let snapshot = SolverSnapshot {
+            assignments: g.assignments.clone(),
+            global_error_sum: g.global_error_sum,
+            global_assignment_count: g.global_assignment_count,
+            profile_error_stats: g.profile_error_stats.clone(),
+        };
+        ClaimedRequestBatch {
+            requests,
+            profile_pending_count,
+            snapshot,
+        }
+    }
+
     /// Return `requests` to the front of the pending queue (preserving order).
     ///
     /// Used when a claimed batch could not be scheduled and must be retried.
@@ -538,32 +624,8 @@ impl SharedState {
         &self,
         profile_id: Option<&QosProfileId>,
     ) -> SwarmContext {
-        let g = self.inner.lock().unwrap();
-        let mut slot_count: HashMap<i32, i64> = HashMap::new();
-        let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
-        for a in g.assignments.values() {
-            *slot_count.entry(a.scheduled_slot).or_insert(0) += 1;
-            if profile_id.map_or(true, |profile_id| a.qos_profile_id == *profile_id) {
-                slot_errors
-                    .entry(a.scheduled_slot)
-                    .or_default()
-                    .push(a.error);
-            }
-        }
-        let (global_error_sum, global_count) = if let Some(profile_id) = profile_id {
-            g.profile_error_stats
-                .get(profile_id)
-                .map(|stats| (stats.error_sum, stats.count as usize))
-                .unwrap_or((0.0, 0))
-        } else {
-            (g.global_error_sum, g.global_assignment_count as usize)
-        };
-        SwarmContext {
-            slot_count,
-            slot_errors,
-            global_error_sum,
-            global_count,
-        }
+        self.snapshot_for_solver()
+            .swarm_context_for_profile(profile_id)
     }
 
     /// All assignments whose `scheduled_slot >= current_slot`.
@@ -807,6 +869,186 @@ impl SharedState {
             .cloned()
             .collect()
     }
+
+    /// Price and commit a solver proposal against current global occupancy.
+    ///
+    /// The proposal is deliberately cost-free. Each placement is priced at
+    /// its actual next position in the slot while holding the assignment
+    /// mutex, then the whole materialized batch is committed before releasing
+    /// the lock. A proposal may have been solved from an older snapshot; it is
+    /// accepted as-is rather than re-solved or rejected for intervening QoS
+    /// changes.
+    pub fn materialize_and_commit_proposal(
+        &self,
+        proposal: &SolverProposal,
+        pending_requests: &[Request],
+        snapshot: &SolverSnapshot,
+        profile_id: &QosProfileId,
+        current_slot: i32,
+        flavours: &[Flavour],
+        carbon_forecast: &[f64],
+        tiers: &[CapacityTier],
+        carbon_cost_duration_scale: f64,
+    ) -> Result<Vec<Assignment>, String> {
+        let mut g = self.inner.lock().unwrap();
+        let pending_by_id: HashMap<u64, &Request> = pending_requests
+            .iter()
+            .map(|request| (request.id, request))
+            .collect();
+        if pending_by_id.len() != pending_requests.len() {
+            return Err("claimed batch contains duplicate request IDs".to_string());
+        }
+
+        let mut seen_request_ids = HashSet::with_capacity(proposal.placements.len());
+        let mut slot_counts: HashMap<i32, i64> = HashMap::new();
+        for assignment in g.assignments.values() {
+            *slot_counts.entry(assignment.scheduled_slot).or_default() += 1;
+        }
+        let mut materialized = Vec::with_capacity(proposal.placements.len());
+
+        for placement in &proposal.placements {
+            if !seen_request_ids.insert(placement.req_id) {
+                return Err(format!(
+                    "solver proposal contains request {} more than once",
+                    placement.req_id
+                ));
+            }
+            if placement.scheduled_slot < 0 {
+                return Err(format!(
+                    "solver proposal placed request {} in negative slot {}",
+                    placement.req_id, placement.scheduled_slot
+                ));
+            }
+            let slot_index = usize::try_from(placement.scheduled_slot)
+                .map_err(|_| "solver proposal has an invalid slot index".to_string())?;
+            let carbon_intensity = carbon_forecast.get(slot_index).copied().ok_or_else(|| {
+                format!(
+                    "solver proposal placed request {} outside the carbon forecast",
+                    placement.req_id
+                )
+            })?;
+
+            let (arrival_slot, deadline_slot, request_profile_id) =
+                if let Some(request) = pending_by_id.get(&placement.req_id) {
+                    (
+                        request.arrival_slot,
+                        request.deadline_slot,
+                        request.qos_profile_id(),
+                    )
+                } else if let Some(assignment) = snapshot.assignments.get(&placement.req_id) {
+                    (
+                        assignment.arrival_slot.unwrap_or(current_slot),
+                        assignment
+                            .deadline_slot
+                            .unwrap_or(assignment.scheduled_slot.max(current_slot)),
+                        assignment.qos_profile_id.clone(),
+                    )
+                } else {
+                    return Err(format!(
+                        "solver proposal references unknown request {}",
+                        placement.req_id
+                    ));
+                };
+            if request_profile_id != *profile_id {
+                return Err(format!(
+                    "solver proposal request {} belongs to profile {}, not {}",
+                    placement.req_id, request_profile_id, profile_id
+                ));
+            }
+
+            let flavour = flavours
+                .iter()
+                .find(|flavour| flavour.name == placement.flavour_name)
+                .ok_or_else(|| {
+                    format!(
+                        "solver proposal selected unknown flavour '{}' for request {}",
+                        placement.flavour_name, placement.req_id
+                    )
+                })?;
+            if let Some(previous) = g.assignments.get(&placement.req_id) {
+                if previous.qos_profile_id != *profile_id {
+                    return Err(format!(
+                        "request {} is already committed to another QoS profile",
+                        placement.req_id
+                    ));
+                }
+                let previous_count = slot_counts.entry(previous.scheduled_slot).or_default();
+                *previous_count = previous_count.checked_sub(1).ok_or_else(|| {
+                    format!(
+                        "slot {} occupancy underflow while replacing request {}",
+                        previous.scheduled_slot, placement.req_id
+                    )
+                })?;
+            }
+
+            let next_position = slot_counts
+                .get(&placement.scheduled_slot)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    format!(
+                        "slot {} occupancy overflow while pricing request {}",
+                        placement.scheduled_slot, placement.req_id
+                    )
+                })?;
+            let capacity_multiplier = get_capacity_multiplier(tiers, next_position);
+            if !carbon_intensity.is_finite()
+                || carbon_intensity < 0.0
+                || !capacity_multiplier.is_finite()
+                || capacity_multiplier < 0.0
+                || !flavour.error.is_finite()
+                || !flavour.duration.is_finite()
+                || flavour.duration < 0.0
+                || !carbon_cost_duration_scale.is_finite()
+                || carbon_cost_duration_scale < 0.0
+            {
+                return Err(format!(
+                    "request {} has invalid forecast, capacity, flavour, or cost-scale data",
+                    placement.req_id
+                ));
+            }
+            let carbon_cost = carbon_intensity
+                * capacity_multiplier
+                * flavour.duration
+                * carbon_cost_duration_scale;
+            if !carbon_cost.is_finite() {
+                return Err(format!(
+                    "request {} produced a non-finite carbon cost",
+                    placement.req_id
+                ));
+            }
+
+            *slot_counts.entry(placement.scheduled_slot).or_default() = next_position;
+            materialized.push(Assignment::new_for_profile(
+                placement.req_id,
+                placement.scheduled_slot,
+                placement.flavour_name.clone(),
+                carbon_cost,
+                flavour.error,
+                flavour.duration,
+                Some(arrival_slot),
+                Some(deadline_slot),
+                profile_id.clone(),
+            ));
+        }
+
+        if let Some(missing) = pending_requests
+            .iter()
+            .find(|request| !seen_request_ids.contains(&request.id))
+        {
+            return Err(format!(
+                "solver proposal omitted claimed request {}",
+                missing.id
+            ));
+        }
+
+        for assignment in &materialized {
+            g.record_assignment(assignment.clone());
+        }
+        Ok(materialized)
+    }
+
     // ── rollback ──────────────────────────────────────────────────────────────
 
     /// Atomically attempt to commit assignments, checking for unintended
@@ -976,9 +1218,11 @@ pub struct Statistics {
 mod tests {
     use super::*;
     use crate::engine::qos::{CumulativeErrorPolicy, ErrorWindowPolicy, QosProfile, TaskKindId};
+    use crate::engine::solver::ProposedPlacement;
     use crate::types::{Assignment, Request};
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1172,6 +1416,31 @@ mod tests {
     }
 
     #[test]
+    fn profile_batch_claim_returns_its_committed_state_snapshot() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(99, 2, 1.0)]);
+        state.add_requests(vec![make_request(1, 0, 2), make_request(2, 0, 2)]);
+
+        let batch = state
+            .claim_pending_requests_for_profile_with_snapshot(&QosProfileId::default_profile(), 1);
+
+        assert_eq!(
+            batch
+                .requests
+                .iter()
+                .map(|request| request.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(batch.profile_pending_count, 2);
+        assert!(batch.snapshot.assignments.contains_key(&99));
+        assert_eq!(state.get_pending_count(), 1);
+
+        state.add_assignments(vec![make_assignment(100, 2, 2.0)]);
+        assert!(!batch.snapshot.assignments.contains_key(&100));
+    }
+
+    #[test]
     fn requeue_preserves_order() {
         let state = SharedState::new();
         state.add_request(make_request(5, 0, 5));
@@ -1349,15 +1618,15 @@ mod tests {
     }
 
     #[test]
-    fn replanned_request_not_double_counted() {
+    fn replanned_request_updates_error_without_double_counting() {
         let state = SharedState::new();
         state.add_assignments(vec![make_assignment(1, 0, 4.0)]);
-        // Replan request 1 (same id, different slot/cost)
+        // Replan request 1 (same id, different slot/error/cost).
         state.add_assignments(vec![make_assignment(1, 1, 0.0)]);
         let g = state.get_global_error_stats();
         // Only counted once
         assert_eq!(g.count, 1);
-        assert!((g.error_sum - 4.0).abs() < 1e-9);
+        assert!(g.error_sum.abs() < 1e-9);
     }
 
     #[test]
@@ -1444,6 +1713,106 @@ mod tests {
             .map(|i| make_assignment(id_start + i, slot, 0.0))
             .collect();
         state.add_assignments(assignments);
+    }
+
+    #[test]
+    fn concurrent_snapshots_both_commit_and_price_at_current_occupancy() {
+        let state = SharedState::new();
+        let profile_id = QosProfileId::default_profile();
+        let snapshot = Arc::new(state.snapshot_for_solver());
+        let barrier = Arc::new(Barrier::new(2));
+        let flavours = Arc::new(vec![Flavour {
+            name: "Accurate".to_string(),
+            error: 5.0,
+            duration: 10.0,
+        }]);
+        let forecast = Arc::new(vec![100.0]);
+        let tiers = Arc::new(vec![
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 2.0,
+            },
+        ]);
+
+        let workers: Vec<_> = (0..2)
+            .map(|id| {
+                let state = state.clone();
+                let snapshot = snapshot.clone();
+                let barrier = barrier.clone();
+                let profile_id = profile_id.clone();
+                let flavours = flavours.clone();
+                let forecast = forecast.clone();
+                let tiers = tiers.clone();
+                std::thread::spawn(move || {
+                    let request = Request::new(id, 0, 0);
+                    let proposal = SolverProposal {
+                        placements: vec![ProposedPlacement::new(id, 0, "Accurate".to_string())],
+                    };
+                    barrier.wait();
+                    state.materialize_and_commit_proposal(
+                        &proposal,
+                        &[request],
+                        &snapshot,
+                        &profile_id,
+                        0,
+                        &flavours,
+                        &forecast,
+                        &tiers,
+                        1.0,
+                    )
+                })
+            })
+            .collect();
+
+        let committed: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect();
+        let mut costs: Vec<_> = committed
+            .into_iter()
+            .map(|assignments| assignments[0].carbon_cost)
+            .collect();
+        costs.sort_by(f64::total_cmp);
+        assert_eq!(costs, vec![1000.0, 2000.0]);
+        assert_eq!(state.get_current_assignments().len(), 2);
+        assert_eq!(state.get_profile_error_stats(&profile_id).avg, 5.0);
+    }
+
+    #[test]
+    fn incomplete_proposal_is_rejected_without_partial_commit() {
+        let state = SharedState::new();
+        let profile_id = QosProfileId::default_profile();
+        let snapshot = state.snapshot_for_solver();
+        let pending = [Request::new(1, 0, 0), Request::new(2, 0, 0)];
+        let proposal = SolverProposal {
+            placements: vec![ProposedPlacement::new(1, 0, "Accurate".to_string())],
+        };
+        let flavours = [Flavour {
+            name: "Accurate".to_string(),
+            error: 0.0,
+            duration: 10.0,
+        }];
+
+        let error = state
+            .materialize_and_commit_proposal(
+                &proposal,
+                &pending,
+                &snapshot,
+                &profile_id,
+                0,
+                &flavours,
+                &[100.0],
+                &[],
+                1.0,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("omitted claimed request 2"));
+        assert!(state.get_current_assignments().is_empty());
     }
 
     #[test]

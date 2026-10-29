@@ -114,7 +114,7 @@ impl SolverAlgorithm for BanditAlgorithm {
         let mut late_window_count = qos.error_window.baseline_err.count;
         let mut placements = Vec::with_capacity(input.requests.len());
         let mut proposed_request_ids = HashSet::new();
-        
+
         for request in &input.requests {
             // If request is late, use cheapest feasible flavour
             if input.current_slot > request.deadline_slot {

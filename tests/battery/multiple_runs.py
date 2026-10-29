@@ -6,11 +6,10 @@ Each phase of the Rust battery harness (see run_battery.py's module docstring)
 is sensitive to a different subset of runtime knobs:
 
   - DP (min_error_greedy/carryover/forecast), singleton_best, and random
-    selection modes (online, N=1 only): sensitive to `rollback_max_consecutive` and
+    selection modes (online, N=1 only): sensitive to
     `max_batch_solver_parallelism`; NOT sensitive to `online_swarm_mode`.
   - bandit (online, N=1) and ant_colony (online, batch-size sweep): sensitive to
-    `online_swarm_mode` and `max_batch_solver_parallelism`; NOT sensitive to
-    `rollback_max_consecutive` (the swarm commit path bypasses rollback).
+    `online_swarm_mode` and `max_batch_solver_parallelism`.
   - offline strategies (offline_singleton_best, offline_singleton_best_accurate, random,
     bandit, ant_colony):
     insensitive to all of the above — a single run per scenario suffices.
@@ -127,58 +126,17 @@ OFFLINE_CONTENT: Dict[str, Any] = {
 INPUT_PATTERNS = ("flat",)
 
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
-# DP + singleton_best: rollback x parallelism (swarm_mode is irrelevant to
-# both, so it is left fixed at whatever battery_config.json already has).
-def build_rollback_parallelism_grid(
-    rollbacks: tuple,
-    parallelisms: tuple,
-    thresholds: tuple,
-) -> List[Dict[str, Any]]:
-    """Build the rollback x parallelism x threshold grid for the phases that
-    are sensitive to rollback (dp / singleton_best).
-
-    `rollback_max_consecutive > 0` only means something when there's more
-    than one parallel batch solver to roll back *among* — with
-    `max_batch_solver_parallelism == 1` there's nothing to roll back
-    against. So:
-
-      - If 0 is one of the requested rollback values, any run with
-        parallelism == 1 and rollback > 0 is skipped (it would be redundant
-        with the rollback == 0 / parallelism == 1 run that's already in the
-        grid).
-      - If every requested rollback value is > 0 (no 0 present in
-        `rollbacks`), there's no rollback == 0 baseline to fall back on, so
-        the parallelism == 1 run is still executed for each rollback value —
-        but with an extra `FORCE_ROLLB_PAR1: True` flag set on that grid
-        point, flagging that parallelism == 1 is being forced together with
-        rollback > 0 on purpose.
-    """
-    has_zero_rollback = 0 in rollbacks
-    grid: List[Dict[str, Any]] = []
-    for rollback in rollbacks:
-        for parallelism in parallelisms:
-            for threshold in thresholds:
-                if has_zero_rollback and parallelism == 1 and rollback > 0:
-                    continue
-                point: Dict[str, Any] = {
-                    "rollback_max_consecutive": rollback,
-                    "max_batch_solver_parallelism": parallelism,
-                    "max_error_threshold": threshold,
-                }
-                if not has_zero_rollback and parallelism == 1:
-                    point["FORCE_ROLLB_PAR1"] = True
-                grid.append(point)
-    return grid
-
-
-# for rollback in (0, 4)
+# DP + singleton_best: parallelism x threshold; swarm mode is irrelevant.
 # for parallelism in (1, 8, 20)
 # for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
-_ROLLBACK_X_PARALLELISM_X_THRESHOLD = build_rollback_parallelism_grid(
-    rollbacks=(0,),
-    parallelisms=(12,),
-    thresholds=(4.0,),
-)
+_PARALLELISM_X_THRESHOLD = [
+    {
+        "max_batch_solver_parallelism": parallelism,
+        "max_error_threshold": threshold,
+    }
+    for parallelism in (12,)
+    for threshold in (4.0,)
+]
 
 # bandit/ant_colony: parallelism x swarm_mode x threshold (rollback is irrelevant, left
 # fixed).
@@ -196,10 +154,10 @@ _PARALLELISM_X_SWARM_MODE = [
 ]
 
 PHASES: Dict[str, PhaseGrid] = {
-    "dp": PhaseGrid("dp", DP_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD),
+    "dp": PhaseGrid("dp", DP_CONTENT, _PARALLELISM_X_THRESHOLD),
     "online": PhaseGrid("online", SWARM_ONLINE_CONTENT, _PARALLELISM_X_SWARM_MODE),
     "per_request": PhaseGrid(
-        "per_request", PER_REQUEST_ONLINE_CONTENT, _ROLLBACK_X_PARALLELISM_X_THRESHOLD
+        "per_request", PER_REQUEST_ONLINE_CONTENT, _PARALLELISM_X_THRESHOLD
     ),
     # Offline strategies can also be evaluated with different per-scenario error
     # thresholds, even though they don't depend on rollback or swarm knobs.
