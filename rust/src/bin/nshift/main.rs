@@ -57,14 +57,18 @@
 //!   "ant_colony" uses the configured sweep; all other online strategies use batch size 1.
 //!   `rollback_max_consecutive` affects `singleton_best` and the random modes because they
 //!   share DP's rollback-checked commit path. `online_swarm_mode` affects bandit/ACO only.
-//! - `additional_strategies`: offline strategies to run once per scenario (no batching or
-//!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "random"]`. Fully
-//!   independent of `batch_sizes`/`rollback_max_consecutive`/`max_batch_solver_parallelism`.
-//!   `offline_singleton_best` scans all feasible slot/flavour pairs for each request, then commits
-//!   the cheapest choice. `offline_singleton_best_accurate` restricts that search to the most
-//!   accurate flavour. `random` chooses a feasible slot uniformly and samples flavours from the
-//!   closest-to-uniform distribution with expected error equal to the scenario threshold; it is a
-//!   statistical baseline, not a per-run QoS guarantee.
+//! - `additional_strategies`: common-engine strategies to run once per scenario (no batching or
+//!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "hazard"]`.
+//!   `hazard` is canonical. The old `random` input label remains temporarily for existing
+//!   configurations and is scheduled for removal at the Step 5B online-scheduler cutover; new
+//!   configurations should use `hazard`. These runs are fully independent of `batch_sizes`,
+//!   `rollback_max_consecutive`, and `max_batch_solver_parallelism`.
+//!   `offline_singleton_best` scans feasible slot/flavour pairs and commits the cheapest choice;
+//!   `offline_singleton_best_accurate` uses the same search with only the lowest-error flavour.
+//!   `hazard` samples flavours from the closest-to-uniform distribution whose expected error
+//!   equals the scenario threshold, then samples slots inversely to forecast intensity multiplied
+//!   by the capacity tier at the slot's next occupancy position. It is statistical, not a per-run
+//!   QoS guarantee.
 //! - `flavours`: overrides `Config::flavours` (the 3 built-in Accurate/Balanced/Fast
 //!   defaults) with `[{"name": "...", "error": <f64>, "duration_sec": <f64>}, ...]`.
 //!   Printed at startup alongside the other config knobs so it's clear which flavours
@@ -92,21 +96,19 @@
 //!   N<n>/  { same files as above }
 //! ```
 
-mod swarm;
-
 use carbonshift_rs::config::{AssignmentPolicy, Config};
+use carbonshift_rs::engine::qos::QosProfileId;
+use carbonshift_rs::engine::solver::{
+    CommitReport, ErrorTotals, ErrorWindowInput, QoSProfileInput, SolveInput, SolveRequest,
+    SolverError, SolverRegistry, SolverScope,
+};
+use carbonshift_rs::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use carbonshift_rs::generator::{RequestGenerator, RequestGeneratorConfig};
 use carbonshift_rs::metrics_logger::MetricsLogger;
-use carbonshift_rs::random_selection::{
-    RandomSelectionMode, closest_to_uniform_flavour_probabilities as random_flavour_probabilities,
-    select_random_assignment,
-};
-use carbonshift_rs::scenario::Scenario;
+use carbonshift_rs::scenario::{Scenario, ScenarioRequest};
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
 use carbonshift_rs::types::{Assignment, CapacityTier, Flavour, get_capacity_multiplier};
-use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -127,7 +129,7 @@ struct BenchmarkConfig {
     infeasibility_recovery_mode: Option<String>,
     /// Max consecutive rollbacks before force-committing (0 = rollback disabled).
     rollback_max_consecutive: usize,
-    /// Additional offline strategies to run (e.g. "offline_singleton_best", "offline_singleton_best_accurate", "random").
+    /// Additional common-engine strategies to run (e.g. singleton_best, hazard).
     additional_strategies: Vec<String>,
     /// Online strategies to run through the scheduler pipeline (e.g. "bandit", "ant_colony").
     online_strategies: Vec<String>,
@@ -858,178 +860,405 @@ fn run_greedy_baseline(
     (per_req, batch_timings, summary)
 }
 
-// ─── per-request greedy strategies ────────────────────────────────────────────
+// ─── common offline engine adapter ────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
-enum OfflineSingletonFlavourSelection {
-    Any,
-    MostAccurate,
+/// Separate seed salt keeps the hazard stream reproducible without sharing the
+/// scenario generator's random sequence.
+const HAZARD_SEED_SALT: u64 = 0xA3F1_95C7_4D2B_6801;
+
+/// Keep runner-specific search settings out of the strategy implementations.
+/// This offline runner registers the common engine factories; the live
+/// scheduler will use the same composition point after its planned Step 5B
+/// cutover from the legacy dispatch path.
+fn build_solver_registry(config: &Config, hazard_seed: u64) -> Result<SolverRegistry, SolverError> {
+    let dp_config = DpAlgorithmConfig {
+        pruning_method: config.solver.dp_pruning_method.clone(),
+        pruning_min_batch_size: config.solver.dp_pruning_min_batch_size,
+        pruning_k: config.solver.dp_pruning_k,
+        timeout_secs: config.solver.dp_timeout,
+    };
+    let mut registry = SolverRegistry::default();
+    register_all_solvers(&mut registry, dp_config, &config.swarm, hazard_seed)?;
+    Ok(registry)
 }
 
-/// Scan candidate slot/flavour pairs for each request, then commit the least
-/// carbon-cost feasible pair before considering the next request.
+/// Convert one offline scenario into the profile-scoped, runner-independent
+/// contract that every common engine consumes.
+fn project_scenario_to_solve_input(
+    scenario: &Scenario,
+    assignment: &AssignmentPolicy<'_>,
+) -> Result<(SolverScope, SolveInput), SolverError> {
+    let total_slots = usize::try_from(assignment.total_slots).map_err(|_| {
+        SolverError::Algorithm("planning horizon must be a positive slot count".to_owned())
+    })?;
+    if total_slots == 0 {
+        return Err(SolverError::Algorithm(
+            "planning horizon must contain at least one slot".to_owned(),
+        ));
+    }
+    if scenario.carbon_forecast.len() != total_slots {
+        return Err(SolverError::Algorithm(format!(
+            "scenario forecast has {} slots but the assignment policy has {total_slots}",
+            scenario.carbon_forecast.len()
+        )));
+    }
+
+    let profile_id = QosProfileId::default_profile();
+    let scope = SolverScope {
+        profile_id: profile_id.clone(),
+        total_slots,
+    };
+
+    // A stable order makes seeded algorithms independent of the JSON request
+    // array's ordering and gives stateful algorithms a repeatable work sequence.
+    let mut requests = scenario.requests.clone();
+    requests.sort_by_key(|request| (request.arrival_slot, request.request_id));
+
+    let input = SolveInput {
+        current_slot: 0,
+        requests: requests
+            .iter()
+            .map(|request| SolveRequest {
+                request_id: request.request_id,
+                arrival_slot: request.arrival_slot,
+                deadline_slot: request.deadline_slot,
+            })
+            .collect(),
+        carbon_forecast: scenario.carbon_forecast.clone(),
+        capacity_tiers: assignment.capacity_tiers.to_vec(),
+        baseline_slot_counts: HashMap::new(),
+        carbon_cost_duration_scale: assignment.carbon_cost_duration_scale,
+        assignment_max_future_slots: assignment.assignment_max_future_slots,
+        assignment_max_slot: Some(assignment.total_slots - 1),
+        qos: QoSProfileInput {
+            profile_id,
+            flavours: assignment.flavours.to_vec(),
+            cumulative_error_constraint_active: assignment.global_error_constraint_enabled
+                && assignment.global_error_constraint_hard,
+            cumulative_err: ErrorTotals::default(),
+            err_by_slot: HashMap::new(),
+            max_average_error: assignment.max_error_threshold,
+            error_window: ErrorWindowInput {
+                baseline_err: ErrorTotals::default(),
+                past_slots: assignment.error_window_past,
+                future_slots: assignment.error_window_future,
+            },
+        },
+    };
+
+    Ok((scope, input))
+}
+
+/// A final assignment plus the solver's late marker, which the domain's
+/// `Assignment` intentionally does not store.
+struct OfflineEnginePlacement {
+    assignment: Assignment,
+    arrival_slot: i32,
+    deadline_slot: i32,
+    late: bool,
+}
+
+/// Information validated once for each proposed placement and then used to
+/// create the accepted, priced domain assignment.
+struct ValidatedProposedPlacement<'request, 'flavour> {
+    request: &'request ScenarioRequest,
+    flavour: &'flavour Flavour,
+    next_position: i64,
+    carbon_cost: f64,
+}
+
+/// Check a single engine placement against its request, time bounds, profile,
+/// forecast, and next capacity-tier position.
 ///
-/// This is a per-request greedy search, not an exhaustive search over complete
-/// schedules. `flavour_selection` narrows the same search for the accurate-only
-/// baseline while keeping slot feasibility and cost calculation identical.
-fn run_offline_singleton(
+/// Keeping these checks together gives the materializer one clear boundary:
+/// it either receives all the trusted data needed to build an `Assignment`,
+/// or it gets a descriptive solver error and commits nothing.
+fn validate_proposed_placement<'request, 'flavour>(
+    placement: &carbonshift_rs::engine::solver::ProposedPlacement,
+    solve_input: &SolveInput,
+    scope: &SolverScope,
+    requests_by_id: &HashMap<u64, &'request ScenarioRequest>,
+    assignment: &'flavour AssignmentPolicy<'_>,
+    slot_counts: &HashMap<i32, i64>,
+    seen_request_ids: &mut HashSet<u64>,
+) -> Result<ValidatedProposedPlacement<'request, 'flavour>, SolverError> {
+    if !seen_request_ids.insert(placement.req_id) {
+        return Err(SolverError::Algorithm(format!(
+            "engine proposed request {} more than once",
+            placement.req_id
+        )));
+    }
+
+    let request = requests_by_id
+        .get(&placement.req_id)
+        .copied()
+        .ok_or_else(|| {
+            SolverError::Algorithm(format!(
+                "engine proposed unknown request {}",
+                placement.req_id
+            ))
+        })?;
+
+    // `late` is explicit proposal metadata, not something inferred later from
+    // the output row. Late placements must be at the current slot and after
+    // their deadline; normal placements must satisfy every upper bound.
+    if placement.late {
+        if placement.scheduled_slot != solve_input.current_slot
+            || placement.scheduled_slot <= request.deadline_slot
+        {
+            return Err(SolverError::Algorithm(format!(
+                "engine marked request {} late at a non-late slot",
+                placement.req_id
+            )));
+        }
+    } else {
+        let earliest = request.arrival_slot.max(solve_input.current_slot);
+        let shift_limit = request
+            .arrival_slot
+            .checked_add(solve_input.assignment_max_future_slots)
+            .ok_or_else(|| {
+                SolverError::Algorithm(format!(
+                    "request {} assignment window overflowed",
+                    placement.req_id
+                ))
+            })?;
+        let forecast_window_end = solve_input
+            .current_slot
+            .checked_add(solve_input.qos.error_window.future_slots)
+            .ok_or_else(|| {
+                SolverError::Algorithm("forecast window boundary overflowed".to_owned())
+            })?;
+        let planning_horizon_end = i32::try_from(scope.total_slots)
+            .ok()
+            .and_then(|slot_count| slot_count.checked_sub(1))
+            .ok_or_else(|| {
+                SolverError::Algorithm("planning horizon must contain valid slots".to_owned())
+            })?;
+        let latest = request
+            .deadline_slot
+            .min(shift_limit)
+            .min(forecast_window_end)
+            .min(
+                solve_input
+                    .assignment_max_slot
+                    .unwrap_or(planning_horizon_end),
+            )
+            .min(planning_horizon_end);
+
+        if placement.scheduled_slot < earliest || placement.scheduled_slot > latest {
+            return Err(SolverError::Algorithm(format!(
+                "engine placed request {} outside its feasible slot window",
+                placement.req_id
+            )));
+        }
+    }
+
+    let flavour = assignment
+        .flavours
+        .iter()
+        .find(|flavour| flavour.name == placement.flavour_name)
+        .ok_or_else(|| {
+            SolverError::Algorithm(format!(
+                "engine selected unknown flavour '{}' for request {}",
+                placement.flavour_name, placement.req_id
+            ))
+        })?;
+    let slot_index = usize::try_from(placement.scheduled_slot).map_err(|_| {
+        SolverError::Algorithm(format!(
+            "engine selected invalid slot {} for request {}",
+            placement.scheduled_slot, placement.req_id
+        ))
+    })?;
+    let carbon_intensity = solve_input
+        .carbon_forecast
+        .get(slot_index)
+        .copied()
+        .ok_or_else(|| {
+            SolverError::Algorithm(format!(
+                "engine selected a slot outside the forecast for request {}",
+                placement.req_id
+            ))
+        })?;
+
+    let current_count = slot_counts
+        .get(&placement.scheduled_slot)
+        .copied()
+        .unwrap_or(0);
+    if current_count < 0 {
+        return Err(SolverError::Algorithm(format!(
+            "slot {} occupancy cannot be negative",
+            placement.scheduled_slot
+        )));
+    }
+    let next_position = current_count.checked_add(1).ok_or_else(|| {
+        SolverError::Algorithm(format!(
+            "slot {} occupancy overflowed i64",
+            placement.scheduled_slot
+        ))
+    })?;
+    let capacity_multiplier = get_capacity_multiplier(assignment.capacity_tiers, next_position);
+    let duration_scale = assignment.carbon_cost_duration_scale;
+    if !carbon_intensity.is_finite()
+        || carbon_intensity < 0.0
+        || !capacity_multiplier.is_finite()
+        || capacity_multiplier < 0.0
+        || !flavour.error.is_finite()
+        || !flavour.duration.is_finite()
+        || flavour.duration < 0.0
+        || !duration_scale.is_finite()
+        || duration_scale < 0.0
+    {
+        return Err(SolverError::Algorithm(format!(
+            "request {} has invalid forecast, capacity, flavour, or cost-scale data",
+            placement.req_id
+        )));
+    }
+    let carbon_cost = carbon_intensity * capacity_multiplier * flavour.duration * duration_scale;
+    if !carbon_cost.is_finite() {
+        return Err(SolverError::Algorithm(format!(
+            "request {} produced a non-finite carbon price",
+            placement.req_id
+        )));
+    }
+
+    Ok(ValidatedProposedPlacement {
+        request,
+        flavour,
+        next_position,
+        carbon_cost,
+    })
+}
+
+/// Apply the offline runner's accept-and-price rule to a proposal.
+///
+/// Proposed placements deliberately have no carbon price. This adapter walks
+/// them in proposal order, prices each at the next occupancy position for its
+/// slot, then increments that slot's count. The resulting prices are exactly
+/// what stateful engines receive in `CommitReport`, so their learned costs are
+/// based on accepted, capacity-adjusted assignments rather than estimates.
+fn materialize_offline_proposal(
+    proposal: &carbonshift_rs::engine::solver::SolverProposal,
+    solve_input: &SolveInput,
+    scope: &SolverScope,
+    scenario: &Scenario,
+    assignment: &AssignmentPolicy<'_>,
+) -> Result<Vec<OfflineEnginePlacement>, SolverError> {
+    let requests_by_id: HashMap<u64, _> = scenario
+        .requests
+        .iter()
+        .map(|request| (request.request_id, request))
+        .collect();
+    if requests_by_id.len() != scenario.requests.len() {
+        return Err(SolverError::Algorithm(
+            "scenario contains duplicate request IDs".to_owned(),
+        ));
+    }
+
+    let mut seen_request_ids = HashSet::with_capacity(proposal.placements.len());
+    let mut slot_counts = solve_input.baseline_slot_counts.clone();
+    let mut materialized = Vec::with_capacity(proposal.placements.len());
+
+    for placement in &proposal.placements {
+        let validated = validate_proposed_placement(
+            placement,
+            solve_input,
+            scope,
+            &requests_by_id,
+            assignment,
+            &slot_counts,
+            &mut seen_request_ids,
+        )?;
+        *slot_counts.entry(placement.scheduled_slot).or_insert(0) = validated.next_position;
+        materialized.push(OfflineEnginePlacement {
+            assignment: Assignment::new_for_profile(
+                placement.req_id,
+                placement.scheduled_slot,
+                placement.flavour_name.clone(),
+                validated.carbon_cost,
+                validated.flavour.error,
+                validated.flavour.duration,
+                Some(validated.request.arrival_slot),
+                Some(validated.request.deadline_slot),
+                solve_input.qos.profile_id.clone(),
+            ),
+            arrival_slot: validated.request.arrival_slot,
+            deadline_slot: validated.request.deadline_slot,
+            late: placement.late,
+        });
+    }
+
+    if seen_request_ids.len() != scenario.requests.len() {
+        return Err(SolverError::Algorithm(format!(
+            "engine proposed {} of {} scenario requests",
+            seen_request_ids.len(),
+            scenario.requests.len()
+        )));
+    }
+
+    Ok(materialized)
+}
+
+/// Convert accepted common-engine assignments to the established `nshift`
+/// per-request and summary output records.
+fn convert_engine_results_to_outputs(
+    mut placements: Vec<OfflineEnginePlacement>,
+    strategy_name: &str,
     scenario: &Scenario,
     assignment: &AssignmentPolicy<'_>,
     slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
-    strategy_name: &str,
-    flavour_selection: OfflineSingletonFlavourSelection,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let slot_dur = slot_duration_seconds;
-    let carbon = &scenario.carbon_forecast;
-    let tiers = assignment.capacity_tiers;
-    let scale = assignment.carbon_cost_duration_scale;
-    let max_future = assignment.assignment_max_future_slots;
-    let total_slots = assignment.total_slots;
-    let win_past = assignment.error_window_past;
-    let win_future = assignment.error_window_future;
-    let max_err = assignment.max_error_threshold;
+    placements.sort_by_key(|placement| (placement.arrival_slot, placement.assignment.request_id));
 
-    let accurate_flavour = assignment
+    let most_accurate = assignment
         .flavours
         .iter()
-        .min_by(|a, b| a.error.total_cmp(&b.error))
-        .expect("no flavours");
-    let mut sorted_flavours: Vec<&Flavour> = match flavour_selection {
-        OfflineSingletonFlavourSelection::Any => assignment.flavours.iter().collect(),
-        OfflineSingletonFlavourSelection::MostAccurate => vec![accurate_flavour],
-    };
-    sorted_flavours.sort_by(|a, b| a.duration.total_cmp(&b.duration));
+        .min_by(|left, right| left.error.total_cmp(&right.error))
+        .expect("a valid engine input has at least one flavour");
+    let mut per_request = Vec::with_capacity(placements.len());
+    let mut batch_timings = Vec::with_capacity(placements.len());
 
-    // In an infeasible error window, commit the lowest-error eligible flavour
-    // at arrival, matching the existing fallback behavior.
-    let fallback_flav = sorted_flavours
-        .iter()
-        .copied()
-        .min_by(|a, b| a.error.total_cmp(&b.error))
-        .expect("no eligible flavours");
-
-    // Process in arrival order so each decision sees the earlier commits.
-    let mut requests: Vec<_> = scenario.requests.iter().collect();
-    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
-
-    let mut slot_count: HashMap<i32, i64> = HashMap::new();
-    let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
-    let mut global_error_sum: f64 = 0.0;
-    let mut global_count: usize = 0;
-    let mut per_req: Vec<PerRequest> = Vec::new();
-    let mut batch_timings: Vec<BatchTiming> = Vec::new();
-    let mut seq: u64 = 0;
-
-    for req in &requests {
-        let arrival = req.arrival_slot;
-        let deadline = req
-            .deadline_slot
-            .min(arrival + max_future)
-            .min(total_slots - 1);
-
-        // Apply the cumulative hard constraint only after the committed
-        // average has crossed the threshold, matching the prior greedy engine.
-        let global_avg = if global_count > 0 {
-            global_error_sum / global_count as f64
+    for (index, placement) in placements.iter().enumerate() {
+        let assignment_result = &placement.assignment;
+        let arrival_slot = placement.arrival_slot;
+        let deadline_slot = placement.deadline_slot;
+        let sequence = (index + 1) as u64;
+        let queue_wait_slots = (assignment_result.scheduled_slot - arrival_slot).max(0);
+        let lateness_slots = if placement.late {
+            assignment_result.scheduled_slot - deadline_slot
         } else {
-            0.0
+            0
         };
-        let global_constraint_active =
-            assignment.global_error_constraint_enabled && global_count > 0 && global_avg > max_err;
-        let allowed_flavours: Vec<&Flavour> =
-            if global_constraint_active && assignment.global_error_constraint_hard {
-                let filtered: Vec<&Flavour> = sorted_flavours
-                    .iter()
-                    .filter(|f| f.error <= max_err)
-                    .copied()
-                    .collect();
-                if filtered.is_empty() {
-                    sorted_flavours.clone()
-                } else {
-                    filtered
-                }
-            } else {
-                sorted_flavours.clone()
-            };
 
-        // For each feasible slot, price every currently allowed flavour using
-        // that slot's next capacity-tier position and retain the cheapest one.
-        let mut best: Option<(f64, i32, &Flavour)> = None;
-        for slot in arrival..=deadline {
-            let ci = carbon.get(slot as usize).copied().unwrap_or(1.0);
-            let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
-            let mult = get_capacity_multiplier(tiers, position);
-
-            for flav in &allowed_flavours {
-                let cost = ci * mult * flav.duration * scale;
-                let mut win_sum = flav.error;
-                let mut win_cnt = 1usize;
-                for ws in (arrival - win_past)..=(arrival + win_future) {
-                    if let Some(errs) = slot_errors.get(&ws) {
-                        win_sum += errs.iter().sum::<f64>();
-                        win_cnt += errs.len();
-                    }
-                }
-                if win_sum / win_cnt as f64 > max_err {
-                    continue;
-                }
-                if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
-                    best = Some((cost, slot, flav));
-                }
-            }
-        }
-
-        // If no candidate satisfies the window, keep the lowest-error eligible
-        // flavour at arrival rather than leaving the request unassigned.
-        let (chosen_cost, chosen_slot, chosen_flav) = best.unwrap_or_else(|| {
-            let slot = arrival;
-            let ci = carbon.get(slot as usize).copied().unwrap_or(1.0);
-            let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
-            let mult = get_capacity_multiplier(tiers, position);
-            let cost = ci * mult * fallback_flav.duration * scale;
-            (cost, slot, fallback_flav)
-        });
-
-        *slot_count.entry(chosen_slot).or_insert(0) += 1;
-        slot_errors
-            .entry(chosen_slot)
-            .or_default()
-            .push(chosen_flav.error);
-        global_error_sum += chosen_flav.error;
-        global_count += 1;
-        seq += 1;
-
-        let queue_wait_slots = (chosen_slot - arrival).max(0);
-        per_req.push(PerRequest {
-            request_id: req.request_id,
-            arrival_time: arrival as f64 * slot_dur,
-            arrival_slot: arrival,
-            deadline_slot: req.deadline_slot,
-            included_in_batch_slot: arrival,
-            batch_sequence: seq,
-            scheduled_slot: chosen_slot,
+        per_request.push(PerRequest {
+            request_id: assignment_result.request_id,
+            arrival_time: arrival_slot as f64 * slot_duration_seconds,
+            arrival_slot,
+            deadline_slot,
+            included_in_batch_slot: arrival_slot,
+            batch_sequence: sequence,
+            scheduled_slot: assignment_result.scheduled_slot,
             queue_wait_slots,
-            queue_wait_seconds: queue_wait_slots as f64 * slot_dur,
+            queue_wait_seconds: queue_wait_slots as f64 * slot_duration_seconds,
             final_wait_slots: queue_wait_slots,
-            final_wait_seconds: queue_wait_slots as f64 * slot_dur,
-            flavour_name: chosen_flav.name.clone(),
-            error: chosen_flav.error,
-            carbon_cost: chosen_cost,
-            assignment_solver_mode: strategy_name.to_string(),
-            assignment_solver_status: "ok".to_string(),
+            final_wait_seconds: queue_wait_slots as f64 * slot_duration_seconds,
+            flavour_name: assignment_result.flavour_name.clone(),
+            error: assignment_result.error,
+            carbon_cost: assignment_result.carbon_cost,
+            assignment_solver_mode: strategy_name.to_owned(),
+            assignment_solver_status: "ok".to_owned(),
             assigned_with_greedy_fallback: false,
             assigned_with_relaxed_retry: false,
             assigned_with_injection: false,
             assigned_with_rollback: false,
-            lateness_slots: (chosen_slot - req.deadline_slot).max(0),
+            lateness_slots,
         });
         batch_timings.push(BatchTiming {
-            batch_sequence: seq,
+            batch_sequence: sequence,
             batch_size_n: 0,
             effective_batch_size: 1,
-            slot: arrival,
+            slot: arrival_slot,
             pending_before: 1,
             solver_elapsed_ms: 0.0,
             scheduled: true,
@@ -1042,178 +1271,7 @@ fn run_offline_singleton(
         0,
         realtime_slots,
         realtime_speed_scale,
-        &per_req,
-        &batch_timings,
-        scenario.requests.len(),
-        &fallback_flav.name,
-        fallback_flav.duration,
-        fallback_flav.error,
-        0,
-        0,
-        0,
-        0,
-        0.0,
-    );
-    (per_req, batch_timings, summary)
-}
-
-fn run_offline_singleton_best(
-    scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
-    slot_duration_seconds: f64,
-    realtime_slots: bool,
-    realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    run_offline_singleton(
-        scenario,
-        assignment,
-        slot_duration_seconds,
-        realtime_slots,
-        realtime_speed_scale,
-        "offline_singleton_best",
-        OfflineSingletonFlavourSelection::Any,
-    )
-}
-
-fn run_offline_singleton_best_accurate(
-    scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
-    slot_duration_seconds: f64,
-    realtime_slots: bool,
-    realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    run_offline_singleton(
-        scenario,
-        assignment,
-        slot_duration_seconds,
-        realtime_slots,
-        realtime_speed_scale,
-        "offline_singleton_best_accurate",
-        OfflineSingletonFlavourSelection::MostAccurate,
-    )
-}
-
-/// Assign each request a uniformly random feasible slot and a random flavour.
-///
-/// Flavour probabilities are the Euclidean-nearest distribution to uniform
-/// subject to having the configured error threshold as their expected error.
-/// This targets the average over many assignments; it is not a per-run or
-/// per-window QoS guarantee.
-fn run_random_with_mode(
-    scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
-    slot_duration_seconds: f64,
-    realtime_slots: bool,
-    realtime_speed_scale: f64,
-    mode: RandomSelectionMode,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    // Calculate the flavour mix once for this run. An unattainable threshold
-    // (outside the configured flavour errors) makes the random baseline invalid.
-    let errors: Vec<f64> = assignment.flavours.iter().map(|f| f.error).collect();
-    let probabilities = random_flavour_probabilities(&errors, assignment.max_error_threshold)
-        .unwrap_or_else(|error| panic!("Cannot run random strategy: {error}"));
-
-    // Reuse the scenario seed so this baseline is repeatable. The fixed xor
-    // constant gives this strategy its own deterministic RNG stream.
-    let mut rng = ChaCha8Rng::seed_from_u64(scenario.metadata.seed ^ 0xA3F1_95C7_4D2B_6801);
-    let mut requests: Vec<_> = scenario.requests.iter().collect();
-    // A stable processing order makes the seeded result independent of the
-    // request vector's input ordering.
-    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
-
-    // Capacity tiers price requests by their one-based commit position in a
-    // slot, so preserve the occupancy accumulated by earlier random choices.
-    let mut slot_count: HashMap<i32, i64> = HashMap::new();
-    let mut per_req: Vec<PerRequest> = Vec::with_capacity(requests.len());
-    let mut batch_timings: Vec<BatchTiming> = Vec::with_capacity(requests.len());
-
-    for (index, req) in requests.iter().enumerate() {
-        let arrival = req.arrival_slot;
-        // Restrict random slot selection to the request's valid scheduling
-        // window: its deadline, the configured maximum shift, and horizon end.
-        let latest = req
-            .deadline_slot
-            .min(arrival + assignment.assignment_max_future_slots)
-            .min(assignment.total_slots - 1);
-        let (slot, flavour_index) = select_random_assignment(
-            mode,
-            arrival,
-            latest,
-            assignment.flavours,
-            &probabilities,
-            &mut rng,
-        )
-        .expect("scenario request must have a feasible slot and configured flavours");
-        let chosen_flavour = &assignment.flavours[flavour_index];
-
-        // Price this assignment at the slot's next occupancy position, then
-        // commit that occupancy so later requests see the correct tier.
-        let position = slot_count.get(&slot).copied().unwrap_or(0) + 1;
-        let multiplier = get_capacity_multiplier(assignment.capacity_tiers, position);
-        let carbon_intensity = scenario
-            .carbon_forecast
-            .get(slot as usize)
-            .copied()
-            .unwrap_or(1.0);
-        let carbon_cost = carbon_intensity
-            * multiplier
-            * chosen_flavour.duration
-            * assignment.carbon_cost_duration_scale;
-        *slot_count.entry(slot).or_insert(0) += 1;
-
-        // Record the same per-request and single-request timing shape used by
-        // the other offline engines; random scheduling itself has no solver
-        // work or batching phase.
-        let wait_slots = (slot - arrival).max(0);
-        let sequence = (index + 1) as u64;
-        per_req.push(PerRequest {
-            request_id: req.request_id,
-            arrival_time: arrival as f64 * slot_duration_seconds,
-            arrival_slot: arrival,
-            deadline_slot: req.deadline_slot,
-            included_in_batch_slot: arrival,
-            batch_sequence: sequence,
-            scheduled_slot: slot,
-            queue_wait_slots: wait_slots,
-            queue_wait_seconds: wait_slots as f64 * slot_duration_seconds,
-            final_wait_slots: wait_slots,
-            final_wait_seconds: wait_slots as f64 * slot_duration_seconds,
-            flavour_name: chosen_flavour.name.clone(),
-            error: chosen_flavour.error,
-            carbon_cost,
-            assignment_solver_mode: "random".to_string(),
-            assignment_solver_status: "ok".to_string(),
-            assigned_with_greedy_fallback: false,
-            assigned_with_relaxed_retry: false,
-            assigned_with_injection: false,
-            assigned_with_rollback: false,
-            lateness_slots: (slot - req.deadline_slot).max(0),
-        });
-        batch_timings.push(BatchTiming {
-            batch_sequence: sequence,
-            batch_size_n: 0,
-            effective_batch_size: 1,
-            slot: arrival,
-            pending_before: 1,
-            solver_elapsed_ms: 0.0,
-            scheduled: true,
-            flush_partial_batch: false,
-        });
-    }
-
-    // The summary's baseline flavour fields describe the common reference
-    // flavour; they do not imply that random assignments use that flavour.
-    let most_accurate = assignment
-        .flavours
-        .iter()
-        .min_by(|a, b| a.error.total_cmp(&b.error))
-        .expect("no flavours");
-    let summary = compute_summary(
-        "random",
-        0,
-        realtime_slots,
-        realtime_speed_scale,
-        &per_req,
+        &per_request,
         &batch_timings,
         scenario.requests.len(),
         &most_accurate.name,
@@ -1225,386 +1283,89 @@ fn run_random_with_mode(
         0,
         0.0,
     );
-    (per_req, batch_timings, summary)
+    (per_request, batch_timings, summary)
 }
 
-fn run_random(
+/// Normalize offline labels at the runner boundary, then create and run the
+/// requested shared engine. The temporary `random` input label routes to
+/// `hazard` until Step 5B migrates the online scheduler and removes that label.
+fn canonical_offline_engine_name(name: &str) -> Result<(&'static str, &'static str), SolverError> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "offline_singleton_best" => Ok(("singleton_best", "offline_singleton_best")),
+        "singleton_best" => Ok(("singleton_best", "singleton_best")),
+        "offline_singleton_best_accurate" => {
+            Ok(("singleton_best_accurate", "offline_singleton_best_accurate"))
+        }
+        "singleton_best_accurate" => Ok(("singleton_best_accurate", "singleton_best_accurate")),
+        // Remove this temporary label at the same time the online scheduler
+        // switches its legacy random modes to the common hazard engine.
+        "random" | "hazard" => Ok(("hazard", "hazard")),
+        "dp" => Ok(("dp", "dp")),
+        "bandit" => Ok(("bandit", "bandit")),
+        "ant_colony" => Ok(("ant_colony", "ant_colony")),
+        _ => Err(SolverError::UnknownEngine(name.to_owned())),
+    }
+}
+
+/// Run one offline scenario through the common solver registry and lifecycle.
+fn run_strategy(
+    registry: &SolverRegistry,
+    name: &str,
     scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
+    config: &Config,
     slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    run_random_with_mode(
+) -> Result<(Vec<PerRequest>, Vec<BatchTiming>, RunSummary), SolverError> {
+    let (engine_name, output_name) = canonical_offline_engine_name(name)?;
+    let assignment = config.assignment_policy();
+    let (scope, solve_input) = project_scenario_to_solve_input(scenario, &assignment)?;
+    let runtime = registry.create(engine_name, scope.clone())?;
+    let pending = runtime.propose(&solve_input)?;
+
+    // If conversion rejects a proposal, settle its pending state delta as
+    // discarded before returning the explicit conversion error.
+    let materialized = match materialize_offline_proposal(
+        &pending.proposal,
+        &solve_input,
+        &scope,
         scenario,
-        assignment,
+        &assignment,
+    ) {
+        Ok(assignments) => assignments,
+        Err(error) => {
+            runtime.discard(pending.id)?;
+            return Err(error);
+        }
+    };
+
+    let commit_report = CommitReport {
+        assignments: materialized
+            .iter()
+            .map(|placement| placement.assignment.clone())
+            .collect(),
+    };
+    runtime.commit(pending.id, commit_report)?;
+
+    Ok(convert_engine_results_to_outputs(
+        materialized,
+        output_name,
+        scenario,
+        &assignment,
         slot_duration_seconds,
         realtime_slots,
         realtime_speed_scale,
-        RandomSelectionMode::Full,
-    )
+    ))
 }
 
+/// Only ACO makes meaningful use of offline batch-size sweeps; every other
+/// online strategy is deliberately run as a sequence of singleton batches.
 fn online_batch_sizes_for_strategy(strategy: &str, configured: &[usize]) -> Vec<usize> {
     if strategy.eq_ignore_ascii_case("ant_colony") {
         configured.to_vec()
     } else {
         vec![1]
     }
-}
-
-/// Project equal flavour probabilities onto the non-negative distributions
-/// whose expected error equals `target_error`.
-///
-/// For each slope, the projection has the form `max(0, intercept + slope*e)`.
-/// The intercept is chosen so probabilities sum to one; a bounded bisection
-/// then finds the slope that matches the requested expected error.
-#[cfg(test)]
-fn closest_to_uniform_flavour_probabilities(
-    errors: &[f64],
-    target_error: f64,
-) -> Result<Vec<f64>, String> {
-    // Validate before calculating a range or normalizing: neither an empty
-    // flavour set nor non-finite values define a usable probability mix.
-    if errors.is_empty() {
-        return Err("at least one flavour is required".to_string());
-    }
-    if !target_error.is_finite() || errors.iter().any(|error| !error.is_finite()) {
-        return Err("flavour errors and target error must be finite".to_string());
-    }
-
-    let min_error = errors.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_error = errors.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    // An expected error is a weighted average, so it cannot be below the
-    // lowest flavour error or above the highest one.
-    if target_error < min_error || target_error > max_error {
-        return Err(format!(
-            "target error {target_error} is outside the flavour error range [{min_error}, {max_error}]"
-        ));
-    }
-
-    // If every flavour has the same error, every distribution has that
-    // expectation; equal probabilities are therefore already nearest uniform.
-    if min_error == max_error {
-        return Ok(vec![1.0 / errors.len() as f64; errors.len()]);
-    }
-
-    // At either endpoint only flavours with that exact error can be selected.
-    // Splitting mass evenly among tied endpoint flavours is the closest mix to
-    // uniform among all distributions that attain the endpoint.
-    if target_error == min_error || target_error == max_error {
-        let selected_error = if target_error == min_error {
-            min_error
-        } else {
-            max_error
-        };
-        let matching_count = errors
-            .iter()
-            .filter(|error| **error == selected_error)
-            .count();
-        return Ok(errors
-            .iter()
-            .map(|error| {
-                if *error == selected_error {
-                    1.0 / matching_count as f64
-                } else {
-                    0.0
-                }
-            })
-            .collect());
-    }
-
-    // Work on a [0, 1] error scale so probability calculations and slope
-    // search do not depend on whether errors are represented as fractions or
-    // percentages, or on the magnitude of the configured values.
-    let normalized_errors: Vec<f64> = errors
-        .iter()
-        .map(|error| (error - min_error) / (max_error - min_error))
-        .collect();
-    let normalized_target = (target_error - min_error) / (max_error - min_error);
-    let uniform_mean = normalized_errors.iter().sum::<f64>() / normalized_errors.len() as f64;
-    // Equal probabilities are the closest possible distribution when their
-    // mean already meets the target.
-    if (normalized_target - uniform_mean).abs() <= f64::EPSILON {
-        return Ok(vec![1.0 / errors.len() as f64; errors.len()]);
-    }
-
-    // For a given slope, project equal probabilities onto the non-negative
-    // unit-sum distribution associated with that slope, then measure its mean
-    // error. Increasing the slope shifts probability toward higher errors.
-    let expected_normalized_error = |slope: f64| {
-        let probabilities = project_probabilities_at_slope(&normalized_errors, slope);
-        probabilities
-            .iter()
-            .zip(&normalized_errors)
-            .map(|(probability, error)| probability * error)
-            .sum::<f64>()
-    };
-
-    // Start at slope zero (the equal-probability mix) and expand in the needed
-    // direction until the target is bracketed. Geometric expansion avoids
-    // guessing a slope scale for different numbers of flavours or error gaps.
-    let (mut low, mut high) = if normalized_target > uniform_mean {
-        (0.0, 1.0)
-    } else {
-        (-1.0, 0.0)
-    };
-    let mut bracketed = false;
-    for _ in 0..64 {
-        if expected_normalized_error(low) <= normalized_target
-            && expected_normalized_error(high) >= normalized_target
-        {
-            bracketed = true;
-            break;
-        }
-        if normalized_target > uniform_mean {
-            high *= 2.0;
-        } else {
-            low *= 2.0;
-        }
-    }
-    if !bracketed {
-        return Err(
-            "could not bracket the target error while calculating probabilities".to_string(),
-        );
-    }
-
-    // The expected error is monotone over this bracket. Bisection narrows it
-    // until the projected mix reaches the target to floating-point precision.
-    for _ in 0..100 {
-        let midpoint = low + (high - low) / 2.0;
-        if expected_normalized_error(midpoint) < normalized_target {
-            low = midpoint;
-        } else {
-            high = midpoint;
-        }
-    }
-    Ok(project_probabilities_at_slope(
-        &normalized_errors,
-        low + (high - low) / 2.0,
-    ))
-}
-
-/// Return the non-negative unit-sum projection for one probability slope.
-#[cfg(test)]
-fn project_probabilities_at_slope(normalized_errors: &[f64], slope: f64) -> Vec<f64> {
-    // The projection has probabilities max(0, intercept + slope*error).
-    // Sorting scores lets us find the active (positive-probability) prefix;
-    // the intercept for each prefix is the value that makes its weights sum
-    // to one.
-    let mut scores: Vec<(usize, f64)> = normalized_errors
-        .iter()
-        .enumerate()
-        .map(|(index, error)| (index, slope * error))
-        .collect();
-    scores.sort_by(|left, right| right.1.total_cmp(&left.1));
-
-    let mut score_sum = 0.0;
-    for active_count in 1..=scores.len() {
-        score_sum += scores[active_count - 1].1;
-        let intercept = (1.0 - score_sum) / active_count as f64;
-        // Once the next score would receive zero or less probability, this
-        // prefix is the complete active set and all remaining flavours stay at
-        // the non-negative boundary.
-        let next_score_is_inactive =
-            active_count == scores.len() || intercept + scores[active_count].1 <= 0.0;
-        if next_score_is_inactive {
-            let mut probabilities = vec![0.0; scores.len()];
-            // Restore the sorted entries to their original flavour order so
-            // callers can zip probabilities with the configured flavours.
-            for (index, score) in scores.iter().take(active_count) {
-                probabilities[*index] = (intercept + score).max(0.0);
-            }
-            return probabilities;
-        }
-    }
-
-    unreachable!("the final active set always normalizes to one")
-}
-// ─── swarm strategy wrappers ──────────────────────────────────────────────────
-
-/// Convert `SwarmAssignment` results into the standard `PerRequest` / summary
-/// format used by the rest of the benchmark output.
-fn convert_swarm_to_outputs(
-    raw: Vec<swarm::SwarmAssignment>,
-    mode_name: &str,
-    scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
-    slot_duration_seconds: f64,
-    realtime_slots: bool,
-    realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let slot_dur = slot_duration_seconds;
-    let best_flav = assignment
-        .flavours
-        .iter()
-        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
-        .expect("no flavours");
-
-    let mut per_req: Vec<PerRequest> = Vec::with_capacity(raw.len());
-    let mut batch_timings: Vec<BatchTiming> = Vec::with_capacity(raw.len());
-
-    for (i, a) in raw.iter().enumerate() {
-        let seq = (i + 1) as u64;
-        let queue_wait_slots = (a.scheduled_slot - a.arrival_slot).max(0);
-        per_req.push(PerRequest {
-            request_id: a.request_id,
-            arrival_time: a.arrival_slot as f64 * slot_dur,
-            arrival_slot: a.arrival_slot,
-            deadline_slot: a.deadline_slot,
-            included_in_batch_slot: a.arrival_slot,
-            batch_sequence: seq,
-            scheduled_slot: a.scheduled_slot,
-            queue_wait_slots,
-            queue_wait_seconds: queue_wait_slots as f64 * slot_dur,
-            final_wait_slots: queue_wait_slots,
-            final_wait_seconds: queue_wait_slots as f64 * slot_dur,
-            flavour_name: a.flavour_name.clone(),
-            error: a.error,
-            carbon_cost: a.carbon_cost,
-            assignment_solver_mode: mode_name.to_string(),
-            assignment_solver_status: "ok".to_string(),
-            assigned_with_greedy_fallback: false,
-            assigned_with_relaxed_retry: false,
-            assigned_with_injection: false,
-            assigned_with_rollback: false,
-            lateness_slots: 0,
-        });
-        batch_timings.push(BatchTiming {
-            batch_sequence: seq,
-            batch_size_n: 0,
-            effective_batch_size: 1,
-            slot: a.arrival_slot,
-            pending_before: 1,
-            solver_elapsed_ms: 0.0,
-            scheduled: true,
-            flush_partial_batch: false,
-        });
-    }
-
-    let summary = compute_summary(
-        mode_name,
-        0,
-        realtime_slots,
-        realtime_speed_scale,
-        &per_req,
-        &batch_timings,
-        scenario.requests.len(),
-        &best_flav.name,
-        best_flav.duration,
-        best_flav.error,
-        0,
-        0,
-        0,
-        0,
-        0.0,
-    );
-    (per_req, batch_timings, summary)
-}
-
-fn run_bandit_strategy(
-    scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
-    slot_duration_seconds: f64,
-    realtime_slots: bool,
-    realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let params = swarm::BanditParams::default();
-    let mut requests: Vec<_> = scenario.requests.clone();
-    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
-    let raw = swarm::run_bandit(&requests, &scenario.carbon_forecast, assignment, &params);
-    convert_swarm_to_outputs(
-        raw,
-        "bandit",
-        scenario,
-        assignment,
-        slot_duration_seconds,
-        realtime_slots,
-        realtime_speed_scale,
-    )
-}
-
-fn run_ant_colony_strategy(
-    scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
-    slot_duration_seconds: f64,
-    realtime_slots: bool,
-    realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let params = swarm::AcoParams::default();
-    let mut requests: Vec<_> = scenario.requests.clone();
-    requests.sort_by_key(|r| (r.arrival_slot, r.request_id));
-    let raw = swarm::run_ant_colony(&requests, &scenario.carbon_forecast, assignment, &params);
-    convert_swarm_to_outputs(
-        raw,
-        "ant_colony",
-        scenario,
-        assignment,
-        slot_duration_seconds,
-        realtime_slots,
-        realtime_speed_scale,
-    )
-}
-
-type OfflineStrategyRunner = for<'a> fn(
-    &Scenario,
-    &AssignmentPolicy<'a>,
-    f64,
-    bool,
-    f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary);
-
-struct OfflineStrategy {
-    name: &'static str,
-    run: OfflineStrategyRunner,
-}
-
-/// Register each offline engine once. New engines add a runner and descriptor,
-/// without adding another branch to the strategy dispatcher.
-const OFFLINE_STRATEGIES: &[OfflineStrategy] = &[
-    OfflineStrategy {
-        name: "offline_singleton_best",
-        run: run_offline_singleton_best,
-    },
-    OfflineStrategy {
-        name: "offline_singleton_best_accurate",
-        run: run_offline_singleton_best_accurate,
-    },
-    OfflineStrategy {
-        name: "random",
-        run: run_random,
-    },
-    OfflineStrategy {
-        name: "bandit",
-        run: run_bandit_strategy,
-    },
-    OfflineStrategy {
-        name: "ant_colony",
-        run: run_ant_colony_strategy,
-    },
-];
-
-/// Dispatch an additional strategy through the offline engine registry.
-fn run_strategy(
-    name: &str,
-    scenario: &Scenario,
-    assignment: &AssignmentPolicy<'_>,
-    slot_duration_seconds: f64,
-    realtime_slots: bool,
-    realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
-    let strategy = OFFLINE_STRATEGIES
-        .iter()
-        .find(|strategy| strategy.name == name)
-        .unwrap_or_else(|| panic!("Unknown offline strategy: '{name}'"));
-
-    (strategy.run)(
-        scenario,
-        assignment,
-        slot_duration_seconds,
-        realtime_slots,
-        realtime_speed_scale,
-    )
 }
 
 // ─── output helpers ───────────────────────────────────────────────────────────
@@ -2307,6 +2068,12 @@ fn main() {
         base_cfg.flavours = flavours.clone();
     }
 
+    // Build the registry once for this benchmark run. Each configured strategy
+    // then gets a fresh scoped runtime from the same factories.
+    let common_engine_registry =
+        build_solver_registry(&base_cfg, scenario.metadata.seed ^ HAZARD_SEED_SALT)
+            .unwrap_or_else(|error| panic!("Cannot register common solver engines: {error}"));
+
     println!(
         "Loaded scenario: {} slots, {} requests ({})",
         scenario.metadata.total_slots,
@@ -2517,13 +2284,15 @@ fn main() {
             .join(format!("strategy_{output_strategy_name}"));
         let strat_t0 = std::time::Instant::now();
         let (per_req, batch_timings, mut summary) = run_strategy(
+            &common_engine_registry,
             strategy,
             &scenario,
-            &base_cfg.assignment_policy(),
+            &base_cfg,
             base_cfg.slot_duration_seconds,
             realtime_slots,
             speed_scale,
-        );
+        )
+        .unwrap_or_else(|error| panic!("Cannot run additional strategy '{strategy}': {error}"));
         summary.run_elapsed_seconds = strat_t0.elapsed().as_secs_f64();
 
         if let Some(bc) = baseline_cost {
@@ -2885,7 +2654,11 @@ mod tests {
     #[test]
     fn random_flavour_probabilities_match_threshold_with_nearest_uniform_mix() {
         let probabilities =
-            closest_to_uniform_flavour_probabilities(&[0.0, 5.0, 10.0], 7.5).unwrap();
+            carbonshift_rs::random_selection::closest_to_uniform_flavour_probabilities(
+                &[0.0, 5.0, 10.0],
+                7.5,
+            )
+            .unwrap();
 
         assert!((probabilities[0] - 1.0 / 12.0).abs() < 1e-9);
         assert!((probabilities[1] - 1.0 / 3.0).abs() < 1e-9);
@@ -2901,10 +2674,19 @@ mod tests {
     #[test]
     fn random_flavour_probabilities_support_boundary_and_interior_targets() {
         let low_boundary =
-            closest_to_uniform_flavour_probabilities(&[0.0, 0.0, 10.0], 0.0).unwrap();
+            carbonshift_rs::random_selection::closest_to_uniform_flavour_probabilities(
+                &[0.0, 0.0, 10.0],
+                0.0,
+            )
+            .unwrap();
         assert_eq!(low_boundary, vec![0.5, 0.5, 0.0]);
 
-        let low_target = closest_to_uniform_flavour_probabilities(&[0.0, 5.0, 10.0], 1.0).unwrap();
+        let low_target =
+            carbonshift_rs::random_selection::closest_to_uniform_flavour_probabilities(
+                &[0.0, 5.0, 10.0],
+                1.0,
+            )
+            .unwrap();
         assert!(low_target.iter().all(|probability| *probability >= 0.0));
         let average_error: f64 = low_target
             .iter()
@@ -2916,19 +2698,45 @@ mod tests {
 
     #[test]
     fn random_flavour_probabilities_reject_unattainable_targets() {
-        let error = closest_to_uniform_flavour_probabilities(&[0.0, 5.0, 10.0], 12.0).unwrap_err();
+        let error = carbonshift_rs::random_selection::closest_to_uniform_flavour_probabilities(
+            &[0.0, 5.0, 10.0],
+            12.0,
+        )
+        .unwrap_err();
         assert!(error.contains("outside the flavour error range"));
     }
 
     #[test]
-    fn offline_strategy_registry_contains_canonical_singleton_names() {
-        let names: Vec<&str> = OFFLINE_STRATEGIES
-            .iter()
-            .map(|strategy| strategy.name)
-            .collect();
+    fn offline_strategy_names_resolve_to_common_engine_names() {
+        assert_eq!(
+            canonical_offline_engine_name("offline_singleton_best").unwrap(),
+            ("singleton_best", "offline_singleton_best")
+        );
+        assert_eq!(
+            canonical_offline_engine_name("offline_singleton_best_accurate").unwrap(),
+            ("singleton_best_accurate", "offline_singleton_best_accurate")
+        );
+        assert_eq!(
+            canonical_offline_engine_name("random").unwrap(),
+            ("hazard", "hazard")
+        );
+        assert!(canonical_offline_engine_name("not-a-solver").is_err());
 
-        assert!(names.contains(&"offline_singleton_best"));
-        assert!(names.contains(&"offline_singleton_best_accurate"));
+        let registry = build_solver_registry(&Config::default(), 42).unwrap();
+        let scope = SolverScope {
+            profile_id: QosProfileId::default_profile(),
+            total_slots: 2,
+        };
+        for name in [
+            "dp",
+            "singleton_best",
+            "singleton_best_accurate",
+            "hazard",
+            "bandit",
+            "ant_colony",
+        ] {
+            assert!(registry.create(name, scope.clone()).is_ok());
+        }
     }
 
     #[test]
@@ -2939,7 +2747,7 @@ mod tests {
         config.assignment_max_future_slots = 1;
         config.max_error_threshold = 7.5;
         config.error_window_past = 0;
-        config.error_window_future = 0;
+        config.error_window_future = 1;
         config.global_error_constraint_enabled = false;
         config.carbon_cost_duration_scale = 1.0;
         config.capacity_tiers = vec![CapacityTier {
@@ -2959,33 +2767,180 @@ mod tests {
             },
         ];
 
-        let (assignments, _, summary) = run_offline_singleton_best_accurate(
+        let registry =
+            build_solver_registry(&config, scenario.metadata.seed ^ HAZARD_SEED_SALT).unwrap();
+        let (assignments, _, summary) = run_strategy(
+            &registry,
+            "offline_singleton_best_accurate",
             &scenario,
-            &config.assignment_policy(),
+            &config,
             60.0,
             false,
             1.0,
-        );
+        )
+        .unwrap();
 
         assert_eq!(assignments[0].flavour_name, "Accurate");
         assert_eq!(assignments[0].scheduled_slot, 1);
         assert_eq!(summary.execution_mode, "offline_singleton_best_accurate");
 
         let (best_assignments, _, best_summary) = run_strategy(
+            &registry,
             "offline_singleton_best",
             &scenario,
-            &config.assignment_policy(),
+            &config,
             60.0,
             false,
             1.0,
-        );
+        )
+        .unwrap();
         assert_eq!(best_assignments[0].flavour_name, "Fast");
         assert_eq!(best_assignments[0].scheduled_slot, 1);
         assert_eq!(best_summary.execution_mode, "offline_singleton_best");
     }
 
     #[test]
-    fn random_strategy_is_seeded_and_targets_threshold_in_expectation() {
+    fn offline_common_engine_commit_prices_each_next_capacity_position() {
+        let scenario = make_scenario(
+            vec![make_request(1, 0, 0), make_request(2, 0, 0)],
+            vec![10.0],
+        );
+        let mut config = Config::default();
+        config.total_slots = 1;
+        config.assignment_max_future_slots = 0;
+        config.error_window_future = 0;
+        config.max_error_threshold = 0.0;
+        config.global_error_constraint_enabled = false;
+        config.carbon_cost_duration_scale = 1.0;
+        config.capacity_tiers = vec![
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 5.0,
+            },
+        ];
+        config.flavours = vec![Flavour {
+            name: "Accurate".to_owned(),
+            error: 0.0,
+            duration: 2.0,
+        }];
+        let registry = build_solver_registry(&config, 42).unwrap();
+
+        let (assignments, _, _) = run_strategy(
+            &registry,
+            "singleton_best",
+            &scenario,
+            &config,
+            60.0,
+            false,
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].carbon_cost, 20.0);
+        assert_eq!(assignments[1].carbon_cost, 100.0);
+    }
+
+    #[test]
+    fn offline_common_runner_executes_bandit_and_aco_through_the_registry() {
+        let scenario = make_scenario(
+            vec![make_request(1, 0, 1), make_request(2, 0, 1)],
+            vec![100.0, 10.0],
+        );
+        let mut config = Config::default();
+        config.total_slots = 2;
+        config.assignment_max_future_slots = 1;
+        config.error_window_future = 1;
+        config.max_error_threshold = 0.0;
+        config.global_error_constraint_enabled = false;
+        config.flavours = vec![Flavour {
+            name: "Accurate".to_owned(),
+            error: 0.0,
+            duration: 1.0,
+        }];
+        let registry = build_solver_registry(&config, 42).unwrap();
+
+        for strategy in ["bandit", "ant_colony"] {
+            let (assignments, _, summary) =
+                run_strategy(&registry, strategy, &scenario, &config, 60.0, false, 1.0).unwrap();
+
+            assert_eq!(assignments.len(), 2);
+            assert_eq!(summary.execution_mode, strategy);
+            assert!(
+                assignments
+                    .iter()
+                    .all(|assignment| assignment.carbon_cost.is_finite())
+            );
+        }
+    }
+
+    #[test]
+    fn offline_output_preserves_the_proposal_late_flag() {
+        let scenario = make_scenario(vec![make_request(1, 0, 1)], vec![10.0; 4]);
+        let mut config = Config::default();
+        config.total_slots = 4;
+        config.error_window_future = 3;
+        config.global_error_constraint_enabled = false;
+        let assignment = config.assignment_policy();
+        let (scope, mut solve_input) =
+            project_scenario_to_solve_input(&scenario, &assignment).unwrap();
+        solve_input.current_slot = 2;
+        let proposal = carbonshift_rs::engine::solver::SolverProposal {
+            placements: vec![carbonshift_rs::engine::solver::ProposedPlacement::late(
+                1,
+                2,
+                "Accurate".to_owned(),
+            )],
+        };
+
+        let materialized =
+            materialize_offline_proposal(&proposal, &solve_input, &scope, &scenario, &assignment)
+                .unwrap();
+        assert!(materialized[0].late);
+
+        let (per_request, _, summary) = convert_engine_results_to_outputs(
+            materialized,
+            "test",
+            &scenario,
+            &assignment,
+            60.0,
+            false,
+            1.0,
+        );
+
+        assert_eq!(per_request[0].lateness_slots, 1);
+        assert_eq!(summary.requests_late, 1);
+    }
+
+    #[test]
+    fn offline_proposal_validation_rejects_assignments_past_the_deadline() {
+        let scenario = make_scenario(vec![make_request(1, 0, 0)], vec![10.0; 2]);
+        let mut config = Config::default();
+        config.total_slots = 2;
+        config.assignment_max_future_slots = 1;
+        config.error_window_future = 1;
+        let assignment = config.assignment_policy();
+        let (scope, solve_input) = project_scenario_to_solve_input(&scenario, &assignment).unwrap();
+        let proposal = carbonshift_rs::engine::solver::SolverProposal {
+            placements: vec![carbonshift_rs::engine::solver::ProposedPlacement::new(
+                1,
+                1,
+                "Accurate".to_owned(),
+            )],
+        };
+
+        assert!(
+            materialize_offline_proposal(&proposal, &solve_input, &scope, &scenario, &assignment,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hazard_is_seeded_and_targets_threshold_in_expectation() {
         let requests = (0..20_000).map(|id| make_request(id, 0, 1)).collect();
         let scenario = make_scenario(requests, vec![100.0, 100.0]);
         let mut config = Config::default();
@@ -3011,9 +2966,13 @@ mod tests {
             },
         ];
 
+        config.error_window_future = 1;
+        let registry =
+            build_solver_registry(&config, scenario.metadata.seed ^ HAZARD_SEED_SALT).unwrap();
         let (assignments, _, _) =
-            run_random(&scenario, &config.assignment_policy(), 60.0, false, 1.0);
-        let (repeated, _, _) = run_random(&scenario, &config.assignment_policy(), 60.0, false, 1.0);
+            run_strategy(&registry, "hazard", &scenario, &config, 60.0, false, 1.0).unwrap();
+        let (repeated, _, _) =
+            run_strategy(&registry, "hazard", &scenario, &config, 60.0, false, 1.0).unwrap();
         let average_error = assignments
             .iter()
             .map(|assignment| assignment.error)

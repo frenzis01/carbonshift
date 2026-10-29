@@ -106,10 +106,16 @@ The executor and client defer heavy optional imports so their services and unit 
 ## Offline simulation battery
 
 The simulation battery supports sinusoidal and flat request patterns and
-offline scheduling baselines, including random assignment and accurate-only
-greedy scheduling. These are simulation-only settings and do not change
-client emulation. See the [simulation battery guide](tests/battery/README.md)
-for configuration, strategy semantics, and test instructions.
+offline scheduling baselines, including hazard-based probabilistic assignment
+and accurate-only greedy scheduling. The `hazard` baseline samples slots
+inversely to forecast carbon intensity after capacity-tier pricing, while
+retaining the threshold-calibrated flavour distribution. The `random` input
+label remains temporarily for existing configurations and will be removed
+when the online scheduler adopts the common hazard engine; new configurations
+should use `hazard`. These simulation-only settings do not change client
+emulation. See the
+[simulation battery guide](tests/battery/README.md) for configuration,
+strategy semantics, and test instructions.
 
 ## Documentation
 

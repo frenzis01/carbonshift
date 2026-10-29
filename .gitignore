@@ -34,6 +34,7 @@ rolling_window_dp.py
 implementation_plan.md
 
 *.md
+*.tex
 !README.md
 !**/README.md
 !carbonshift/services/provider/INTERFACE.md

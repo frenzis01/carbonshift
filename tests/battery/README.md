@@ -60,17 +60,22 @@ once per scenario:
   is exhaustive over that request's candidates, not over complete schedules.
 - `offline_singleton_best_accurate`: uses the lowest-error flavour only, then scans feasible
   slots for the least-carbon-cost assignment.
-- `random`: selects a feasible slot uniformly at random and samples flavours
-  from the distribution closest to equal probabilities in squared Euclidean
-  distance, subject to expected flavour error equalling the configured
-  threshold. For errors 0%, 5%, and 10% with a 7.5% threshold, the
-  probabilities are 1/12, 1/3, and 7/12. This is an expectation over many
-  assignments; it does not enforce the threshold on each run or error window.
-  The scenario seed makes the random schedule reproducible. A target outside
-  the available flavour-error range cannot be achieved and is reported as an
-  error.
-- `bandit` and `ant_colony`: existing offline variants, independent of their
-  online scheduler counterparts.
+- `hazard`: samples a feasible slot with probability inversely proportional
+  to forecast carbon intensity multiplied by the capacity-tier multiplier at
+  that slot's next occupancy position. It samples flavours from the
+  distribution closest to equal probabilities in squared Euclidean distance,
+  subject to expected flavour error equalling the configured threshold. For
+  errors 0%, 5%, and 10% with a 7.5% threshold, the flavour probabilities are
+  1/12, 1/3, and 7/12. This is an expectation over many assignments; it does
+  not enforce the threshold on each run or error window. The scenario seed
+  makes the hazard schedule reproducible. A target outside the available
+  flavour-error range cannot be achieved and is reported as an error. The
+  `random` input label remains temporarily for existing configurations and is
+  scheduled for removal when the online scheduler adopts `hazard`; new
+  configurations should use `hazard`.
+- `bandit` and `ant_colony`: use the common engine kernels, with a fresh
+  runtime and learned state for each offline run. The live scheduler cutover
+  to those kernels is still pending Step 5B.
 
 ## Online random strategies
 
@@ -95,7 +100,7 @@ Example:
   "additional_strategies": [
     "offline_singleton_best",
     "offline_singleton_best_accurate",
-    "random"
+    "hazard"
   ],
   "scenarios": [
     {
