@@ -84,7 +84,9 @@ pub(super) struct BatchSolveContext<'a> {
 
 /// Common result contract consumed by the worker's proposal materializer.
 pub(super) struct BatchSolveResult {
-    pub(super) assignments: Vec<Assignment>,
+    /// Candidate decisions priced against the claim-time snapshot. The worker
+    /// drops these estimated prices when building its `SolverProposal`.
+    pub(super) candidate_assignments: Vec<Assignment>,
     pub(super) context: SolveContext,
 }
 
@@ -121,7 +123,7 @@ impl BatchSolverStrategy for RandomBatchSolver {
 type BatchSolverFactory = fn() -> Box<dyn BatchSolverStrategy>;
 
 /// Factory used by the registry so strategy creation stays separate from the
-/// worker's shared lifecycle and commit/rollback handling.
+/// worker's shared lifecycle, proposal materialization, and commit handling.
 fn build_dp_batch_solver() -> Box<dyn BatchSolverStrategy> {
     Box::new(DpBatchSolver)
 }
@@ -628,7 +630,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
             println!("[Scheduler] ⚠ Infeasible batch; retrying later.");
         }
         return BatchSolveResult {
-            assignments: vec![],
+            candidate_assignments: vec![],
             context: SolveContext {
                 status: "infeasible".to_string(),
                 mode: "singleton_best".to_string(),
@@ -709,7 +711,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
     };
 
     BatchSolveResult {
-        assignments,
+        candidate_assignments: assignments,
         context: ctx,
     }
 }
@@ -799,7 +801,7 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
         let start_slot = request.arrival_slot.max(current_slot);
         if start_slot > deadline {
             return BatchSolveResult {
-                assignments: vec![],
+                candidate_assignments: vec![],
                 context: SolveContext {
                     status: "infeasible".to_string(),
                     mode: "singleton_best".to_string(),
@@ -950,7 +952,7 @@ fn solve_singleton_best(input: BatchSolveContext<'_>) -> BatchSolveResult {
     };
 
     BatchSolveResult {
-        assignments,
+        candidate_assignments: assignments,
         context: ctx,
     }
 }
@@ -1046,7 +1048,7 @@ fn solve_random(
     };
 
     BatchSolveResult {
-        assignments,
+        candidate_assignments: assignments,
         context,
     }
 }

@@ -20,19 +20,24 @@ slot. Carbon-intensity generation is unchanged by this setting.
 
 ## Batch-worker parallelism
 
-`max_batch_solver_parallelism` is an upper bound on concurrent scheduler
-workers, not a promise that workers stay busy when there are too few pending
-batches or a run is starting or draining. DP and online scheduler runs may
-claim multiple batches from the same QoS profile at once. Each worker solves
-from the snapshot taken when its requests are claimed. Commit recalculates
-carbon prices using current slot occupancy, but does not revalidate the
-profile's error threshold against concurrent commits; a burst can temporarily
-exceed it, and later batches see the committed errors. The battery runner uses
-the online swarm `merge` backend by default so bandit and ant-colony batches
-can use this worker cap. Set `online_swarm_mode` to `serialized` to run those
-strategies with one worker instead. `avg_concurrent_workers` is time-weighted
-over intervals with at least one batch worker active, excluding no-work
-startup and drain time.
+`max_batch_solver_parallelism` is an upper bound on concurrent online
+simulation workers, not a promise that workers stay busy when there are too
+few pending batches or a run is starting or draining. Online batches may be
+claimed concurrently from the same QoS profile. Each worker solves from the
+snapshot taken atomically with its queue claim. Commit recalculates carbon
+prices using current slot occupancy, but does not revalidate the profile's
+error threshold against concurrent commits; a burst can temporarily or
+permanently exceed it.
+
+Bandit and ant-colony online batches can use the worker cap only with the
+`merge` swarm backend. The battery runner selects `merge` by default; choosing
+`serialized` intentionally limits those strategies to one worker. The live
+service uses the default one-worker-per-profile scheduling policy.
+
+Offline whole-scenario strategies run synchronously and do not use this worker
+pool or the REST service. `avg_concurrent_workers` is time-weighted over
+intervals with at least one batch worker active, excluding no-work startup and
+drain time.
 
 ## Future-slot assignment trimming
 

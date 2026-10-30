@@ -5,14 +5,13 @@ Run `run_battery.py` across several PHASE-AWARE parameter grids.
 Each phase of the Rust battery harness (see run_battery.py's module docstring)
 is sensitive to a different subset of runtime knobs:
 
-  - DP (min_error_greedy/carryover/forecast), singleton_best, and random
-    selection modes (online, N=1 only): sensitive to
+  - DP, singleton_best, and random selection modes (online): sensitive to
     `max_batch_solver_parallelism`; NOT sensitive to `online_swarm_mode`.
   - bandit (online, N=1) and ant_colony (online, batch-size sweep): sensitive to
     `online_swarm_mode` and `max_batch_solver_parallelism`.
-  - offline strategies (offline_singleton_best, offline_singleton_best_accurate, random,
-    bandit, ant_colony):
-    insensitive to all of the above — a single run per scenario suffices.
+  - offline strategies (offline_singleton_best, offline_singleton_best_accurate,
+    random, bandit, ant_colony): run each scenario synchronously, without the
+    online worker pool, and are insensitive to the parallelism/swarm-mode knobs.
 
 Sweeping every knob against every phase (the old flat PARAM_GRID behaviour)
 therefore re-runs each phase many times for knobs that cannot change its

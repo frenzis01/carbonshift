@@ -120,7 +120,7 @@ fn run_batch_strategy(
         carbon_forecast,
         flavour_duration_by_name: &flavour_duration_by_name,
     });
-    (result.assignments, result.context)
+    (result.candidate_assignments, result.context)
 }
 
 fn call_solve_dp(

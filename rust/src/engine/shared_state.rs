@@ -955,6 +955,26 @@ impl SharedState {
                     placement.req_id, request_profile_id, profile_id
                 ));
             }
+            if placement.late {
+                if placement.scheduled_slot != current_slot
+                    || placement.scheduled_slot <= deadline_slot
+                {
+                    return Err(format!(
+                        "solver proposal marked request {} late at a non-late slot",
+                        placement.req_id
+                    ));
+                }
+            } else {
+                let earliest_slot = arrival_slot.max(current_slot);
+                if placement.scheduled_slot < earliest_slot
+                    || placement.scheduled_slot > deadline_slot
+                {
+                    return Err(format!(
+                        "solver proposal placed request {} outside its feasible slot window",
+                        placement.req_id
+                    ));
+                }
+            }
 
             let flavour = flavours
                 .iter()
@@ -1780,6 +1800,72 @@ mod tests {
         assert_eq!(costs, vec![1000.0, 2000.0]);
         assert_eq!(state.get_current_assignments().len(), 2);
         assert_eq!(state.get_profile_error_stats(&profile_id).avg, 5.0);
+    }
+
+    #[test]
+    fn proposal_validation_rejects_out_of_window_on_time_placements() {
+        let state = SharedState::new();
+        let profile_id = QosProfileId::default_profile();
+        let snapshot = state.snapshot_for_solver();
+        let pending = [Request::new(1, 0, 1)];
+        let proposal = SolverProposal {
+            placements: vec![ProposedPlacement::new(1, 2, "Accurate".to_string())],
+        };
+        let flavours = [Flavour {
+            name: "Accurate".to_string(),
+            error: 0.0,
+            duration: 10.0,
+        }];
+
+        let error = state
+            .materialize_and_commit_proposal(
+                &proposal,
+                &pending,
+                &snapshot,
+                &profile_id,
+                0,
+                &flavours,
+                &[100.0, 100.0, 100.0],
+                &[],
+                1.0,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("outside its feasible slot window"));
+        assert!(state.get_current_assignments().is_empty());
+    }
+
+    #[test]
+    fn proposal_validation_accepts_late_placement_at_current_slot() {
+        let state = SharedState::new();
+        let profile_id = QosProfileId::default_profile();
+        let snapshot = state.snapshot_for_solver();
+        let pending = [Request::new(1, 0, 0)];
+        let proposal = SolverProposal {
+            placements: vec![ProposedPlacement::late(1, 1, "Accurate".to_string())],
+        };
+        let flavours = [Flavour {
+            name: "Accurate".to_string(),
+            error: 0.0,
+            duration: 10.0,
+        }];
+
+        let assignments = state
+            .materialize_and_commit_proposal(
+                &proposal,
+                &pending,
+                &snapshot,
+                &profile_id,
+                1,
+                &flavours,
+                &[100.0, 100.0],
+                &[],
+                1.0,
+            )
+            .unwrap();
+
+        assert_eq!(assignments[0].scheduled_slot, 1);
+        assert_eq!(assignments[0].deadline_slot, Some(0));
     }
 
     #[test]

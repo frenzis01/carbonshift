@@ -437,7 +437,7 @@ fn main_loop(
         let active_workers = mutable.lock().unwrap().active_workers;
         // Freeze the virtual clock whenever there is *any* outstanding work —
         // pending requests waiting to be dispatched, or workers still solving.
-        // Freezing only at full saturation (the previous condition) has a gap:
+        // Freezing only at full saturation has a gap:
         // every time a worker finishes and is about to be immediately
         // replaced, `active_workers` momentarily dips below the parallelism
         // cap for the one loop iteration that reads it — and at batch_size=1
@@ -1008,7 +1008,7 @@ fn batch_worker_entry(
         carbon_forecast,
         flavour_duration_by_name: fdb,
     });
-    let proposed_assignments = solve_result.assignments;
+    let proposed_assignments = solve_result.candidate_assignments;
     let ctx = solve_result.context;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let wall_end = unix_now_f64();
@@ -1131,7 +1131,6 @@ fn batch_worker_entry(
                 &HashSet::new(),
             )
             .average;
-
 
         let mut run_row: HashMap<String, String> = HashMap::new();
         run_row.insert("run_sequence".into(), run_sequence.to_string());
