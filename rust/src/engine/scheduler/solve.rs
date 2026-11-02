@@ -179,16 +179,15 @@ struct PreparedSolve {
     pending_ids: HashSet<u64>,
     window_start: i32,
     window_end: i32,
-    assignment_cap: i32,
-    /// Slot-bounded requests to schedule — the batch's pending requests plus,
-    /// when `dp_lock_future_assignments` is false, movable future assignments.
+    /// Last absolute slot with forecast data available to the solve.
+    forecast_max_slot: i32,
+    /// Only newly claimed requests are solved. Existing future assignments
+    /// always remain fixed occupancy in the baseline.
     solve_requests: Vec<SolveRequest>,
     /// request_id → (arrival_slot, capped_deadline), for converting solver
     /// results back into `Assignment`s.
     assignment_metadata: HashMap<u64, (i32, i32)>,
     baseline_slot_counts: HashMap<i32, i64>,
-    /// Committed errors for this QoS profile, grouped by execution slot.
-    err_by_slot: HashMap<i32, ErrorTotals>,
     error_baseline: ErrorBaseline,
     mock_pool_input: MockPool,
     global_error_stats: GlobalErrorStats,
@@ -202,17 +201,37 @@ struct PreparedSolve {
     effective_capacity_tiers: Vec<CapacityTier>,
 }
 
+/// Cap one request using its original arrival, deadline, QoS future window,
+/// and the last slot for which the solver has forecast data.
+fn cap_request_deadline(
+    current_slot: i32,
+    arrival_slot: i32,
+    deadline_slot: i32,
+    future_slots: i32,
+    forecast_max_slot: i32,
+) -> i32 {
+    if current_slot > deadline_slot {
+        return current_slot;
+    }
+
+    // Both operands originate as i32 slot values, so their sum safely fits
+    // in i64. The final minimum is bounded by the i32 deadline and forecast.
+    let qos_horizon = i64::from(arrival_slot) + i64::from(future_slots);
+    i64::from(deadline_slot)
+        .min(qos_horizon)
+        .min(i64::from(forecast_max_slot)) as i32
+}
+
 /// Capture and derive all shared inputs needed by a single batch solve.
 ///
 /// Both `solve_dp` and `solve_singleton_best` call this first, ensuring they
-/// use the same state snapshot, profile-specific error history, movable future
+/// use the same state snapshot, profile-specific error history, fixed future
 /// assignments, recovery inputs, and global capacity policy.
 fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     let current_slot = input.current_slot;
     let pending = input.pending;
     let snapshot = input.snapshot;
     let assignment = input.assignment;
-    let solver = input.solver_config;
     let simulation = input.simulation_config;
     let recovery = input.recovery_config;
     let verbose = input.verbose;
@@ -224,87 +243,49 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         .map(Request::qos_profile_id)
         .unwrap_or_else(QosProfileId::default_profile);
 
-    // Deadline cap = end of error window.
+    // Error-window reporting is centered on the current scheduler slot.
     let window_start = (current_slot - assignment.error_window_past).max(0);
     let window_end =
         (current_slot + assignment.error_window_future).min(assignment.total_slots - 1);
-    let assignment_cap = window_end;
-
-    let cap_deadline = |d: i32| -> i32 {
-        d.max(current_slot)
-            .min(assignment_cap)
-            .min(assignment.total_slots - 1)
-    };
+    let forecast_max_slot = i32::try_from(input.carbon_forecast.len())
+        .ok()
+        .and_then(|length| length.checked_sub(1))
+        .unwrap_or(assignment.total_slots - 1)
+        .min(assignment.total_slots - 1);
 
     // ── Step 1 (pre-solve): use the claim-time shared-state snapshot ─────────
     // Queue removal and snapshot capture happened together before this worker
     // was launched. No live shared-state reads occur while solving.
-    // ── Step 2: decide which future work can move with this batch ────────────
-    // If DP_LOCK_FUTURE_ASSIGNMENTS=True, future assignments are pinned as
-    // baseline load.  If False, they join the pool for joint re-planning.
-    let future_assignments = snapshot.get_future_assignments(current_slot);
-    let (same_profile_future, other_profile_future): (Vec<_>, Vec<_>) = future_assignments
-        .into_iter()
-        .partition(|assignment| assignment.qos_profile_id == profile_id);
+    // Existing future assignments are always locked. They contribute to
+    // capacity occupancy and are never added to this solve's request list.
+    let fixed_future_assignments = snapshot.get_future_assignments(current_slot);
 
-    let mut solve_requests: Vec<SolveRequest> = pending
+    let solve_requests: Vec<SolveRequest> = pending
         .iter()
         .map(|r| SolveRequest {
             request_id: r.id,
             arrival_slot: r.arrival_slot,
-            deadline_slot: cap_deadline(r.deadline_slot),
+            deadline_slot: cap_request_deadline(
+                current_slot,
+                r.arrival_slot,
+                r.deadline_slot,
+                assignment.error_window_future,
+                forecast_max_slot,
+            ),
         })
         .collect();
 
-    // Metadata for converting RequestAssignment → Assignment later.
-    let mut assignment_metadata: HashMap<u64, (i32, i32)> = pending
+    // Preserve each original deadline for committed assignments and lateness
+    // reporting; the solver request above carries the capped effective bound.
+    let assignment_metadata: HashMap<u64, (i32, i32)> = pending
         .iter()
         .map(|r| (r.id, (r.arrival_slot, r.deadline_slot)))
         .collect();
 
-    let mut fixed_future: Vec<Assignment> = other_profile_future;
-    let mut movable_future_ids: HashSet<u64> = HashSet::new();
-
-    if solver.dp_lock_future_assignments {
-        // Other profiles are always fixed because their error/QoS constraints
-        // are independent; this flag controls only this profile's future work.
-        fixed_future.extend(same_profile_future);
-    } else {
-        movable_future_ids = same_profile_future.iter().map(|a| a.request_id).collect();
-        for a in &same_profile_future {
-            let deadline = a
-                .deadline_slot
-                .unwrap_or_else(|| a.scheduled_slot.max(current_slot));
-            let capped = cap_deadline(deadline);
-            let arrival_slot = a.arrival_slot.unwrap_or(current_slot);
-            solve_requests.push(SolveRequest {
-                request_id: a.request_id,
-                arrival_slot,
-                deadline_slot: capped,
-            });
-            assignment_metadata.insert(a.request_id, (arrival_slot, deadline));
-        }
-    }
-
-    // Baseline counts from pinned future assignments.
+    // Capacity tiers are global, so every profile's fixed future work counts.
     let mut baseline_slot_counts: HashMap<i32, i64> = HashMap::new();
-    for a in &fixed_future {
+    for a in &fixed_future_assignments {
         *baseline_slot_counts.entry(a.scheduled_slot).or_insert(0) += 1;
-    }
-
-    // Reuse the same coherent snapshot used for the window and cumulative
-    // statistics. Movable future assignments are excluded because this solve
-    // will account for their proposed replacements instead.
-    let mut err_by_slot: HashMap<i32, ErrorTotals> = HashMap::new();
-    for assignment_snapshot in snapshot.assignments.values().filter(|assignment| {
-        assignment.qos_profile_id == profile_id
-            && !movable_future_ids.contains(&assignment.request_id)
-    }) {
-        let totals = err_by_slot
-            .entry(assignment_snapshot.scheduled_slot)
-            .or_default();
-        totals.sum += assignment_snapshot.error;
-        totals.count += 1.0;
     }
 
     // ── Step 3: assemble this profile's error baseline ──────────────────────
@@ -314,7 +295,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         current_slot,
         assignment.error_window_past,
         assignment.error_window_future,
-        &movable_future_ids,
+        &HashSet::new(),
     );
     let mut error_baseline = ErrorBaseline::new(ws.error_sum, ws.count as f64);
 
@@ -325,7 +306,7 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         &profile_id,
         assignment,
         &snapshot,
-        &movable_future_ids,
+        &HashSet::new(),
     );
 
     // 3c. Virtual prehistory for startup slots (disabled by default).
@@ -395,11 +376,10 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
         pending_ids,
         window_start,
         window_end,
-        assignment_cap,
+        forecast_max_slot,
         solve_requests,
         assignment_metadata,
         baseline_slot_counts,
-        err_by_slot,
         error_baseline,
         mock_pool_input,
         global_error_stats,
@@ -411,63 +391,147 @@ fn prepare_solve(input: &BatchSolveContext<'_>) -> PreparedSolve {
     }
 }
 
-fn project_solver_input(
-    context: &BatchSolveContext<'_>,
-    prepared: &PreparedSolve,
+/// Build the common solver input directly from the claim-time snapshot.
+///
+/// Every previously committed future assignment stays fixed: it contributes
+/// to the global capacity baseline and is not added to the new request batch.
+/// Error totals remain profile-specific. This projection intentionally keeps
+/// real history, decayed-past history, and configured virtual prehistory, but
+/// does not add the separate infeasibility mock pool.
+pub(super) fn build_solve_input_from_snapshot(
+    current_slot: i32,
+    pending: &[Request],
+    snapshot: &SolverSnapshot,
+    assignment: &AssignmentPolicy<'_>,
+    simulation: &SimulationConfig,
+    recovery: &InfeasibilityConfig,
+    carbon_forecast: &[f64],
 ) -> Result<SolveInput, SolverError> {
-    let cumulative_error_count =
-        i64::try_from(prepared.profile_error_stats.count).map_err(|_| {
-            SolverError::Algorithm("profile cumulative error count exceeds i64".to_owned())
-        })?;
-    let requests = prepared
-        .solve_requests
+    let first_request = pending.first().ok_or_else(|| {
+        SolverError::Algorithm("cannot build solver input for an empty batch".to_owned())
+    })?;
+    let profile_id = first_request.qos_profile_id();
+    if pending
         .iter()
-        .map(|request| {
-            let (arrival_slot, deadline_slot) = prepared
-                .assignment_metadata
-                .get(&request.request_id)
-                .copied()
-                .ok_or_else(|| {
-                    SolverError::Algorithm(format!(
-                        "missing request metadata for {}",
-                        request.request_id
-                    ))
-                })?;
-            Ok(crate::engine::solver::SolveRequest {
-                request_id: request.request_id,
-                arrival_slot,
-                deadline_slot,
-            })
-        })
-        .collect::<Result<Vec<_>, SolverError>>()?;
+        .any(|request| request.qos_profile_id() != profile_id)
+    {
+        return Err(SolverError::Algorithm(
+            "solver input must contain requests from exactly one QoS profile".to_owned(),
+        ));
+    }
+
+    let total_slots = usize::try_from(assignment.total_slots).map_err(|_| {
+        SolverError::Algorithm("planning horizon must be a positive slot count".to_owned())
+    })?;
+    if total_slots == 0 {
+        return Err(SolverError::Algorithm(
+            "planning horizon must contain at least one slot".to_owned(),
+        ));
+    }
+    if carbon_forecast.len() != total_slots {
+        return Err(SolverError::Algorithm(format!(
+            "carbon forecast has {} slots but the planning horizon has {total_slots}",
+            carbon_forecast.len()
+        )));
+    }
+    let forecast_max_slot = i32::try_from(carbon_forecast.len() - 1).map_err(|_| {
+        SolverError::Algorithm("carbon forecast exceeds the supported slot range".to_owned())
+    })?;
+
+    // Capacity tiers are fleet-wide, so fixed future assignments from every
+    // profile contribute to these counts.
+    let mut baseline_slot_counts: HashMap<i32, i64> = HashMap::new();
+    for existing in snapshot.get_future_assignments(current_slot) {
+        let count = baseline_slot_counts
+            .entry(existing.scheduled_slot)
+            .or_insert(0);
+        *count = count.checked_add(1).ok_or_else(|| {
+            SolverError::Algorithm(format!(
+                "slot {} baseline occupancy overflowed i64",
+                existing.scheduled_slot
+            ))
+        })?;
+    }
+
+    // Unlike capacity counts, error history belongs only to this profile.
+    let mut err_by_slot: HashMap<i32, ErrorTotals> = HashMap::new();
+    for existing in snapshot
+        .assignments
+        .values()
+        .filter(|existing| existing.qos_profile_id == profile_id)
+    {
+        let totals = err_by_slot.entry(existing.scheduled_slot).or_default();
+        totals.sum += existing.error;
+        totals.count += 1.0;
+    }
+
+    let profile_stats = snapshot.get_profile_error_stats(&profile_id);
+    let mut error_baseline = {
+        let window = snapshot.get_profile_window_error_stats(
+            &profile_id,
+            current_slot,
+            assignment.error_window_past,
+            assignment.error_window_future,
+            &HashSet::new(),
+        );
+        ErrorBaseline::new(window.error_sum, window.count as f64)
+    };
+    error_baseline = augment_with_decayed_past(
+        current_slot,
+        error_baseline,
+        &profile_id,
+        assignment,
+        snapshot,
+        &HashSet::new(),
+    );
+    error_baseline = augment_with_virtual_prehistory(
+        current_slot,
+        error_baseline,
+        assignment,
+        simulation,
+        recovery,
+    );
+
+    // Preserve the established cumulative-QoS behavior: the hard constraint
+    // becomes active once this profile's committed average has exceeded its
+    // threshold. The common algorithm then receives the actual profile totals.
+    let cumulative_error_constraint_active = assignment.global_error_constraint_enabled
+        && assignment.global_error_constraint_hard
+        && profile_stats.count > 0
+        && profile_stats.avg > assignment.max_error_threshold;
 
     Ok(SolveInput {
-        current_slot: context.current_slot,
-        requests,
-        carbon_forecast: context.carbon_forecast.to_vec(),
-        capacity_tiers: prepared.effective_capacity_tiers.clone(),
-        baseline_slot_counts: prepared.baseline_slot_counts.clone(),
-        carbon_cost_duration_scale: context.assignment.carbon_cost_duration_scale,
-        assignment_max_future_slots: context.assignment.assignment_max_future_slots,
-        assignment_max_slot: Some(prepared.assignment_cap),
+        current_slot,
+        requests: pending
+            .iter()
+            .map(|request| SolveRequest {
+                request_id: request.id,
+                arrival_slot: request.arrival_slot,
+                deadline_slot: request.deadline_slot,
+            })
+            .collect(),
+        carbon_forecast: carbon_forecast.to_vec(),
+        capacity_tiers: assignment.capacity_tiers.to_vec(),
+        baseline_slot_counts,
+        carbon_cost_duration_scale: assignment.carbon_cost_duration_scale,
+        forecast_max_slot: Some(forecast_max_slot),
         qos: QoSProfileInput {
-            profile_id: prepared.profile_id.clone(),
-            flavours: context.assignment.flavours.to_vec(),
-            cumulative_error_constraint_active: prepared.profile_constraint_active
-                && context.assignment.global_error_constraint_hard,
+            profile_id,
+            flavours: assignment.flavours.to_vec(),
+            cumulative_error_constraint_active,
             cumulative_err: ErrorTotals {
-                count: cumulative_error_count as f64,
-                sum: prepared.profile_error_stats.error_sum,
+                sum: profile_stats.error_sum,
+                count: profile_stats.count as f64,
             },
-            err_by_slot: prepared.err_by_slot.clone(),
-            max_average_error: prepared.effective_error_threshold,
+            err_by_slot,
+            max_average_error: assignment.max_error_threshold,
             error_window: ErrorWindowInput {
                 baseline_err: ErrorTotals {
-                    count: prepared.error_baseline.request_count,
-                    sum: prepared.error_baseline.error_sum,
+                    sum: error_baseline.error_sum,
+                    count: error_baseline.request_count,
                 },
-                past_slots: context.assignment.error_window_past,
-                future_slots: context.assignment.error_window_future,
+                past_slots: assignment.error_window_past,
+                future_slots: assignment.error_window_future,
             },
         },
     })
@@ -487,11 +551,10 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         pending_ids,
         window_start,
         window_end,
-        assignment_cap,
+        forecast_max_slot,
         solve_requests: dp_requests,
         assignment_metadata,
         baseline_slot_counts,
-        err_by_slot: _,
         error_baseline,
         mock_pool_input,
         global_error_stats,
@@ -543,7 +606,7 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
         max_error_threshold: Some(effective_error_threshold),
         error_window_past: assignment.error_window_past,
         error_window_future: assignment.error_window_future,
-        assignment_max_slot: Some(assignment_cap),
+        forecast_max_slot: Some(forecast_max_slot),
         dynamic_mock_pool: mock_pool_input.clone(),
     });
 
@@ -558,11 +621,6 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
     let mut solve_mode = format!("dp_{effective_pruning}");
 
     if scheduled_pending_ids.len() != pending_ids.len() {
-        let cap_deadline = |d: i32| -> i32 {
-            d.max(current_slot)
-                .min(assignment_cap)
-                .min(assignment.total_slots - 1)
-        };
         // Greedy fallback: the error constraint is never relaxed/removed — on
         // infeasibility (even after mock-pool dilution, if the recovery mode
         // injects one) we go straight to the accurate-flavour/cheapest-slot
@@ -580,7 +638,13 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
             .map(|r| SolveRequest {
                 request_id: r.id,
                 arrival_slot: r.arrival_slot,
-                deadline_slot: cap_deadline(r.deadline_slot),
+                deadline_slot: cap_request_deadline(
+                    current_slot,
+                    r.arrival_slot,
+                    r.deadline_slot,
+                    assignment.error_window_future,
+                    forecast_max_slot,
+                ),
             })
             .collect();
         if verbose {
@@ -734,8 +798,8 @@ fn solve_dp(input: BatchSolveContext<'_>) -> BatchSolveResult {
 /// distinct, lighter "online alternative strategy" (grouped with Bandit/ACO)
 /// rather than just "DP with batch_size=1": it skips the DP machinery
 /// entirely, at the cost of never jointly re-planning already-scheduled
-/// future assignments (it always treats them as pinned baseline load,
-/// regardless of `dp_lock_future_assignments`).
+/// future assignments; previously committed future work is always pinned as
+/// baseline load.
 ///
 /// Shares `prepare_solve`'s snapshot/error-baseline/global-constraint setup
 /// with `solve_dp` so both strategies see the exact same feasibility rules;
@@ -989,11 +1053,16 @@ fn solve_random(
         let earliest_slot = arrival
             .max(input.current_slot)
             .min(input.assignment.total_slots - 1);
-        let latest_slot = deadline
-            .max(earliest_slot)
-            .min(arrival + input.assignment.assignment_max_future_slots)
-            .min(input.assignment.total_slots - 1)
-            .max(earliest_slot);
+        let forecast_max_slot = (input.assignment.total_slots - 1)
+            .min(input.carbon_forecast.len().saturating_sub(1) as i32);
+        let latest_slot = cap_request_deadline(
+            input.current_slot,
+            arrival,
+            deadline,
+            input.assignment.error_window_future,
+            forecast_max_slot,
+        )
+        .max(earliest_slot);
         let (scheduled_slot, flavour_index) = select_random_assignment(
             selection_mode,
             earliest_slot,

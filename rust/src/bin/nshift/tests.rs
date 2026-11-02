@@ -375,7 +375,6 @@ fn offline_singleton_best_accurate_uses_min_error_flavour_and_cheapest_slot() {
     let scenario = make_scenario(vec![make_request(1, 0, 1)], vec![100.0, 10.0]);
     let mut config = Config::default();
     config.total_slots = 2;
-    config.assignment_max_future_slots = 1;
     config.max_error_threshold = 7.5;
     config.error_window_past = 0;
     config.error_window_future = 1;
@@ -438,7 +437,6 @@ fn offline_common_engine_commit_prices_each_next_capacity_position() {
     );
     let mut config = Config::default();
     config.total_slots = 1;
-    config.assignment_max_future_slots = 0;
     config.error_window_future = 0;
     config.max_error_threshold = 0.0;
     config.global_error_constraint_enabled = false;
@@ -484,7 +482,6 @@ fn offline_common_runner_executes_bandit_and_aco_through_the_registry() {
     );
     let mut config = Config::default();
     config.total_slots = 2;
-    config.assignment_max_future_slots = 1;
     config.error_window_future = 1;
     config.max_error_threshold = 0.0;
     config.global_error_constraint_enabled = false;
@@ -551,7 +548,6 @@ fn offline_proposal_validation_rejects_assignments_past_the_deadline() {
     let scenario = make_scenario(vec![make_request(1, 0, 0)], vec![10.0; 2]);
     let mut config = Config::default();
     config.total_slots = 2;
-    config.assignment_max_future_slots = 1;
     config.error_window_future = 1;
     let assignment = config.assignment_policy();
     let (scope, solve_input) = project_scenario_to_solve_input(&scenario, &assignment).unwrap();
@@ -575,7 +571,7 @@ fn hazard_is_seeded_and_targets_threshold_in_expectation() {
     let scenario = make_scenario(requests, vec![100.0, 100.0]);
     let mut config = Config::default();
     config.total_slots = 2;
-    config.assignment_max_future_slots = 1;
+    config.error_window_future = 1;
     config.max_error_threshold = 7.5;
     config.global_error_constraint_enabled = false;
     config.flavours = vec![

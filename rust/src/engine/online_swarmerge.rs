@@ -89,17 +89,16 @@ fn slot_eta(
     }
 }
 
-/// Return the sorted list of valid target slots for a request:
-/// `[arrival_slot, min(deadline_slot, arrival_slot + max_future, total_slots-1)]`.
+/// Return slots no later than the request's arrival-based QoS look-ahead.
 fn valid_slots(
     arrival_slot: i32,
     deadline_slot: i32,
-    max_future: i32,
+    future_slots: i32,
     total_slots: i32,
 ) -> Vec<i32> {
     let from = arrival_slot;
     let to = deadline_slot
-        .min(arrival_slot + max_future)
+        .min(arrival_slot + future_slots)
         .min(total_slots - 1)
         .max(from);
     (from..=to).collect()
@@ -242,7 +241,6 @@ impl OnlineBanditState {
         let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(assignment.flavours);
         let tiers = assignment.capacity_tiers;
         let scale = assignment.carbon_cost_duration_scale;
-        let max_future = assignment.assignment_max_future_slots;
         let total_slots = assignment.total_slots;
         let win_past = assignment.error_window_past;
         let win_future_cfg = assignment.error_window_future;
@@ -265,8 +263,12 @@ impl OnlineBanditState {
         let mut assignments = Vec::with_capacity(pending.len());
 
         for req in pending {
-            let candidates =
-                valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
+            let candidates = valid_slots(
+                req.arrival_slot,
+                req.deadline_slot,
+                win_future_cfg,
+                total_slots,
+            );
             if candidates.is_empty() {
                 continue;
             }
@@ -453,7 +455,6 @@ impl OnlineAcoState {
         let (sorted_flavours, fallback_flav) = sorted_flavours_and_fallback(assignment.flavours);
         let tiers = assignment.capacity_tiers;
         let scale = assignment.carbon_cost_duration_scale;
-        let max_future = assignment.assignment_max_future_slots;
         let total_slots = assignment.total_slots;
         let win_past = assignment.error_window_past;
         let win_future_cfg = assignment.error_window_future;
@@ -488,8 +489,12 @@ impl OnlineAcoState {
                 let mut ant_cost = 0.0f64;
 
                 for req in pending {
-                    let candidates =
-                        valid_slots(req.arrival_slot, req.deadline_slot, max_future, total_slots);
+                    let candidates = valid_slots(
+                        req.arrival_slot,
+                        req.deadline_slot,
+                        win_future_cfg,
+                        total_slots,
+                    );
                     if candidates.is_empty() {
                         continue;
                     }
@@ -736,7 +741,7 @@ mod tests {
     fn test_cfg() -> Config {
         let mut cfg = Config::default();
         cfg.total_slots = 6;
-        cfg.assignment_max_future_slots = 5;
+        cfg.error_window_future = 5;
         cfg.global_error_constraint_enabled = false;
         cfg
     }

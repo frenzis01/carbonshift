@@ -849,7 +849,6 @@ _RUST_CONFIG_README_FIELDS: List[tuple[str, str]] = [
     ("dp_pruning_min_batch_size", "DP pruning min batch size"),
     ("dp_pruning_k", "DP pruning k"),
     ("dp_timeout", "DP solver timeout (s)"),
-    ("dp_lock_future_assignments", "DP locks future assignments"),
     ("infeasibility_recovery_mode", "Infeasibility recovery mode"),
     ("prehistory_use_virtual_past", "Virtual prehistory enabled (default)"),
     ("queue_timeout", "Queue timeout (s)"),

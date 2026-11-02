@@ -58,7 +58,6 @@ fn config_from_meta(meta: &ScenarioMeta) -> Config {
     Config {
         solver: SolverConfig {
             batch_size: 3,
-            dp_lock_future_assignments: true,
             dp_pruning_min_batch_size: 0,
             dp_pruning_method: "none".to_string(),
             ..SolverConfig::default()
@@ -154,7 +153,7 @@ fn drain_pending_with_dp(
             max_error_threshold: Some(assignment.max_error_threshold),
             error_window_past: assignment.error_window_past,
             error_window_future: assignment.error_window_future,
-            assignment_max_slot: Some(window_end),
+            forecast_max_slot: Some(window_end),
             dynamic_mock_pool: MockPool::default(),
         };
 

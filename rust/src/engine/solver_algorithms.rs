@@ -183,7 +183,7 @@ impl SolverAlgorithm for DpAlgorithm {
             max_error_threshold: Some(input.qos.max_average_error),
             error_window_past: input.qos.error_window.past_slots,
             error_window_future: input.qos.error_window.future_slots,
-            assignment_max_slot: Some(latest_forecast_slot(input, scope)),
+            forecast_max_slot: Some(latest_forecast_slot(input, scope)),
             dynamic_mock_pool: MockPool::default(),
         });
 
@@ -576,26 +576,9 @@ impl SolverAlgorithm for HazardAlgorithm {
             }
 
             let (earliest, forecast_deadline) = request_slot_bounds(input, request, scope)?;
-            let latest_shift_slot = request
-                .arrival_slot
-                .checked_add(input.assignment_max_future_slots)
-                .ok_or_else(|| {
-                    SolverError::Algorithm(format!(
-                        "request {} assignment window overflowed",
-                        request.request_id
-                    ))
-                })?;
-
-            // Both bounds matter: the forecast/QoS deadline was capped by
-            // request_slot_bounds, then this policy applies the independent
-            // maximum-shift limit measured from the original arrival slot.
-            let latest = forecast_deadline.min(latest_shift_slot);
-            if earliest > latest {
-                return Err(SolverError::Algorithm(format!(
-                    "request {} has no feasible slot within its deadline and assignment window",
-                    request.request_id
-                )));
-            }
+            // `request_slot_bounds` already applies the one assignment-look-
+            // ahead policy: arrival + this profile's future error-window size.
+            let latest = forecast_deadline;
 
             let candidate_slots: Vec<i32> = (earliest..=latest).collect();
             let slot_probabilities = inverse_carbon_slot_probabilities(
@@ -852,9 +835,8 @@ fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), S
     }
 
     // The forecast vector is indexed by absolute solver slots, so it must
-    // cover the configured local horizon. A rolling provider window is
-    // represented separately by `assignment_max_slot`; request deadlines are
-    // capped to that slot and to the QoS future-window boundary below.
+    // cover the configured local horizon. `forecast_max_slot` may narrow the
+    // readable data range, but it never extends the per-request QoS horizon.
 
     if input.current_slot < 0 || input.current_slot >= scope.total_slots as i32 {
         return Err(SolverError::Algorithm(format!(
@@ -867,17 +849,12 @@ fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), S
             "error-window slot counts cannot be negative".to_owned(),
         ));
     }
-    if input.assignment_max_future_slots < 0 {
-        return Err(SolverError::Algorithm(
-            "maximum assignment shift cannot be negative".to_owned(),
-        ));
-    }
     if input
-        .assignment_max_slot
+        .forecast_max_slot
         .is_some_and(|max_slot| max_slot < input.current_slot)
     {
         return Err(SolverError::Algorithm(
-            "assignment cap is earlier than the current slot".to_owned(),
+            "forecast coverage ends before the current slot".to_owned(),
         ));
     }
     if !input.carbon_cost_duration_scale.is_finite()
@@ -936,8 +913,8 @@ fn validate_solve_input(input: &SolveInput, scope: &SolverScope) -> Result<(), S
     Ok(())
 }
 
-/// Cap a request's deadline to slots for which this solve has forecast data
-/// or for whose future assignment horizon is valid.
+/// Cap a request's deadline to its arrival-based QoS look-ahead and to slots
+/// for which this solve has forecast data.
 /// Already-expired work is retained at the current slot so the algorithm can
 /// mark it late and choose its explicit late-work fallback.
 fn cap_deadline_inside_forecast(
@@ -949,9 +926,27 @@ fn cap_deadline_inside_forecast(
         return Ok(input.current_slot);
     }
 
-    let cap = request
-        .deadline_slot
-        .min(latest_forecast_slot(input, scope));
+    // ErrorWindow.future_slots is the single per-request assignment horizon.
+    // The carbon forecast may extend farther, but it cannot enlarge this
+    // policy limit. Use i64 for the addition so a large valid slot value
+    // cannot overflow i32 before the later horizon cap is applied.
+    let arrival_horizon = i64::from(request.arrival_slot)
+        .checked_add(i64::from(input.qos.error_window.future_slots))
+        .ok_or_else(|| {
+            SolverError::Algorithm(format!(
+                "request {} assignment horizon overflowed",
+                request.request_id
+            ))
+        })?;
+    let cap = i64::from(request.deadline_slot)
+        .min(arrival_horizon)
+        .min(i64::from(latest_forecast_slot(input, scope)));
+    let cap = i32::try_from(cap).map_err(|_| {
+        SolverError::Algorithm(format!(
+            "request {} has an invalid capped deadline",
+            request.request_id
+        ))
+    })?;
     let earliest = request.arrival_slot.max(input.current_slot);
     if cap < earliest {
         return Err(SolverError::Algorithm(format!(
@@ -975,9 +970,7 @@ fn request_slot_bounds(
 
 fn latest_forecast_slot(input: &SolveInput, scope: &SolverScope) -> i32 {
     let total_slots: i32 = scope.total_slots as i32;
-    (total_slots - 1)
-        .min(input.current_slot + input.qos.error_window.future_slots)
-        .min(input.assignment_max_slot.unwrap_or(total_slots - 1))
+    (total_slots - 1).min(input.forecast_max_slot.unwrap_or(total_slots - 1))
 }
 
 // ----------------------------------------------------------------------------
@@ -1031,8 +1024,7 @@ mod tests {
             }],
             baseline_slot_counts: HashMap::new(),
             carbon_cost_duration_scale: 1.0,
-            assignment_max_future_slots: 2,
-            assignment_max_slot: Some(3),
+            forecast_max_slot: Some(3),
             qos: QoSProfileInput {
                 profile_id: QosProfileId::default_profile(),
                 flavours: vec![Flavour {
@@ -1197,8 +1189,8 @@ mod tests {
                 multiplier: 10.0,
             },
         ];
-        solve_input.assignment_max_future_slots = 1;
-        solve_input.assignment_max_slot = Some(1);
+        solve_input.qos.error_window.future_slots = 1;
+        solve_input.forecast_max_slot = Some(1);
 
         let placements =
             placements_for_scope("singleton_best", &solve_input, scope_with_total_slots(2));
@@ -1233,8 +1225,8 @@ mod tests {
         solve_input
             .baseline_slot_counts
             .insert(0, i64::from(i32::MAX) + 1);
-        solve_input.assignment_max_future_slots = 1;
-        solve_input.assignment_max_slot = Some(1);
+        solve_input.qos.error_window.future_slots = 1;
+        solve_input.forecast_max_slot = Some(1);
 
         let placements =
             placements_for_scope("singleton_best", &solve_input, scope_with_total_slots(2));
@@ -1342,11 +1334,10 @@ mod tests {
     }
 
     #[test]
-    fn all_algorithms_cap_on_time_deadlines_to_forecast_availability() {
+    fn all_algorithms_cap_on_time_deadlines_to_the_qos_assignment_horizon() {
         let mut solve_input = input();
         solve_input.current_slot = 0;
         solve_input.qos.error_window.future_slots = 1;
-        solve_input.assignment_max_future_slots = 3;
         solve_input.qos.flavours = vec![
             Flavour {
                 name: "Accurate".to_owned(),
@@ -1368,6 +1359,51 @@ mod tests {
             assert_eq!(placements.len(), 1);
             assert!(placements[0].scheduled_slot <= 1);
             assert!(!placements[0].late);
+        }
+    }
+
+    #[test]
+    fn qos_assignment_horizon_is_anchored_to_arrival_not_current_slot() {
+        let mut solve_input = input();
+        solve_input.current_slot = 1;
+        solve_input.requests.truncate(1);
+        solve_input.requests[0].arrival_slot = 0;
+        solve_input.requests[0].deadline_slot = 3;
+        solve_input.qos.error_window.future_slots = 1;
+        solve_input.qos.max_average_error = 0.0;
+        solve_input.forecast_max_slot = Some(3);
+
+        for name in ["dp", "singleton_best", "hazard"] {
+            let placements = placements_for(name, &solve_input);
+
+            assert_eq!(placements.len(), 1);
+            assert_eq!(
+                placements[0].scheduled_slot, 1,
+                "{name} must not schedule beyond arrival_slot + future_slots"
+            );
+            assert!(!placements[0].late);
+        }
+    }
+
+    #[test]
+    fn a_shorter_forecast_caps_assignments_without_expanding_the_qos_horizon() {
+        let mut solve_input = input();
+        solve_input.current_slot = 0;
+        solve_input.requests.truncate(1);
+        solve_input.requests[0].arrival_slot = 0;
+        solve_input.requests[0].deadline_slot = 3;
+        solve_input.qos.error_window.future_slots = 3;
+        solve_input.qos.max_average_error = 0.0;
+        solve_input.forecast_max_slot = Some(1);
+
+        for name in ["dp", "singleton_best", "hazard"] {
+            let placements = placements_for(name, &solve_input);
+
+            assert_eq!(placements.len(), 1);
+            assert!(
+                placements[0].scheduled_slot <= 1,
+                "{name} must not schedule where no forecast is available"
+            );
         }
     }
 
@@ -1450,8 +1486,8 @@ mod tests {
                 .unwrap();
             let latest = request
                 .deadline_slot
-                .min(solve_input.assignment_max_slot.unwrap())
-                .min(request.arrival_slot + solve_input.assignment_max_future_slots);
+                .min(solve_input.forecast_max_slot.unwrap())
+                .min(request.arrival_slot + solve_input.qos.error_window.future_slots);
             assert!(
                 (request.arrival_slot.max(solve_input.current_slot)..=latest)
                     .contains(&placement.scheduled_slot)
@@ -1481,8 +1517,8 @@ mod tests {
             },
         ];
         solve_input.carbon_forecast = vec![1.0];
-        solve_input.assignment_max_future_slots = 0;
-        solve_input.assignment_max_slot = Some(0);
+        solve_input.qos.error_window.future_slots = 0;
+        solve_input.forecast_max_slot = Some(0);
 
         let placements = placements_for_scope("hazard", &solve_input, scope_with_total_slots(1));
 
@@ -1497,7 +1533,7 @@ mod tests {
         solve_input.requests.truncate(1);
         solve_input.requests[0].arrival_slot = 0;
         solve_input.requests[0].deadline_slot = 3;
-        solve_input.assignment_max_future_slots = 1;
+        solve_input.qos.error_window.future_slots = 1;
         solve_input.qos.flavours = vec![
             Flavour {
                 name: "Accurate".to_owned(),

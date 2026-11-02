@@ -104,6 +104,7 @@ fn is_valid_stable_identifier(value: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ErrorWindowPolicy {
     pub past_slots: i32,
+    /// Future error-window extent and maximum assignment offset from arrival.
     pub future_slots: i32,
     pub past_decay_slots: i32,
 }

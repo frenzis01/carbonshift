@@ -153,12 +153,7 @@ impl SolverAlgorithm for BanditAlgorithm {
             }
 
             let (earliest_slot, deadline_slot) = super::request_slot_bounds(input, request, scope)?;
-            let candidates = valid_slots(
-                earliest_slot,
-                deadline_slot,
-                input.assignment_max_future_slots,
-                scope.total_slots,
-            );
+            let candidates = valid_slots(earliest_slot, deadline_slot, scope.total_slots);
             // Should not happen, unless there has been improper configuration/input
             if candidates.is_empty() {
                 return Err(SolverError::Algorithm(format!(
@@ -312,8 +307,7 @@ mod tests {
             }],
             baseline_slot_counts: HashMap::new(),
             carbon_cost_duration_scale: 1.0,
-            assignment_max_future_slots: 2,
-            assignment_max_slot: Some(2),
+            forecast_max_slot: Some(2),
             qos: QoSProfileInput {
                 profile_id: QosProfileId::default_profile(),
                 flavours: vec![Flavour {

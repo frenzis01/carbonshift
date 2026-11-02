@@ -70,8 +70,7 @@ pub(super) fn project_scenario_to_solve_input(
         capacity_tiers: assignment.capacity_tiers.to_vec(),
         baseline_slot_counts: HashMap::new(),
         carbon_cost_duration_scale: assignment.carbon_cost_duration_scale,
-        assignment_max_future_slots: assignment.assignment_max_future_slots,
-        assignment_max_slot: Some(assignment.total_slots - 1),
+        forecast_max_slot: Some(assignment.total_slots - 1),
         qos: QoSProfileInput {
             profile_id,
             flavours: assignment.flavours.to_vec(),
@@ -157,18 +156,12 @@ fn validate_proposed_placement<'request, 'flavour>(
         let earliest = request.arrival_slot.max(solve_input.current_slot);
         let shift_limit = request
             .arrival_slot
-            .checked_add(solve_input.assignment_max_future_slots)
-            .ok_or_else(|| {
-                SolverError::Algorithm(format!(
-                    "request {} assignment window overflowed",
-                    placement.req_id
-                ))
-            })?;
-        let forecast_window_end = solve_input
-            .current_slot
             .checked_add(solve_input.qos.error_window.future_slots)
             .ok_or_else(|| {
-                SolverError::Algorithm("forecast window boundary overflowed".to_owned())
+                SolverError::Algorithm(format!(
+                    "request {} QoS assignment horizon overflowed",
+                    placement.req_id
+                ))
             })?;
         let planning_horizon_end = i32::try_from(scope.total_slots)
             .ok()
@@ -179,10 +172,9 @@ fn validate_proposed_placement<'request, 'flavour>(
         let latest = request
             .deadline_slot
             .min(shift_limit)
-            .min(forecast_window_end)
             .min(
                 solve_input
-                    .assignment_max_slot
+                    .forecast_max_slot
                     .unwrap_or(planning_horizon_end),
             )
             .min(planning_horizon_end);

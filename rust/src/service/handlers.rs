@@ -1106,13 +1106,27 @@ pub async fn get_slot_detail(
 ) -> Result<Json<SlotDetailResponse>, ApiError> {
     let carbon_forecast = _state.carbon_forecast.read().unwrap().clone();
 
-    // Accept both configured assignment reach and known forecast length:
-    // a provider may publish farther ahead than the solver's immediate window.
-    // horizon is yielded by max(current_slot + assignment_max_future_slots, carbon_forecast length)
-    let horizon = std::cmp::max(
-        _state.shared_state.get_current_slot() + _state.scheduler.assignment_max_future_slots,
-        carbon_forecast.len() as i32,
-    );
+    // Slot details may be inspected through the larger of the active QoS
+    // look-ahead and the published forecast. This display/API horizon does not
+    // enlarge a request's assignment horizon beyond its profile's
+    // `error_window.future_slots`.
+    let window_horizon = _state
+        .shared_state
+        .get_current_slot()
+        .checked_add(_state.scheduler.error_window_future)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Configured slot horizon overflowed",
+            )
+        })?;
+    let forecast_horizon = i32::try_from(carbon_forecast.len()).map_err(|_| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Forecast contains more slots than the API can address",
+        )
+    })?;
+    let horizon = window_horizon.max(forecast_horizon);
 
     // Status code 400 Bad Request for invalid slot
     if _slot < 0 {

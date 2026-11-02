@@ -209,8 +209,6 @@ pub struct ServiceSchedulerConfig {
     pub cumulative_error_enabled: bool,
     /// Whether the per-profile cumulative error constraint is hard.
     pub cumulative_error_hard: bool,
-    /// Maximum number of slots into the future for an assignment.
-    pub assignment_max_future_slots: i32,
 }
 
 /// Outcome of registering a profile under a stable shared ID.
@@ -340,7 +338,6 @@ impl ServiceSchedulerConfig {
             error_window_past_decay_slots: cfg.error_window_past_decay_slots,
             cumulative_error_enabled: cfg.global_error_constraint_enabled,
             cumulative_error_hard: cfg.global_error_constraint_hard,
-            assignment_max_future_slots: cfg.assignment_max_future_slots,
         }
     }
 }
@@ -546,7 +543,6 @@ mod tests {
         cfg.max_error_threshold = 8.25;
         cfg.error_window_past = 5;
         cfg.error_window_future = 7;
-        cfg.assignment_max_future_slots = 11;
 
         let service = ServiceSchedulerConfig::from_config(&cfg);
 
@@ -573,7 +569,6 @@ mod tests {
             service.cumulative_error_hard,
             cfg.global_error_constraint_hard
         );
-        assert_eq!(service.assignment_max_future_slots, 11);
     }
 
     #[test]

@@ -13,7 +13,6 @@ fn make_config(overrides: impl FnOnce(&mut Config)) -> Config {
     let mut cfg = Config {
         solver: crate::config::SolverConfig {
             batch_size: 3,
-            dp_lock_future_assignments: true,
             dp_pruning_min_batch_size: 0,
             dp_pruning_method: "none".to_string(),
             ..crate::config::SolverConfig::default()
@@ -155,6 +154,86 @@ fn call_solve_dp_with_forecast(
 
 // ── tests ─────────────────────────────────────────────────────────────────
 
+#[test]
+fn common_solve_input_uses_global_fixed_occupancy_and_profile_only_errors() {
+    let cfg = make_config(|_| {});
+    let mut profile_a = profile(
+        "profile-a",
+        "text_generation",
+        cfg.flavours.clone(),
+        cfg.max_error_threshold,
+    );
+    Arc::make_mut(&mut profile_a).error_window.future_slots = 2;
+    let profile_a_id = profile_a.profile_id.clone();
+    let profile_b_id = QosProfileId::parse("profile-b").unwrap();
+
+    let shared_state = SharedState::new();
+    shared_state.add_assignments(vec![
+        Assignment::new_for_profile(
+            90,
+            1,
+            "Fast".to_owned(),
+            1.0,
+            2.0,
+            10.0,
+            Some(0),
+            Some(4),
+            profile_a_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            91,
+            2,
+            "Fast".to_owned(),
+            1.0,
+            99.0,
+            10.0,
+            Some(0),
+            Some(4),
+            profile_b_id,
+        ),
+        Assignment::new_for_profile(
+            92,
+            3,
+            "Fast".to_owned(),
+            1.0,
+            4.0,
+            10.0,
+            Some(0),
+            Some(5),
+            profile_a_id.clone(),
+        ),
+    ]);
+
+    let request = Request::new_for_qos_profile(10, 1, 5, profile_a.clone());
+    let assignment = cfg.assignment_policy_for_profile(&profile_a);
+    let snapshot = shared_state.snapshot_for_solver();
+    let forecast = flat_forecast(cfg.total_slots, 100.0);
+    let input = super::solve::build_solve_input_from_snapshot(
+        1,
+        &[request],
+        &snapshot,
+        &assignment,
+        &cfg.simulation,
+        &cfg.infeasibility,
+        &forecast,
+    )
+    .unwrap();
+
+    assert_eq!(input.qos.profile_id, profile_a_id);
+    assert_eq!(input.requests.len(), 1);
+    assert_eq!(input.baseline_slot_counts.get(&1), Some(&1));
+    assert_eq!(input.baseline_slot_counts.get(&2), Some(&1));
+    assert_eq!(input.baseline_slot_counts.get(&3), Some(&1));
+    assert_eq!(input.qos.cumulative_err.count, 2.0);
+    assert_eq!(input.qos.cumulative_err.sum, 6.0);
+    assert_eq!(input.qos.err_by_slot.get(&1).unwrap().sum, 2.0);
+    assert_eq!(input.qos.err_by_slot.get(&3).unwrap().sum, 4.0);
+    assert!(!input.qos.err_by_slot.contains_key(&2));
+    assert_eq!(input.qos.error_window.baseline_err.count, 2.0);
+    assert_eq!(input.qos.error_window.baseline_err.sum, 6.0);
+    assert_eq!(input.forecast_max_slot, Some(cfg.total_slots - 1));
+}
+
 /// All assigned slots must be ≥ current_slot.
 #[test]
 fn test_scheduled_slots_never_before_current_slot() {
@@ -179,11 +258,11 @@ fn test_scheduled_slots_never_before_current_slot() {
     }
 }
 
-/// With `dp_lock_future_assignments=true`, pre-existing future assignments
-/// are pinned as baseline load and must NOT appear in the DP result.
+/// Pre-existing future assignments are always pinned as baseline load and
+/// never become placements in a newly claimed batch.
 #[test]
-fn test_lock_future_pins_and_excludes_future_assignments() {
-    let cfg = make_config(|c| c.solver.dp_lock_future_assignments = true);
+fn future_assignments_are_always_pinned_and_excluded_from_the_solve_result() {
+    let cfg = make_config(|_| {});
     let ss = SharedState::new();
     let current_slot = 2i32;
 
@@ -210,45 +289,11 @@ fn test_lock_future_pins_and_excludes_future_assignments() {
     let result_ids: HashSet<u64> = assignments.iter().map(|a| a.request_id).collect();
     assert!(
         !result_ids.contains(&future_id),
-        "future assignment should not be re-planned when dp_lock_future_assignments=true"
+        "a pre-existing future assignment must not be re-planned"
     );
     for i in 0u64..3 {
         assert!(result_ids.contains(&i), "pending request {} missing", i);
     }
-}
-
-/// With `dp_lock_future_assignments=false`, future assignments ARE included
-/// in the DP pool for joint re-planning.
-#[test]
-fn test_unlock_future_includes_future_in_dp() {
-    let cfg = make_config(|c| c.solver.dp_lock_future_assignments = false);
-    let ss = SharedState::new();
-    let current_slot = 2i32;
-
-    let future_id = 99u64;
-    ss.add_assignments(vec![Assignment::new(
-        future_id,
-        6,
-        "Fast".to_string(),
-        1.0,
-        5.0,
-        10.0,
-        Some(0),
-        Some(8),
-    )]);
-
-    let pending = vec![
-        req(0, current_slot, current_slot + 3),
-        req(1, current_slot, current_slot + 3),
-        req(2, current_slot, current_slot + 4),
-    ];
-    let (assignments, _ctx) = call_solve_dp_with_state(current_slot, &pending, &cfg, &ss);
-
-    let result_ids: HashSet<u64> = assignments.iter().map(|a| a.request_id).collect();
-    assert!(
-        result_ids.contains(&future_id),
-        "future assignment should be re-planned when dp_lock_future_assignments=false"
-    );
 }
 
 /// When all flavours have error > threshold, DP is infeasible.
@@ -436,7 +481,7 @@ fn batch_solver_registry_resolves_trimmed_case_insensitive_names() {
 #[test]
 fn random_batch_strategies_apply_their_requested_random_dimensions() {
     let cfg = make_config(|cfg| {
-        cfg.assignment_max_future_slots = 3;
+        cfg.error_window_future = 3;
     });
     let current_slot = 1;
     let pending = vec![req(1, current_slot, current_slot + 3)];

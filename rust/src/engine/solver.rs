@@ -19,6 +19,7 @@ pub struct SolveRequest {
 pub struct ErrorWindowInput {
     pub baseline_err: ErrorTotals,
     pub past_slots: i32,
+    /// Future error-window extent and maximum assignment offset from arrival.
     pub future_slots: i32,
 }
 
@@ -52,8 +53,12 @@ pub struct SolveInput {
     pub baseline_slot_counts: HashMap<i32, i64>,
 
     pub carbon_cost_duration_scale: f64,
-    pub assignment_max_future_slots: i32,
-    pub assignment_max_slot: Option<i32>,
+    /// Last absolute slot with forecast data available to this solve.
+    ///
+    /// This may be later than a request's QoS assignment horizon. It only
+    /// limits which forecast indexes can be read; `error_window.future_slots`
+    /// remains the sole policy limit for how far a request may be shifted.
+    pub forecast_max_slot: Option<i32>,
     pub qos: QoSProfileInput,
 }
 
@@ -420,8 +425,7 @@ mod tests {
             }],
             baseline_slot_counts: HashMap::new(),
             carbon_cost_duration_scale: 1.0,
-            assignment_max_future_slots: 3,
-            assignment_max_slot: Some(3),
+            forecast_max_slot: Some(3),
             qos: QoSProfileInput {
                 profile_id: QosProfileId::default_profile(),
                 flavours: vec![Flavour {

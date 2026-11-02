@@ -6,19 +6,11 @@ use crate::engine::{
 };
 use std::collections::HashMap;
 
-/// Return the sorted list of valid target slots for a request:
-/// `[arrival_slot, min(deadline_slot, arrival_slot + max_future, total_slots-1)]`.
-pub(super) fn valid_slots(
-    arrival_slot: i32,
-    deadline_slot: i32,
-    max_future: i32,
-    total_slots: usize,
-) -> Vec<i32> {
-    let from = arrival_slot;
-    let to = deadline_slot
-        .min(arrival_slot + max_future)
-        .min(total_slots as i32 - 1)
-        .max(from);
+/// Return the sorted candidate slots after request bounds have already been
+/// capped by the deadline, QoS future window, and forecast availability.
+pub(super) fn valid_slots(earliest_slot: i32, deadline_slot: i32, total_slots: usize) -> Vec<i32> {
+    let from = earliest_slot;
+    let to = deadline_slot.min(total_slots as i32 - 1).max(from);
     (from..=to).collect()
 }
 

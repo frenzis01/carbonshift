@@ -24,8 +24,6 @@ pub struct SolverConfig {
     pub dp_pruning_k: usize,
     /// Maximum seconds for the DP solver per batch before timeout fallback.
     pub dp_timeout: f64,
-    /// Whether future assignments are pinned as baseline load.
-    pub dp_lock_future_assignments: bool,
     /// Maximum consecutive capacity-tier rollbacks for one batch (0 = disabled).
     pub rollback_max_consecutive: usize,
     /// Maximum number of batch solver workers.
@@ -163,12 +161,10 @@ pub struct Config {
     pub max_error_threshold: f64,
     /// Number of past slots in the error window.
     pub error_window_past: i32,
-    /// Number of future slots in the error window.
+    /// Future error-window extent and maximum assignment offset from arrival.
     pub error_window_future: i32,
     /// Additional past slots included with linearly decayed weight.
     pub error_window_past_decay_slots: i32,
-    /// Maximum number of slots into the future for an assignment.
-    pub assignment_max_future_slots: i32,
     /// Enforce the global error constraint.
     pub global_error_constraint_enabled: bool,
     /// Reject assignments that violate the global error constraint.
@@ -192,12 +188,10 @@ pub struct AssignmentPolicy<'a> {
     pub max_error_threshold: f64,
     /// Number of past slots in the error window.
     pub error_window_past: i32,
-    /// Number of future slots in the error window.
+    /// Future error-window extent and maximum assignment offset from arrival.
     pub error_window_future: i32,
     /// Additional past slots included with linearly decayed weight.
     pub error_window_past_decay_slots: i32,
-    /// Maximum scheduling shift in slots.
-    pub assignment_max_future_slots: i32,
     /// Whether to enforce this policy's cumulative error constraint.
     pub global_error_constraint_enabled: bool,
     /// Whether cumulative-constraint violations exclude flavours.
@@ -213,7 +207,6 @@ impl Default for SolverConfig {
             dp_pruning_min_batch_size: 8,
             dp_pruning_k: 1200,
             dp_timeout: 30.0,
-            dp_lock_future_assignments: true,
             rollback_max_consecutive: 0,
             max_batch_solver_parallelism: 12,
             queue_timeout: 1.0,
@@ -322,7 +315,6 @@ impl Default for Config {
             error_window_past: 12,
             error_window_future: 14,
             error_window_past_decay_slots: 12,
-            assignment_max_future_slots: 14,
             global_error_constraint_enabled: true,
             global_error_constraint_hard: true,
             capacity_tiers: vec![
@@ -349,9 +341,10 @@ impl Default for Config {
 
 impl Config {
     /// Builds assignment policy from a profile while retaining global
-    /// horizon, cost scale, default capacity tiers, and assignment-future
-    /// limits. The live batch scheduler replaces the borrowed tier slice with
-    /// its locked runtime snapshot before solving.
+    /// horizon, cost scale, and default capacity tiers. The profile's future
+    /// error-window size is also the maximum per-request assignment look-ahead.
+    /// The live batch scheduler replaces the borrowed tier slice with its
+    /// locked runtime snapshot before solving.
     pub fn assignment_policy_for_profile<'a>(
         &'a self,
         profile: &'a QosProfile,
@@ -365,7 +358,6 @@ impl Config {
             error_window_past: profile.error_window.past_slots,
             error_window_future: profile.error_window.future_slots,
             error_window_past_decay_slots: profile.error_window.past_decay_slots,
-            assignment_max_future_slots: self.assignment_max_future_slots,
             global_error_constraint_enabled: profile.cumulative_error.enabled,
             global_error_constraint_hard: profile.cumulative_error.hard,
         }
@@ -383,7 +375,6 @@ impl Config {
             error_window_past: self.error_window_past,
             error_window_future: self.error_window_future,
             error_window_past_decay_slots: self.error_window_past_decay_slots,
-            assignment_max_future_slots: self.assignment_max_future_slots,
             global_error_constraint_enabled: self.global_error_constraint_enabled,
             global_error_constraint_hard: self.global_error_constraint_hard,
         }
@@ -491,7 +482,6 @@ mod tests {
         cfg.error_window_past = 11;
         cfg.error_window_future = 13;
         cfg.error_window_past_decay_slots = 17;
-        cfg.assignment_max_future_slots = 19;
         cfg.global_error_constraint_enabled = false;
         cfg.global_error_constraint_hard = false;
 
@@ -512,7 +502,6 @@ mod tests {
         assert_eq!(policy.error_window_past, 11);
         assert_eq!(policy.error_window_future, 13);
         assert_eq!(policy.error_window_past_decay_slots, 17);
-        assert_eq!(policy.assignment_max_future_slots, 19);
         assert!(!policy.global_error_constraint_enabled);
         assert!(!policy.global_error_constraint_hard);
     }

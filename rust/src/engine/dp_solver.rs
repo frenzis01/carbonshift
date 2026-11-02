@@ -94,10 +94,10 @@ pub struct SolveBatchInput<'a> {
     pub max_error_threshold: Option<f64>,
     /// Number of historical slots included before `current_slot`.
     pub error_window_past: i32,
-    /// Number of future slots included after `current_slot`.
+    /// Future error-window extent and maximum assignment offset from arrival.
     pub error_window_future: i32,
-    /// Hard upper bound on scheduled slot (None = window_size − 1).
-    pub assignment_max_slot: Option<i32>,
+    /// Last absolute slot with forecast data available to this solve.
+    pub forecast_max_slot: Option<i32>,
     /// Optional synthetic mock pool for infeasibility recovery.
     pub dynamic_mock_pool: MockPool,
 }
@@ -200,23 +200,31 @@ impl DpSolver {
 
         let window_start = (input.current_slot - input.error_window_past).max(0);
         let window_end = (input.current_slot + input.error_window_future).min(self.window_size - 1);
-        let assignment_cap = input
-            .assignment_max_slot
+        let forecast_cap = input
+            .forecast_max_slot
             .unwrap_or(self.window_size - 1)
             .min(self.window_size - 1)
             .max(input.current_slot);
 
-        // A request may be scheduled no earlier than its arrival and no later
-        // than both its deadline and this solve's bounded planning window.
+        // Keep the assignment horizon in one place: each request may be
+        // scheduled through arrival + its profile's future-window size. The
+        // forecast cap can shorten that range, but never expand it.
         let deadlines: Vec<i32> = input
             .requests
             .iter()
             .map(|request| {
-                request
-                    .deadline_slot
-                    .max(input.current_slot)
-                    .min(assignment_cap)
-                    .min(self.window_size - 1)
+                if input.current_slot > request.deadline_slot {
+                    // Preserve late work at the current slot for the existing
+                    // late/fallback handling.
+                    input.current_slot
+                } else {
+                    let arrival_horizon =
+                        i64::from(request.arrival_slot) + i64::from(input.error_window_future);
+                    i64::from(request.deadline_slot)
+                        .min(arrival_horizon)
+                        .min(i64::from(forecast_cap))
+                        .min(i64::from(self.window_size - 1)) as i32
+                }
             })
             .collect();
         if input
@@ -802,7 +810,7 @@ mod tests {
             max_error_threshold: Some(4.0),
             error_window_past: 2,
             error_window_future: 2,
-            assignment_max_slot: None,
+            forecast_max_slot: None,
             dynamic_mock_pool: MockPool::default(),
         }
     }
@@ -897,7 +905,9 @@ mod tests {
         let tiers = no_tiers();
         let counts = HashMap::new();
 
-        let result = solver.solve_batch(make_input(&requests, 3, &tiers, &counts));
+        let mut input = make_input(&requests, 3, &tiers, &counts);
+        input.error_window_future = 4;
+        let result = solver.solve_batch(input);
 
         assert_eq!(result.len(), 1);
         assert!(result[0].slot >= 3);
@@ -1125,11 +1135,12 @@ mod tests {
         let counts = HashMap::new();
         let result = solver.solve_batch(make_input(&requests, 0, &tiers, &counts));
         assert_eq!(result.len(), 5, "all requests must be scheduled");
-        // All assignments should be in cheap slots (outside window).
+        // The configured future-window size is also the assignment look-ahead,
+        // so no request can be placed after arrival slot 0 + 2.
         for a in &result {
             assert!(
-                a.slot >= 3,
-                "beam should prefer cheap slots outside error window"
+                a.slot <= 2,
+                "DP must keep assignments within the QoS future horizon"
             );
         }
     }

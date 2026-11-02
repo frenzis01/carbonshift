@@ -256,12 +256,7 @@ impl SolverAlgorithm for AcoAlgorithm {
 
                 for request in &on_time_requests {
                     let (earliest, deadline) = request_slot_bounds(input, request, scope)?;
-                    let candidates = valid_slots(
-                        earliest,
-                        deadline,
-                        input.assignment_max_future_slots,
-                        scope.total_slots,
-                    );
+                    let candidates = valid_slots(earliest, deadline, scope.total_slots);
                     // Should not happen unless input is inconsistent
                     if candidates.is_empty() {
                         return Err(SolverError::Algorithm(format!(
@@ -588,8 +583,7 @@ mod tests {
             }],
             baseline_slot_counts: HashMap::new(),
             carbon_cost_duration_scale: 1.0,
-            assignment_max_future_slots: 3,
-            assignment_max_slot: Some(3),
+            forecast_max_slot: Some(3),
             qos: QoSProfileInput {
                 profile_id: QosProfileId::default_profile(),
                 flavours: vec![
@@ -716,7 +710,7 @@ mod tests {
         let mut solve_input = input();
         solve_input.current_slot = 2;
         solve_input.requests[0].arrival_slot = 2;
-        solve_input.assignment_max_future_slots = 1;
+        solve_input.qos.error_window.future_slots = 1;
         solve_input.qos.error_window.future_slots = 1;
 
         let (proposal, delta) = algorithm.solve(&state, &scope, &solve_input).unwrap();

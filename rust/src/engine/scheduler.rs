@@ -21,7 +21,10 @@ use std::sync::RwLock;
 
 use crate::config::{AssignmentPolicy, Config, SolverConfig, SwarmConfig};
 use crate::engine::qos::QosProfileId;
-use crate::engine::solver::{ProposedPlacement, SolverProposal};
+use crate::engine::solver::{
+    ProposedPlacement, SolverError, SolverProposal, SolverRegistry, SolverRuntime, SolverScope,
+};
+use crate::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use crate::metrics_logger::MetricsLogger;
 use crate::shared_state::{ClaimedRequestBatch, SharedState, SolverSnapshot};
 use crate::types::{Assignment, Request};
@@ -37,7 +40,7 @@ use recovery::RecoveryState;
 pub use solve::SolveContext;
 #[cfg(test)]
 use solve::get_effective_pruning_mode;
-use solve::{BatchSolveContext, select_batch_solver};
+use solve::{BatchSolveContext, build_solve_input_from_snapshot, select_batch_solver};
 
 // ─── internal state types ────────────────────────────────────────────────────
 
@@ -175,8 +178,6 @@ impl SwarmBackend {
 /// All mutable scheduler state shared between the main loop and workers.
 struct SchedulerMutableState {
     active_workers: usize,
-    /// Revision of the global tiers used by the cached online-solvers.
-    capacity_tier_revision: u64,
     /// Used when a caller opts to serialize batches for each QoS profile.
     active_profiles: HashSet<QosProfileId>,
     /// Anti-storm guard scoped to a profile's pending queue.
@@ -188,6 +189,7 @@ struct SchedulerMutableState {
     /// Online solver state is independent per profile; different flavour
     /// sets must not train the same cost/pheromone state.
     swarm_states: HashMap<QosProfileId, SwarmBackend>,
+    solver_runtimes: HashMap<QosProfileId, Arc<dyn SolverRuntime>>,
 }
 
 // ─── public result type ──────────────────────────────────────────────────────
@@ -222,6 +224,8 @@ pub struct SchedulerStatistics {
 pub struct BatchScheduler {
     shared_state: SharedState,
     cfg: Arc<Config>,
+    /// Immutable factories shared with workers; profile runtimes are created later.
+    solver_registry: Arc<SolverRegistry>,
     /// Pre-computed carbon-intensity forecast for the planning horizon.
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
     /// flavour_name → duration_seconds lookup (immutable after construction).
@@ -232,6 +236,29 @@ pub struct BatchScheduler {
     allow_same_profile_parallelism: bool,
     pub metrics_logger: Arc<MetricsLogger>,
     main_thread: Option<JoinHandle<()>>,
+}
+
+/// Temporary deterministic seed until the online hazard seed is configurable.
+const ONLINE_HAZARD_SEED: u64 = 345_542;
+
+/// Build all engine factories once, using the same concrete algorithm
+/// registrations for both scheduler constructors.
+fn build_solver_registry(cfg: &Config) -> SolverRegistry {
+    let dp_config = DpAlgorithmConfig {
+        pruning_method: cfg.solver.dp_pruning_method.clone(),
+        pruning_min_batch_size: cfg.solver.dp_pruning_min_batch_size,
+        pruning_k: cfg.solver.dp_pruning_k,
+        timeout_secs: cfg.solver.dp_timeout,
+    };
+    let mut registry = SolverRegistry::default();
+
+    // Engine names are registered by this fixed composition function, so a
+    // registration error here indicates a programming error (for example,
+    // accidentally registering the same built-in name twice).
+    register_all_solvers(&mut registry, dp_config, &cfg.swarm, ONLINE_HAZARD_SEED)
+        .expect("built-in solver registry registration should succeed");
+
+    registry
 }
 
 impl BatchScheduler {
@@ -274,28 +301,30 @@ impl BatchScheduler {
         // Offline schedulers have no REST AppState to initialize the runtime
         // policy. For the live service this is idempotent with AppState::new.
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
-        let capacity_tier_revision = shared_state.capacity_tier_revision();
+        let solver_registry = Arc::new(build_solver_registry(&cfg));
         let carbon_forecast = carbon_forecast;
         let flavour_duration_by_name: HashMap<String, f64> = cfg
             .flavours
             .iter()
             .map(|f| (f.name.clone(), f.duration))
             .collect();
+
         Self {
             shared_state,
             cfg: cfg.clone(),
+            solver_registry,
             carbon_forecast,
             flavour_duration_by_name: Arc::new(flavour_duration_by_name),
             running: Arc::new(AtomicBool::new(false)),
             mutable: Arc::new(Mutex::new(SchedulerMutableState {
                 active_workers: 0,
-                capacity_tier_revision,
                 active_profiles: HashSet::new(),
                 last_infeasible: HashMap::new(),
                 last_dispatched_profile: None,
                 stats: SchedulerStats::default(),
                 recovery: Arc::new(RecoveryState::new()),
                 swarm_states: HashMap::new(),
+                solver_runtimes: HashMap::new(),
             })),
             allow_same_profile_parallelism,
             metrics_logger,
@@ -314,6 +343,7 @@ impl BatchScheduler {
         let running = self.running.clone();
         let ss = self.shared_state.clone();
         let cfg = self.cfg.clone();
+        let solver_registry = Arc::clone(&self.solver_registry);
         let forecast = self.carbon_forecast.clone();
         let fdb = self.flavour_duration_by_name.clone();
         let mutable = self.mutable.clone();
@@ -332,6 +362,7 @@ impl BatchScheduler {
                 running,
                 ss,
                 cfg,
+                solver_registry,
                 forecast,
                 fdb,
                 mutable,
@@ -413,6 +444,7 @@ fn main_loop(
     running: Arc<AtomicBool>,
     shared_state: SharedState,
     cfg: Arc<Config>,
+    solver_registry: Arc<SolverRegistry>,
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
     fdb: Arc<HashMap<String, f64>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
@@ -506,6 +538,7 @@ fn main_loop(
                 current_slot,
                 &shared_state,
                 &cfg,
+                &solver_registry,
                 &carbon_forecast,
                 &fdb,
                 &mutable,
@@ -528,6 +561,7 @@ fn main_loop(
                 current_slot,
                 &shared_state,
                 &cfg,
+                &solver_registry,
                 &carbon_forecast,
                 &fdb,
                 &mutable,
@@ -558,6 +592,7 @@ fn main_loop(
                         current_slot,
                         &shared_state,
                         &cfg,
+                        &solver_registry,
                         &carbon_forecast,
                         &fdb,
                         &mutable,
@@ -738,6 +773,7 @@ fn dispatch_batch_workers(
     slot: i32,
     shared_state: &SharedState,
     cfg: &Arc<Config>,
+    solver_registry: &Arc<SolverRegistry>,
     carbon_forecast: &Arc<RwLock<Vec<f64>>>,
     fdb: &Arc<HashMap<String, f64>>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
@@ -790,6 +826,7 @@ fn dispatch_batch_workers(
 
         let shared_state = shared_state.clone();
         let cfg = cfg.clone();
+        let solver_registry = Arc::clone(solver_registry);
         let carbon_forecast = carbon_forecast.clone();
         let fdb = fdb.clone();
         let mutable = mutable.clone();
@@ -805,6 +842,7 @@ fn dispatch_batch_workers(
                 allow_same_profile_parallelism,
                 shared_state,
                 cfg,
+                solver_registry,
                 carbon_forecast,
                 fdb,
                 mutable,
@@ -825,6 +863,7 @@ fn batch_worker_loop(
     allow_same_profile_parallelism: bool,
     shared_state: SharedState,
     cfg: Arc<Config>,
+    solver_registry: Arc<SolverRegistry>,
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
     fdb: Arc<HashMap<String, f64>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
@@ -841,6 +880,7 @@ fn batch_worker_loop(
             claimed.snapshot,
             &shared_state,
             &cfg,
+            &solver_registry,
             &forecast,
             &fdb,
             &mutable,
@@ -925,13 +965,53 @@ fn assignments_to_solver_proposal(assignments: &[Assignment]) -> SolverProposal 
     }
 }
 
+/// Return the cached engine runtime for this profile, creating it on first use.
+///
+/// The runtime owns the profile's persistent Bandit/ACO learning state. We
+/// return an `Arc` so a worker can keep using that runtime after the scheduler
+/// state lock has been released.
+fn get_runtime(
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    registry: &SolverRegistry,
+    engine_name: &str,
+    scope: SolverScope,
+) -> Result<Arc<dyn SolverRuntime>, SolverError> {
+    let profile_id = scope.profile_id.clone();
+
+    // The usual case is a cache hit. Clone the Arc while locked, then return
+    // an owned handle; never return a reference into the mutex-protected map.
+    {
+        let scheduler_state = mutable.lock().map_err(|_| SolverError::LockPoisoned)?;
+        if let Some(runtime) = scheduler_state.solver_runtimes.get(&profile_id) {
+            return Ok(Arc::clone(runtime));
+        }
+    }
+
+    // Runtime initialization may allocate algorithm state proportional to the
+    // horizon. Do that without holding the scheduler-wide mutex.
+    let new_runtime: Arc<dyn SolverRuntime> = Arc::from(registry.create(engine_name, scope)?);
+
+    // Another worker for this profile may have initialized the runtime while
+    // this worker was creating its candidate. The second lookup ensures both
+    // workers use the one runtime stored in the cache; the unused candidate
+    // is simply dropped.
+    let mut scheduler_state = mutable.lock().map_err(|_| SolverError::LockPoisoned)?;
+    let runtime = scheduler_state
+        .solver_runtimes
+        .entry(profile_id)
+        .or_insert(new_runtime);
+    Ok(Arc::clone(runtime))
+}
+
 /// Solve and commit one already-claimed, single-profile batch using its claim-time snapshot.
+/// Requires that pending requests share the same QoS profile.
 fn batch_worker_entry(
     slot: i32,
     pending: Vec<Request>,
     snapshot: SolverSnapshot,
     shared_state: &SharedState,
     cfg: &Config,
+    solver_registry: &SolverRegistry,
     carbon_forecast: &[f64],
     fdb: &HashMap<String, f64>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
@@ -941,33 +1021,87 @@ fn batch_worker_entry(
     let capacity_tiers = capacity_tiers_guard
         .as_deref()
         .unwrap_or(&cfg.capacity_tiers);
-    let capacity_tier_revision = shared_state.capacity_tier_revision();
+
+    let Some(first_request) = pending.first() else {
+        eprintln!("Scheduler received an empty batch.");
+        return BatchWorkerOutcome::Infeasible;
+    };
+    let profile_id = first_request.qos_profile_id();
+    let qos_profile = first_request.qos_profile.clone();
+    if pending
+        .iter()
+        .any(|request| request.qos_profile_id() != profile_id)
     {
-        let mut scheduler_state = mutable.lock().unwrap();
-        if scheduler_state.capacity_tier_revision != capacity_tier_revision {
-            scheduler_state.swarm_states.clear();
-            scheduler_state.capacity_tier_revision = capacity_tier_revision;
-        }
+        eprintln!("Scheduler received a batch containing multiple QoS profiles.");
+        shared_state.requeue_pending_requests_front(pending);
+        return BatchWorkerOutcome::Infeasible;
     }
 
-    let profile_id = pending
-        .first()
-        .map(Request::qos_profile_id)
-        .unwrap_or_else(crate::engine::qos::QosProfileId::default_profile);
-    let qos_profile = pending
-        .first()
-        .and_then(|request| request.qos_profile.clone());
-    let mut assignment = qos_profile
-        .as_deref()
-        .map(|profile| cfg.assignment_policy_for_profile(profile))
-        .unwrap_or_else(|| cfg.assignment_policy());
+    // Unprofiled callers are valid only for the built-in default profile.
+    // Custom profile IDs must carry the immutable profile snapshot resolved
+    // when the request was admitted.
+    let mut assignment = match qos_profile.as_deref() {
+        Some(profile) if profile.profile_id == profile_id => {
+            cfg.assignment_policy_for_profile(profile)
+        }
+        Some(profile) => {
+            eprintln!(
+                "Request profile ID {profile_id} does not match resolved profile {}.",
+                profile.profile_id
+            );
+            shared_state.requeue_pending_requests_front(pending);
+            return BatchWorkerOutcome::Infeasible;
+        }
+        None if profile_id == QosProfileId::default_profile() => cfg.assignment_policy(),
+        None => {
+            eprintln!("Request profile {profile_id} has no resolved QoS definition.");
+            shared_state.requeue_pending_requests_front(pending);
+            return BatchWorkerOutcome::Infeasible;
+        }
+    };
     assignment.capacity_tiers = capacity_tiers;
-    debug_assert!(
-        pending
-            .iter()
-            .all(|request| request.qos_profile_id() == profile_id),
-        "batch_worker_entry requires a homogeneous QoS profile batch"
-    );
+
+    let total_slots = match usize::try_from(cfg.total_slots) {
+        Ok(total_slots) => total_slots,
+        Err(error) => {
+            eprintln!("Invalid solver planning horizon: {error}");
+            shared_state.requeue_pending_requests_front(pending);
+            return BatchWorkerOutcome::Infeasible;
+        }
+    };
+
+    let _solve_input = match build_solve_input_from_snapshot(
+        slot,
+        &pending,
+        &snapshot,
+        &assignment,
+        &cfg.simulation,
+        &cfg.infeasibility,
+        carbon_forecast,
+    ) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("Could not prepare solver input for profile {profile_id}: {error}");
+            shared_state.requeue_pending_requests_front(pending);
+            return BatchWorkerOutcome::Infeasible;
+        }
+    };
+
+    let scope = SolverScope {
+        profile_id: profile_id.clone(),
+        total_slots,
+    };
+    let _runtime = match get_runtime(mutable, solver_registry, &cfg.solver.solver_strategy, scope) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("Could not create solver runtime: {error}");
+            shared_state.requeue_pending_requests_front(pending);
+            return BatchWorkerOutcome::Infeasible;
+        }
+    };
+
+    // `solve_input` is ready for the common runtime integration. The current
+    // worker still dispatches through its legacy path below.
 
     if is_online_swarm_strategy(&cfg.solver.solver_strategy) {
         return batch_worker_entry_swarm(
@@ -1147,10 +1281,7 @@ fn batch_worker_entry(
         );
         run_row.insert("qos_profile_id".into(), profile_id.to_string());
         run_row.insert("consecutive_rollbacks".into(), "0".into());
-        run_row.insert(
-            "lock_future_assignments".into(),
-            cfg.solver.dp_lock_future_assignments.to_string(),
-        );
+        run_row.insert("lock_future_assignments".into(), "true".into());
         run_row.insert("solver_start_ts".into(), wall_start.to_string());
         run_row.insert("solver_end_ts".into(), wall_end.to_string());
         run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());

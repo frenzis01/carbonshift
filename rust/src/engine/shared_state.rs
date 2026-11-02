@@ -1089,10 +1089,9 @@ impl SharedState {
     /// `consecutive_before` is the number of rollbacks this batch has already
     /// experienced; used to update `max_consecutive_rollbacks_seen`.
     ///
-    /// Note: when `dp_lock_future_assignments=false` the check may be conservative
-    /// (occasional spurious rollbacks) because re-planned future requests still
-    /// appear at their old slots in the assignment map until overwritten.  The
-    /// K-limit ensures the batch is eventually committed.
+    /// Future assignments remain pinned while this batch is solved, so the
+    /// expected occupancy snapshot includes every pre-existing future slot
+    /// occupant.
     pub fn try_add_assignments_checked(
         &self,
         assignments: &[Assignment],
