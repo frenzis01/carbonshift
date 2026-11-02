@@ -123,6 +123,55 @@ fn compute_per_request_marks_assignments_with_injected_mock_pool() {
     assert!(!rows[1].assigned_with_injection);
 }
 
+#[test]
+fn compact_solver_logs_keep_legacy_report_inputs_available() {
+    let prefix = std::env::temp_dir().join(format!(
+        "carbonshift-nshift-compact-log-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let runs_path = prefix.with_extension("runs.csv");
+    let assignments_path = prefix.with_extension("assignments.csv");
+
+    std::fs::write(
+        &runs_path,
+        concat!(
+            "run_id,run_sequence,current_slot,qos_profile_id,solver_mode,solver_status,",
+            "new_assignments,solver_elapsed_ms,total_carbon_cost,error_window_avg_after,",
+            "error_window_avg_after_real,error_window_start_slot,error_window_end_slot,",
+            "error_window_threshold,profile_error_constraint_active\n",
+            "run_s0_n1_1,1,0,default,dp,ok,1,1.5,2.0,0.0,0.0,0,1,4.0,false\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &assignments_path,
+        concat!(
+            "run_id,current_slot,request_id,qos_profile_id,scheduled_slot,flavour_name,",
+            "flavour_duration_sec,error,carbon_cost,arrival_slot,deadline_slot\n",
+            "run_s0_n1_1,0,1,default,0,Accurate,30,0.0,2.0,0,1\n"
+        ),
+    )
+    .unwrap();
+
+    let runs = super::reporting::read_solver_runs(&runs_path);
+    let assignments = super::reporting::read_solver_assignments(&assignments_path);
+
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].pending_batch_size, 1);
+    assert_eq!(runs[0].new_assignments, 1);
+    assert_eq!(runs[0].mock_recovery_injected_count, 0);
+    assert_eq!(runs[0].solver_mode, "dp");
+    assert_eq!(assignments.len(), 1);
+    assert!(assignments[0].is_new_assignment_in_run);
+
+    std::fs::remove_file(runs_path).unwrap();
+    std::fs::remove_file(assignments_path).unwrap();
+}
+
 /// Single tier (mult=1.0 up to 20): all 10 requests pay the same.
 /// Under per-request model: each costs carbon * 1.0 * dur * scale.
 #[test]

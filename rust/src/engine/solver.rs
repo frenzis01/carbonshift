@@ -175,6 +175,11 @@ pub trait SolverAlgorithm: Send + Sync {
 
 /// Object-safe interface that runners will use
 pub trait SolverRuntime: Send + Sync {
+    /// Return the normalized registry name used to create this runtime.
+    fn engine_name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+
     fn propose(&self, input: &SolveInput) -> Result<PendingProposal, SolverError>;
     fn commit(&self, id: ProposalId, report: CommitReport) -> Result<(), SolverError>;
     fn discard(&self, id: ProposalId) -> Result<(), SolverError>;
@@ -188,6 +193,7 @@ struct RuntimeData<S, D> {
 /// Holds typed state behind an object-safe runtime boundary
 pub struct TypedSolverRuntime<A: SolverAlgorithm> {
     algorithm: A,
+    engine_name: String,
     scope: SolverScope,
     data: Mutex<RuntimeData<A::State, A::Delta>>,
     next_id: AtomicU64,
@@ -195,9 +201,18 @@ pub struct TypedSolverRuntime<A: SolverAlgorithm> {
 
 impl<A: SolverAlgorithm> TypedSolverRuntime<A> {
     pub fn new(algorithm: A, scope: &SolverScope) -> Result<Self, SolverError> {
+        Self::new_named(algorithm, scope, std::any::type_name::<A>().to_owned())
+    }
+
+    fn new_named(
+        algorithm: A,
+        scope: &SolverScope,
+        engine_name: String,
+    ) -> Result<Self, SolverError> {
         let state = algorithm.initial_state(scope);
         Ok(Self {
             algorithm,
+            engine_name,
             scope: scope.clone(),
             data: Mutex::new(RuntimeData {
                 state,
@@ -209,6 +224,10 @@ impl<A: SolverAlgorithm> TypedSolverRuntime<A> {
 }
 
 impl<A: SolverAlgorithm> SolverRuntime for TypedSolverRuntime<A> {
+    fn engine_name(&self) -> &str {
+        &self.engine_name
+    }
+
     fn propose(&self, input: &SolveInput) -> Result<PendingProposal, SolverError> {
         // Take the lock to have a snapshot
         let snapshot = {
@@ -298,10 +317,11 @@ impl SolverRegistry {
         // 2. Wraps that algorithm in a TypedSolverRuntime.
         // 3. Boxes it as the type-erased `dyn SolverRuntime`, allowing the
         //    registry to store runtimes for different algorithm types together
+        let runtime_name = name.clone();
         self.factories.insert(
             name,
             Arc::new(move |scope| {
-                let runtime = TypedSolverRuntime::new(build(), &scope)?;
+                let runtime = TypedSolverRuntime::new_named(build(), &scope, runtime_name.clone())?;
                 Ok(Box::new(runtime) as Box<dyn SolverRuntime>)
             }),
         );
@@ -482,6 +502,7 @@ mod tests {
             .unwrap();
 
         let runtime = registry.create("UNIT", scope()).unwrap();
+        assert_eq!(runtime.engine_name(), "unit");
         let pending = runtime.propose(&input()).unwrap();
 
         assert_eq!(pending.proposal.placements.len(), 1);

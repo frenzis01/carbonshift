@@ -28,12 +28,6 @@ impl Online2System {
             cfg.logging.enable_solver_logging,
             cfg.logging.solver_runs_file.clone(),
             cfg.logging.solver_assignments_file.clone(),
-            cfg.logging.solver_slot_metrics_file.clone(),
-            if cfg.logging.enable_infeasibility_debug_logging {
-                Some(cfg.logging.solver_infeasible_debug_file.clone())
-            } else {
-                None
-            },
         ));
 
         let generator = match scenario_requests {

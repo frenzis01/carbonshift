@@ -116,7 +116,6 @@ async fn main() {
     cfg.logging.verbose = false;
     cfg.logging.enable_progress_display = false;
     cfg.logging.enable_solver_logging = env_or("CARBONSHIFT_ENABLE_SOLVER_LOGGING", "0") == "1";
-    cfg.logging.enable_infeasibility_debug_logging = false;
     let cfg = Arc::new(cfg);
 
     match &executor_url {
@@ -166,8 +165,6 @@ async fn main() {
         cfg.logging.enable_solver_logging,
         cfg.logging.solver_runs_file.clone(),
         cfg.logging.solver_assignments_file.clone(),
-        cfg.logging.solver_slot_metrics_file.clone(),
-        None,
     ));
 
     // No RequestGenerator: HTTP submissions feed `shared_state` directly.

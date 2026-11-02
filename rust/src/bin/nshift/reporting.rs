@@ -140,8 +140,9 @@ pub(super) fn read_solver_runs(path: &Path) -> Vec<SolverRunRow> {
     let i_run_id = idx("run_id");
     let i_seq = idx("run_sequence");
     let i_slot = idx("current_slot");
-    let i_pending = idx("pending_batch_size");
     let i_new = idx("new_assignments");
+    let i_pending = idx("pending_batch_size").or(i_new);
+    let i_new = i_new.or(i_pending);
     let i_ms = idx("solver_elapsed_ms");
     let i_status = idx("solver_status");
     let i_mode = idx("solver_mode");
@@ -194,8 +195,12 @@ pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
         let g = |i: Option<usize>| i.and_then(|j| rec.get(j)).unwrap_or("").to_string();
         let gf = |i: Option<usize>| g(i).parse::<f64>().unwrap_or(0.0);
         let gi = |i: Option<usize>| g(i).parse::<i64>().unwrap_or(0);
-        let is_new_str = g(i_is_new).to_lowercase();
-        let is_new = is_new_str == "true" || is_new_str == "1";
+        let is_new = i_is_new
+            .map(|index| {
+                let value = g(Some(index)).to_lowercase();
+                value == "true" || value == "1"
+            })
+            .unwrap_or(true);
         rows.push(AssignmentRow {
             run_id: g(i_run_id),
             request_id: gi(i_rid) as u64,

@@ -124,12 +124,6 @@ pub struct LoggingConfig {
     pub solver_runs_file: String,
     /// Destination for per-assignment metrics.
     pub solver_assignments_file: String,
-    /// Destination for per-slot metrics.
-    pub solver_slot_metrics_file: String,
-    /// Write diagnostics for infeasible solver batches.
-    pub enable_infeasibility_debug_logging: bool,
-    /// Destination for infeasibility diagnostics.
-    pub solver_infeasible_debug_file: String,
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -275,9 +269,6 @@ impl Default for LoggingConfig {
             enable_solver_logging: true,
             solver_runs_file: "/tmp/online2_solver_runs.csv".to_string(),
             solver_assignments_file: "/tmp/online2_solver_assignments.csv".to_string(),
-            solver_slot_metrics_file: "/tmp/online2_solver_slot_metrics.csv".to_string(),
-            enable_infeasibility_debug_logging: true,
-            solver_infeasible_debug_file: "/tmp/online2_solver_infeasible_debug.csv".to_string(),
         }
     }
 }

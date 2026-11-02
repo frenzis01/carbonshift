@@ -539,6 +539,98 @@ fn batch_solver_registry_preserves_dp_fallback_for_unknown_names() {
 }
 
 #[test]
+fn common_worker_commits_claimed_batch_and_logs_assignment_counts() {
+    let cfg = make_config(|cfg| {
+        cfg.solver.solver_strategy = "dp".to_string();
+        cfg.solver.batch_size = 1;
+    });
+    let shared_state = SharedState::new();
+    shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
+    let profile_id = QosProfileId::default_profile();
+    shared_state.add_request(req(1000, 0, 1));
+
+    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(&profile_id, 1);
+    assert_eq!(claimed.requests.len(), 1);
+
+    let registry = build_solver_registry(&cfg);
+    let forecast = flat_forecast(cfg.total_slots, 100.0);
+    let mutable = Arc::new(Mutex::new(SchedulerMutableState {
+        active_workers: 1,
+        active_profiles: HashSet::new(),
+        last_infeasible: HashMap::new(),
+        last_dispatched_profile: None,
+        stats: SchedulerStats::default(),
+        solver_runtimes: HashMap::new(),
+    }));
+
+    let file_prefix = std::env::temp_dir().join(format!(
+        "carbonshift-worker-stats-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let runs_path = file_prefix.with_extension("runs.csv");
+    let assignments_path = file_prefix.with_extension("assignments.csv");
+    let logger = MetricsLogger::new(
+        true,
+        runs_path.to_string_lossy().into_owned(),
+        assignments_path.to_string_lossy().into_owned(),
+    );
+
+    let outcome = batch_worker_entry(
+        0,
+        claimed.requests,
+        claimed.snapshot,
+        &shared_state,
+        &cfg,
+        &registry,
+        &forecast,
+        &mutable,
+        &logger,
+    );
+    assert!(matches!(outcome, BatchWorkerOutcome::Committed));
+
+    let scheduler_state = mutable.lock().unwrap();
+    assert_eq!(scheduler_state.stats.total_scheduled, 1);
+    assert_eq!(scheduler_state.stats.batches_processed, 1);
+    drop(scheduler_state);
+
+    let mut reader = csv::Reader::from_path(&runs_path).unwrap();
+    let headers = reader.headers().unwrap().clone();
+    let run_row = reader.records().next().unwrap().unwrap();
+    let column = |name: &str| headers.iter().position(|header| header == name).unwrap();
+    assert_eq!(run_row.get(column("new_assignments")), Some("1"));
+    assert_eq!(run_row.get(column("solver_status")), Some("ok"));
+    assert_eq!(run_row.get(column("solver_mode")), Some("dp"));
+    for removed_field in [
+        "pending_batch_size",
+        "total_assignments",
+        "replanned_assignments",
+        "mock_recovery_injected_count",
+        "consecutive_rollbacks",
+        "lock_future_assignments",
+        "solver_start_ts",
+        "solver_end_ts",
+        "global_error_before",
+        "global_error_count_before",
+        "profile_error_before",
+        "profile_error_count_before",
+    ] {
+        assert!(
+            !headers.iter().any(|field| field == removed_field),
+            "obsolete run field {removed_field} is still in the CSV header"
+        );
+    }
+
+    drop(reader);
+    drop(logger);
+    std::fs::remove_file(runs_path).unwrap();
+    std::fs::remove_file(assignments_path).unwrap();
+}
+
+#[test]
 fn profile_batches_ignore_other_profiles_window_errors() {
     let cfg = make_config(|c| {
         c.global_error_constraint_enabled = false;

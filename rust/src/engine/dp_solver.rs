@@ -708,7 +708,7 @@ impl DpSolver {
             let fallback_flavour = self
                 .flavours
                 .iter()
-                .max_by(|a, b| a.duration.total_cmp(&b.duration))
+                .min_by(|a, b| a.error.total_cmp(&b.error))
                 .expect("at least one flavour");
             let mut best: Option<(f64, i32)> = None;
             let empty_base = vec![0i64; self.window_size as usize];

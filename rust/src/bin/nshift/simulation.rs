@@ -203,11 +203,8 @@ pub(super) fn run_single_n(
     cfg.logging.enable_solver_logging = true;
     let tmp_runs = run_dir.join("_solver_runs.csv");
     let tmp_assignments = run_dir.join("_solver_assignments.csv");
-    let tmp_slot_mets = run_dir.join("_solver_slot_metrics.csv");
     cfg.logging.solver_runs_file = tmp_runs.to_str().unwrap().to_string();
     cfg.logging.solver_assignments_file = tmp_assignments.to_str().unwrap().to_string();
-    cfg.logging.solver_slot_metrics_file = tmp_slot_mets.to_str().unwrap().to_string();
-    cfg.logging.enable_infeasibility_debug_logging = false;
     cfg.simulation.total_requests = scenario.requests.len();
 
     let cfg = Arc::new(cfg);
@@ -217,15 +214,12 @@ pub(super) fn run_single_n(
     // MetricsLogger (which appends) starts with a clean slate.
     let _ = std::fs::remove_file(&tmp_runs);
     let _ = std::fs::remove_file(&tmp_assignments);
-    let _ = std::fs::remove_file(&tmp_slot_mets);
 
     let shared_state = SharedState::new();
     let ml = Arc::new(MetricsLogger::new(
         true,
         tmp_runs.to_str().unwrap().to_string(),
         tmp_assignments.to_str().unwrap().to_string(),
-        tmp_slot_mets.to_str().unwrap().to_string(),
-        None,
     ));
 
     let by_slot = scenario.requests_by_slot();
@@ -347,7 +341,6 @@ pub(super) fn run_single_n(
     // Clean up temp files.
     let _ = std::fs::remove_file(&tmp_runs);
     let _ = std::fs::remove_file(&tmp_assignments);
-    let _ = std::fs::remove_file(&tmp_slot_mets);
 
     // Print a definitive final progress line overwriting whatever partial
     // line the main_loop left behind.  This runs after late scheduling so

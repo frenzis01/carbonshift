@@ -39,7 +39,6 @@ fn test_engine_config() -> Config {
     let mut cfg = Config::default();
     cfg.total_slots = 50;
     cfg.logging.enable_solver_logging = false;
-    cfg.logging.enable_infeasibility_debug_logging = false;
     cfg.logging.enable_progress_display = false;
     cfg.logging.verbose = false;
     cfg
@@ -877,13 +876,7 @@ async fn stats_reports_global_error_avg_after_scheduling() {
     cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -966,13 +959,7 @@ async fn end_to_end_submit_gets_scheduled() {
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -1039,13 +1026,7 @@ async fn explicit_qos_profile_is_preserved_through_request_scheduling() {
     cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -1428,13 +1409,7 @@ async fn scheduler_dispatches_profile_homogeneous_batches_for_distinct_qos_polic
     cfg.solver.batch_size = 2;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -1551,13 +1526,7 @@ async fn executor_callback_with_actual_error_pct_corrects_global_error() {
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -1670,13 +1639,7 @@ async fn executor_callback_corrects_carbon_cost_with_actual_carbon_intensity() {
     cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -1745,13 +1708,7 @@ async fn advance_slot_moves_clock_and_waits_for_dispatch() {
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -1818,13 +1775,7 @@ async fn close_slot_flushes_pending_requests_without_advancing() {
     let slot_minutes = cfg.effective_slot_duration_secs() / 60.0;
 
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -1975,13 +1926,7 @@ async fn executor_callback_corrects_carbon_cost_with_actual_execution_time() {
     cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -2043,13 +1988,7 @@ async fn executor_callback_corrects_baseline_carbon_cost_with_execution_time_and
     cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
@@ -2125,13 +2064,7 @@ async fn fine_grained_monitoring_endpoints_work() {
     let cfg = Arc::new(cfg);
 
     let shared_state = SharedState::new();
-    let metrics_logger = Arc::new(MetricsLogger::new(
-        false,
-        String::new(),
-        String::new(),
-        String::new(),
-        None,
-    ));
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
     let forecast = test_forecast(cfg.total_slots);
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),

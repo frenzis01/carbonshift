@@ -18,49 +18,25 @@ const RUN_FIELDS: &[&str] = &[
     "run_id",
     "run_sequence",
     "current_slot",
-    "pending_batch_size",
-    "total_assignments",
-    "new_assignments",
-    "replanned_assignments",
-    "solver_status",
+    "qos_profile_id",
     "solver_mode",
-    "mock_recovery_injected_count",
-    "lock_future_assignments",
-    "solver_start_ts",
-    "solver_end_ts",
+    "solver_status",
+    "new_assignments",
     "solver_elapsed_ms",
-    "avg_ms_per_new_request",
-    "avg_ms_per_assignment",
     "total_carbon_cost",
-    "carbon_cost_per_new_request",
-    "carbon_cost_per_assignment",
     "error_window_avg_after",
     "error_window_avg_after_real",
     "error_window_start_slot",
     "error_window_end_slot",
     "error_window_threshold",
-    "error_window_violated_after",
-    "error_window_violated_after_real",
-    "batches_processed_after",
-    "total_scheduled_after",
-    "global_error_before",
-    "global_error_count_before",
-    "global_error_constraint_active",
-    "qos_profile_id",
-    "profile_error_before",
-    "profile_error_count_before",
     "profile_error_constraint_active",
 ];
 
 const ASSIGNMENT_FIELDS: &[&str] = &[
     "run_id",
     "current_slot",
-    "solver_start_ts",
-    "solver_end_ts",
     "request_id",
     "qos_profile_id",
-    "is_pending_request",
-    "is_new_assignment_in_run",
     "scheduled_slot",
     "flavour_name",
     "flavour_duration_sec",
@@ -70,93 +46,37 @@ const ASSIGNMENT_FIELDS: &[&str] = &[
     "deadline_slot",
 ];
 
-const SLOT_METRIC_FIELDS: &[&str] = &[
-    "run_id",
-    "current_slot",
-    "scheduled_slot",
-    "run_slot_count",
-    "total_slot_count_after",
-    "avg_error_in_slot",
-    "run_avg_error_in_slot",
-    "slot_has_assignments_after",
-    "carbon_intensity",
-    "capacity_multiplier_after",
-    "capacity_level_max_requests",
-    "request_ids",
-    "flavour_breakdown",
-];
-
-const INFEASIBLE_DEBUG_FIELDS: &[&str] = &[
-    "event_id",
-    "timestamp",
-    "current_slot",
-    "pending_batch_size",
-    "pending_request_details",
-    "strict_threshold",
-    "baseline_error_sum",
-    "baseline_request_count",
-    "baseline_average_error",
-    "min_flavour_error",
-    "max_flavour_error",
-    "min_possible_avg_error_pending_only",
-    "max_possible_avg_error_pending_only",
-    "strict_infeasible_by_error_bound",
-    "strict_scheduled_pending_count",
-    "relaxed_scheduled_pending_count",
-    "relaxed_success",
-    "lock_future_assignments",
-    "future_assignment_count",
-    "future_slot_counts",
-    "future_assignment_details",
-    "all_active_slot_counts",
-];
-
 // ─── MetricsLogger ───────────────────────────────────────────────────────────
 
 pub struct MetricsLogger {
     pub enabled: bool,
     pub runs_file: String,
     pub assignments_file: String,
-    pub slot_metrics_file: String,
-    pub infeasible_debug_file: Option<String>,
     lock: Mutex<()>,
 }
 
 impl MetricsLogger {
-    pub fn new(
-        enabled: bool,
-        runs_file: String,
-        assignments_file: String,
-        slot_metrics_file: String,
-        infeasible_debug_file: Option<String>,
-    ) -> Self {
+    pub fn new(enabled: bool, runs_file: String, assignments_file: String) -> Self {
         let logger = Self {
             enabled,
             runs_file,
             assignments_file,
-            slot_metrics_file,
-            infeasible_debug_file,
             lock: Mutex::new(()),
         };
         if logger.enabled {
             ensure_header(&logger.runs_file, RUN_FIELDS);
             ensure_header(&logger.assignments_file, ASSIGNMENT_FIELDS);
-            ensure_header(&logger.slot_metrics_file, SLOT_METRIC_FIELDS);
-            if let Some(ref p) = logger.infeasible_debug_file {
-                ensure_header(p, INFEASIBLE_DEBUG_FIELDS);
-            }
         }
         logger
     }
 
-    /// Log one solver run plus its per-assignment and per-slot-metric rows.
+    /// Log one solver run and the assignments committed by that run.
     ///
     /// Returns the generated `run_id` string (empty string when disabled).
     pub fn log_solver_run(
         &self,
         run_data: &HashMap<String, String>,
         assignment_rows: &[HashMap<String, String>],
-        slot_metric_rows: &[HashMap<String, String>],
     ) -> String {
         if !self.enabled {
             return String::new();
@@ -180,38 +100,7 @@ impl MetricsLogger {
             ASSIGNMENT_FIELDS,
             &augmented_assignments,
         );
-
-        let augmented_slots: Vec<HashMap<String, String>> = slot_metric_rows
-            .iter()
-            .map(|r| {
-                let mut row = r.clone();
-                row.insert("run_id".to_string(), run_id.clone());
-                row
-            })
-            .collect();
-        append_rows(
-            &self.slot_metrics_file,
-            SLOT_METRIC_FIELDS,
-            &augmented_slots,
-        );
         run_id
-    }
-
-    /// Log one infeasibility debug event. Returns the event_id string.
-    pub fn log_infeasible_debug(&self, event_data: &HashMap<String, String>) -> String {
-        if !self.enabled {
-            return String::new();
-        }
-        if let Some(ref path) = self.infeasible_debug_file {
-            let event_id = format!("inf_{}", unix_now_ms());
-            let _guard = self.lock.lock().unwrap();
-            let mut row = event_data.clone();
-            row.insert("event_id".to_string(), event_id.clone());
-            row.insert("timestamp".to_string(), unix_now_ms().to_string());
-            append_rows(path, INFEASIBLE_DEBUG_FIELDS, &[row]);
-            return event_id;
-        }
-        String::new()
     }
 }
 

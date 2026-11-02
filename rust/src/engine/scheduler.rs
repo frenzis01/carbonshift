@@ -15,14 +15,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use std::sync::RwLock;
 
-use crate::config::{AssignmentPolicy, Config, SolverConfig, SwarmConfig};
+use crate::config::Config;
 use crate::engine::qos::QosProfileId;
 use crate::engine::solver::{
-    ProposedPlacement, SolverError, SolverProposal, SolverRegistry, SolverRuntime, SolverScope,
+    CommitReport, SolverError, SolverRegistry, SolverRuntime, SolverScope,
 };
 use crate::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use crate::metrics_logger::MetricsLogger;
@@ -36,11 +36,14 @@ mod solve;
 mod tests;
 
 pub use forecast::{advance_to_next_slot, generate_carbon_intensity_forecast};
+#[cfg(test)]
 use recovery::RecoveryState;
 pub use solve::SolveContext;
+use solve::build_solve_input_from_snapshot;
 #[cfg(test)]
 use solve::get_effective_pruning_mode;
-use solve::{BatchSolveContext, build_solve_input_from_snapshot, select_batch_solver};
+#[cfg(test)]
+use solve::{BatchSolveContext, select_batch_solver};
 
 // ─── internal state types ────────────────────────────────────────────────────
 
@@ -134,47 +137,6 @@ enum BatchWorkerOutcome {
     Infeasible,
 }
 
-/// Wraps the two selectable online-swarm concurrency backends (see
-/// `Config::swarm.mode`): `Serialized` (from `online_swarm.rs`, each
-/// worker mutates it while holding the scheduler mutex) or `Merge` (from
-/// `online_swarmerge.rs`, workers solve lock-free against a clone and
-/// additively merge their contribution back). Irrelevant when the scheduler
-/// uses the DP solver (`Config::solver.solver_strategy == "dp"`).
-enum SwarmBackend {
-    Serialized(crate::online_swarm::OnlineSwarmState),
-    Merge(crate::online_swarmerge::OnlineSwarmState),
-}
-
-impl SwarmBackend {
-    /// Construct the configured online strategy for one QoS profile. Forecast
-    /// values are supplied per solve so ACO heuristics can follow updates.
-    fn from_config(
-        solver: &SolverConfig,
-        swarm: &SwarmConfig,
-        assignment: &AssignmentPolicy<'_>,
-    ) -> Self {
-        if swarm.mode == "merge" {
-            Self::Merge(crate::online_swarmerge::OnlineSwarmState::from_config(
-                solver, swarm, assignment,
-            ))
-        } else {
-            Self::Serialized(crate::online_swarm::OnlineSwarmState::from_config(
-                solver, swarm, assignment,
-            ))
-        }
-    }
-
-    /// Strategy name for logging/diagnostics (mirrors the wrapped state's
-    /// `name()`; not currently read anywhere but kept for parity/future use).
-    #[allow(dead_code)]
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Serialized(s) => s.name(),
-            Self::Merge(s) => s.name(),
-        }
-    }
-}
-
 /// All mutable scheduler state shared between the main loop and workers.
 struct SchedulerMutableState {
     active_workers: usize,
@@ -185,10 +147,6 @@ struct SchedulerMutableState {
     /// Round-robin cursor prevents a busy profile from monopolizing workers.
     last_dispatched_profile: Option<QosProfileId>,
     stats: SchedulerStats,
-    recovery: Arc<RecoveryState>,
-    /// Online solver state is independent per profile; different flavour
-    /// sets must not train the same cost/pheromone state.
-    swarm_states: HashMap<QosProfileId, SwarmBackend>,
     solver_runtimes: HashMap<QosProfileId, Arc<dyn SolverRuntime>>,
 }
 
@@ -228,8 +186,6 @@ pub struct BatchScheduler {
     solver_registry: Arc<SolverRegistry>,
     /// Pre-computed carbon-intensity forecast for the planning horizon.
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
-    /// flavour_name → duration_seconds lookup (immutable after construction).
-    flavour_duration_by_name: Arc<HashMap<String, f64>>,
     running: Arc<AtomicBool>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
     /// Whether multiple batches for one QoS profile may solve concurrently.
@@ -303,18 +259,12 @@ impl BatchScheduler {
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
         let solver_registry = Arc::new(build_solver_registry(&cfg));
         let carbon_forecast = carbon_forecast;
-        let flavour_duration_by_name: HashMap<String, f64> = cfg
-            .flavours
-            .iter()
-            .map(|f| (f.name.clone(), f.duration))
-            .collect();
 
         Self {
             shared_state,
             cfg: cfg.clone(),
             solver_registry,
             carbon_forecast,
-            flavour_duration_by_name: Arc::new(flavour_duration_by_name),
             running: Arc::new(AtomicBool::new(false)),
             mutable: Arc::new(Mutex::new(SchedulerMutableState {
                 active_workers: 0,
@@ -322,8 +272,6 @@ impl BatchScheduler {
                 last_infeasible: HashMap::new(),
                 last_dispatched_profile: None,
                 stats: SchedulerStats::default(),
-                recovery: Arc::new(RecoveryState::new()),
-                swarm_states: HashMap::new(),
                 solver_runtimes: HashMap::new(),
             })),
             allow_same_profile_parallelism,
@@ -345,7 +293,6 @@ impl BatchScheduler {
         let cfg = self.cfg.clone();
         let solver_registry = Arc::clone(&self.solver_registry);
         let forecast = self.carbon_forecast.clone();
-        let fdb = self.flavour_duration_by_name.clone();
         let mutable = self.mutable.clone();
         let ml = self.metrics_logger.clone();
         let allow_same_profile_parallelism = self.allow_same_profile_parallelism;
@@ -364,7 +311,6 @@ impl BatchScheduler {
                 cfg,
                 solver_registry,
                 forecast,
-                fdb,
                 mutable,
                 ml,
                 allow_same_profile_parallelism,
@@ -446,7 +392,6 @@ fn main_loop(
     cfg: Arc<Config>,
     solver_registry: Arc<SolverRegistry>,
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
-    fdb: Arc<HashMap<String, f64>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
     ml: Arc<MetricsLogger>,
     allow_same_profile_parallelism: bool,
@@ -540,7 +485,6 @@ fn main_loop(
                 &cfg,
                 &solver_registry,
                 &carbon_forecast,
-                &fdb,
                 &mutable,
                 &ml,
                 &running,
@@ -563,7 +507,6 @@ fn main_loop(
                 &cfg,
                 &solver_registry,
                 &carbon_forecast,
-                &fdb,
                 &mutable,
                 &ml,
                 &running,
@@ -594,7 +537,6 @@ fn main_loop(
                         &cfg,
                         &solver_registry,
                         &carbon_forecast,
-                        &fdb,
                         &mutable,
                         &ml,
                         &running,
@@ -775,7 +717,6 @@ fn dispatch_batch_workers(
     cfg: &Arc<Config>,
     solver_registry: &Arc<SolverRegistry>,
     carbon_forecast: &Arc<RwLock<Vec<f64>>>,
-    fdb: &Arc<HashMap<String, f64>>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &Arc<MetricsLogger>,
     running: &Arc<AtomicBool>,
@@ -785,15 +726,9 @@ fn dispatch_batch_workers(
 ) -> bool {
     let mut dispatched = false;
     let min_pending = if flush { 1 } else { cfg.solver.batch_size };
-    // Serialized swarm state mutates in place, so only that backend is
-    // restricted to one worker. Stateless strategies and merge-mode swarm
-    // workers can use the configured cap.
-    let max_workers =
-        if is_online_swarm_strategy(&cfg.solver.solver_strategy) && cfg.swarm.mode != "merge" {
-            1
-        } else {
-            cfg.solver.max_batch_solver_parallelism
-        };
+    // The common runtime snapshots and merges solver state under its own
+    // short-lived lock, so the configured worker cap applies to every engine.
+    let max_workers = cfg.solver.max_batch_solver_parallelism;
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -828,7 +763,6 @@ fn dispatch_batch_workers(
         let cfg = cfg.clone();
         let solver_registry = Arc::clone(solver_registry);
         let carbon_forecast = carbon_forecast.clone();
-        let fdb = fdb.clone();
         let mutable = mutable.clone();
         let ml = ml.clone();
         let running = running.clone();
@@ -844,7 +778,6 @@ fn dispatch_batch_workers(
                 cfg,
                 solver_registry,
                 carbon_forecast,
-                fdb,
                 mutable,
                 ml,
                 running,
@@ -865,7 +798,6 @@ fn batch_worker_loop(
     cfg: Arc<Config>,
     solver_registry: Arc<SolverRegistry>,
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
-    fdb: Arc<HashMap<String, f64>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
     ml: Arc<MetricsLogger>,
     running: Arc<AtomicBool>,
@@ -882,7 +814,6 @@ fn batch_worker_loop(
             &cfg,
             &solver_registry,
             &forecast,
-            &fdb,
             &mutable,
             &ml,
         );
@@ -936,35 +867,6 @@ fn batch_worker_loop(
 
 // ─── worker entry ─────────────────────────────────────────────────────────────
 
-fn assignments_to_solver_proposal(assignments: &[Assignment]) -> SolverProposal {
-    // The legacy batch solvers price candidates against their snapshot while
-    // optimizing. Keep only the placement decision here; the shared-state
-    // commit recalculates every final price using current occupancy.
-    SolverProposal {
-        placements: assignments
-            .iter()
-            .map(|assignment| {
-                if assignment
-                    .deadline_slot
-                    .is_some_and(|deadline| assignment.scheduled_slot > deadline)
-                {
-                    ProposedPlacement::late(
-                        assignment.request_id,
-                        assignment.scheduled_slot,
-                        assignment.flavour_name.clone(),
-                    )
-                } else {
-                    ProposedPlacement::new(
-                        assignment.request_id,
-                        assignment.scheduled_slot,
-                        assignment.flavour_name.clone(),
-                    )
-                }
-            })
-            .collect(),
-    }
-}
-
 /// Return the cached engine runtime for this profile, creating it on first use.
 ///
 /// The runtime owns the profile's persistent Bandit/ACO learning state. We
@@ -1013,7 +915,6 @@ fn batch_worker_entry(
     cfg: &Config,
     solver_registry: &SolverRegistry,
     carbon_forecast: &[f64],
-    fdb: &HashMap<String, f64>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
     ml: &MetricsLogger,
 ) -> BatchWorkerOutcome {
@@ -1070,7 +971,7 @@ fn batch_worker_entry(
         }
     };
 
-    let _solve_input = match build_solve_input_from_snapshot(
+    let solve_input = match build_solve_input_from_snapshot(
         slot,
         &pending,
         &snapshot,
@@ -1091,7 +992,7 @@ fn batch_worker_entry(
         profile_id: profile_id.clone(),
         total_slots,
     };
-    let _runtime = match get_runtime(mutable, solver_registry, &cfg.solver.solver_strategy, scope) {
+    let runtime = match get_runtime(mutable, solver_registry, &cfg.solver.solver_strategy, scope) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("Could not create solver runtime: {error}");
@@ -1100,24 +1001,6 @@ fn batch_worker_entry(
         }
     };
 
-    // `solve_input` is ready for the common runtime integration. The current
-    // worker still dispatches through its legacy path below.
-
-    if is_online_swarm_strategy(&cfg.solver.solver_strategy) {
-        return batch_worker_entry_swarm(
-            slot,
-            pending,
-            &snapshot,
-            shared_state,
-            cfg,
-            &assignment,
-            &profile_id,
-            carbon_forecast,
-            mutable,
-            ml,
-        );
-    }
-
     if cfg.logging.verbose {
         println!(
             "[Scheduler] Worker start: slot={slot}, batch_size={}",
@@ -1125,36 +1008,26 @@ fn batch_worker_entry(
         );
     }
 
-    let recovery_state = Arc::clone(&mutable.lock().unwrap().recovery);
-    let batch_solver = select_batch_solver(&cfg.solver.solver_strategy);
     let t0 = Instant::now();
-    let wall_start = unix_now_f64();
-    let solve_result = batch_solver.solve(BatchSolveContext {
-        current_slot: slot,
-        pending: &pending,
-        snapshot: &snapshot,
-        assignment: &assignment,
-        solver_config: &cfg.solver,
-        simulation_config: &cfg.simulation,
-        recovery_config: &cfg.infeasibility,
-        recovery_state: &recovery_state,
-        verbose: cfg.logging.verbose,
-        carbon_forecast,
-        flavour_duration_by_name: fdb,
-    });
-    let proposed_assignments = solve_result.candidate_assignments;
-    let ctx = solve_result.context;
+
+    // -------- STEP 1 : Solve - assignment proposal
+    // No scheduler-state mutex is held while the engine solves.
+    let pending_proposal = match runtime.propose(&solve_input) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            eprintln!("Solver proposal failed: {error}");
+            shared_state.requeue_pending_requests_front(pending);
+            return BatchWorkerOutcome::Infeasible;
+        }
+    };
+
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let wall_end = unix_now_f64();
 
-    if proposed_assignments.is_empty() {
-        shared_state.requeue_pending_requests_front(pending);
-        return BatchWorkerOutcome::Infeasible;
-    }
-
-    let proposal = assignments_to_solver_proposal(&proposed_assignments);
-    let assignments = match shared_state.materialize_and_commit_proposal(
-        &proposal,
+    // -------- STEP 2 : Price proposal and commit it to shared state
+    // This is the assignment commit. It validates placements and prices them
+    // against the live global occupancy, not the solver's estimated prices.
+    let committed = match shared_state.materialize_and_commit_proposal(
+        &pending_proposal.proposal,
         &pending,
         &snapshot,
         &profile_id,
@@ -1166,96 +1039,85 @@ fn batch_worker_entry(
     ) {
         Ok(assignments) => assignments,
         Err(error) => {
-            eprintln!(
-                "[Scheduler] Could not materialize proposal for profile {profile_id}: {error}"
-            );
+            if let Err(discard_error) = runtime.discard(pending_proposal.id) {
+                eprintln!("Could not discard rejected proposal: {discard_error}");
+            }
+            eprintln!("Proposal was not committed: {error}");
             shared_state.requeue_pending_requests_front(pending);
             return BatchWorkerOutcome::Infeasible;
         }
     };
-    recovery::consume_mock_pool(
-        slot,
-        &ctx.mode,
-        ctx.mock_recovery_consumed,
-        &profile_id,
-        &cfg.infeasibility.recovery_mode,
-        &recovery_state,
-    );
 
-    let new_count = pending.len();
-    let total_count = assignments.len();
-    let replanned = total_count.saturating_sub(new_count);
-    let total_cost: f64 = assignments.iter().map(|a| a.carbon_cost).sum();
+    // -------- STEP 2.1 : Inform solver of committed assignments
+    // This updates solver learning from the final accepted prices.
+    // It does not write assignments to SharedState.
+    // This is fundamental for stateful solvers, where only committed
+    // proposals influence the state
+    let status = if let Err(error) = runtime.commit(
+        pending_proposal.id,
+        CommitReport {
+            assignments: committed.clone(),
+        },
+    ) {
+        // SharedState already committed. Do not requeue these requests.
+        eprintln!("Assignments committed, but solver learning update failed: {error}");
+        "committed_learning_update_failed"
+    } else {
+        "ok"
+    };
 
-    // Update stats and get run_sequence for logging.
-    let (run_sequence, batches_processed, total_scheduled) = {
+    // The commit adapter rejects incomplete proposals, so every returned
+    // assignment represents one newly claimed request.
+    let assigned_count = committed.len();
+    let total_cost: f64 = committed.iter().map(|a| a.carbon_cost).sum();
+
+    let window_start = (slot - assignment.error_window_past).max(0);
+    let window_end = (slot + assignment.error_window_future).min(assignment.total_slots - 1);
+    let mut modeled_error_sum = solve_input.qos.error_window.baseline_err.sum;
+    let mut modeled_request_count = solve_input.qos.error_window.baseline_err.count;
+    for committed_assignment in &committed {
+        if (window_start..=window_end).contains(&committed_assignment.scheduled_slot) {
+            modeled_error_sum += committed_assignment.error;
+            modeled_request_count += 1.0;
+        }
+    }
+    let modeled_window_average = if modeled_request_count > 0.0 {
+        modeled_error_sum / modeled_request_count
+    } else {
+        0.0
+    };
+    let solver_mode = runtime.engine_name().to_owned();
+    let profile_error_constraint_active = solve_input.qos.cumulative_error_constraint_active;
+
+    // Update scheduler counters and capture this run's unique sequence number.
+    let run_sequence = {
         let mut g = mutable.lock().unwrap();
         g.stats.solver_runs += 1;
         g.stats.batches_processed += 1;
-        g.stats.total_scheduled += new_count as u64;
+        g.stats.total_scheduled += assigned_count as u64;
         g.stats.solver_total_time_ms += elapsed_ms;
-        g.stats.solver_total_requests += new_count as u64;
+        g.stats.solver_total_requests += assigned_count as u64;
         g.stats.last_solver_elapsed_ms = elapsed_ms;
-        (
-            g.stats.solver_runs,
-            g.stats.batches_processed,
-            g.stats.total_scheduled,
-        )
+        g.stats.solver_runs
     };
 
     if cfg.logging.verbose {
         let avg_error: f64 =
-            assignments.iter().map(|a| a.error).sum::<f64>() / assignments.len() as f64;
+            committed.iter().map(|a| a.error).sum::<f64>() / committed.len() as f64;
         println!(
-            "[Scheduler] ✓ Scheduled {} new requests{} \
+            "[Scheduler] ✓ Scheduled {} new requests \
                          (cost={total_cost:.2}, error={avg_error:.2}%, solver={elapsed_ms:.2}ms)",
-            new_count,
-            if replanned > 0 {
-                format!(" + {replanned} re-planned")
-            } else {
-                String::new()
-            },
+            assigned_count
         );
     }
 
     // Build and emit metrics log row.
-    let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
-    let pending_ids_str: HashSet<u64> = new_ids.clone();
     if ml.enabled {
         // Only log the NEW assignments from this batch — not all existing
         // assignments.  The old code fetched get_current_assignments() here
         // (all-time O(N) entries) and iterated every batch, producing
         // O(N²) total rows and memory pressure.
-        let assignment_rows = build_assignment_rows(
-            &assignments,
-            &new_ids,
-            &pending_ids_str,
-            slot,
-            wall_start,
-            wall_end,
-        );
-
-        let avg_ms_per_new = if new_count > 0 {
-            elapsed_ms / new_count as f64
-        } else {
-            0.0
-        };
-        let avg_ms_per_total = if total_count > 0 {
-            elapsed_ms / total_count as f64
-        } else {
-            0.0
-        };
-        let avg_cost_per_new = if new_count > 0 {
-            total_cost / new_count as f64
-        } else {
-            0.0
-        };
-        let avg_cost_per_total = if total_count > 0 {
-            total_cost / total_count as f64
-        } else {
-            0.0
-        };
-        let modeled_avg = ctx.modeled_window_avg_after;
+        let assignment_rows = build_assignment_rows(&committed, slot);
         let real_avg = shared_state
             .get_profile_window_error_stats(
                 &profile_id,
@@ -1269,252 +1131,30 @@ fn batch_worker_entry(
         let mut run_row: HashMap<String, String> = HashMap::new();
         run_row.insert("run_sequence".into(), run_sequence.to_string());
         run_row.insert("current_slot".into(), slot.to_string());
-        run_row.insert("pending_batch_size".into(), new_count.to_string());
-        run_row.insert("total_assignments".into(), total_count.to_string());
-        run_row.insert("new_assignments".into(), new_count.to_string());
-        run_row.insert("replanned_assignments".into(), replanned.to_string());
-        run_row.insert("solver_status".into(), ctx.status.clone());
-        run_row.insert("solver_mode".into(), ctx.mode.clone());
-        run_row.insert(
-            "mock_recovery_injected_count".into(),
-            ctx.mock_recovery_injected_count.to_string(),
-        );
+        run_row.insert("new_assignments".into(), assigned_count.to_string());
+        run_row.insert("solver_status".into(), status.to_owned());
+        run_row.insert("solver_mode".into(), solver_mode);
         run_row.insert("qos_profile_id".into(), profile_id.to_string());
-        run_row.insert("consecutive_rollbacks".into(), "0".into());
-        run_row.insert("lock_future_assignments".into(), "true".into());
-        run_row.insert("solver_start_ts".into(), wall_start.to_string());
-        run_row.insert("solver_end_ts".into(), wall_end.to_string());
         run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
-        run_row.insert("avg_ms_per_new_request".into(), avg_ms_per_new.to_string());
-        run_row.insert("avg_ms_per_assignment".into(), avg_ms_per_total.to_string());
         run_row.insert("total_carbon_cost".into(), total_cost.to_string());
         run_row.insert(
-            "carbon_cost_per_new_request".into(),
-            avg_cost_per_new.to_string(),
+            "error_window_avg_after".into(),
+            modeled_window_average.to_string(),
         );
-        run_row.insert(
-            "carbon_cost_per_assignment".into(),
-            avg_cost_per_total.to_string(),
-        );
-        run_row.insert("error_window_avg_after".into(), modeled_avg.to_string());
         run_row.insert("error_window_avg_after_real".into(), real_avg.to_string());
-        run_row.insert(
-            "error_window_start_slot".into(),
-            ctx.window_start_slot.to_string(),
-        );
-        run_row.insert(
-            "error_window_end_slot".into(),
-            ctx.window_end_slot.to_string(),
-        );
+        run_row.insert("error_window_start_slot".into(), window_start.to_string());
+        run_row.insert("error_window_end_slot".into(), window_end.to_string());
         run_row.insert(
             "error_window_threshold".into(),
             assignment.max_error_threshold.to_string(),
         );
         run_row.insert(
-            "error_window_violated_after".into(),
-            (modeled_avg > assignment.max_error_threshold).to_string(),
-        );
-        run_row.insert(
-            "error_window_violated_after_real".into(),
-            (real_avg > assignment.max_error_threshold).to_string(),
-        );
-        run_row.insert(
-            "batches_processed_after".into(),
-            batches_processed.to_string(),
-        );
-        run_row.insert("total_scheduled_after".into(), total_scheduled.to_string());
-        run_row.insert(
-            "global_error_before".into(),
-            ctx.global_error_before.to_string(),
-        );
-        run_row.insert(
-            "global_error_count_before".into(),
-            ctx.global_error_count_before.to_string(),
-        );
-        run_row.insert(
-            "profile_error_before".into(),
-            ctx.profile_error_before.to_string(),
-        );
-        run_row.insert(
-            "profile_error_count_before".into(),
-            ctx.profile_error_count_before.to_string(),
-        );
-        run_row.insert("global_error_constraint_active".into(), "false".to_string());
-        run_row.insert(
             "profile_error_constraint_active".into(),
-            ctx.profile_error_constraint_active.to_string(),
+            profile_error_constraint_active.to_string(),
         );
 
-        ml.log_solver_run(&run_row, &assignment_rows, &[]);
+        ml.log_solver_run(&run_row, &assignment_rows);
     }
-    BatchWorkerOutcome::Committed
-}
-
-// ─── online swarm batch worker ────────────────────────────────────────────────
-
-/// Whether the configured algorithm needs persistent online learning state.
-///
-/// Used by dispatch to select its concurrency policy and by the worker entry
-/// to route bandit/ACO batches away from the stateless batch-solver registry.
-fn is_online_swarm_strategy(strategy: &str) -> bool {
-    // These algorithms keep learning state between batches; unlike the
-    // stateless DP and greedy strategies, they need the swarm worker path.
-    matches!(
-        strategy.trim().to_ascii_lowercase().as_str(),
-        "bandit" | "ant_colony"
-    )
-}
-
-/// Solve one online swarm batch from its claim-time snapshot and commit its
-/// price-free proposal against current global occupancy.
-fn batch_worker_entry_swarm(
-    slot: i32,
-    pending: Vec<Request>,
-    snapshot: &SolverSnapshot,
-    shared_state: &SharedState,
-    cfg: &Config,
-    assignment: &AssignmentPolicy<'_>,
-    profile_id: &QosProfileId,
-    carbon_forecast: &[f64],
-    mutable: &Arc<Mutex<SchedulerMutableState>>,
-    ml: &MetricsLogger,
-) -> BatchWorkerOutcome {
-    let t0 = Instant::now();
-    let ctx = snapshot.swarm_context_for_profile(Some(profile_id));
-    let is_merge = cfg.swarm.mode == "merge";
-
-    let (mut proposed_assignments, merge_delta) = if is_merge {
-        let swarm_snapshot = {
-            let mut g = mutable.lock().unwrap();
-            let swarm_state = g
-                .swarm_states
-                .entry(profile_id.clone())
-                .or_insert_with(|| SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment));
-            let SwarmBackend::Merge(swarm) = swarm_state else {
-                unreachable!("batch_worker_entry_swarm dispatched Merge mode");
-            };
-            swarm.clone()
-        };
-        let (assignments, delta) =
-            swarm_snapshot.solve_batch(&pending, slot, carbon_forecast, &ctx, assignment);
-        (assignments, Some(delta))
-    } else {
-        let mut g = mutable.lock().unwrap();
-        let swarm_state = g
-            .swarm_states
-            .entry(profile_id.clone())
-            .or_insert_with(|| SwarmBackend::from_config(&cfg.solver, &cfg.swarm, assignment));
-        let SwarmBackend::Serialized(swarm) = swarm_state else {
-            unreachable!("batch_worker_entry_swarm dispatched Serialized mode");
-        };
-        (
-            swarm.solve_batch(&pending, slot, carbon_forecast, &ctx, assignment),
-            None,
-        )
-    };
-
-    if proposed_assignments.is_empty() {
-        shared_state.requeue_pending_requests_front(pending);
-        return BatchWorkerOutcome::Infeasible;
-    }
-    for assignment in &mut proposed_assignments {
-        assignment.qos_profile_id = profile_id.clone();
-    }
-
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let proposal = assignments_to_solver_proposal(&proposed_assignments);
-    let assignments = match shared_state.materialize_and_commit_proposal(
-        &proposal,
-        &pending,
-        snapshot,
-        profile_id,
-        slot,
-        assignment.flavours,
-        carbon_forecast,
-        assignment.capacity_tiers,
-        assignment.carbon_cost_duration_scale,
-    ) {
-        Ok(assignments) => assignments,
-        Err(error) => {
-            eprintln!(
-                "[Scheduler] Could not materialize online proposal for profile {profile_id}: {error}"
-            );
-            shared_state.requeue_pending_requests_front(pending);
-            return BatchWorkerOutcome::Infeasible;
-        }
-    };
-
-    if let Some(delta) = merge_delta {
-        let mut g = mutable.lock().unwrap();
-        if let Some(SwarmBackend::Merge(swarm)) = g.swarm_states.get_mut(profile_id) {
-            swarm.merge_delta(delta);
-        }
-    }
-
-    finish_swarm_batch(
-        slot,
-        &pending,
-        assignments,
-        elapsed_ms,
-        &cfg.solver.solver_strategy,
-        mutable,
-        ml,
-    )
-}
-
-/// Shared tail after proposal materialization and commit: update stats and log metrics.
-fn finish_swarm_batch(
-    slot: i32,
-    pending: &[Request],
-    assignments: Vec<Assignment>,
-    elapsed_ms: f64,
-    solver_strategy: &str,
-    mutable: &Arc<Mutex<SchedulerMutableState>>,
-    ml: &MetricsLogger,
-) -> BatchWorkerOutcome {
-    let new_count = assignments.len();
-
-    // NOTE: active_workers is decremented by the outer dispatch_batch_workers closure —
-    // do NOT touch it here to avoid a double-decrement that would underflow to usize::MAX.
-    let run_sequence = {
-        let mut g = mutable.lock().unwrap();
-        g.stats.solver_runs += 1;
-        g.stats.batches_processed += 1;
-        g.stats.total_scheduled += new_count as u64;
-        g.stats.solver_total_requests += new_count as u64;
-        g.stats.solver_total_time_ms += elapsed_ms;
-        g.stats.last_solver_elapsed_ms = elapsed_ms;
-        g.stats.solver_runs
-    };
-
-    // Metrics logging — mark all batch requests as new assignments so
-    // compute_per_request includes them (is_new_assignment_in_run=true).
-    {
-        let wall_ts = unix_now_f64();
-        let new_ids: HashSet<u64> = pending.iter().map(|r| r.id).collect();
-        let total_cost: f64 = assignments.iter().map(|a| a.carbon_cost).sum();
-        let assignment_rows =
-            build_assignment_rows(&assignments, &new_ids, &new_ids, slot, wall_ts, wall_ts);
-        let mut run_row: HashMap<String, String> = HashMap::new();
-        run_row.insert("run_sequence".into(), run_sequence.to_string());
-        run_row.insert("current_slot".into(), slot.to_string());
-        run_row.insert("pending_batch_size".into(), new_count.to_string());
-        run_row.insert("new_assignments".into(), new_count.to_string());
-        run_row.insert("total_assignments".into(), new_count.to_string());
-        if let Some(assignment) = assignments.first() {
-            run_row.insert(
-                "qos_profile_id".into(),
-                assignment.qos_profile_id.to_string(),
-            );
-        }
-        run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
-        run_row.insert("total_carbon_cost".into(), total_cost.to_string());
-        run_row.insert("solver_mode".into(), solver_strategy.to_string());
-        run_row.insert("mock_recovery_injected_count".into(), "0".into());
-        run_row.insert("solver_status".into(), "ok".into());
-        ml.log_solver_run(&run_row, &assignment_rows, &[]);
-    }
-
     BatchWorkerOutcome::Committed
 }
 
@@ -1523,11 +1163,7 @@ fn finish_swarm_batch(
 /// may have been assembled from different solver paths.
 fn build_assignment_rows(
     assignments: &[Assignment],
-    new_ids: &HashSet<u64>,
-    pending_ids: &HashSet<u64>,
     current_slot: i32,
-    solver_start_ts: f64,
-    solver_end_ts: f64,
 ) -> Vec<HashMap<String, String>> {
     let mut rows = Vec::with_capacity(assignments.len());
     let mut sorted = assignments.to_vec();
@@ -1535,18 +1171,8 @@ fn build_assignment_rows(
     for a in &sorted {
         let mut row = HashMap::new();
         row.insert("current_slot".into(), current_slot.to_string());
-        row.insert("solver_start_ts".into(), solver_start_ts.to_string());
-        row.insert("solver_end_ts".into(), solver_end_ts.to_string());
         row.insert("request_id".into(), a.request_id.to_string());
         row.insert("qos_profile_id".into(), a.qos_profile_id.to_string());
-        row.insert(
-            "is_pending_request".into(),
-            pending_ids.contains(&a.request_id).to_string(),
-        );
-        row.insert(
-            "is_new_assignment_in_run".into(),
-            new_ids.contains(&a.request_id).to_string(),
-        );
         row.insert("scheduled_slot".into(), a.scheduled_slot.to_string());
         row.insert("flavour_name".into(), a.flavour_name.clone());
         row.insert(
@@ -1566,15 +1192,4 @@ fn build_assignment_rows(
         rows.push(row);
     }
     rows
-}
-
-/// Return a wall-clock timestamp for solver logs, separate from virtual slot
-/// time used by scheduling and simulation.
-fn unix_now_f64() -> f64 {
-    // Wall-clock timestamps are used for diagnostics only; virtual scheduler
-    // time is maintained separately in SharedState.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
 }
