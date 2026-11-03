@@ -10,8 +10,6 @@
 pub mod config;
 pub mod dp_solver;
 pub mod metrics_logger;
-pub mod online_swarm;
-pub mod online_swarmerge;
 pub mod qos;
 pub mod random_selection;
 pub mod scheduler;

@@ -40,6 +40,7 @@ pub(super) fn run_greedy_baseline(
             before_count = position;
             per_req.push(PerRequest {
                 request_id: req.id,
+                qos_profile_id: QosProfileId::default_profile().to_string(),
                 arrival_time: req.arrival_slot as f64 * slot_dur,
                 arrival_slot: req.arrival_slot,
                 deadline_slot: req.deadline_slot,
@@ -53,12 +54,9 @@ pub(super) fn run_greedy_baseline(
                 flavour_name: flav.name.clone(),
                 error: flav.error,
                 carbon_cost: cost,
-                assignment_solver_mode: "greedy".to_string(),
                 assignment_solver_status: "ok".to_string(),
-                assigned_with_greedy_fallback: false,
-                assigned_with_relaxed_retry: false,
-                assigned_with_injection: false,
-                assigned_with_rollback: false,
+                fallback_assigned: false,
+                late_assigned: false,
                 lateness_slots: 0,
             });
             batch_timings.push(BatchTiming {
@@ -86,9 +84,6 @@ pub(super) fn run_greedy_baseline(
         &flav.name,
         flav.duration,
         flav.error,
-        0,
-        0,
-        0,
         0,   // peak_concurrent_workers
         0.0, // avg_concurrent_workers
     );
@@ -149,6 +144,7 @@ pub(super) fn schedule_late_requests(
 
         out.push(PerRequest {
             request_id: req.id,
+            qos_profile_id: QosProfileId::default_profile().to_string(),
             arrival_time: req.arrival_slot as f64 * slot_dur,
             arrival_slot: req.arrival_slot,
             deadline_slot: req.deadline_slot,
@@ -162,12 +158,9 @@ pub(super) fn schedule_late_requests(
             flavour_name: fallback_flav.name.clone(),
             error: fallback_flav.error,
             carbon_cost: cost,
-            assignment_solver_mode: "late_fallback".to_string(),
             assignment_solver_status: "late".to_string(),
-            assigned_with_greedy_fallback: false,
-            assigned_with_relaxed_retry: false,
-            assigned_with_injection: false,
-            assigned_with_rollback: false,
+            fallback_assigned: true,
+            late_assigned: true,
             lateness_slots: lateness,
         });
     }
@@ -277,20 +270,28 @@ pub(super) fn run_single_n(
     sched.stop();
 
     let total_received = shared_state.get_statistics().total_received as usize;
-    let rollback_stats = shared_state.get_rollback_stats();
-    let rolled_back_ids = shared_state.get_rolled_back_request_ids();
-
     // Post-process Rust CSVs into Python-compatible tables.
     let runs = read_solver_runs(&tmp_runs);
     let assignment_rows = read_solver_assignments(&tmp_assignments);
     let runs_by_id: HashMap<String, &SolverRunRow> =
         runs.iter().map(|r| (r.run_id.clone(), r)).collect();
+    let default_profile_id = QosProfileId::default_profile().to_string();
+    let flavour_errors: HashMap<(String, String), f64> = base_cfg
+        .flavours
+        .iter()
+        .map(|flavour| {
+            (
+                (default_profile_id.clone(), flavour.name.clone()),
+                flavour.error,
+            )
+        })
+        .collect();
 
     let mut per_req = compute_per_request(
         &assignment_rows,
         &runs_by_id,
+        &flavour_errors,
         base_cfg.slot_duration_seconds,
-        &rolled_back_ids,
     );
     // Drain any requests that never made it into a batch (e.g., deadline
     // expired while waiting in the pending queue) and schedule them late.
@@ -314,7 +315,7 @@ pub(super) fn run_single_n(
         &base_cfg.capacity_tiers,
         base_cfg.carbon_cost_duration_scale,
     );
-    let batch_timings = compute_batch_timings(&runs, batch_size);
+    let batch_timings = compute_batch_timings(&runs, &assignment_rows, batch_size);
     let exec_mode = if cfg.solver.solver_strategy == "dp" || cfg.solver.solver_strategy.is_empty() {
         "nshift_dp".to_string()
     } else {
@@ -331,9 +332,6 @@ pub(super) fn run_single_n(
         "",
         0.0,
         0.0,
-        rollback_stats.total_rollbacks,
-        rollback_stats.max_consecutive_rollbacks as u64,
-        rolled_back_ids.len(),
         sched_stats.peak_concurrent_workers,
         sched_stats.avg_concurrent_workers,
     );

@@ -43,6 +43,7 @@ fn make_assignment(id: u64, slot: i32, dur: f64) -> Assignment {
 fn make_per_req(id: u64, slot: i32) -> PerRequest {
     PerRequest {
         request_id: id,
+        qos_profile_id: QosProfileId::default_profile().to_string(),
         arrival_time: 0.0,
         arrival_slot: slot,
         deadline_slot: slot,
@@ -56,40 +57,29 @@ fn make_per_req(id: u64, slot: i32) -> PerRequest {
         flavour_name: "Balanced".into(),
         error: 0.0,
         carbon_cost: 999.0, // deliberately wrong — will be recomputed
-        assignment_solver_mode: "dp".into(),
         assignment_solver_status: "ok".into(),
-        assigned_with_greedy_fallback: false,
-        assigned_with_relaxed_retry: false,
-        assigned_with_injection: false,
-        assigned_with_rollback: false,
+        fallback_assigned: false,
+        late_assigned: false,
         lateness_slots: 0,
     }
 }
 
 #[test]
-fn compute_per_request_marks_assignments_with_injected_mock_pool() {
+fn compute_per_request_joins_batch_status_and_profile_flavour_data() {
     let run_rows = vec![
         SolverRunRow {
             run_id: "injected".into(),
             run_sequence: 1,
-            current_slot: 0,
-            pending_batch_size: 1,
             new_assignments: 1,
             solver_elapsed_ms: 0.0,
             solver_status: "ok".into(),
-            solver_mode: "dp_none".into(),
-            mock_recovery_injected_count: 2,
         },
         SolverRunRow {
             run_id: "plain".into(),
             run_sequence: 2,
-            current_slot: 0,
-            pending_batch_size: 1,
             new_assignments: 1,
             solver_elapsed_ms: 0.0,
-            solver_status: "ok".into(),
-            solver_mode: "dp_none".into(),
-            mock_recovery_injected_count: 0,
+            solver_status: "committed_learning_update_failed".into(),
         },
     ];
     let runs_by_id = run_rows
@@ -103,26 +93,37 @@ fn compute_per_request_marks_assignments_with_injected_mock_pool() {
             run_id: run_id.into(),
             request_id: i as u64 + 1,
             current_slot: 0,
-            is_new_assignment_in_run: true,
-            assigned_with_greedy_fallback: false,
+            qos_profile_id: QosProfileId::default_profile().to_string(),
+            fallback_assigned: i == 0,
+            late_assigned: i == 1,
             scheduled_slot: 0,
             flavour_name: "Accurate".into(),
-            error: 0.0,
             carbon_cost: 0.0,
             arrival_slot: 0,
             deadline_slot: 1,
         })
         .collect::<Vec<_>>();
+    let flavour_errors = HashMap::from([(
+        (
+            QosProfileId::default_profile().to_string(),
+            "Accurate".to_owned(),
+        ),
+        0.0,
+    )]);
 
-    let rows = compute_per_request(&assignments, &runs_by_id, 60.0, &HashSet::new());
+    let rows = compute_per_request(&assignments, &runs_by_id, &flavour_errors, 60.0);
 
     assert_eq!(rows.len(), 2);
-    assert!(rows[0].assigned_with_injection);
-    assert!(!rows[1].assigned_with_injection);
+    assert!(rows[0].fallback_assigned);
+    assert_eq!(
+        rows[1].assignment_solver_status,
+        "committed_learning_update_failed"
+    );
+    assert!(rows[1].late_assigned);
 }
 
 #[test]
-fn compact_solver_logs_keep_legacy_report_inputs_available() {
+fn schema_v2_solver_logs_parse_required_fields() {
     let prefix = std::env::temp_dir().join(format!(
         "carbonshift-nshift-compact-log-{}-{}",
         std::process::id(),
@@ -137,11 +138,10 @@ fn compact_solver_logs_keep_legacy_report_inputs_available() {
     std::fs::write(
         &runs_path,
         concat!(
-            "run_id,run_sequence,current_slot,qos_profile_id,solver_mode,solver_status,",
-            "new_assignments,solver_elapsed_ms,total_carbon_cost,error_window_avg_after,",
-            "error_window_avg_after_real,error_window_start_slot,error_window_end_slot,",
-            "error_window_threshold,profile_error_constraint_active\n",
-            "run_s0_n1_1,1,0,default,dp,ok,1,1.5,2.0,0.0,0.0,0,1,4.0,false\n"
+            "run_id,run_sequence,solver_mode,solver_status,new_assignments,",
+            "fallback_assigned_count,solver_elapsed_ms,total_carbon_cost,",
+            "error_window_avg_after,error_window_avg_after_real\n",
+            "run_n1_1,1,dp,ok,1,0,1.5,2.0,0.0,0.0\n"
         ),
     )
     .unwrap();
@@ -149,9 +149,9 @@ fn compact_solver_logs_keep_legacy_report_inputs_available() {
         &assignments_path,
         concat!(
             "run_id,current_slot,request_id,qos_profile_id,scheduled_slot,flavour_name,",
-            "assigned_with_greedy_fallback,flavour_duration_sec,error,carbon_cost,",
+            "fallback_assigned,late_assigned,carbon_cost,",
             "arrival_slot,deadline_slot\n",
-            "run_s0_n1_1,0,1,default,0,Accurate,false,30,0.0,2.0,0,1\n"
+            "run_n1_1,0,1,default-text-generation,0,Accurate,true,false,2.0,0,1\n"
         ),
     )
     .unwrap();
@@ -160,13 +160,9 @@ fn compact_solver_logs_keep_legacy_report_inputs_available() {
     let assignments = super::reporting::read_solver_assignments(&assignments_path);
 
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].pending_batch_size, 1);
     assert_eq!(runs[0].new_assignments, 1);
-    assert_eq!(runs[0].mock_recovery_injected_count, 0);
-    assert_eq!(runs[0].solver_mode, "dp");
     assert_eq!(assignments.len(), 1);
-    assert!(assignments[0].is_new_assignment_in_run);
-    assert!(!assignments[0].assigned_with_greedy_fallback);
+    assert!(assignments[0].fallback_assigned);
 
     std::fs::remove_file(runs_path).unwrap();
     std::fs::remove_file(assignments_path).unwrap();
@@ -495,9 +491,9 @@ fn offline_dp_marks_greedy_fallback_and_reports_its_flavour() {
         run_strategy(&registry, "dp", &scenario, &config, 60.0, false, 1.0).unwrap();
 
     assert_eq!(per_request.len(), 1);
-    assert!(per_request[0].assigned_with_greedy_fallback);
+    assert!(per_request[0].fallback_assigned);
     assert_eq!(per_request[0].flavour_name, "LowestError");
-    assert_eq!(summary.requests_assigned_with_greedy_fallback, 1);
+    assert_eq!(summary.reqs_fallback_assigned, 1);
 }
 
 #[test]
@@ -608,10 +604,12 @@ fn offline_output_preserves_the_proposal_late_flag() {
         60.0,
         false,
         1.0,
+        2.5,
     );
 
+    assert!(per_request[0].late_assigned);
     assert_eq!(per_request[0].lateness_slots, 1);
-    assert_eq!(summary.requests_late, 1);
+    assert_eq!(summary.reqs_late, 1);
 }
 
 #[test]

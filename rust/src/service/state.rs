@@ -13,6 +13,7 @@ use crate::engine::qos::{
 };
 use crate::engine::shared_state::SharedState;
 use crate::engine::types::Flavour;
+use crate::metrics_logger::MetricsLogger;
 use crate::service::models::RequestStatus;
 use chrono::{SecondsFormat, Utc};
 
@@ -347,6 +348,8 @@ pub struct AppState {
     pub shared_state: SharedState,
     pub scheduler: ServiceSchedulerConfig,
     pub qos_profiles: QosProfileRegistry,
+    /// Optional sink for immutable profile definitions received by the service.
+    pub profile_metrics_logger: Option<Arc<MetricsLogger>>,
     pub http: reqwest::Client,
     pub service_cfg: Arc<ServiceConfig>,
     pub tracked: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
@@ -388,11 +391,44 @@ impl AppState {
         service_cfg: ServiceConfig,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
+        Self::new_inner(shared_state, cfg, service_cfg, carbon_forecast, None)
+    }
+
+    /// Construct service state with the shared metrics logger so the profile
+    /// catalog is emitted at startup and when new definitions are registered.
+    pub fn new_with_metrics_logger(
+        shared_state: SharedState,
+        cfg: Arc<Config>,
+        service_cfg: ServiceConfig,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
+        metrics_logger: Arc<MetricsLogger>,
+    ) -> Self {
+        Self::new_inner(
+            shared_state,
+            cfg,
+            service_cfg,
+            carbon_forecast,
+            Some(metrics_logger),
+        )
+    }
+
+    fn new_inner(
+        shared_state: SharedState,
+        cfg: Arc<Config>,
+        service_cfg: ServiceConfig,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
+        profile_metrics_logger: Option<Arc<MetricsLogger>>,
+    ) -> Self {
         // Tests and integrations can construct AppState without a live
         // BatchScheduler. Initialize the shared policy here too; in the
         // service binary the scheduler constructor has already done so.
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
         let qos_profiles = QosProfileRegistry::from_config(&cfg);
+        if let Some(logger) = &profile_metrics_logger {
+            for profile in qos_profiles.list() {
+                logger.log_qos_profile(&profile);
+            }
+        }
         let engine_elapsed =
             Duration::try_from_secs_f64(shared_state.virtual_elapsed_secs().max(0.0))
                 .expect("engine virtual elapsed time must be finite and non-negative");
@@ -405,6 +441,7 @@ impl AppState {
             shared_state,
             scheduler: ServiceSchedulerConfig::from_config(&cfg),
             qos_profiles,
+            profile_metrics_logger,
             http: reqwest::Client::new(),
             service_cfg: Arc::new(service_cfg),
             tracked: Arc::new(Mutex::new(HashMap::new())),

@@ -19,9 +19,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "scenarios"))
 
 import multiple_runs as mr  # noqa: E402
 import run_battery as rb  # noqa: E402
+from nb_utils import require_output_schema  # noqa: E402
 
 
-def test_battery_runner_defaults_online_swarm_to_parallel_merge(tmp_path):
+def test_battery_runner_does_not_emit_obsolete_runtime_controls(tmp_path):
     config_path = rb._write_rust_config(
         tmp_path / "scenario.json",
         [],
@@ -33,8 +34,30 @@ def test_battery_runner_defaults_online_swarm_to_parallel_merge(tmp_path):
     finally:
         config_path.unlink(missing_ok=True)
 
-    assert config["runner"]["online_swarm_mode"] == "merge"
+    assert "online_swarm_mode" not in config["runner"]
+    assert "rollback_max_consecutive" not in config["runner"]
+    assert (
+        config["runner"]["max_batch_solver_parallelism"]
+        == rb.DEFAULT_MAX_BATCH_SOLVER_PARALLELISM
+    )
     assert "infeasibility_recovery_mode" not in config["runner"]
+
+
+def test_output_schema_guard_accepts_only_the_declared_version(tmp_path):
+    manifest_path = tmp_path / "output_schema.json"
+    manifest_path.write_text(
+        json.dumps({"schema_version": 2, "schema_name": "carbonshift.nshift"}),
+        encoding="utf-8",
+    )
+    manifest = require_output_schema(tmp_path, schema_name="carbonshift.nshift")
+    assert manifest["schema_version"] == 2
+
+    manifest_path.write_text(
+        json.dumps({"schema_version": 1, "schema_name": "carbonshift.nshift"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unsupported output schema version"):
+        require_output_schema(tmp_path, schema_name="carbonshift.nshift")
 
 
 def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path):
@@ -90,42 +113,39 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
     request_rows = [
         {
             "request_id": "1",
+            "qos_profile_id": "default-text-generation",
+            "deadline_slot": "1",
             "scheduled_slot": "0",
-            "error": "0.0",
             "carbon_cost": "3.0",
             "queue_wait_seconds": "2.0",
             "final_wait_seconds": "4.0",
-            "lateness_slots": "0",
-            "assigned_with_greedy_fallback": "false",
-            "assigned_with_relaxed_retry": "false",
-            "assigned_with_injection": "true",
-            "assigned_with_rollback": "false",
+            "flavour_name": "Accurate",
+            "fallback_assigned": "false",
+            "late_assigned": "false",
         },
         {
             "request_id": "2",
+            "qos_profile_id": "default-text-generation",
+            "deadline_slot": "1",
             "scheduled_slot": "2",
-            "error": "5.0",
             "carbon_cost": "5.0",
             "queue_wait_seconds": "3.0",
             "final_wait_seconds": "5.0",
-            "lateness_slots": "1",
-            "assigned_with_greedy_fallback": "true",
-            "assigned_with_relaxed_retry": "false",
-            "assigned_with_injection": "false",
-            "assigned_with_rollback": "true",
+            "flavour_name": "Balanced",
+            "fallback_assigned": "true",
+            "late_assigned": "true",
         },
         {
             "request_id": "3",
+            "qos_profile_id": "default-text-generation",
+            "deadline_slot": "1",
             "scheduled_slot": "1",
-            "error": "2.0",
             "carbon_cost": "7.0",
             "queue_wait_seconds": "6.0",
             "final_wait_seconds": "8.0",
-            "lateness_slots": "0",
-            "assigned_with_greedy_fallback": "false",
-            "assigned_with_relaxed_retry": "true",
-            "assigned_with_injection": "true",
-            "assigned_with_rollback": "false",
+            "flavour_name": "Fast",
+            "fallback_assigned": "false",
+            "late_assigned": "false",
         },
     ]
     request_fields = list(request_rows[0])
@@ -147,18 +167,14 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
 
     summary_fields = [
         "batch_size",
-        "requests_total",
-        "requests_scheduled",
-        "requests_unscheduled",
-        "requests_late",
+        "reqs_total",
+        "reqs_scheduled",
+        "reqs_unscheduled",
+        "reqs_late",
         "max_lateness_slots",
         "carbon_cost",
         "global_average_error",
-        "global_average_error_real",
-        "global_average_error_modeled",
-        "requests_assigned_with_greedy_fallback",
-        "requests_assigned_with_relaxed_retry",
-        "requests_assigned_with_rollback",
+        "reqs_fallback_assigned",
         "queue_wait_seconds_min",
         "queue_wait_seconds_max",
         "queue_wait_seconds_avg",
@@ -170,7 +186,7 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
         "carbon_saving",
     ]
     initial_summary = {field: "0" for field in summary_fields}
-    initial_summary.update({"batch_size": "2", "requests_total": "3"})
+    initial_summary.update({"batch_size": "2", "reqs_total": "3"})
     for filename in ("summary.csv",):
         with (run_dir / filename).open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=summary_fields)
@@ -188,29 +204,35 @@ def test_trim_rust_outputs_recomputes_request_metrics_from_retained_assignments(
         error_window_past=0,
         error_window_future=0,
         baseline_request_costs={1: 4.0, 2: 6.0, 3: 8.0},
+        flavour_errors={
+            ("default-text-generation", "Accurate"): 0.0,
+            ("default-text-generation", "Balanced"): 5.0,
+            ("default-text-generation", "Fast"): 2.0,
+        },
     )
 
     _, retained = rb._read_csv(run_dir / "per_request.csv")
     assert [int(row["request_id"]) for row in retained] == [1, 3]
-    assert [row["assigned_with_injection"] for row in retained] == ["true", "true"]
+    assert [row["fallback_assigned"] for row in retained] == ["false", "false"]
     _, runtime_assignments = rb._read_csv(run_dir / "assignments_runtime.csv")
     assert len(runtime_assignments) == 2
     _, summary_rows = rb._read_csv(run_dir / "summary.csv")
-    assert int(summary_rows[0]["requests_scheduled"]) == 2
-    assert int(summary_rows[0]["requests_unscheduled"]) == 1
+    assert int(summary_rows[0]["reqs_scheduled"]) == 2
+    assert int(summary_rows[0]["reqs_unscheduled"]) == 1
     assert float(summary_rows[0]["carbon_cost"]) == 10.0
     assert float(summary_rows[0]["global_average_error"]) == 1.0
+    assert int(summary_rows[0]["reqs_fallback_assigned"]) == 0
     assert float(summary_rows[0]["baseline_carbon_cost"]) == 12.0
     assert float(summary_rows[0]["carbon_saving"]) == pytest.approx(100 / 6)
     _, summary_by_n_rows = rb._read_csv(output_dir / "summary_by_n.csv")
-    assert int(summary_by_n_rows[0]["requests_scheduled"]) == 2
+    assert int(summary_by_n_rows[0]["reqs_scheduled"]) == 2
     _, timeslots = rb._read_csv(run_dir / "per_timeslot.csv")
     assert len(timeslots) == 2
-    assert int(timeslots[1]["real_request_count"]) == 1
+    assert int(timeslots[1]["reqs_count"]) == 1
     retained_json = json.loads((run_dir / "per_request.json").read_text())["rows"]
     assert len(retained_json) == 2
-    assert [row["assigned_with_injection"] for row in retained_json] == ["true", "true"]
-    assert json.loads((run_dir / "summary.json").read_text())["requests_scheduled"] == 2
+    assert [row["fallback_assigned"] for row in retained_json] == ["false", "false"]
+    assert json.loads((run_dir / "summary.json").read_text())["reqs_scheduled"] == 2
 
 
 def test_rust_invocation_uses_scenario_input_horizon_for_trimming(tmp_path, monkeypatch):
@@ -242,13 +264,19 @@ def test_rust_invocation_uses_scenario_input_horizon_for_trimming(tmp_path, monk
     monkeypatch.setattr(
         rb,
         "_trim_rust_outputs",
-        lambda path, cutoff, past, future, costs: trimmed.update({
+        lambda path, cutoff, past, future, costs, flavour_errors: trimmed.update({
             "output_dir": path,
             "cutoff": cutoff,
             "past": past,
             "future": future,
             "costs": costs,
+            "flavour_errors": flavour_errors,
         }),
+    )
+    monkeypatch.setattr(
+        rb,
+        "_read_flavour_errors",
+        lambda _path: {("default-text-generation", "Accurate"): 0.0},
     )
 
     rb._run_rust_binary(Path("nshift"), config_path)
@@ -259,6 +287,7 @@ def test_rust_invocation_uses_scenario_input_horizon_for_trimming(tmp_path, monk
         "past": 12,
         "future": 14,
         "costs": {0: 1.0},
+        "flavour_errors": {("default-text-generation", "Accurate"): 0.0},
     }
     assert not config_path.exists()
 
@@ -267,14 +296,14 @@ def test_rust_invocation_uses_scenario_input_horizon_for_trimming(tmp_path, monk
 
 def test_folder_name_realtime_disabled_uses_zero_token():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, False, 0.5, False, "serialized", 0)
-    assert name == "mybattery_0709_1123_20_roll0_0_F_S"
+    name = rb._format_run_folder_name("mybattery", dt, 20, False, 0.5, False)
+    assert name == "mybattery_0709_1123_20_0_F"
 
 
 def test_folder_name_realtime_enabled_strips_dot_from_scale():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.5, True, "serialized", 0)
-    assert name == "mybattery_0709_1123_20_roll0_05_T_S"
+    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.5, True)
+    assert name == "mybattery_0709_1123_20_05_T"
 
 
 def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
@@ -324,26 +353,14 @@ def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
 
 def test_folder_name_scale_with_leading_zero():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.05, True, "serialized", 0)
-    assert name.endswith("_005_T_S")
+    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.05, True)
+    assert name.endswith("_005_T")
 
 
 def test_folder_name_altstrat_false_when_no_strategies():
     dt = datetime(2026, 1, 1, 0, 0)
-    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False, "serialized", 0)
-    assert name.endswith("_F_S")
-
-
-def test_folder_name_merge_swarm_mode_uses_m_token():
-    dt = datetime(2026, 1, 1, 0, 0)
-    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False, "merge", 0)
-    assert name.endswith("_F_M")
-
-
-def test_folder_name_includes_rollback_token():
-    dt = datetime(2026, 1, 1, 0, 0)
-    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False, "serialized", 4)
-    assert "_roll4_" in name
+    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False)
+    assert name == "b_0101_0000_5_0_F"
 
 
 # ─── _parse_rust_config_defaults ───────────────────────────────────────────
@@ -376,20 +393,20 @@ def test_parse_rust_config_defaults_missing_file_returns_empty(tmp_path):
 # ─── _row_label ─────────────────────────────────────────────────────────────
 
 def test_row_label_plain_dp_mode():
-    row = {"infeasibility_mode": "min_error_greedy", "batch_size": 4}
+    row = {"strategy": "min_error_greedy", "batch_size": 4}
     assert rb._row_label(row) == "N=4"
 
 
 def test_row_label_online_strategy():
-    row = {"infeasibility_mode": "online_bandit", "batch_size": 8}
+    row = {"strategy": "online_bandit", "batch_size": 8}
     assert rb._row_label(row) == "bandit (N=8)"
 
 
 def test_row_label_offline_strategy():
-    row = {"infeasibility_mode": "offline_singleton_best", "batch_size": 0}
+    row = {"strategy": "offline_singleton_best", "batch_size": 0}
     assert rb._row_label(row) == "offline_singleton_best"
     accurate_row = {
-        "infeasibility_mode": "offline_singleton_best_accurate",
+        "strategy": "offline_singleton_best_accurate",
         "batch_size": 0,
     }
     assert rb._row_label(accurate_row) == "offline_singleton_best_accurate"
@@ -397,10 +414,10 @@ def test_row_label_offline_strategy():
 
 # ─── _top3_markdown_table / _build_top3_section ────────────────────────────
 
-def _make_row(scenario_id, mode, batch_size, carbon_cost, saving=10.0, solver_ms=1.0):
+def _make_row(scenario_id, strategy, batch_size, carbon_cost, saving=10.0, solver_ms=1.0):
     return {
         "scenario_id": scenario_id,
-        "infeasibility_mode": mode,
+        "strategy": strategy,
         "batch_size": batch_size,
         "carbon_cost": carbon_cost,
         "carbon_saving": saving,

@@ -161,17 +161,19 @@ async fn main() {
     // build one Arc<RwLock<Vec<f64>>> and hand the same Arc to both BatchScheduler::new and AppState::new.
     let shared_carbon_forecast = Arc::new(RwLock::new(carbon_forecast));
 
-    let metrics_logger = Arc::new(MetricsLogger::new(
+    let metrics_logger = Arc::new(MetricsLogger::new_with_profile_files(
         cfg.logging.enable_solver_logging,
         cfg.logging.solver_runs_file.clone(),
         cfg.logging.solver_assignments_file.clone(),
+        cfg.logging.solver_profiles_file.clone(),
+        cfg.logging.solver_profile_flavours_file.clone(),
     ));
 
     // No RequestGenerator: HTTP submissions feed `shared_state` directly.
     let mut scheduler = BatchScheduler::new(
         shared_state.clone(),
         cfg.clone(),
-        metrics_logger,
+        Arc::clone(&metrics_logger),
         shared_carbon_forecast.clone(),
     );
     // Realtime slot zero is a local horizon index, but its first transition
@@ -213,7 +215,13 @@ async fn main() {
             .parse()
             .expect("DISPATCHER_POLL_INTERVAL_MS must be an integer"),
     };
-    let state = AppState::new(shared_state, cfg, service_cfg, shared_carbon_forecast);
+    let state = AppState::new_with_metrics_logger(
+        shared_state,
+        cfg,
+        service_cfg,
+        shared_carbon_forecast,
+        metrics_logger,
+    );
     if let Some(alignment) = realtime_alignment {
         state.set_wall_clock_alignment(alignment);
     }

@@ -1,6 +1,7 @@
 """Shared utilities for online2 analysis notebooks."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
@@ -13,6 +14,40 @@ FLAVOUR_COLORS: Dict[str, str] = {
     "Balanced": "#2ca02c",
     "Accurate": "#ff7f0e",
 }
+
+OUTPUT_SCHEMA_VERSION = 2
+
+
+def require_output_schema(
+    path: Path,
+    *,
+    schema_name: str | None = None,
+) -> dict:
+    """Require the nearest ancestor manifest to declare the supported schema."""
+    path = Path(path)
+    if path.is_file():
+        path = path.parent
+    for directory in (path, *path.parents):
+        manifest_path = directory / "output_schema.json"
+        if not manifest_path.is_file():
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        actual_version = manifest.get("schema_version")
+        if actual_version != OUTPUT_SCHEMA_VERSION:
+            raise ValueError(
+                f"Unsupported output schema version {actual_version!r} in "
+                f"{manifest_path}; expected {OUTPUT_SCHEMA_VERSION}"
+            )
+        if schema_name is not None and manifest.get("schema_name") != schema_name:
+            raise ValueError(
+                f"Expected output schema {schema_name!r} in {manifest_path}, "
+                f"found {manifest.get('schema_name')!r}"
+            )
+        return manifest
+    raise FileNotFoundError(
+        f"No output_schema.json found at or above {path}; regenerate outputs "
+        f"with schema version {OUTPUT_SCHEMA_VERSION}"
+    )
 
 
 @dataclass(frozen=True)
@@ -42,6 +77,7 @@ def discover_assignment_runs(
 
     for per_request_path in search_root.rglob("per_request.csv"):
         assignment_dir = per_request_path.parent
+        require_output_schema(assignment_dir, schema_name="carbonshift.nshift")
         parent = assignment_dir.parent
         if (
             assignment_dir.name.startswith("N")
@@ -124,4 +160,3 @@ def flavour_order(local: pd.DataFrame) -> list:
     ordered = [name for name in FLAVOUR_COLORS if name in seen]
     ordered.extend(sorted(name for name in seen if name not in ordered))
     return ordered
-

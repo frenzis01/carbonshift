@@ -5,13 +5,13 @@ Run `run_battery.py` across several PHASE-AWARE parameter grids.
 Each phase of the Rust battery harness (see run_battery.py's module docstring)
 is sensitive to a different subset of runtime knobs:
 
-  - DP, singleton_best, and random selection modes (online): sensitive to
-    `max_batch_solver_parallelism`; NOT sensitive to `online_swarm_mode`.
-  - bandit (online, N=1) and ant_colony (online, batch-size sweep): sensitive to
-    `online_swarm_mode` and `max_batch_solver_parallelism`.
+  - DP and request-level online strategies: sensitive to
+    `max_batch_solver_parallelism`.
+  - Bandit and ant_colony online strategies: use the same parallel merge
+    behavior and are sensitive to `max_batch_solver_parallelism`.
   - offline strategies (offline_singleton_best, offline_singleton_best_accurate,
-    random, bandit, ant_colony): run each scenario synchronously, without the
-    online worker pool, and are insensitive to the parallelism/swarm-mode knobs.
+    hazard, bandit, ant_colony): run each scenario synchronously, without the
+    online worker pool, and are insensitive to online worker parallelism.
 
 Sweeping every knob against every phase (the old flat PARAM_GRID behaviour)
 therefore re-runs each phase many times for knobs that cannot change its
@@ -113,7 +113,7 @@ OFFLINE_CONTENT: Dict[str, Any] = {
 INPUT_PATTERNS = ("flat",)
 
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
-# DP + singleton_best: parallelism x threshold; swarm mode is irrelevant.
+# DP + online strategies: parallelism x threshold.
 # for parallelism in (1, 8, 20)
 # for max_error_threshold in (3.0, 3.5, 4.0, 4.5)
 _PARALLELISM_X_THRESHOLD = [
@@ -125,29 +125,14 @@ _PARALLELISM_X_THRESHOLD = [
     for threshold in (4.0,)
 ]
 
-# bandit/ant_colony: parallelism x swarm_mode x threshold (rollback is irrelevant, left
-# fixed).
-_PARALLELISM_X_SWARM_MODE = [
-    {
-        "max_batch_solver_parallelism": parallelism,
-        "online_swarm_mode": swarm_mode,
-        "max_error_threshold": threshold,
-    }
-    # for parallelism in (1, 8, 20)
-    for parallelism in (12,)
-    # for swarm_mode in ("serialized", "merge")
-    for swarm_mode in ("merge",)
-    for threshold in (4.0,)
-]
-
 PHASES: Dict[str, PhaseGrid] = {
     "dp": PhaseGrid("dp", DP_CONTENT, _PARALLELISM_X_THRESHOLD),
-    "online": PhaseGrid("online", SWARM_ONLINE_CONTENT, _PARALLELISM_X_SWARM_MODE),
+    "online": PhaseGrid("online", SWARM_ONLINE_CONTENT, _PARALLELISM_X_THRESHOLD),
     "per_request": PhaseGrid(
         "per_request", PER_REQUEST_ONLINE_CONTENT, _PARALLELISM_X_THRESHOLD
     ),
     # Offline strategies can also be evaluated with different per-scenario error
-    # thresholds, even though they don't depend on rollback or swarm knobs.
+    # thresholds; their execution is independent of the online worker pool.
     "offline": PhaseGrid(
         "offline",
         OFFLINE_CONTENT,

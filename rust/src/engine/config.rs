@@ -24,8 +24,6 @@ pub struct SolverConfig {
     pub dp_pruning_k: usize,
     /// Maximum seconds for the DP solver per batch before timeout fallback.
     pub dp_timeout: f64,
-    /// Maximum consecutive capacity-tier rollbacks for one batch (0 = disabled).
-    pub rollback_max_consecutive: usize,
     /// Maximum number of batch solver workers.
     pub max_batch_solver_parallelism: usize,
     /// Maximum wait for work on the solver queue, in seconds.
@@ -59,11 +57,9 @@ pub struct SimulationConfig {
     pub total_requests: usize,
 }
 
-/// Hyperparameters and concurrency mode for online swarm solvers.
+/// Hyperparameters for the online bandit and ant-colony solvers.
 #[derive(Debug, Clone)]
 pub struct SwarmConfig {
-    /// Concurrency mode: "serialized" or "merge".
-    pub mode: String,
     /// Exploration probability for the online bandit.
     pub bandit_epsilon: f64,
     /// Optimistic initial Q-value for the online bandit.
@@ -101,6 +97,10 @@ pub struct LoggingConfig {
     pub solver_runs_file: String,
     /// Destination for per-assignment metrics.
     pub solver_assignments_file: String,
+    /// Destination for immutable QoS profile definitions.
+    pub solver_profiles_file: String,
+    /// Destination for QoS profile flavour definitions.
+    pub solver_profile_flavours_file: String,
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -176,7 +176,6 @@ impl Default for SolverConfig {
             dp_pruning_min_batch_size: 8,
             dp_pruning_k: 1200,
             dp_timeout: 30.0,
-            rollback_max_consecutive: 0,
             max_batch_solver_parallelism: 12,
             queue_timeout: 1.0,
             batch_timeout_secs: 0.0,
@@ -204,7 +203,6 @@ impl Default for SimulationConfig {
 impl Default for SwarmConfig {
     fn default() -> Self {
         Self {
-            mode: "serialized".to_string(),
             bandit_epsilon: 0.15,
             bandit_initial_q: 10.0,
             bandit_seed: 42,
@@ -228,6 +226,8 @@ impl Default for LoggingConfig {
             enable_solver_logging: true,
             solver_runs_file: "/tmp/online2_solver_runs.csv".to_string(),
             solver_assignments_file: "/tmp/online2_solver_assignments.csv".to_string(),
+            solver_profiles_file: "/tmp/online2_solver_profiles.csv".to_string(),
+            solver_profile_flavours_file: "/tmp/online2_solver_profile_flavours.csv".to_string(),
         }
     }
 }
@@ -395,7 +395,6 @@ mod tests {
         assert!(cfg.simulation.skip_empty_slots);
         assert!(!cfg.simulation.manual_clock);
         assert_eq!(cfg.simulation.request_generation_seed, 4242);
-        assert_eq!(cfg.swarm.mode, "serialized");
         assert_eq!(cfg.swarm.aco_n_ants, 10);
         assert!(cfg.logging.enable_solver_logging);
         assert_eq!(cfg.total_slots, 24);

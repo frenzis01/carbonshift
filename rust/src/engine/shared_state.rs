@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
 use crate::engine::qos::QosProfileId;
 use crate::engine::solver::SolverProposal;
-use crate::online_swarm::SwarmContext;
 use crate::types::{Assignment, CapacityTier, Flavour, Request, get_capacity_multiplier};
 
 // ─── solver snapshot ─────────────────────────────────────────────────────────
@@ -163,35 +162,6 @@ impl SolverSnapshot {
             })
             .collect()
     }
-
-    /// Build the swarm solver's view from this exact state snapshot.
-    pub fn swarm_context_for_profile(&self, profile_id: Option<&QosProfileId>) -> SwarmContext {
-        let mut slot_count: HashMap<i32, i64> = HashMap::new();
-        let mut slot_errors: HashMap<i32, Vec<f64>> = HashMap::new();
-        for assignment in self.assignments.values() {
-            *slot_count.entry(assignment.scheduled_slot).or_insert(0) += 1;
-            if profile_id.map_or(true, |id| assignment.qos_profile_id == *id) {
-                slot_errors
-                    .entry(assignment.scheduled_slot)
-                    .or_default()
-                    .push(assignment.error);
-            }
-        }
-        let (global_error_sum, global_count) = match profile_id {
-            Some(id) => self
-                .profile_error_stats
-                .get(id)
-                .map(|stats| (stats.error_sum, stats.count as usize))
-                .unwrap_or((0.0, 0)),
-            None => (self.global_error_sum, self.global_assignment_count as usize),
-        };
-        SwarmContext {
-            slot_count,
-            slot_errors,
-            global_error_sum,
-            global_count,
-        }
-    }
 }
 
 /// Requests claimed by a worker together with their atomic shared-state snapshot.
@@ -219,13 +189,6 @@ struct Inner {
     global_assignment_count: u64,
     /// Cumulative hard/window QoS totals partitioned by profile.
     profile_error_stats: HashMap<QosProfileId, GlobalErrorStats>,
-    // ── rollback tracking ─────────────────────────────────────────────────
-    /// Total number of rollbacks (tier-breach detections) that occurred.
-    total_rollbacks: u64,
-    /// Highest consecutive-rollback count seen for a single batch.
-    max_consecutive_rollbacks_seen: u64,
-    /// Request IDs that were ultimately committed after ≥1 rollback attempt.
-    rolled_back_request_ids: HashSet<u64>,
 }
 
 impl Inner {
@@ -295,9 +258,6 @@ impl Inner {
             global_error_sum: 0.0,
             global_assignment_count: 0,
             profile_error_stats: HashMap::new(),
-            total_rollbacks: 0,
-            max_consecutive_rollbacks_seen: 0,
-            rolled_back_request_ids: HashSet::new(),
         }
     }
 }
@@ -362,8 +322,8 @@ impl SharedState {
     ///
     /// Active batch workers hold a read guard through solve and commit, so this
     /// write waits for them to finish; a batch cannot be solved with one ladder
-    /// and checked/committed with another. Existing committed assignment costs
-    /// are stored values and are intentionally not repriced here.
+    /// and priced with another. Existing committed assignment costs are stored
+    /// values and are intentionally not repriced here.
     pub fn replace_capacity_tiers(&self, tiers: Vec<CapacityTier>) {
         let mut current = self.capacity_tiers.write().unwrap();
         *current = Some(tiers);
@@ -371,8 +331,8 @@ impl SharedState {
     }
 
     /// Borrow the runtime ladder. A solver keeps this guard until its commit
-    /// finishes so an administrative replacement cannot split its pricing
-    /// snapshot from the global capacity rollback check.
+    /// finishes so an administrative replacement cannot change the pricing
+    /// policy mid-transaction.
     pub fn capacity_tiers_guard(&self) -> RwLockReadGuard<'_, Option<Vec<CapacityTier>>> {
         self.capacity_tiers.read().unwrap()
     }
@@ -609,23 +569,6 @@ impl SharedState {
             global_assignment_count: g.global_assignment_count,
             profile_error_stats: g.profile_error_stats.clone(),
         }
-    }
-
-    /// Snapshot of committed state for the online swarm solvers.
-    ///
-    /// Builds per-slot assignment counts and error vectors from the current
-    /// committed assignments in a single lock acquisition.
-    pub fn swarm_context_snapshot(&self) -> SwarmContext {
-        self.swarm_context_snapshot_for_profile(None)
-    }
-
-    /// Snapshot global capacity occupancy and one profile's error history.
-    pub fn swarm_context_snapshot_for_profile(
-        &self,
-        profile_id: Option<&QosProfileId>,
-    ) -> SwarmContext {
-        self.snapshot_for_solver()
-            .swarm_context_for_profile(profile_id)
     }
 
     /// All assignments whose `scheduled_slot >= current_slot`.
@@ -1068,100 +1011,6 @@ impl SharedState {
         }
         Ok(materialized)
     }
-
-    // ── rollback ──────────────────────────────────────────────────────────────
-
-    /// Atomically attempt to commit assignments, checking for unintended
-    /// capacity-tier breaches caused by concurrent thread activity.
-    ///
-    /// `expected_per_slot` maps each slot to the occupancy the solver assumed
-    /// after committing this batch:
-    ///   expected[s] = baseline_slot_counts[s] + (assignments in batch to slot s)
-    ///
-    /// If the actual occupancy (current shared_state count + batch additions) for
-    /// any slot would land in a *higher* capacity tier than the solver expected,
-    /// the commit is refused and `CommitOutcome::RolledBack` is returned —
-    /// nothing is written to the assignment map.
-    ///
-    /// `force_commit` bypasses the check (used once the per-batch rollback limit K
-    /// is reached, so the batch is committed even with a tier breach).
-    ///
-    /// `consecutive_before` is the number of rollbacks this batch has already
-    /// experienced; used to update `max_consecutive_rollbacks_seen`.
-    ///
-    /// Future assignments remain pinned while this batch is solved, so the
-    /// expected occupancy snapshot includes every pre-existing future slot
-    /// occupant.
-    pub fn try_add_assignments_checked(
-        &self,
-        assignments: &[Assignment],
-        expected_per_slot: &HashMap<i32, i64>,
-        tiers: &[CapacityTier],
-        force_commit: bool,
-        consecutive_before: usize,
-    ) -> CommitOutcome {
-        let mut g = self.inner.lock().unwrap();
-
-        if !force_commit {
-            for (&slot, &expected) in expected_per_slot {
-                let current_before = g
-                    .assignments
-                    .values()
-                    .filter(|a| a.scheduled_slot == slot)
-                    .count() as i64;
-                let batch_adds = assignments
-                    .iter()
-                    .filter(|a| a.scheduled_slot == slot)
-                    .count() as i64;
-                let actual_after = current_before + batch_adds;
-
-                if actual_after > expected {
-                    let expected_mult = capacity_multiplier_for_count(expected, tiers);
-                    let actual_mult = capacity_multiplier_for_count(actual_after, tiers);
-                    if actual_mult > expected_mult {
-                        g.total_rollbacks += 1;
-                        let consec = (consecutive_before + 1) as u64;
-                        if consec > g.max_consecutive_rollbacks_seen {
-                            g.max_consecutive_rollbacks_seen = consec;
-                        }
-                        return CommitOutcome::RolledBack;
-                    }
-                }
-            }
-        }
-
-        // Commit the assignments.
-        for assignment in assignments {
-            g.record_assignment(assignment.clone());
-        }
-        CommitOutcome::Committed
-    }
-
-    /// Mark request IDs as having been committed after ≥1 rollback.
-    pub fn mark_requests_rolled_back(&self, request_ids: &[u64]) {
-        if request_ids.is_empty() {
-            return;
-        }
-        let mut g = self.inner.lock().unwrap();
-        for &id in request_ids {
-            g.rolled_back_request_ids.insert(id);
-        }
-    }
-
-    /// Cumulative rollback statistics for the entire scenario run.
-    pub fn get_rollback_stats(&self) -> RollbackStats {
-        let g = self.inner.lock().unwrap();
-        RollbackStats {
-            total_rollbacks: g.total_rollbacks,
-            max_consecutive_rollbacks: g.max_consecutive_rollbacks_seen,
-            requests_assigned_with_rollback: g.rolled_back_request_ids.len() as u64,
-        }
-    }
-
-    /// Set of request IDs that were committed after ≥1 rollback (for PerRequest tagging).
-    pub fn get_rolled_back_request_ids(&self) -> HashSet<u64> {
-        self.inner.lock().unwrap().rolled_back_request_ids.clone()
-    }
 }
 
 impl Default for SharedState {
@@ -1170,38 +1019,7 @@ impl Default for SharedState {
     }
 }
 
-// ─── capacity-tier helper (mirrors DpSolver::get_capacity_multiplier) ─────────
-
-fn capacity_multiplier_for_count(count: i64, tiers: &[CapacityTier]) -> f64 {
-    for tier in tiers {
-        match tier.max_requests {
-            None => return tier.multiplier,
-            Some(max) if count <= max => return tier.multiplier,
-            _ => {}
-        }
-    }
-    tiers.last().map(|t| t.multiplier).unwrap_or(1.0)
-}
-
 // ─── result structs ───────────────────────────────────────────────────────────
-
-/// Outcome of [`SharedState::try_add_assignments_checked`].
-#[derive(Debug, PartialEq)]
-pub enum CommitOutcome {
-    Committed,
-    RolledBack,
-}
-
-/// Aggregated rollback statistics for a completed scenario run.
-#[derive(Debug, Clone, Default)]
-pub struct RollbackStats {
-    /// Total number of tier-breach rollbacks detected across all batches.
-    pub total_rollbacks: u64,
-    /// Largest consecutive-rollback count seen for any single batch.
-    pub max_consecutive_rollbacks: u64,
-    /// Number of requests that were ultimately assigned after ≥1 rollback.
-    pub requests_assigned_with_rollback: u64,
-}
 
 #[derive(Debug, Clone)]
 pub struct WindowErrorStats {
@@ -1507,69 +1325,6 @@ mod tests {
     }
 
     #[test]
-    fn capacity_tier_commit_check_counts_occupancy_from_all_profiles() {
-        let state = SharedState::new();
-        let tiers = vec![
-            CapacityTier {
-                max_requests: Some(1),
-                multiplier: 1.0,
-            },
-            CapacityTier {
-                max_requests: None,
-                multiplier: 2.0,
-            },
-        ];
-        state.add_assignments(vec![make_profiled_assignment(1, 4, 0.0, "qa-standard-v1")]);
-        let second_profile_assignment = make_profiled_assignment(2, 4, 0.0, "ner-standard-v1");
-        let outcome = state.try_add_assignments_checked(
-            &[second_profile_assignment],
-            &HashMap::from([(4, 1)]),
-            &tiers,
-            false,
-            0,
-        );
-
-        assert_eq!(outcome, CommitOutcome::RolledBack);
-        assert!(!state.get_current_assignments().contains_key(&2));
-        assert_eq!(state.get_current_assignments().len(), 1);
-    }
-
-    #[test]
-    fn cross_profile_concurrent_tier_breach_rolls_back_atomically() {
-        let state = SharedState::new();
-        let tiers = vec![
-            CapacityTier {
-                max_requests: Some(1),
-                multiplier: 1.0,
-            },
-            CapacityTier {
-                max_requests: None,
-                multiplier: 3.0,
-            },
-        ];
-        let first_profile = make_profiled_assignment(11, 6, 0.0, "qa-standard-v1");
-        let other_profile = make_profiled_assignment(12, 6, 0.0, "ner-standard-v1");
-        state.add_assignments(vec![first_profile]);
-
-        let outcome = state.try_add_assignments_checked(
-            &[other_profile],
-            &HashMap::from([(6, 1)]),
-            &tiers,
-            false,
-            0,
-        );
-
-        assert_eq!(outcome, CommitOutcome::RolledBack);
-        assert_eq!(state.get_current_assignments().len(), 1);
-        assert_eq!(
-            state
-                .get_profile_error_stats(&QosProfileId::parse("ner-standard-v1").unwrap())
-                .count,
-            0
-        );
-    }
-
-    #[test]
     fn error_correction_updates_only_the_assignment_profile_aggregate() {
         let state = SharedState::new();
         let qa = QosProfileId::parse("qa-standard-v1").unwrap();
@@ -1685,53 +1440,6 @@ mod tests {
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
         assert!(!ids.contains(&1));
-    }
-
-    // ── Rollback / try_add_assignments_checked tests ───────────────────────────
-
-    fn tiers_with_implicit_one() -> Vec<CapacityTier> {
-        // [{30,1.0}, {50,1.5}, {null,2.0}] — explicit 1.0 first tier
-        vec![
-            CapacityTier {
-                max_requests: Some(30),
-                multiplier: 1.0,
-            },
-            CapacityTier {
-                max_requests: Some(50),
-                multiplier: 1.5,
-            },
-            CapacityTier {
-                max_requests: None,
-                multiplier: 2.0,
-            },
-        ]
-    }
-
-    fn tiers_no_implicit_one() -> Vec<CapacityTier> {
-        // [{30,1.5}, {50,2.0}, {null,5.0}] — battery-style (no explicit 1.0)
-        vec![
-            CapacityTier {
-                max_requests: Some(30),
-                multiplier: 1.5,
-            },
-            CapacityTier {
-                max_requests: Some(50),
-                multiplier: 2.0,
-            },
-            CapacityTier {
-                max_requests: None,
-                multiplier: 5.0,
-            },
-        ]
-    }
-
-    /// Commit `count` dummy assignments to `slot`, using sequential request IDs
-    /// starting from `id_start`.
-    fn prefill_slot(state: &SharedState, slot: i32, count: usize, id_start: u64) {
-        let assignments: Vec<Assignment> = (0..count as u64)
-            .map(|i| make_assignment(id_start + i, slot, 0.0))
-            .collect();
-        state.add_assignments(assignments);
     }
 
     #[test]
@@ -1898,152 +1606,6 @@ mod tests {
 
         assert!(error.contains("omitted claimed request 2"));
         assert!(state.get_current_assignments().is_empty());
-    }
-
-    #[test]
-    fn rollback_no_race_commits() {
-        // No concurrent writes: current_before == baseline => actual_after == expected => no rollback.
-        let state = SharedState::new();
-        let tiers = tiers_with_implicit_one();
-
-        // Pre-fill slot 5 with 25 requests (baseline the solver will have observed).
-        prefill_slot(&state, 5, 25, 1000);
-
-        // Batch of 5 new requests for slot 5.
-        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
-        // expected = baseline(25) + batch_adds(5) = 30
-        let mut expected = HashMap::new();
-        expected.insert(5i32, 30i64);
-
-        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
-        assert_eq!(outcome, CommitOutcome::Committed);
-    }
-
-    #[test]
-    fn rollback_race_same_tier_commits() {
-        // Race occurred but both expected and actual_after land in the same tier => no rollback.
-        let state = SharedState::new();
-        let tiers = tiers_with_implicit_one();
-
-        // Baseline solver saw: slot 5 has 31 requests (already past the 30-threshold → tier 1.5).
-        // Race: 3 more were committed in the meantime → now 34.
-        prefill_slot(&state, 5, 34, 1000);
-
-        // Batch adds 5 more.
-        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
-        // expected = baseline(31) + batch_adds(5) = 36
-        let mut expected = HashMap::new();
-        expected.insert(5i32, 36i64);
-
-        // actual_after = 34 + 5 = 39; expected = 36
-        // Both in tier 1.5 (31-50) => same tier => Committed.
-        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
-        assert_eq!(outcome, CommitOutcome::Committed);
-    }
-
-    #[test]
-    fn rollback_race_tier_breach_rolls_back() {
-        // Race pushed slot past a tier boundary that the solver did NOT intend to cross.
-        let state = SharedState::new();
-        let tiers = tiers_with_implicit_one();
-
-        // Baseline solver saw: slot 5 has 25 requests (tier 1.0, ≤30).
-        // Race: 8 more were committed → now 33 (tier 1.5, >30).
-        prefill_slot(&state, 5, 33, 1000);
-
-        // Batch adds 5 more.
-        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
-        // expected = baseline(25) + batch_adds(5) = 30 → capacity_multiplier(30) = 1.0
-        // actual_after = 33 + 5 = 38 → capacity_multiplier(38) = 1.5
-        // 1.5 > 1.0 => RolledBack
-        let mut expected = HashMap::new();
-        expected.insert(5i32, 30i64);
-
-        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
-        assert_eq!(outcome, CommitOutcome::RolledBack);
-
-        // Nothing should have been committed.
-        assert_eq!(state.get_current_assignments().len(), 33);
-    }
-
-    #[test]
-    fn rollback_force_commit_bypasses_tier_check() {
-        // Even with a tier breach, force_commit=true always commits.
-        let state = SharedState::new();
-        let tiers = tiers_with_implicit_one();
-
-        prefill_slot(&state, 5, 33, 1000);
-
-        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
-        let mut expected = HashMap::new();
-        expected.insert(5i32, 30i64); // same breach scenario as above
-
-        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, true, 0);
-        assert_eq!(outcome, CommitOutcome::Committed);
-        assert_eq!(state.get_current_assignments().len(), 38);
-    }
-
-    #[test]
-    fn rollback_increments_stats_correctly() {
-        // Each RolledBack outcome increments total_rollbacks and updates max_consecutive.
-        let state = SharedState::new();
-        let tiers = tiers_with_implicit_one();
-
-        prefill_slot(&state, 5, 33, 1000);
-
-        let batch: Vec<Assignment> = (0..5u64).map(|i| make_assignment(i, 5, 0.0)).collect();
-        let mut expected = HashMap::new();
-        expected.insert(5i32, 30i64);
-
-        // First rollback (consecutive_before = 0)
-        let _ = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
-        // Second rollback (consecutive_before = 1)
-        let _ = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 1);
-
-        let stats = state.get_rollback_stats();
-        assert_eq!(stats.total_rollbacks, 2);
-        assert_eq!(stats.max_consecutive_rollbacks, 2); // max(0+1, 1+1) = 2
-    }
-
-    #[test]
-    fn rollback_battery_style_tiers_work() {
-        // Battery config tiers don't have the explicit 1.0 first entry.
-        // Test that tier-breach detection still functions correctly.
-        let state = SharedState::new();
-        let tiers = tiers_no_implicit_one(); // [{30,1.5}, {50,2.0}, {null,5.0}]
-
-        // Baseline: slot 5 has 28 requests (tier 1.5, ≤30).
-        // Race: 5 more committed → now 33 (tier 2.0, >30).
-        prefill_slot(&state, 5, 33, 1000);
-
-        // Batch adds 3 more.
-        let batch: Vec<Assignment> = (0..3u64).map(|i| make_assignment(i, 5, 0.0)).collect();
-        // expected = baseline(28) + batch_adds(3) = 31 → capacity_multiplier(31) = 2.0 (>30, ≤50)
-        // actual_after = 33 + 3 = 36 → capacity_multiplier(36) = 2.0
-        // Same tier → Committed (race didn't push to a NEW tier).
-        let mut expected = HashMap::new();
-        expected.insert(5i32, 31i64);
-        let outcome = state.try_add_assignments_checked(&batch, &expected, &tiers, false, 0);
-        assert_eq!(
-            outcome,
-            CommitOutcome::Committed,
-            "same tier should not rollback"
-        );
-
-        // Reset: now a breach scenario.
-        let state2 = SharedState::new();
-        prefill_slot(&state2, 5, 33, 1000);
-        // expected = baseline(28) + batch(3) = 31, but we choose baseline=27 batch=3 → expected=30
-        // expected=30 → tier 1.5 (30<=30); actual_after=36 → tier 2.0 (36>30, 36<=50) → BREACH
-        let mut expected2 = HashMap::new();
-        expected2.insert(5i32, 30i64); // baseline=27, batch=3
-        let batch2: Vec<Assignment> = (3..6u64).map(|i| make_assignment(i, 5, 0.0)).collect();
-        let outcome2 = state2.try_add_assignments_checked(&batch2, &expected2, &tiers, false, 0);
-        assert_eq!(
-            outcome2,
-            CommitOutcome::RolledBack,
-            "tier breach should rollback"
-        );
     }
 
     #[test]

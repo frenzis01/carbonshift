@@ -6,6 +6,27 @@ use super::*;
 /// scenario generator's random sequence.
 pub(super) const HAZARD_SEED_SALT: u64 = 0xA3F1_95C7_4D2B_6801;
 
+/// Build the immutable default profile used by offline scenario requests.
+pub(super) fn default_qos_profile(config: &Config) -> carbonshift_rs::engine::qos::QosProfile {
+    carbonshift_rs::engine::qos::QosProfile {
+        profile_id: QosProfileId::default_profile(),
+        task_kind: carbonshift_rs::engine::qos::TaskKindId::parse("text_generation")
+            .expect("built-in task kind is valid"),
+        flavours: config.flavours.clone(),
+        error_semantics: "relative-confidence-degradation-v1".to_owned(),
+        max_error_threshold: config.max_error_threshold,
+        error_window: carbonshift_rs::engine::qos::ErrorWindowPolicy {
+            past_slots: config.error_window_past,
+            future_slots: config.error_window_future,
+            past_decay_slots: config.error_window_past_decay_slots,
+        },
+        cumulative_error: carbonshift_rs::engine::qos::CumulativeErrorPolicy {
+            enabled: config.global_error_constraint_enabled,
+            hard: config.global_error_constraint_hard,
+        },
+    }
+}
+
 /// Keep runner-specific search settings out of the strategy implementations.
 /// The offline runner registers the common engine factories and uses the same
 /// registry contract as other callers.
@@ -344,6 +365,7 @@ pub(super) fn convert_engine_results_to_outputs(
     slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
+    solver_elapsed_ms: f64,
 ) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
     placements.sort_by_key(|placement| (placement.arrival_slot, placement.assignment.request_id));
 
@@ -353,14 +375,15 @@ pub(super) fn convert_engine_results_to_outputs(
         .min_by(|left, right| left.error.total_cmp(&right.error))
         .expect("a valid engine input has at least one flavour");
     let mut per_request = Vec::with_capacity(placements.len());
-    let mut batch_timings = Vec::with_capacity(placements.len());
+    let mut batch_timings = Vec::with_capacity(1);
 
-    for (index, placement) in placements.iter().enumerate() {
+    for placement in &placements {
         let assignment_result = &placement.assignment;
         let arrival_slot = placement.arrival_slot;
         let deadline_slot = placement.deadline_slot;
-        let sequence = (index + 1) as u64;
-        let queue_wait_slots = (assignment_result.scheduled_slot - arrival_slot).max(0);
+        let sequence = 1;
+        let queue_wait_slots = 0;
+        let final_wait_slots = (assignment_result.scheduled_slot - arrival_slot).max(0);
         let lateness_slots = if placement.late {
             assignment_result.scheduled_slot - deadline_slot
         } else {
@@ -369,38 +392,36 @@ pub(super) fn convert_engine_results_to_outputs(
 
         per_request.push(PerRequest {
             request_id: assignment_result.request_id,
+            qos_profile_id: assignment_result.qos_profile_id.to_string(),
             arrival_time: arrival_slot as f64 * slot_duration_seconds,
             arrival_slot,
             deadline_slot,
-            included_in_batch_slot: arrival_slot,
+            included_in_batch_slot: 0,
             batch_sequence: sequence,
             scheduled_slot: assignment_result.scheduled_slot,
             queue_wait_slots,
             queue_wait_seconds: queue_wait_slots as f64 * slot_duration_seconds,
-            final_wait_slots: queue_wait_slots,
-            final_wait_seconds: queue_wait_slots as f64 * slot_duration_seconds,
+            final_wait_slots,
+            final_wait_seconds: final_wait_slots as f64 * slot_duration_seconds,
             flavour_name: assignment_result.flavour_name.clone(),
             error: assignment_result.error,
             carbon_cost: assignment_result.carbon_cost,
-            assignment_solver_mode: strategy_name.to_owned(),
             assignment_solver_status: "ok".to_owned(),
-            assigned_with_greedy_fallback: placement.origin == PlacementOrigin::GreedyFallback,
-            assigned_with_relaxed_retry: false,
-            assigned_with_injection: false,
-            assigned_with_rollback: false,
+            fallback_assigned: placement.origin == PlacementOrigin::GreedyFallback,
+            late_assigned: placement.late,
             lateness_slots,
         });
-        batch_timings.push(BatchTiming {
-            batch_sequence: sequence,
-            batch_size_n: 0,
-            effective_batch_size: 1,
-            slot: arrival_slot,
-            pending_before: 1,
-            solver_elapsed_ms: 0.0,
-            scheduled: true,
-            flush_partial_batch: false,
-        });
     }
+    batch_timings.push(BatchTiming {
+        batch_sequence: 1,
+        batch_size_n: 0,
+        effective_batch_size: per_request.len(),
+        slot: 0,
+        pending_before: scenario.requests.len(),
+        solver_elapsed_ms,
+        scheduled: per_request.len() == scenario.requests.len(),
+        flush_partial_batch: false,
+    });
 
     let summary = compute_summary(
         strategy_name,
@@ -413,9 +434,6 @@ pub(super) fn convert_engine_results_to_outputs(
         &most_accurate.name,
         most_accurate.duration,
         most_accurate.error,
-        0,
-        0,
-        0,
         0,
         0.0,
     );
@@ -456,7 +474,9 @@ pub(super) fn run_strategy(
     let assignment = config.assignment_policy();
     let (scope, solve_input) = project_scenario_to_solve_input(scenario, &assignment)?;
     let runtime = registry.create(engine_name, scope.clone())?;
+    let solve_started = std::time::Instant::now();
     let pending = runtime.propose(&solve_input)?;
+    let solver_elapsed_ms = solve_started.elapsed().as_secs_f64() * 1000.0;
 
     // If conversion rejects a proposal, settle its pending state delta as
     // discarded before returning the explicit conversion error.
@@ -490,5 +510,6 @@ pub(super) fn run_strategy(
         slot_duration_seconds,
         realtime_slots,
         realtime_speed_scale,
+        solver_elapsed_ms,
     ))
 }

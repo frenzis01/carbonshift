@@ -626,8 +626,8 @@ fn next_profile_to_dispatch(
     min_pending: usize,
 ) -> Option<(QosProfileId, usize)> {
     // When enabled, same-profile batches solve concurrently from independent
-    // snapshots. Otherwise, an active profile is serialized. Only an
-    // unchanged infeasible queue is held back.
+    // snapshots. Otherwise, an active profile is processed one batch at a time.
+    // Only an unchanged infeasible queue is held back.
     // Sorting before applying the cursor makes round-robin order deterministic.
     let mut eligible: Vec<_> = pending_by_profile
         .iter()
@@ -1020,6 +1020,13 @@ fn batch_worker_entry(
         .filter(|placement| placement.origin == PlacementOrigin::GreedyFallback)
         .map(|placement| placement.req_id)
         .collect();
+    let late_request_ids: HashSet<u64> = pending_proposal
+        .proposal
+        .placements
+        .iter()
+        .filter(|placement| placement.late)
+        .map(|placement| placement.req_id)
+        .collect();
 
     // -------- STEP 2 : Price proposal and commit it to shared state
     // This is the assignment commit. It validates placements and prices them
@@ -1085,7 +1092,6 @@ fn batch_worker_entry(
         0.0
     };
     let solver_mode = runtime.engine_name().to_owned();
-    let profile_error_constraint_active = solve_input.qos.cumulative_error_constraint_active;
 
     // Update scheduler counters and capture this run's unique sequence number.
     let run_sequence = {
@@ -1115,7 +1121,8 @@ fn batch_worker_entry(
         // assignments.  The old code fetched get_current_assignments() here
         // (all-time O(N) entries) and iterated every batch, producing
         // O(N²) total rows and memory pressure.
-        let assignment_rows = build_assignment_rows(&committed, slot, &fallback_request_ids);
+        let assignment_rows =
+            build_assignment_rows(&committed, slot, &fallback_request_ids, &late_request_ids);
         let real_avg = shared_state
             .get_profile_window_error_stats(
                 &profile_id,
@@ -1128,13 +1135,11 @@ fn batch_worker_entry(
 
         let mut run_row: HashMap<String, String> = HashMap::new();
         run_row.insert("run_sequence".into(), run_sequence.to_string());
-        run_row.insert("current_slot".into(), slot.to_string());
         run_row.insert("new_assignments".into(), assigned_count.to_string());
         run_row.insert("solver_status".into(), status.to_owned());
         run_row.insert("solver_mode".into(), solver_mode);
-        run_row.insert("qos_profile_id".into(), profile_id.to_string());
         run_row.insert(
-            "greedy_fallback_assignments".into(),
+            "fallback_assigned_count".into(),
             fallback_request_ids.len().to_string(),
         );
         run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
@@ -1144,16 +1149,6 @@ fn batch_worker_entry(
             modeled_window_average.to_string(),
         );
         run_row.insert("error_window_avg_after_real".into(), real_avg.to_string());
-        run_row.insert("error_window_start_slot".into(), window_start.to_string());
-        run_row.insert("error_window_end_slot".into(), window_end.to_string());
-        run_row.insert(
-            "error_window_threshold".into(),
-            assignment.max_error_threshold.to_string(),
-        );
-        run_row.insert(
-            "profile_error_constraint_active".into(),
-            profile_error_constraint_active.to_string(),
-        );
 
         ml.log_solver_run(&run_row, &assignment_rows);
     }
@@ -1167,6 +1162,7 @@ fn build_assignment_rows(
     assignments: &[Assignment],
     current_slot: i32,
     fallback_request_ids: &HashSet<u64>,
+    late_request_ids: &HashSet<u64>,
 ) -> Vec<HashMap<String, String>> {
     let mut rows = Vec::with_capacity(assignments.len());
     let mut sorted = assignments.to_vec();
@@ -1179,14 +1175,13 @@ fn build_assignment_rows(
         row.insert("scheduled_slot".into(), a.scheduled_slot.to_string());
         row.insert("flavour_name".into(), a.flavour_name.clone());
         row.insert(
-            "assigned_with_greedy_fallback".into(),
+            "fallback_assigned".into(),
             fallback_request_ids.contains(&a.request_id).to_string(),
         );
         row.insert(
-            "flavour_duration_sec".into(),
-            a.flavour_duration.to_string(),
+            "late_assigned".into(),
+            late_request_ids.contains(&a.request_id).to_string(),
         );
-        row.insert("error".into(), a.error.to_string());
         row.insert("carbon_cost".into(), a.carbon_cost.to_string());
         row.insert(
             "arrival_slot".into(),

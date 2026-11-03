@@ -49,12 +49,10 @@
 //! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
 //!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent. Only
 //!   "ant_colony" uses the configured sweep; all other online strategies use batch size 1.
-//!   `online_swarm_mode` affects bandit/ACO only. Scheduler workers commit
-//!   proposals without rollback, repricing each at current slot occupancy.
 //! - `additional_strategies`: common-engine strategies to run once per scenario (no batching or
 //!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "hazard"]`.
 //!   `hazard` is the canonical stochastic strategy name. These runs are fully independent of `batch_sizes`,
-//!   `rollback_max_consecutive`, and `max_batch_solver_parallelism`.
+//!   `max_batch_solver_parallelism`.
 //!   `offline_singleton_best` scans feasible slot/flavour pairs and commits the cheapest choice;
 //!   `offline_singleton_best_accurate` uses the same search with only the lowest-error flavour.
 //!   `hazard` samples flavours from the closest-to-uniform distribution whose expected error
@@ -96,7 +94,7 @@ use carbonshift_rs::engine::solver::{
 };
 use carbonshift_rs::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use carbonshift_rs::generator::{RequestGenerator, RequestGeneratorConfig};
-use carbonshift_rs::metrics_logger::MetricsLogger;
+use carbonshift_rs::metrics_logger::{MetricsLogger, write_qos_profile_catalog};
 use carbonshift_rs::scenario::{Scenario, ScenarioRequest};
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
@@ -123,8 +121,6 @@ struct BenchmarkConfig {
     realtime_slots: bool,
     realtime_speed_scale: f64,
     include_greedy_baseline: bool,
-    /// Legacy compatibility field; scheduler proposals now price at commit without rollback.
-    rollback_max_consecutive: usize,
     /// Additional common-engine strategies to run (e.g. singleton_best, hazard).
     additional_strategies: Vec<String>,
     /// Online strategies to run through the scheduler pipeline (e.g. "bandit", "ant_colony").
@@ -139,8 +135,6 @@ struct BenchmarkConfig {
     batch_timeout_secs: f64,
     /// Overrides `Config::max_batch_solver_parallelism` when present; `None` keeps the default.
     max_batch_solver_parallelism: Option<usize>,
-    /// Overrides `Config::swarm.mode` when present; `None` keeps the default ("serialized").
-    online_swarm_mode: Option<String>,
     /// Precomputed baseline carbon cost to reuse when `include_greedy_baseline` is false
     /// (e.g. a second nshift invocation for additional/offline strategies that shouldn't
     /// recompute the greedy baseline already produced by an earlier invocation of the same
@@ -197,12 +191,6 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .get("include_greedy_baseline")
         .and_then(|x| x.as_bool())
         .unwrap_or(true);
-    // TODO in run_battery this is set in a tmp config. ideally unify with the same param in config.rs
-    let rollback_max_consecutive = runner
-        .get("rollback_max_consecutive")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(3) as usize;
-
     let additional_strategies: Vec<String> = runner
         .get("additional_strategies")
         .and_then(|x| x.as_array())
@@ -246,11 +234,6 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .and_then(|x| x.as_u64())
         .map(|x| x as usize);
 
-    let online_swarm_mode = runner
-        .get("online_swarm_mode")
-        .and_then(|x| x.as_str())
-        .map(String::from);
-
     let baseline_total_carbon_cost = runner
         .get("baseline_total_carbon_cost")
         .and_then(|x| x.as_f64());
@@ -267,13 +250,11 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         realtime_slots,
         realtime_speed_scale,
         include_greedy_baseline,
-        rollback_max_consecutive,
         additional_strategies,
         online_strategies,
         online_batch_sizes,
         batch_timeout_secs,
         max_batch_solver_parallelism,
-        online_swarm_mode,
         baseline_total_carbon_cost,
         flavours,
     }
@@ -400,13 +381,9 @@ fn main() {
     // Build a base config that has all scenario parameters applied.
     let mut base_cfg = Config::default();
     base_cfg.apply_scenario_metadata(&scenario.metadata);
-    base_cfg.solver.rollback_max_consecutive = bcfg.rollback_max_consecutive;
     base_cfg.solver.batch_timeout_secs = bcfg.batch_timeout_secs;
     if let Some(parallelism) = bcfg.max_batch_solver_parallelism {
         base_cfg.solver.max_batch_solver_parallelism = parallelism;
-    }
-    if let Some(mode) = &bcfg.online_swarm_mode {
-        base_cfg.swarm.mode = mode.clone();
     }
     if let Some(flavours) = &bcfg.flavours {
         base_cfg.flavours = flavours.clone();
@@ -432,17 +409,25 @@ fn main() {
         .join(", ");
     println!("Flavours in use: [{flavour_summary}]");
     println!(
-        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, rollback_max_consecutive={} (online_swarm_mode={}), max_batch_solver_parallelism={}, output={}",
+        "Config: batch_sizes={:?}, realtime_slots={}, speed_scale={:.2}, max_batch_solver_parallelism={}, output={}",
         bcfg.batch_sizes,
         realtime_slots,
         speed_scale,
-        bcfg.rollback_max_consecutive,
-        base_cfg.swarm.mode,
         base_cfg.solver.max_batch_solver_parallelism,
         bcfg.output_dir.display(),
     );
 
     std::fs::create_dir_all(&bcfg.output_dir).expect("Cannot create output dir");
+    write_output_schema_manifest(&bcfg.output_dir);
+    let default_profile = default_qos_profile(&base_cfg);
+    write_qos_profile_catalog(
+        &bcfg.output_dir.join("qos_profiles.csv").to_string_lossy(),
+        &bcfg
+            .output_dir
+            .join("qos_profile_flavours.csv")
+            .to_string_lossy(),
+        &[default_profile],
+    );
 
     let mut all_summaries: Vec<RunSummary> = Vec::new();
     let mut baseline_cost: Option<f64> = bcfg.baseline_total_carbon_cost;

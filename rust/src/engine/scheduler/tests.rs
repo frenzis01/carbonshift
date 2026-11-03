@@ -142,7 +142,7 @@ fn common_solve_input_uses_global_fixed_occupancy_and_profile_only_errors() {
 }
 
 #[test]
-fn common_solve_input_keeps_real_decayed_history_without_synthetic_prehistory() {
+fn common_solve_input_keeps_real_decayed_history() {
     let config = make_config(|config| {
         config.error_window_past = 1;
         config.error_window_past_decay_slots = 2;
@@ -276,16 +276,13 @@ fn common_worker_reports_greedy_fallback_and_selected_flavour() {
     let row = assignments_reader.records().next().unwrap().unwrap();
     let column = |name: &str| headers.iter().position(|header| header == name).unwrap();
     assert_eq!(row.get(column("flavour_name")), Some("LowestError"));
-    assert_eq!(
-        row.get(column("assigned_with_greedy_fallback")),
-        Some("true")
-    );
+    assert_eq!(row.get(column("fallback_assigned")), Some("true"));
     let mut runs_reader = csv::Reader::from_path(&runs_path).unwrap();
     let run_headers = runs_reader.headers().unwrap().clone();
     let run_row = runs_reader.records().next().unwrap().unwrap();
     let fallback_count_column = run_headers
         .iter()
-        .position(|header| header == "greedy_fallback_assignments")
+        .position(|header| header == "fallback_assigned_count")
         .unwrap();
     assert_eq!(run_row.get(fallback_count_column), Some("1"));
 

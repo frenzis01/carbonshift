@@ -1,7 +1,7 @@
 {
   "_comment": "CarbonShift solver battery test configuration (Rust nshift binary only).",
   "_phases_comment": "Each phase is independently toggled by leaving its content list(s) empty: DP runs only if batch_sizes is non-empty; online runs only if online_strategies is non-empty; offline runs only if additional_strategies is non-empty. See tests/battery/multiple_runs.py for phase-aware parameter grids that avoid redundantly re-running phases a given knob doesn't affect.",
-  "_trim_future_assignments_comment": "Optional. When true, requests are still generated only in each scenario's total_slots, but the planning horizon and carbon forecast extend by ERROR_WINDOW_FUTURE slots. Assignments and request-level metrics beyond the configured total_slots are trimmed; requests_in counts scenario inputs and requests_out counts retained assignments.",
+  "_trim_future_assignments_comment": "Optional. When true, requests are still generated only in each scenario's total_slots, but the planning horizon and carbon forecast extend by ERROR_WINDOW_FUTURE slots. Assignments and request-level metrics beyond the configured total_slots are trimmed; reqs_in counts scenario inputs and reqs_out counts retained assignments.",
   "trim_future_assignments": true,
   "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat keeps a nearly constant rate with seeded 5%-of-rate slot-count jitter and the same rounded horizon total. Both retain random sub-slot arrival times. multiple_runs.py sweeps both by default. This does not configure client emulation.",
   "battery_id": "cfg_test4_dp_0",
@@ -36,12 +36,10 @@
   ],
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
-  "_runtime_knobs_comment": "Runtime knobs below mirror rust/src/config.rs; omit any of them to fall back to that file's Config::default() values. rollback_max_consecutive/max_batch_solver_parallelism affect DP and request-level strategies; online_swarm_mode affects bandit/ant_colony only (see multiple_runs.py sensitivity matrix).",
+  "_runtime_knobs_comment": "Runtime knobs below mirror the Rust solver configuration; omit them to use the documented defaults.",
   "max_batch_solver_parallelism": 12,
-  "online_swarm_mode": "merge",
   "realtime_slots": false,
   "realtime_speed_scale": 1.0,
-  "rollback_max_consecutive": 0,
   "scenarios": [
     {
       "id": "high_load_1500_92",

@@ -22,7 +22,7 @@ runs the Rust solver across three independent, individually-toggleable phases:
                  `batch_sizes: []` to sweep online strategies without running DP.
   3. Offline   – runs `additional_strategies` (e.g. "offline_singleton_best",
                  "offline_singleton_best_accurate", "hazard", "ant_colony", "bandit") once per scenario, with no batch-size
-                 or rollback dependency. Skipped if `additional_strategies` is
+                 or DP-phase dependency. Skipped if `additional_strategies` is
                  empty.
 
 The greedy baseline is computed once per scenario (a dedicated lightweight Rust
@@ -106,27 +106,18 @@ from scenario_io import generate_scenario_data, load_json, save_json  # noqa: E4
 DEFAULT_MAX_BATCH_SOLVER_PARALLELISM = 20
 DEFAULT_REALTIME_SLOTS = False
 DEFAULT_REALTIME_SPEED_SCALE = 0.05
-# Retained in output/config files for compatibility; proposal commits now price
-# against live occupancy and do not roll back or re-solve.
-DEFAULT_ROLLBACK_MAX_CONSECUTIVE = 0
-# Use the merge backend by default so online swarm runs can use the configured
-# batch-worker parallelism. Select "serialized" explicitly for reproducibility.
-DEFAULT_ONLINE_SWARM_MODE = "merge"
+OUTPUT_SCHEMA_VERSION = 2
 
 RESULT_COLUMNS = [
     "scenario_id",
     "batch_size",
-    "infeasibility_mode",
+    "strategy",
     "solver_time_ms_avg",
     "carbon_cost",
     "final_global_error",
-    "avg_global_error_per_slot",
-    "requests_in",
-    "requests_out",
-    "requests_assigned_with_greedy_fallback",
-    "requests_assigned_with_relaxed_retry",
-    "total_rollbacks",
-    "peak_consecutive_rollbacks",
+    "reqs_in",
+    "reqs_out",
+    "reqs_fallback_assigned",
     "baseline_carbon_cost",
     "carbon_saving",
     "peak_concurrent_workers",
@@ -135,24 +126,10 @@ RESULT_COLUMNS = [
 
 TIMING_COLUMNS = ["scenario_id", "elapsed_seconds"]
 
-PER_N_TIMING_COLUMNS = ["scenario_id", "mode", "batch_size", "elapsed_seconds"]
+PER_N_TIMING_COLUMNS = ["scenario_id", "strategy", "batch_size", "elapsed_seconds"]
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
-
-def _avg_slot_error_from_csv(csv_path: Path) -> float:
-    """Parse per_timeslot.csv and return mean of window_avg_error_real."""
-    if not csv_path.exists():
-        return 0.0
-    errors: List[float] = []
-    with open(csv_path, newline="") as f:
-        for row in csv.DictReader(f):
-            try:
-                errors.append(float(row["window_avg_error_real"]))
-            except (KeyError, ValueError, TypeError):
-                pass
-    return sum(errors) / len(errors) if errors else 0.0
-
 
 def _generate_scenario(
     scenario_def: Dict[str, Any],
@@ -207,8 +184,6 @@ def _write_rust_config(
     realtime_slots: bool = DEFAULT_REALTIME_SLOTS,
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
-    rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
-    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     baseline_total_carbon_cost: Optional[float] = None,
     flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
@@ -219,9 +194,7 @@ def _write_rust_config(
         "include_greedy_baseline": include_baseline,
         "realtime_slots": realtime_slots,
         "realtime_speed_scale": realtime_speed_scale,
-        "rollback_max_consecutive": rollback_max_consecutive,
         "max_batch_solver_parallelism": max_batch_solver_parallelism,
-        "online_swarm_mode": online_swarm_mode,
     }
     if flavours:
         runner["flavours"] = flavours
@@ -269,12 +242,14 @@ def _run_rust_binary(rust_binary: Path, tmp_config: Path) -> None:
             )
             baseline_request_path = baseline_dir / "baseline_greedy" / "per_request.csv"
             baseline_request_costs = _read_request_costs(baseline_request_path)
+            flavour_errors = _read_flavour_errors(output_dir)
             _trim_rust_outputs(
                 output_dir,
                 int(trim_after_slot),
                 int(metadata["error_window_past"]),
                 int(metadata["error_window_future"]),
                 baseline_request_costs,
+                flavour_errors,
             )
     finally:
         tmp_config.unlink(missing_ok=True)
@@ -295,12 +270,35 @@ def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) ->
         writer.writerows(rows)
 
 
+def _write_output_schema_manifest(output_dir: Path, schema_name: str) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": OUTPUT_SCHEMA_VERSION,
+        "schema_name": schema_name,
+    }
+    (output_dir / "output_schema.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _read_request_costs(path: Path) -> Dict[int, float]:
     if not path.is_file():
         raise FileNotFoundError(f"Baseline per-request costs are required for horizon trimming: {path}")
     _, rows = _read_csv(path)
     return {
         int(row["request_id"]): float(row["carbon_cost"])
+        for row in rows
+    }
+
+
+def _read_flavour_errors(path: Path) -> Dict[tuple[str, str], float]:
+    catalog_path = path / "qos_profile_flavours.csv"
+    if not catalog_path.is_file():
+        raise FileNotFoundError(f"QoS profile flavour catalog is required: {catalog_path}")
+    _, rows = _read_csv(catalog_path)
+    return {
+        (row["profile_id"], row["flavour_name"]): float(row["error"])
         for row in rows
     }
 
@@ -317,6 +315,7 @@ def _request_summary_metrics(
     rows: List[Dict[str, str]],
     summary: Dict[str, str],
     baseline_request_costs: Dict[int, float],
+    flavour_errors: Dict[tuple[str, str], float],
 ) -> Dict[str, Any]:
     request_ids = [int(row["request_id"]) for row in rows]
     if len(request_ids) != len(set(request_ids)):
@@ -330,10 +329,16 @@ def _request_summary_metrics(
 
     count = len(rows)
     costs = [float(row["carbon_cost"]) for row in rows]
-    errors = [float(row["error"]) for row in rows]
+    errors = [
+        flavour_errors[(row["qos_profile_id"], row["flavour_name"])]
+        for row in rows
+    ]
     queue_waits = [float(row["queue_wait_seconds"]) for row in rows]
     final_waits = [float(row["final_wait_seconds"]) for row in rows]
-    lateness = [int(row["lateness_slots"]) for row in rows]
+    lateness = [
+        max(0, int(row["scheduled_slot"]) - int(row["deadline_slot"]))
+        for row in rows
+    ]
     carbon_cost = sum(costs)
     baseline_cost = sum(baseline_request_costs[request_id] for request_id in request_ids)
 
@@ -345,22 +350,14 @@ def _request_summary_metrics(
         }
 
     return {
-        "requests_scheduled": count,
-        "requests_unscheduled": max(0, int(summary["requests_total"]) - count),
-        "requests_late": sum(value > 0 for value in lateness),
+        "reqs_scheduled": count,
+        "reqs_unscheduled": max(0, int(summary["reqs_total"]) - count),
+        "reqs_late": sum(_is_true(row["late_assigned"]) for row in rows),
         "max_lateness_slots": max(lateness, default=0),
         "carbon_cost": carbon_cost,
         "global_average_error": _average(errors),
-        "global_average_error_real": _average(errors),
-        "global_average_error_modeled": _average(errors),
-        "requests_assigned_with_greedy_fallback": sum(
-            _is_true(row["assigned_with_greedy_fallback"]) for row in rows
-        ),
-        "requests_assigned_with_relaxed_retry": sum(
-            _is_true(row["assigned_with_relaxed_retry"]) for row in rows
-        ),
-        "requests_assigned_with_rollback": sum(
-            _is_true(row["assigned_with_rollback"]) for row in rows
+        "reqs_fallback_assigned": sum(
+            _is_true(row["fallback_assigned"]) for row in rows
         ),
         **wait_metrics("queue_wait_seconds", queue_waits),
         **wait_metrics("final_wait_seconds", final_waits),
@@ -393,6 +390,7 @@ def _trim_rust_outputs(
     error_window_past: int,
     error_window_future: int,
     baseline_request_costs: Dict[int, float],
+    flavour_errors: Dict[tuple[str, str], float],
 ) -> None:
     """Keep request outcomes and derived metrics within the original input horizon."""
     for request_path in output_dir.rglob("per_request.csv"):
@@ -410,6 +408,7 @@ def _trim_rust_outputs(
             kept_rows,
             summary_rows[0],
             baseline_request_costs,
+            flavour_errors,
         )
         request_fields, _ = _read_csv(request_path)
         _write_csv(request_path, request_fields, kept_rows)
@@ -440,7 +439,8 @@ def _trim_rust_outputs(
 
         errors_by_slot: Dict[int, List[float]] = {}
         for row in kept_rows:
-            errors_by_slot.setdefault(int(row["scheduled_slot"]), []).append(float(row["error"]))
+            error = flavour_errors[(row["qos_profile_id"], row["flavour_name"])]
+            errors_by_slot.setdefault(int(row["scheduled_slot"]), []).append(error)
         per_timeslot_rows = []
         for slot in range(trim_after_slot):
             window_start = slot - error_window_past
@@ -456,19 +456,15 @@ def _trim_rust_outputs(
                 "timeslot": slot,
                 "window_start": window_start,
                 "window_end": window_end,
-                "real_request_count": len(window_errors),
-                "modeled_request_count": len(window_errors),
-                "window_avg_error_real": average_error,
-                "window_avg_error_modeled": average_error,
+                "reqs_count": len(window_errors),
+                "window_avg_error": average_error,
             })
         per_timeslot_fields = [
             "timeslot",
             "window_start",
             "window_end",
-            "real_request_count",
-            "modeled_request_count",
-            "window_avg_error_real",
-            "window_avg_error_modeled",
+            "reqs_count",
+            "window_avg_error",
         ]
         _write_csv(run_dir / "per_timeslot.csv", per_timeslot_fields, per_timeslot_rows)
         (run_dir / "per_timeslot.json").write_text(
@@ -507,16 +503,14 @@ def _trim_rust_outputs(
 def _make_result_row(
     scenario_id: str,
     batch_size: int,
-    infeasibility_mode: str,
+    strategy: str,
     row: Dict[str, Any],
     baseline_cost: float,
-    avg_slot_err: float,
 ) -> Dict[str, Any]:
     """Build one `RESULT_COLUMNS`-shaped row from a parsed Rust summary CSV row.
 
     Shared by the DP/online/offline phases so each only supplies what differs
-    (label, batch_size, the summary row itself); missing columns in strategy
-    summaries (e.g. no rollback/concurrency stats for offline runs) default to 0.
+    (strategy label, batch size, and summary row).
     """
     carbon = float(row.get("carbon_cost", 0.0))
     baseline_value = row.get("baseline_carbon_cost")
@@ -533,21 +527,13 @@ def _make_result_row(
     return {
         "scenario_id": scenario_id,
         "batch_size": batch_size,
-        "infeasibility_mode": infeasibility_mode,
+        "strategy": strategy,
         "solver_time_ms_avg": float(row.get("solver_time_ms_avg", 0.0)),
         "carbon_cost": carbon,
         "final_global_error": float(row.get("global_average_error", 0.0)),
-        "avg_global_error_per_slot": avg_slot_err,
-        "requests_in": int(row.get("requests_total", 0)),
-        "requests_out": int(row.get("requests_scheduled", row.get("requests_total", 0))),
-        "requests_assigned_with_greedy_fallback": int(
-            row.get("requests_assigned_with_greedy_fallback", 0)
-        ),
-        "requests_assigned_with_relaxed_retry": int(
-            row.get("requests_assigned_with_relaxed_retry", 0)
-        ),
-        "total_rollbacks": int(row.get("total_rollbacks", 0)),
-        "peak_consecutive_rollbacks": int(row.get("peak_consecutive_rollbacks", 0)),
+        "reqs_in": int(row.get("reqs_total", 0)),
+        "reqs_out": int(row.get("reqs_scheduled", row.get("reqs_total", 0))),
+        "reqs_fallback_assigned": int(row.get("reqs_fallback_assigned", 0)),
         "baseline_carbon_cost": row_baseline_cost,
         "carbon_saving": savings_pct,
         "peak_concurrent_workers": int(row.get("peak_concurrent_workers", 0)),
@@ -562,8 +548,6 @@ def _run_baseline_only(
     realtime_slots: bool = DEFAULT_REALTIME_SLOTS,
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
-    rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
-    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> float:
     """Compute the greedy baseline once via a dedicated, lightweight Rust
@@ -576,8 +560,6 @@ def _run_baseline_only(
         realtime_slots=realtime_slots,
         realtime_speed_scale=realtime_speed_scale,
         max_batch_solver_parallelism=max_batch_solver_parallelism,
-        rollback_max_consecutive=rollback_max_consecutive,
-        online_swarm_mode=online_swarm_mode,
         flavours=flavours,
     )
     _run_rust_binary(rust_binary, tmp_config)
@@ -603,8 +585,6 @@ def _run_dp_phase(
     realtime_slots: bool = DEFAULT_REALTIME_SLOTS,
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
-    rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
-    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Sweep DP batch sizes. The baseline is precomputed and passed in."""
@@ -621,8 +601,6 @@ def _run_dp_phase(
         realtime_slots=realtime_slots,
         realtime_speed_scale=realtime_speed_scale,
         max_batch_solver_parallelism=max_batch_solver_parallelism,
-        rollback_max_consecutive=rollback_max_consecutive,
-        online_swarm_mode=online_swarm_mode,
         baseline_total_carbon_cost=baseline_cost,
         flavours=flavours,
     )
@@ -635,12 +613,11 @@ def _run_dp_phase(
     with open(summary_csv, newline="") as f:
         for row in csv.DictReader(f):
             n = int(row["batch_size"])
-            avg_slot_err = _avg_slot_error_from_csv(dp_dir / f"N{n}" / "per_timeslot.csv")
-            result_row = _make_result_row(scenario_id, n, "dp", row, baseline_cost, avg_slot_err)
+            result_row = _make_result_row(scenario_id, n, "dp", row, baseline_cost)
             all_rows.append(result_row)
             run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
             per_n_timing_rows.append({
-                "scenario_id": scenario_id, "mode": "dp", "batch_size": n,
+                "scenario_id": scenario_id, "strategy": "dp", "batch_size": n,
                 "elapsed_seconds": round(run_elapsed, 3),
             })
             print(
@@ -649,8 +626,7 @@ def _run_dp_phase(
                 f"carbon={result_row['carbon_cost']:.3f}, "
                 f"error={result_row['final_global_error']:.3f}, "
                 f"saving={result_row['carbon_saving']:.1f}%, "
-                f"elapsed={run_elapsed:.1f}s, "
-                f"total_rollbacks={result_row['total_rollbacks']}"
+                f"elapsed={run_elapsed:.1f}s"
             )
     return all_rows, per_n_timing_rows
 
@@ -666,8 +642,6 @@ def _run_online_phase(
     realtime_slots: bool = DEFAULT_REALTIME_SLOTS,
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
-    rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
-    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run `online_strategies` once, independent of the DP phase (`batch_sizes`
@@ -685,8 +659,6 @@ def _run_online_phase(
         realtime_slots=realtime_slots,
         realtime_speed_scale=realtime_speed_scale,
         max_batch_solver_parallelism=max_batch_solver_parallelism,
-        rollback_max_consecutive=rollback_max_consecutive,
-        online_swarm_mode=online_swarm_mode,
         baseline_total_carbon_cost=baseline_cost,
         flavours=flavours,
     )
@@ -697,18 +669,16 @@ def _run_online_phase(
         if not summary_csv.exists():
             print(f"    WARNING: {summary_csv} not found; skipping online strategy={strategy}")
             continue
-        mode_label = f"online_{strategy}"
+        strategy_label = f"online_{strategy}"
         with open(summary_csv, newline="") as f:
             rows_csv = list(csv.DictReader(f))
         for row in rows_csv:
             n = int(row["batch_size"])
-            per_ts_csv = online_dir / f"online_{strategy}" / f"N{n}" / "per_timeslot.csv"
-            avg_slot_err = _avg_slot_error_from_csv(per_ts_csv)
-            result_row = _make_result_row(scenario_id, n, mode_label, row, baseline_cost, avg_slot_err)
+            result_row = _make_result_row(scenario_id, n, strategy_label, row, baseline_cost)
             all_rows.append(result_row)
             run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
             per_n_timing_rows.append({
-                "scenario_id": scenario_id, "mode": mode_label, "batch_size": n,
+                "scenario_id": scenario_id, "strategy": strategy_label, "batch_size": n,
                 "elapsed_seconds": round(run_elapsed, 3),
             })
             print(
@@ -732,12 +702,9 @@ def _run_offline_phase(
     realtime_slots: bool = DEFAULT_REALTIME_SLOTS,
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
-    rollback_max_consecutive: int = DEFAULT_ROLLBACK_MAX_CONSECUTIVE,
-    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Run `additional_strategies` once per scenario — no batch-size,
-    rollback, or DP-mode dependency. Caller ensures the list is non-empty."""
+    """Run `additional_strategies` once per scenario, independently of DP batches."""
     all_rows: List[Dict[str, Any]] = []
     per_n_timing_rows: List[Dict[str, Any]] = []
 
@@ -749,8 +716,6 @@ def _run_offline_phase(
         realtime_slots=realtime_slots,
         realtime_speed_scale=realtime_speed_scale,
         max_batch_solver_parallelism=max_batch_solver_parallelism,
-        rollback_max_consecutive=rollback_max_consecutive,
-        online_swarm_mode=online_swarm_mode,
         baseline_total_carbon_cost=baseline_cost,
         flavours=flavours,
     )
@@ -760,26 +725,24 @@ def _run_offline_phase(
         output_strategy_name = strategy.removeprefix("offline_")
         strategy_dir = strat_dir / f"strategy_{output_strategy_name}"
         summary_csv = strategy_dir / "summary.csv"
-        per_ts_csv = strategy_dir / "per_timeslot.csv"
         if not summary_csv.exists():
             print(f"    WARNING: {summary_csv} not found; skipping strategy={strategy}")
             continue
-        mode_label = (
+        strategy_label = (
             strategy if strategy.startswith("offline_") else f"offline_{strategy}"
         )
-        avg_slot_err = _avg_slot_error_from_csv(per_ts_csv)
         with open(summary_csv, newline="") as f:
             rows_csv = list(csv.DictReader(f))
         for row in rows_csv:
-            result_row = _make_result_row(scenario_id, 0, mode_label, row, baseline_cost, avg_slot_err)
+            result_row = _make_result_row(scenario_id, 0, strategy_label, row, baseline_cost)
             all_rows.append(result_row)
             run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
             per_n_timing_rows.append({
-                "scenario_id": scenario_id, "mode": mode_label, "batch_size": 0,
+                "scenario_id": scenario_id, "strategy": strategy_label, "batch_size": 0,
                 "elapsed_seconds": round(run_elapsed, 3),
             })
             print(
-                f"    [rust/{mode_label}]: "
+                f"    [rust/{strategy_label}]: "
                 f"carbon={result_row['carbon_cost']:.3f}, "
                 f"error={result_row['final_global_error']:.3f}, "
                 f"saving={result_row['carbon_saving']:.1f}%, "
@@ -797,28 +760,19 @@ def _format_run_folder_name(
     realtime_slots: bool,
     realtime_speed_scale: float,
     alt_strategies_enabled: bool,
-    online_swarm_mode: str,
-    rollback_max_consecutive: int,
 ) -> str:
     """Build the per-run results subfolder name.
 
-    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_roll<X>_<realtime_scale>_<altstratT|F>_<S|M>
+    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_<realtime_scale>_<altstratT|F>
     - realtime_scale is "0" when realtime_slots is disabled, otherwise the
       configured speed scale with its decimal point stripped (0.5 -> "05").
-    - rollX preserves the configured legacy rollback_max_consecutive value.
     - altstrat is "T" if any online/additional alternative strategy is enabled.
-    - the trailing token is "S" for online_swarm_mode="serialized" or "M" for
-      "merge" (the battery runner's default) — see Config::swarm.mode.
     """
     mmdd = start_dt.strftime("%m%d")
     hhmm = start_dt.strftime("%H%M")
     scale_token = str(realtime_speed_scale).replace(".", "") if realtime_slots else "0"
     altstrat_token = "T" if alt_strategies_enabled else "F"
-    swarm_mode_token = "M" if online_swarm_mode == "merge" else "S"
-    return (
-        f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_roll{rollback_max_consecutive}_"
-        f"{scale_token}_{altstrat_token}_{swarm_mode_token}"
-    )
+    return f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_{scale_token}_{altstrat_token}"
 
 
 # Rust scalar Config fields worth surfacing in the run README, mapped to a
@@ -879,7 +833,7 @@ def _parse_rust_config_defaults(config_rs_path: Path) -> Dict[str, str]:
 
 def _row_label(row: Dict[str, Any]) -> str:
     """Human-readable identifier for a results row: 'N=<n>' or an offline/online strategy name."""
-    mode = row["infeasibility_mode"]
+    mode = row["strategy"]
     if mode.startswith("offline_singleton_"):
         return mode
     if mode.startswith("offline_"):
@@ -903,7 +857,7 @@ def _top3_markdown_table(
         "|---|---|---|---|---|",
     ]
     for r in top3:
-        key = (scenario_id, r["infeasibility_mode"], r["batch_size"])
+        key = (scenario_id, r["strategy"], r["batch_size"])
         elapsed = elapsed_lookup.get(key)
         elapsed_str = f"{elapsed:.1f}" if elapsed is not None else "n/a"
         lines.append(
@@ -919,7 +873,7 @@ def _build_top3_section(
     """Per-scenario TOP-3 (lowest carbon cost) tables for relaxed-retry, online and
     offline alternative-strategy executions."""
     elapsed_lookup: Dict[tuple, float] = {
-        (r["scenario_id"], r["mode"], r["batch_size"]): r["elapsed_seconds"]
+        (r["scenario_id"], r["strategy"], r["batch_size"]): r["elapsed_seconds"]
         for r in per_n_timing_rows
     }
     scenario_ids = sorted({r["scenario_id"] for r in all_rows})
@@ -936,7 +890,7 @@ def _build_top3_section(
         sections.append(f"### {sid}\n")
         rows_for_scenario = [r for r in all_rows if r["scenario_id"] == sid]
         for title, predicate in categories:
-            matched = [r for r in rows_for_scenario if predicate(r["infeasibility_mode"])]
+            matched = [r for r in rows_for_scenario if predicate(r["strategy"])]
             sections.append(f"**{title}**\n")
             sections.append(_top3_markdown_table(matched, elapsed_lookup, sid))
     return "\n".join(sections)
@@ -949,7 +903,6 @@ def _write_run_readme(
     max_batch_solver_parallelism: int,
     realtime_slots: bool,
     realtime_speed_scale: float,
-    rollback_max_consecutive: int,
     alt_strategies_enabled: bool,
     batch_sizes: List[int],
     additional_strategies: List[str],
@@ -959,7 +912,6 @@ def _write_run_readme(
     all_rows: List[Dict[str, Any]],
     per_n_timing_rows: List[Dict[str, Any]],
     battery_elapsed: float,
-    online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     trim_future_assignments: bool = False,
 ) -> None:
     rust_defaults = _parse_rust_config_defaults(RUST_CONFIG_RS)
@@ -986,7 +938,7 @@ def _write_run_readme(
             if trim_future_assignments
             else "- Future-slot trimming: disabled (scenario planning horizon unchanged)."
         ),
-        "- `requests_in` is the input request count; `requests_out` is the count assigned "
+        "- `reqs_in` is the input request count; `reqs_out` is the count assigned "
         "within the original horizon.",
         f"- Max batch solver parallelism (max concurrent DP workers): {max_batch_solver_parallelism}",
         (
@@ -995,11 +947,6 @@ def _write_run_readme(
             "- Realtime slot pacing: disabled (slots advance instantly)"
         ),
         f"- Alternative strategies enabled: {'yes' if alt_strategies_enabled else 'no'}",
-        (
-            f"- Online swarm concurrency mode: {online_swarm_mode} "
-            f"({'S' if online_swarm_mode != 'merge' else 'M'} token in folder name; "
-            "see Config::online_swarm_mode in rust/src/engine/config.rs)"
-        ),
         "",
         "## Other key runtime parameters",
         "",
@@ -1011,9 +958,6 @@ def _write_run_readme(
         f"- DP pruning min batch size: {rust_defaults.get('dp_pruning_min_batch_size', '?')}",
         f"- Max error threshold: {rust_defaults.get('max_error_threshold', '?')}%",
         f"- DP solver timeout: {rust_defaults.get('dp_timeout', '?')}s",
-        f"- Legacy rollback max consecutive: {rollback_max_consecutive} "
-        "(retained for config compatibility; proposal commits are materialized "
-        "against live occupancy and are not rolled back or re-solved)",
         "",
         "## Enabled phases",
         "",
@@ -1066,10 +1010,6 @@ def run_battery(config_path: Path) -> None:
     )
     realtime_slots = bool(cfg.get("realtime_slots", DEFAULT_REALTIME_SLOTS))
     realtime_speed_scale = float(cfg.get("realtime_speed_scale", DEFAULT_REALTIME_SPEED_SCALE))
-    rollback_max_consecutive = int(
-        cfg.get("rollback_max_consecutive", DEFAULT_ROLLBACK_MAX_CONSECUTIVE)
-    )
-    online_swarm_mode = str(cfg.get("online_swarm_mode", DEFAULT_ONLINE_SWARM_MODE))
     trim_future_assignments = bool(cfg.get("trim_future_assignments", False))
     alt_strategies_enabled = run_online or run_offline
 
@@ -1081,10 +1021,10 @@ def run_battery(config_path: Path) -> None:
     run_folder_name = _format_run_folder_name(
         battery_id, start_dt, max_batch_solver_parallelism,
         realtime_slots, realtime_speed_scale, alt_strategies_enabled,
-        online_swarm_mode, rollback_max_consecutive,
     )
     output_dir = base_output_dir / run_folder_name
     output_dir.mkdir(parents=True, exist_ok=True)
+    _write_output_schema_manifest(output_dir, "carbonshift.battery-run")
 
     # Snapshot the exact battery config and Rust config used for this run.
     shutil.copy2(config_path, output_dir / config_path.name)
@@ -1158,8 +1098,6 @@ def run_battery(config_path: Path) -> None:
             realtime_slots=realtime_slots,
             realtime_speed_scale=realtime_speed_scale,
             max_batch_solver_parallelism=max_batch_solver_parallelism,
-            rollback_max_consecutive=rollback_max_consecutive,
-            online_swarm_mode=online_swarm_mode,
             flavours=flavours,
         )
 
@@ -1170,8 +1108,6 @@ def run_battery(config_path: Path) -> None:
                 realtime_slots=realtime_slots,
                 realtime_speed_scale=realtime_speed_scale,
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
-                rollback_max_consecutive=rollback_max_consecutive,
-                online_swarm_mode=online_swarm_mode,
                 flavours=flavours,
             )
             all_rows.extend(rows)
@@ -1185,8 +1121,6 @@ def run_battery(config_path: Path) -> None:
                 realtime_slots=realtime_slots,
                 realtime_speed_scale=realtime_speed_scale,
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
-                rollback_max_consecutive=rollback_max_consecutive,
-                online_swarm_mode=online_swarm_mode,
                 flavours=flavours,
             )
             all_rows.extend(rows)
@@ -1199,8 +1133,6 @@ def run_battery(config_path: Path) -> None:
                 realtime_slots=realtime_slots,
                 realtime_speed_scale=realtime_speed_scale,
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
-                rollback_max_consecutive=rollback_max_consecutive,
-                online_swarm_mode=online_swarm_mode,
                 flavours=flavours,
             )
             all_rows.extend(rows)
@@ -1242,7 +1174,6 @@ def run_battery(config_path: Path) -> None:
         max_batch_solver_parallelism,
         realtime_slots,
         realtime_speed_scale,
-        rollback_max_consecutive,
         alt_strategies_enabled,
         batch_sizes,
         additional_strategies,
@@ -1252,7 +1183,6 @@ def run_battery(config_path: Path) -> None:
         all_rows,
         per_n_timing_rows,
         battery_elapsed,
-        online_swarm_mode,
         trim_future_assignments,
     )
 

@@ -163,10 +163,14 @@ pub async fn register_qos_profile(
 
     // The registry treats profiles as immutable snapshots. An identical
     // retry is idempotent, while a caller must choose a new ID to change policy.
-    match state.qos_profiles.register(profile) {
-        Ok(ProfileRegistration::Created | ProfileRegistration::AlreadyRegistered) => {
+    match state.qos_profiles.register(profile.clone()) {
+        Ok(ProfileRegistration::Created) => {
+            if let Some(logger) = &state.profile_metrics_logger {
+                logger.log_qos_profile(&profile);
+            }
             Ok(StatusCode::NO_CONTENT)
         }
+        Ok(ProfileRegistration::AlreadyRegistered) => Ok(StatusCode::NO_CONTENT),
         Err(ProfileRegistryError::Invalid(error)) => Err(api_error(StatusCode::BAD_REQUEST, error)),
         Err(ProfileRegistryError::Conflict(profile_id)) => Err(api_error(
             StatusCode::CONFLICT,

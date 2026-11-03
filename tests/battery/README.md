@@ -29,10 +29,9 @@ prices using current slot occupancy, but does not revalidate the profile's
 error threshold against concurrent commits; a burst can temporarily or
 permanently exceed it.
 
-Bandit and ant-colony online batches can use the worker cap only with the
-`merge` swarm backend. The battery runner selects `merge` by default; choosing
-`serialized` intentionally limits those strategies to one worker. The live
-service uses the default one-worker-per-profile scheduling policy.
+Bandit and ant-colony online batches use additive state merging, so they can
+use the configured worker cap without a separate concurrency-mode setting.
+The live service uses the default one-worker-per-profile scheduling policy.
 
 Offline whole-scenario strategies run synchronously and do not use this worker
 pool or the REST service. `avg_concurrent_workers` is time-weighted over
@@ -55,8 +54,8 @@ carbon cost, error, and carbon saving, from retained assignments. The baseline
 carbon cost is restricted to the same retained request IDs. Solver runtime and
 other execution-level measurements still describe the full extended run.
 
-`requests_in` is the number of requests generated for the scenario;
-`requests_out` is the run-specific number assigned within the original
+`reqs_in` is the number of requests generated for the scenario;
+`reqs_out` is the run-specific number assigned within the original
 horizon. These values can differ across strategy runs. Leaving
 `trim_future_assignments` absent or `false` preserves the existing behavior.
 
