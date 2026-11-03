@@ -76,21 +76,16 @@ class PhaseGrid:
 
 # ─── phase content (which strategies/batch sizes each phase exercises) ────────
 DP_CONTENT: Dict[str, Any] = {
-    # "batch_sizes": [1, 4, 6, 8, 10, 12, 16, 22],
-    # "infeasibility_modes": ["min_error_greedy", "carryover", "forecast"],
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
     # "batch_sizes": [8,10,22],
     # "batch_sizes": [1,4,6,8,22],
     "batch_sizes": [4,],
-    # "infeasibility_modes": ["min_error_greedy", "carryover"],
-    "infeasibility_modes": ["carryover"],
     "online_strategies": [],
     "additional_strategies": [],
 }
 
 SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
-    "infeasibility_modes": [],
     "online_strategies": ["bandit", "ant_colony"],
     "online_batch_sizes": [8,96,256,1024],
     "additional_strategies": [],
@@ -98,25 +93,18 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
 
 PER_REQUEST_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
-    "infeasibility_modes": [],
-    "online_strategies": [
-        "singleton_best",
-        "random_flavour",
-        "random_slot",
-        "random_full",
-    ],
+    "online_strategies": ["singleton_best", "hazard"],
     # The online runner forces N=1 for these request-level policies.
     "additional_strategies": [],
 }
 
 OFFLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
-    "infeasibility_modes": [],
     "online_strategies": [],
     "additional_strategies": [
         "offline_singleton_best",
         "offline_singleton_best_accurate",
-        "random",
+        "hazard",
         "bandit",
         "ant_colony",
     ],

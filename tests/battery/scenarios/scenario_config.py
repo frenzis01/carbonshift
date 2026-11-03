@@ -27,7 +27,7 @@ INPUT_PATTERN: str = "sinusoidal"
 # Target average requests per slot. Sinusoidal scenarios distribute this
 # average across the day/night cycle; flat scenarios keep it nearly constant.
 PREDICTED_REQUESTS_PER_SLOT: float = 60.0
-# Gaussian noise factor for sinusoidal slot counts and synthetic prehistory:
+# Gaussian noise factor for sinusoidal slot counts:
 # sigma = max(1, mean_rate_for_slot * REQUEST_RATE_STD_FACTOR).
 # Flat slot counts use their own small jitter factor in scenario_io.
 REQUEST_RATE_STD_FACTOR: float = 0.25
@@ -35,14 +35,11 @@ DEADLINE_MIN_SLACK: int = 0
 # Keep generated request deadlines within the simulation's 14-slot forward horizon.
 DEADLINE_MAX_SLACK: int = 14
 
-# ── error budget / prehistory ────────────────────────────────────────────────
+# ── error budget ─────────────────────────────────────────────────────────────
 MAX_ERROR_THRESHOLD: float = 4.0
 ERROR_WINDOW_PAST: int = 12
 ERROR_WINDOW_FUTURE: int = 14
 ERROR_WINDOW_PAST_DECAY_SLOTS: int = 0
-PREHISTORY_USE_VIRTUAL_PAST: bool = False
-PREHISTORY_ERROR_RATIO_OF_THRESHOLD: float = 1.0
-PREHISTORY_MOCK_INFLUENCE: float = 0.4
 
 # ── carbon intensity daylight wave ───────────────────────────────────────────
 # Period (slots) of the sinusoidal carbon-intensity wave. 24 == one daily cycle

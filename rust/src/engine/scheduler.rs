@@ -1,4 +1,4 @@
-/// Batch scheduler — orchestrates the DP-based carbon-aware scheduling.
+/// Batch scheduler — orchestrates carbon-aware scheduling through solver runtimes.
 ///
 /// Mirrors `scheduler.py::BatchScheduler`.
 ///
@@ -6,8 +6,8 @@
 /// A single background thread (the "main loop") polls the pending queue and
 /// dispatches short-lived worker threads (one per batch).  All mutable
 /// scheduler state is protected by `Arc<Mutex<SchedulerMutableState>>`.
-/// The `DpSolver` is created fresh per worker so there is no shared mutable
-/// solver state across concurrent batches.
+/// Each QoS profile has a cached runtime. Runtime state and worker counters use
+/// separate locks, and solver work runs without holding the scheduler lock.
 use std::collections::{HashMap, HashSet};
 use std::io::Write as IoWrite;
 use std::sync::{
@@ -22,28 +22,21 @@ use std::sync::RwLock;
 use crate::config::Config;
 use crate::engine::qos::QosProfileId;
 use crate::engine::solver::{
-    CommitReport, SolverError, SolverRegistry, SolverRuntime, SolverScope,
+    CommitReport, PlacementOrigin, SolverError, SolverRegistry, SolverRuntime, SolverScope,
 };
 use crate::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use crate::metrics_logger::MetricsLogger;
 use crate::shared_state::{ClaimedRequestBatch, SharedState, SolverSnapshot};
 use crate::types::{Assignment, Request};
 
+mod error_history;
 mod forecast;
-mod recovery;
-mod solve;
+mod input;
 #[cfg(test)]
 mod tests;
 
 pub use forecast::{advance_to_next_slot, generate_carbon_intensity_forecast};
-#[cfg(test)]
-use recovery::RecoveryState;
-pub use solve::SolveContext;
-use solve::build_solve_input_from_snapshot;
-#[cfg(test)]
-use solve::get_effective_pruning_mode;
-#[cfg(test)]
-use solve::{BatchSolveContext, select_batch_solver};
+use input::build_solve_input_from_snapshot;
 
 // ─── internal state types ────────────────────────────────────────────────────
 
@@ -976,8 +969,6 @@ fn batch_worker_entry(
         &pending,
         &snapshot,
         &assignment,
-        &cfg.simulation,
-        &cfg.infeasibility,
         carbon_forecast,
     ) {
         Ok(input) => input,
@@ -1022,6 +1013,13 @@ fn batch_worker_entry(
     };
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let fallback_request_ids: HashSet<u64> = pending_proposal
+        .proposal
+        .placements
+        .iter()
+        .filter(|placement| placement.origin == PlacementOrigin::GreedyFallback)
+        .map(|placement| placement.req_id)
+        .collect();
 
     // -------- STEP 2 : Price proposal and commit it to shared state
     // This is the assignment commit. It validates placements and prices them
@@ -1117,7 +1115,7 @@ fn batch_worker_entry(
         // assignments.  The old code fetched get_current_assignments() here
         // (all-time O(N) entries) and iterated every batch, producing
         // O(N²) total rows and memory pressure.
-        let assignment_rows = build_assignment_rows(&committed, slot);
+        let assignment_rows = build_assignment_rows(&committed, slot, &fallback_request_ids);
         let real_avg = shared_state
             .get_profile_window_error_stats(
                 &profile_id,
@@ -1135,6 +1133,10 @@ fn batch_worker_entry(
         run_row.insert("solver_status".into(), status.to_owned());
         run_row.insert("solver_mode".into(), solver_mode);
         run_row.insert("qos_profile_id".into(), profile_id.to_string());
+        run_row.insert(
+            "greedy_fallback_assignments".into(),
+            fallback_request_ids.len().to_string(),
+        );
         run_row.insert("solver_elapsed_ms".into(), elapsed_ms.to_string());
         run_row.insert("total_carbon_cost".into(), total_cost.to_string());
         run_row.insert(
@@ -1164,6 +1166,7 @@ fn batch_worker_entry(
 fn build_assignment_rows(
     assignments: &[Assignment],
     current_slot: i32,
+    fallback_request_ids: &HashSet<u64>,
 ) -> Vec<HashMap<String, String>> {
     let mut rows = Vec::with_capacity(assignments.len());
     let mut sorted = assignments.to_vec();
@@ -1175,6 +1178,10 @@ fn build_assignment_rows(
         row.insert("qos_profile_id".into(), a.qos_profile_id.to_string());
         row.insert("scheduled_slot".into(), a.scheduled_slot.to_string());
         row.insert("flavour_name".into(), a.flavour_name.clone());
+        row.insert(
+            "assigned_with_greedy_fallback".into(),
+            fallback_request_ids.contains(&a.request_id).to_string(),
+        );
         row.insert(
             "flavour_duration_sec".into(),
             a.flavour_duration.to_string(),

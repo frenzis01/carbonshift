@@ -23,6 +23,7 @@ pub(super) struct AssignmentRow {
     pub(super) request_id: u64,
     pub(super) current_slot: i32,
     pub(super) is_new_assignment_in_run: bool,
+    pub(super) assigned_with_greedy_fallback: bool,
     pub(super) scheduled_slot: i32,
     pub(super) flavour_name: String,
     pub(super) error: f64,
@@ -182,6 +183,7 @@ pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
     let i_rid = idx("request_id");
     let i_slot = idx("current_slot");
     let i_is_new = idx("is_new_assignment_in_run");
+    let i_fallback = idx("assigned_with_greedy_fallback");
     let i_sched = idx("scheduled_slot");
     let i_flav = idx("flavour_name");
     let i_err = idx("error");
@@ -201,11 +203,18 @@ pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
                 value == "true" || value == "1"
             })
             .unwrap_or(true);
+        let assigned_with_greedy_fallback = i_fallback
+            .map(|index| {
+                let value = g(Some(index)).to_lowercase();
+                value == "true" || value == "1"
+            })
+            .unwrap_or(false);
         rows.push(AssignmentRow {
             run_id: g(i_run_id),
             request_id: gi(i_rid) as u64,
             current_slot: gi(i_slot) as i32,
             is_new_assignment_in_run: is_new,
+            assigned_with_greedy_fallback,
             scheduled_slot: gi(i_sched) as i32,
             flavour_name: g(i_flav),
             error: gf(i_err),
@@ -233,7 +242,8 @@ pub(super) fn compute_per_request(
             let solver_status = run.map(|r| r.solver_status.clone()).unwrap_or_default();
             let solver_mode = run.map(|r| r.solver_mode.clone()).unwrap_or_default();
             let assigned_with_relaxed = solver_mode.contains("relaxed");
-            let assigned_with_greedy = solver_mode.contains("greedy_after_infeasible");
+            let assigned_with_greedy =
+                a.assigned_with_greedy_fallback || solver_mode.contains("greedy_after_infeasible");
             let assigned_with_injection = run
                 .map(|r| r.mock_recovery_injected_count > 0)
                 .unwrap_or(false);

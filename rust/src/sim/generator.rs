@@ -32,7 +32,7 @@ pub struct RequestGeneratorConfig {
     deadline_max_slack: i32,
     skip_empty_slots: bool,
     realtime_chunk_size: usize,
-    prehistory_random_seed: u64,
+    request_generation_seed: u64,
     verbose: bool,
 }
 
@@ -48,7 +48,7 @@ impl RequestGeneratorConfig {
             deadline_max_slack: config.simulation.deadline_max_slack,
             skip_empty_slots: config.simulation.skip_empty_slots,
             realtime_chunk_size: config.simulation.generator_realtime_chunk_size,
-            prehistory_random_seed: config.infeasibility.prehistory_random_seed,
+            request_generation_seed: config.simulation.request_generation_seed,
             verbose: config.logging.verbose,
         }
     }
@@ -154,7 +154,7 @@ fn generator_loop(
     let rate = cfg.requests_per_slot;
     let sigma = (rate * cfg.request_rate_std_factor).max(1.0);
     let dist = Normal::new(rate, sigma).expect("valid Normal distribution");
-    let base_seed = cfg.prehistory_random_seed;
+    let base_seed = cfg.request_generation_seed;
 
     let mut last_slot: i32 = -1;
     // True realtime pacing only makes sense when the virtual clock actually
@@ -303,7 +303,7 @@ mod tests {
         config.simulation.deadline_max_slack = 4;
         config.simulation.skip_empty_slots = false;
         config.simulation.generator_realtime_chunk_size = 3;
-        config.infeasibility.prehistory_random_seed = 901;
+        config.simulation.request_generation_seed = 901;
         config.logging.verbose = false;
 
         let generator_config = RequestGeneratorConfig::from_config(&config);
@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(generator_config.deadline_max_slack, 4);
         assert!(!generator_config.skip_empty_slots);
         assert_eq!(generator_config.realtime_chunk_size, 3);
-        assert_eq!(generator_config.prehistory_random_seed, 901);
+        assert_eq!(generator_config.request_generation_seed, 901);
         assert!(!generator_config.verbose);
 
         let counter = Arc::new(AtomicU64::new(0));

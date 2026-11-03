@@ -29,16 +29,9 @@ pub struct ScenarioMetadata {
     pub error_window_past: i32,
     pub error_window_future: i32,
     pub error_window_past_decay_slots: i32,
-    /// Maps to `Config::prehistory_use_virtual_past`.
-    pub prehistory_enabled: bool,
-    /// Maps to `Config::prehistory_error_ratio_of_threshold` and
-    /// `Config::forecast_error_ratio_of_threshold`.
-    pub prehistory_error_ratio: f64,
-    /// Maps to `Config::prehistory_mock_influence`.
-    pub prehistory_mock_influence: f64,
     pub carbon_intensity_cycle_slots: i32,
     pub carbon_random_noise_amplitude: f64,
-    /// RNG seed used during generation — stored in `Config::prehistory_random_seed`.
+    /// RNG seed used for deterministic scenario-derived runtime behavior.
     pub seed: u64,
     /// Capacity tiers recorded at generation time.  When present, these
     /// override the runtime config so that benchmark replays use exactly the

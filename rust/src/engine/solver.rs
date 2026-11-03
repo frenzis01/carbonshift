@@ -69,7 +69,17 @@ pub struct SolverScope {
     pub total_slots: usize,
 }
 
-//  A proposed request-to-slot-and-flavour decision; it has no final price yet
+/// Identifies how an engine produced a placement for analysis and reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlacementOrigin {
+    /// The engine's primary scheduling policy selected the placement.
+    #[default]
+    Solver,
+    /// The primary DP could not place the request, so the coverage fallback did.
+    GreedyFallback,
+}
+
+/// A proposed request-to-slot-and-flavour decision; it has no final price yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedPlacement {
     pub req_id: u64,
@@ -77,16 +87,19 @@ pub struct ProposedPlacement {
     pub flavour_name: String,
     /// True when the solver had to place this request after its deadline.
     pub late: bool,
+    /// Provenance kept with the decision so runners can report fallback use.
+    pub origin: PlacementOrigin,
 }
 
 impl ProposedPlacement {
-    /// Build an on-time placement without requiring callers to set `late`.
+    /// Build a placement selected by the engine's primary policy.
     pub fn new(req_id: u64, scheduled_slot: i32, flavour_name: String) -> Self {
         Self {
             req_id,
             scheduled_slot,
             flavour_name,
             late: false,
+            origin: PlacementOrigin::Solver,
         }
     }
 
@@ -97,6 +110,18 @@ impl ProposedPlacement {
             scheduled_slot,
             flavour_name,
             late: true,
+            origin: PlacementOrigin::Solver,
+        }
+    }
+
+    /// Build a placement made by the DP coverage fallback.
+    pub fn greedy_fallback(req_id: u64, scheduled_slot: i32, flavour_name: String) -> Self {
+        Self {
+            req_id,
+            scheduled_slot,
+            flavour_name,
+            late: false,
+            origin: PlacementOrigin::GreedyFallback,
         }
     }
 }

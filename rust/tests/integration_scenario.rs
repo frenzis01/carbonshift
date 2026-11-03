@@ -1,9 +1,7 @@
 use carbonshift_rs::config::{
-    AssignmentPolicy, Config, InfeasibilityConfig, LoggingConfig, SimulationConfig, SolverConfig,
+    AssignmentPolicy, Config, LoggingConfig, SimulationConfig, SolverConfig,
 };
-use carbonshift_rs::dp_solver::{
-    DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput, SolveRequest,
-};
+use carbonshift_rs::dp_solver::{DpSolver, ErrorWindowBaseline, SolveBatchInput, SolveRequest};
 use carbonshift_rs::shared_state::SharedState;
 use carbonshift_rs::types::{Assignment, Request};
 /// Integration test: full slot-by-slot scheduling of the canonical scenario.
@@ -67,11 +65,6 @@ fn config_from_meta(meta: &ScenarioMeta) -> Config {
             deadline_max_slack: meta.deadline_max_slack,
             predicted_requests_per_slot: meta.requests_per_slot,
             ..SimulationConfig::default()
-        },
-        infeasibility: InfeasibilityConfig {
-            recovery_mode: "min_error_greedy".to_string(),
-            mock_influence: 0.0,
-            ..InfeasibilityConfig::default()
         },
         logging: LoggingConfig {
             verbose: false,
@@ -154,7 +147,6 @@ fn drain_pending_with_dp(
             error_window_past: assignment.error_window_past,
             error_window_future: assignment.error_window_future,
             forecast_max_slot: Some(window_end),
-            dynamic_mock_pool: MockPool::default(),
         };
 
         let dp_result = solver.solve_batch(input);

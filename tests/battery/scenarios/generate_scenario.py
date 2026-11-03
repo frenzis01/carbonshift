@@ -35,21 +35,14 @@ def generate_and_save_scenario(
     error_window_past: int,
     error_window_future: int,
     max_error_threshold: float,
-    prehistory_error_ratio: float,
     carbon_random_noise_amplitude: float = 40.0,
-    prehistory_mock_influence: Optional[float] = None,
     error_window_past_decay_slots: Optional[int] = None,
-    include_prehistory: Optional[bool] = None,
     carbon_intensity_cycle_slots: Optional[int] = None,
     capacity_tiers: Optional[list] = None,
     input_pattern: str = cfg.INPUT_PATTERN,
 ) -> Dict[str, Any]:
-    if prehistory_mock_influence is None:
-        prehistory_mock_influence = float(cfg.PREHISTORY_MOCK_INFLUENCE)
     if error_window_past_decay_slots is None:
         error_window_past_decay_slots = int(cfg.ERROR_WINDOW_PAST_DECAY_SLOTS)
-    if include_prehistory is None:
-        include_prehistory = bool(cfg.PREHISTORY_USE_VIRTUAL_PAST)
     if carbon_intensity_cycle_slots is None:
         carbon_intensity_cycle_slots = int(cfg.CARBON_INTENSITY_CYCLE_SLOTS)
     if capacity_tiers is None:
@@ -66,10 +59,7 @@ def generate_and_save_scenario(
         error_window_future=error_window_future,
         error_window_past_decay_slots=error_window_past_decay_slots,
         max_error_threshold=max_error_threshold,
-        prehistory_error_ratio=prehistory_error_ratio,
         carbon_random_noise_amplitude=carbon_random_noise_amplitude,
-        prehistory_mock_influence=prehistory_mock_influence,
-        include_prehistory=bool(include_prehistory),
         carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
         capacity_tiers=capacity_tiers,
         carbon_night_max=float(cfg.CARBON_NIGHT_MAX),
@@ -119,28 +109,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-error-threshold", type=float, default=float(cfg.MAX_ERROR_THRESHOLD))
     parser.add_argument(
-        "--prehistory-error-ratio",
-        type=float,
-        default=float(cfg.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
-    )
-    parser.add_argument(
         "--carbon-random-noise-amplitude",
         type=float,
         default=float(cfg.CARBON_RANDOM_NOISE_AMPLITUDE),
         help="Recorded in scenario metadata only; currently unused by the forecast generator "
              "(see scenario_config.CARBON_RANDOM_NOISE_AMPLITUDE docstring).",
-    )
-    parser.add_argument(
-        "--include-prehistory",
-        action=argparse.BooleanOptionalAction,
-        default=bool(cfg.PREHISTORY_USE_VIRTUAL_PAST),
-        help="Include synthetic prehistory slots (use --no-include-prehistory to disable).",
-    )
-    parser.add_argument(
-        "--prehistory-mock-influence",
-        type=float,
-        default=float(cfg.PREHISTORY_MOCK_INFLUENCE),
-        help="Scale factor [0..1] applied to synthetic prehistory request counts.",
     )
     parser.add_argument(
         "--carbon-intensity-cycle-slots",
@@ -174,10 +147,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Error Window Future (slots):       {args.error_window_future}")
     print(f"  Error Window Past Decay Slots:     {args.error_window_past_decay_slots}")
     print(f"  Max Error Threshold (%):           {args.max_error_threshold}")
-    print(f"  Prehistory Error Ratio:            {args.prehistory_error_ratio}")
-    print(f"  Include Prehistory:                {args.include_prehistory}")
     print(f"  Carbon Random Noise Amplitude:     {args.carbon_random_noise_amplitude}")
-    print(f"  Prehistory Mock Influence:         {args.prehistory_mock_influence}")
     print(f"  Carbon Intensity Cycle Slots:      {args.carbon_intensity_cycle_slots}")
     print(f"  Output Path:                       {args.output}")
     print("=" * 70)
@@ -196,10 +166,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         error_window_future=args.error_window_future,
         error_window_past_decay_slots=args.error_window_past_decay_slots,
         max_error_threshold=args.max_error_threshold,
-        prehistory_error_ratio=args.prehistory_error_ratio,
         carbon_random_noise_amplitude=args.carbon_random_noise_amplitude,
-        prehistory_mock_influence=args.prehistory_mock_influence,
-        include_prehistory=args.include_prehistory,
         carbon_intensity_cycle_slots=args.carbon_intensity_cycle_slots,
     )
 

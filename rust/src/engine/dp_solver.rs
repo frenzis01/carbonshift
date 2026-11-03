@@ -37,7 +37,6 @@ use crate::types::{CapacityTier, Flavour, RequestAssignment, get_capacity_multip
 /// All fields together uniquely identify the "progress" made so far:
 /// - `error_sum_bp`     total error in window, multiplied by 100 (integer arith.)
 /// - `error_count`      number of requests counted in that sum (×1000 for int)
-/// - `mock_remaining`   synthetic baseline requests not yet consumed
 /// - `inc_counts`       per-slot request count delta introduced by this batch
 ///
 /// `error_count` is stored as `(f64 * 1000) as i64` to avoid f64 in HashMap
@@ -50,7 +49,6 @@ use crate::types::{CapacityTier, Flavour, RequestAssignment, get_capacity_multip
 struct DpStateKey {
     error_sum_bp: i64,
     error_count_milli: i64, // error_count × 1000, rounded
-    mock_remaining: i32,
     inc_counts: Vec<i64>,
 }
 
@@ -58,11 +56,10 @@ impl DpStateKey {
     /// Build a hashable description of the solver's accumulated error and
     /// per-slot load. Floating-point request counts are quantized because
     /// `HashMap` keys must support exact equality and hashing.
-    fn new(error_sum_bp: i64, error_count: f64, mock_remaining: i32, inc_counts: Vec<i64>) -> Self {
+    fn new(error_sum_bp: i64, error_count: f64, inc_counts: Vec<i64>) -> Self {
         Self {
             error_sum_bp,
             error_count_milli: (error_count * 1000.0).round() as i64,
-            mock_remaining,
             inc_counts,
         }
     }
@@ -98,8 +95,6 @@ pub struct SolveBatchInput<'a> {
     pub error_window_future: i32,
     /// Last absolute slot with forecast data available to this solve.
     pub forecast_max_slot: Option<i32>,
-    /// Optional synthetic mock pool for infeasibility recovery.
-    pub dynamic_mock_pool: MockPool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,16 +103,6 @@ pub struct ErrorWindowBaseline {
     pub error_sum: f64,
     /// Number of real or weighted requests represented by `error_sum`.
     pub request_count: f64,
-}
-
-/// Synthetic requests used only during infeasibility recovery. They model
-/// already-known history for the DP constraint; they are not scheduled jobs.
-#[derive(Debug, Clone, Default)]
-pub struct MockPool {
-    /// Maximum synthetic requests available to consume during this solve.
-    pub initial_count: i32,
-    /// Error contribution modeled for each synthetic request.
-    pub error_per_request: f64,
 }
 
 /// Stateless rolling-window optimizer. A worker constructs one solver for a
@@ -251,8 +236,6 @@ impl DpSolver {
         // deterministic; retain fractional request counts for decayed history.
         let initial_error_sum_bp = (input.error_window_baseline.error_sum * 100.0).round() as i64;
         let initial_error_count = input.error_window_baseline.request_count;
-        let initial_mock_count = input.dynamic_mock_pool.initial_count.max(0);
-        let mock_error_bp = (input.dynamic_mock_pool.error_per_request * 100.0).round() as i64;
 
         // ── warm start: sequential (request-by-request) solution ─────────
         // This is equivalent to calling solve_batch once per request and
@@ -265,8 +248,6 @@ impl DpSolver {
             &tiers,
             initial_error_sum_bp,
             initial_error_count,
-            initial_mock_count,
-            mock_error_bp,
             window_start,
             window_end,
         );
@@ -284,7 +265,7 @@ impl DpSolver {
         // falling through here fixes that without adding new logic.
 
         // `compute_sequential_solution` picks purely by minimum cost — it has
-        // no notion of `max_error_threshold` at all (unlike `solve_singleton_best`
+        // no notion of `max_error_threshold` at all (unlike `SingletonBestAlgorithm`
         // and `greedy_fallback`, which both skip/avoid infeasible candidates
         // and only fall back to the most-accurate flavour as a last resort).
         // So `warm_assignments` is *not* guaranteed to respect the constraint,
@@ -304,12 +285,7 @@ impl DpSolver {
 
         // Each map entry is one distinct feasibility/load state paired with
         // its cheapest path so far. The initial state contains no new work.
-        let init_key = DpStateKey::new(
-            initial_error_sum_bp,
-            initial_error_count,
-            initial_mock_count,
-            vec![0i64; t],
-        );
+        let init_key = DpStateKey::new(initial_error_sum_bp, initial_error_count, vec![0i64; t]);
         let mut dp_prev: HashMap<DpStateKey, (f64, Vec<RequestAssignment>)> = HashMap::new();
         dp_prev.insert(init_key, (0.0, vec![]));
 
@@ -345,30 +321,18 @@ impl DpSolver {
                         // toward carbon and capacity, but not this window.
                         let mut new_error_sum_bp = state_key.error_sum_bp;
                         let mut new_error_count = state_key.error_count();
-                        let mut new_mock_remaining = state_key.mock_remaining;
 
                         if slot >= window_start && slot <= window_end {
                             new_error_sum_bp += f_error_bp;
                             new_error_count += 1.0;
-
-                            // Optionally consume one synthetic mock request.
-                            if new_mock_remaining > 0 && mock_error_bp > 0 {
-                                new_error_sum_bp -= mock_error_bp;
-                                new_error_count = (new_error_count - 1.0).max(0.0);
-                                new_mock_remaining -= 1;
-                            }
                         }
 
                         let mut new_inc_counts = inc_counts.clone();
                         new_inc_counts[s] += 1;
 
                         let new_cost = prev_cost + delta_cost;
-                        let new_key = DpStateKey::new(
-                            new_error_sum_bp,
-                            new_error_count,
-                            new_mock_remaining,
-                            new_inc_counts,
-                        );
+                        let new_key =
+                            DpStateKey::new(new_error_sum_bp, new_error_count, new_inc_counts);
 
                         let assignment = RequestAssignment {
                             request_id: request.request_id,
@@ -525,13 +489,13 @@ impl DpSolver {
     ///                   after each processed request (`len = N+1`).
     /// Sequential (request-by-request) warm-start solution.
     ///
-    /// Unlike a pure cost-greedy scan, this mirrors `solve_singleton_best`'s
+    /// Unlike a pure cost-greedy scan, this mirrors `SingletonBestAlgorithm`'s
     /// feasibility rule: for each request, only cost-compare (flavour, slot)
     /// candidates that keep the running window-average error within
     /// `max_error_threshold` (checked a priori, before committing), and only
     /// if *no* candidate is feasible does it fall back to the most-accurate
     /// (min-error) flavour at its cheapest slot — the same "guaranteed to
-    /// schedule" last resort `greedy_fallback`/`solve_singleton_best` use.
+    /// schedule" last resort `greedy_fallback`/`SingletonBestAlgorithm` use.
     /// This makes the resulting `warm_assignments` a real, constraint-respecting
     /// solution whenever one is reachable via request-by-request placement, so
     /// callers that return it directly (DP dead-end, DP timeout) are safe by
@@ -549,19 +513,12 @@ impl DpSolver {
         tiers: &[CapacityTier],
         initial_error_sum_bp: i64,
         initial_error_count: f64,
-        initial_mock_count: i32,
-        mock_error_bp: i64,
         window_start: i32,
         window_end: i32,
     ) -> (Vec<RequestAssignment>, Vec<DpStateKey>) {
         let t = self.window_size as usize;
 
-        let mut key = DpStateKey::new(
-            initial_error_sum_bp,
-            initial_error_count,
-            initial_mock_count,
-            vec![0i64; t],
-        );
+        let mut key = DpStateKey::new(initial_error_sum_bp, initial_error_count, vec![0i64; t]);
         let mut keys = vec![key.clone()];
         let mut assignments = Vec::new();
 
@@ -572,11 +529,16 @@ impl DpSolver {
 
             // Most-accurate (min-error) flavour, and its cheapest slot — the
             // last-resort candidate if nothing keeps the window error within
-            // threshold (mirrors `solve_singleton_best`'s fallback).
+            // threshold (mirrors `SingletonBestAlgorithm`'s fallback).
             let candidate_flavours = &self.flavours;
             let min_error_flavour = candidate_flavours
                 .iter()
-                .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+                .min_by(|a, b| {
+                    a.error
+                        .total_cmp(&b.error)
+                        .then_with(|| b.duration.total_cmp(&a.duration))
+                        .then_with(|| a.name.cmp(&b.name))
+                })
                 .expect("at least one flavour");
             let mut fallback: Option<(f64, i32)> = None;
 
@@ -604,12 +566,8 @@ impl DpSolver {
                     if let Some(threshold) = input.max_error_threshold {
                         if slot >= window_start && slot <= window_end {
                             let f_error_bp = (flavour.error * 100.0).round() as i64;
-                            let mut proj_sum = key.error_sum_bp + f_error_bp;
-                            let mut proj_cnt = key.error_count() + 1.0;
-                            if key.mock_remaining > 0 && mock_error_bp > 0 {
-                                proj_sum -= mock_error_bp;
-                                proj_cnt = (proj_cnt - 1.0).max(0.0);
-                            }
+                            let proj_sum = key.error_sum_bp + f_error_bp;
+                            let proj_cnt = key.error_count() + 1.0;
                             if proj_cnt > 0.0 && (proj_sum as f64 / 100.0) / proj_cnt > threshold {
                                 continue; // infeasible candidate: skip it
                             }
@@ -643,27 +601,16 @@ impl DpSolver {
 
                 let mut new_error_sum_bp = key.error_sum_bp;
                 let mut new_error_count = key.error_count();
-                let mut new_mock_remaining = key.mock_remaining;
 
                 if slot >= window_start && slot <= window_end {
                     new_error_sum_bp += f_error_bp;
                     new_error_count += 1.0;
-                    if new_mock_remaining > 0 && mock_error_bp > 0 {
-                        new_error_sum_bp -= mock_error_bp;
-                        new_error_count = (new_error_count - 1.0).max(0.0);
-                        new_mock_remaining -= 1;
-                    }
                 }
 
                 let mut new_inc = key.inc_counts.clone();
                 new_inc[s] += 1;
 
-                key = DpStateKey::new(
-                    new_error_sum_bp,
-                    new_error_count,
-                    new_mock_remaining,
-                    new_inc,
-                );
+                key = DpStateKey::new(new_error_sum_bp, new_error_count, new_inc);
                 keys.push(key.clone());
 
                 assignments.push(RequestAssignment {
@@ -681,11 +628,10 @@ impl DpSolver {
 
     /// Last-resort placement when the DP cannot cover every request.
     ///
-    /// For each remaining request, use its longest-duration flavour (the
-    /// standard calibrated profiles use the longest option as their most
-    /// accurate one) and choose the cheapest legal slot. This prioritizes
-    /// coverage over a global optimum; callers must not treat it as proof that
-    /// the DP error constraint was feasible.
+    /// For each remaining request, use the profile's minimum-error flavour
+    /// and choose its cheapest legal slot. This prioritizes coverage over a
+    /// global optimum; it is not proof that the batch error constraint was
+    /// feasible.
     pub fn greedy_fallback(
         &self,
         requests: &[SolveRequest],
@@ -708,7 +654,12 @@ impl DpSolver {
             let fallback_flavour = self
                 .flavours
                 .iter()
-                .min_by(|a, b| a.error.total_cmp(&b.error))
+                .min_by(|left, right| {
+                    left.error
+                        .total_cmp(&right.error)
+                        .then_with(|| right.duration.total_cmp(&left.duration))
+                        .then_with(|| left.name.cmp(&right.name))
+                })
                 .expect("at least one flavour");
             let mut best: Option<(f64, i32)> = None;
             let empty_base = vec![0i64; self.window_size as usize];
@@ -811,7 +762,6 @@ mod tests {
             error_window_past: 2,
             error_window_future: 2,
             forecast_max_slot: None,
-            dynamic_mock_pool: MockPool::default(),
         }
     }
 
@@ -1150,14 +1100,14 @@ mod tests {
         let solver = DpSolver {
             flavours: vec![
                 Flavour {
-                    name: "Accurate".to_string(),
-                    error: 0.0,
+                    name: "LongestButInaccurate".to_string(),
+                    error: 2.0,
                     duration: 60.0,
                 },
                 Flavour {
-                    name: "Fast".to_string(),
-                    error: 5.0,
-                    duration: 10.0,
+                    name: "LowestError".to_string(),
+                    error: 0.0,
+                    duration: 1.0,
                 },
             ],
             window_size: 5,
@@ -1188,6 +1138,57 @@ mod tests {
         let base = vec![0i64; 5];
         let result = solver.greedy_fallback(&requests, 0, &tiers, &base);
         assert_eq!(result.len(), 3);
+        assert!(
+            result
+                .iter()
+                .all(|assignment| assignment.flavour_name == "LowestError")
+        );
+    }
+
+    #[test]
+    fn greedy_fallback_accounts_for_each_earlier_capacity_position() {
+        let solver = DpSolver {
+            flavours: vec![Flavour {
+                name: "LowestError".to_owned(),
+                error: 0.0,
+                duration: 1.0,
+            }],
+            window_size: 2,
+            carbon_forecast: vec![1.0, 2.0],
+            pruning: "none".to_owned(),
+            pruning_k: 10,
+            timeout: 1.0,
+            carbon_cost_scale: 1.0,
+        };
+        let requests = vec![
+            SolveRequest {
+                request_id: 1,
+                arrival_slot: 0,
+                deadline_slot: 1,
+            },
+            SolveRequest {
+                request_id: 2,
+                arrival_slot: 0,
+                deadline_slot: 1,
+            },
+        ];
+        let tiers = vec![
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 5.0,
+            },
+        ];
+        let base_counts = vec![0, 0];
+
+        let assignments = solver.greedy_fallback(&requests, 0, &tiers, &base_counts);
+
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].slot, 0);
+        assert_eq!(assignments[1].slot, 1);
     }
 
     #[test]

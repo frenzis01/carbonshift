@@ -90,33 +90,25 @@ once per scenario:
   1/12, 1/3, and 7/12. This is an expectation over many assignments; it does
   not enforce the threshold on each run or error window. The scenario seed
   makes the hazard schedule reproducible. A target outside the available
-  flavour-error range cannot be achieved and is reported as an error. The
-  `random` input label remains temporarily for existing configurations and is
-  scheduled for removal when the online scheduler adopts `hazard`; new
-  configurations should use `hazard`.
+  flavour-error range cannot be achieved and is reported as an error.
 - `bandit` and `ant_colony`: use the common engine kernels, with a fresh
-  runtime and learned state for each offline run. The live scheduler cutover
-  to those kernels is still pending Step 5B.
+  runtime and learned state for each run. The live scheduler and offline
+  runner use the same common engine registry.
 
-## Online random strategies
+## Online strategies
 
-Set these names in `online_strategies` to run each policy through the online
-scheduler pipeline:
+Set `hazard`, `bandit`, `ant_colony`, or `singleton_best` in
+`online_strategies` to run it through the streaming scheduler. The same engine
+implementations are available offline through `additional_strategies`.
 
-- `random_flavour`: sample a flavour using the configured threshold-matching
-  probability distribution and schedule at the earliest feasible slot.
-- `random_slot`: sample a feasible slot and use the most accurate flavour.
-- `random_full`: sample both the feasible slot and flavour.
-
-Only `ant_colony` uses the `online_batch_sizes` sweep. Every other online
-strategy, including `bandit`, uses batch size 1.
+Only `ant_colony` uses the `online_batch_sizes` sweep. Other online strategies
+use batch size 1.
 
 Example:
 
 ```json
 {
   "batch_sizes": [],
-  "infeasibility_modes": [],
   "online_strategies": [],
   "additional_strategies": [
     "offline_singleton_best",

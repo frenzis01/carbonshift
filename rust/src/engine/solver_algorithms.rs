@@ -11,7 +11,7 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::engine::config::SwarmConfig;
-use crate::engine::dp_solver::{DpSolver, ErrorWindowBaseline, MockPool, SolveBatchInput};
+use crate::engine::dp_solver::{DpSolver, ErrorWindowBaseline, SolveBatchInput};
 use crate::engine::random_selection::{
     RandomSelectionMode, closest_to_uniform_flavour_probabilities, select_random_assignment,
 };
@@ -170,7 +170,7 @@ impl SolverAlgorithm for DpAlgorithm {
         };
         // Keep the DP-specific solve input here; the common input supplies one
         // flavour set for this homogeneous QoS-profile batch.
-        let mut assignments = solver.solve_batch(SolveBatchInput {
+        let assignments = solver.solve_batch(SolveBatchInput {
             requests: &on_time_requests,
             current_slot: input.current_slot,
             capacity_multiplier: 1.0,
@@ -184,7 +184,6 @@ impl SolverAlgorithm for DpAlgorithm {
             error_window_past: input.qos.error_window.past_slots,
             error_window_future: input.qos.error_window.future_slots,
             forecast_max_slot: Some(latest_forecast_slot(input, scope)),
-            dynamic_mock_pool: MockPool::default(),
         });
 
         let scheduled_ids: HashSet<u64> = assignments
@@ -210,21 +209,35 @@ impl SolverAlgorithm for DpAlgorithm {
                 fallback_counts[assignment.slot as usize] += 1;
             }
 
-            assignments.extend(solver.greedy_fallback(
+            let fallback_assignments = solver.greedy_fallback(
                 &unscheduled,
                 input.current_slot,
                 &input.capacity_tiers,
                 &fallback_counts,
-            ));
+            );
+            placements.extend(assignments.into_iter().map(|assignment| {
+                ProposedPlacement::new(
+                    assignment.request_id,
+                    assignment.slot,
+                    assignment.flavour_name,
+                )
+            }));
+            placements.extend(fallback_assignments.into_iter().map(|assignment| {
+                ProposedPlacement::greedy_fallback(
+                    assignment.request_id,
+                    assignment.slot,
+                    assignment.flavour_name,
+                )
+            }));
+        } else {
+            placements.extend(assignments.into_iter().map(|assignment| {
+                ProposedPlacement::new(
+                    assignment.request_id,
+                    assignment.slot,
+                    assignment.flavour_name,
+                )
+            }));
         }
-
-        placements.extend(assignments.into_iter().map(|assignment| {
-            ProposedPlacement::new(
-                assignment.request_id,
-                assignment.slot,
-                assignment.flavour_name,
-            )
-        }));
         Ok((SolverProposal { placements }, ()))
     }
 
@@ -1455,6 +1468,38 @@ mod tests {
 
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].flavour_name, "Accurate");
+    }
+
+    #[test]
+    fn dp_coverage_fallback_is_tagged_and_uses_minimum_error_not_duration() {
+        let mut solve_input = input();
+        solve_input.current_slot = 0;
+        solve_input.requests.truncate(1);
+        solve_input.requests[0].arrival_slot = 0;
+        solve_input.requests[0].deadline_slot = 0;
+        solve_input.qos.error_window.future_slots = 0;
+        solve_input.qos.max_average_error = 0.0;
+        solve_input.qos.flavours = vec![
+            Flavour {
+                name: "LongestButInaccurate".to_owned(),
+                error: 10.0,
+                duration: 100.0,
+            },
+            Flavour {
+                name: "LowestError".to_owned(),
+                error: 1.0,
+                duration: 1.0,
+            },
+        ];
+
+        let placements = placements_for("dp", &solve_input);
+
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].flavour_name, "LowestError");
+        assert_eq!(
+            placements[0].origin,
+            crate::engine::solver::PlacementOrigin::GreedyFallback
+        );
     }
 
     #[test]

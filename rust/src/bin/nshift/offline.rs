@@ -97,6 +97,7 @@ pub(super) struct OfflineEnginePlacement {
     pub(super) arrival_slot: i32,
     pub(super) deadline_slot: i32,
     pub(super) late: bool,
+    pub(super) origin: PlacementOrigin,
 }
 
 /// Information validated once for each proposed placement and then used to
@@ -318,6 +319,7 @@ pub(super) fn materialize_offline_proposal(
             arrival_slot: validated.request.arrival_slot,
             deadline_slot: validated.request.deadline_slot,
             late: placement.late,
+            origin: placement.origin,
         });
     }
 
@@ -382,7 +384,7 @@ pub(super) fn convert_engine_results_to_outputs(
             carbon_cost: assignment_result.carbon_cost,
             assignment_solver_mode: strategy_name.to_owned(),
             assignment_solver_status: "ok".to_owned(),
-            assigned_with_greedy_fallback: false,
+            assigned_with_greedy_fallback: placement.origin == PlacementOrigin::GreedyFallback,
             assigned_with_relaxed_retry: false,
             assigned_with_injection: false,
             assigned_with_rollback: false,
@@ -421,8 +423,7 @@ pub(super) fn convert_engine_results_to_outputs(
 }
 
 /// Normalize offline labels at the runner boundary, then create and run the
-/// requested shared engine. The temporary `random` input label routes to
-/// `hazard` until Step 5B migrates the online scheduler and removes that label.
+/// requested shared engine.
 pub(super) fn canonical_offline_engine_name(
     name: &str,
 ) -> Result<(&'static str, &'static str), SolverError> {
@@ -433,9 +434,7 @@ pub(super) fn canonical_offline_engine_name(
             Ok(("singleton_best_accurate", "offline_singleton_best_accurate"))
         }
         "singleton_best_accurate" => Ok(("singleton_best_accurate", "singleton_best_accurate")),
-        // Remove this temporary label at the same time the online scheduler
-        // switches its legacy random modes to the common hazard engine.
-        "random" | "hazard" => Ok(("hazard", "hazard")),
+        "hazard" => Ok(("hazard", "hazard")),
         "dp" => Ok(("dp", "dp")),
         "bandit" => Ok(("bandit", "bandit")),
         "ant_colony" => Ok(("ant_colony", "ant_colony")),

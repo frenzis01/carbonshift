@@ -14,7 +14,7 @@ use crate::types::{CapacityTier, Flavour};
 pub struct SolverConfig {
     /// Number of requests to accumulate before running a solver batch.
     pub batch_size: usize,
-    /// Which solver to use: "dp", "bandit", "ant_colony", or "singleton_best".
+    /// Which engine to use: dp, singleton_best, singleton_best_accurate, hazard, bandit, or ant_colony.
     pub solver_strategy: String,
     /// DP pruning method: "beam", "kbest", or "none".
     pub dp_pruning_method: String,
@@ -41,6 +41,8 @@ pub struct SimulationConfig {
     pub predicted_requests_per_slot: f64,
     /// Standard-deviation factor for generated request rates.
     pub request_rate_std_factor: f64,
+    /// Seed used to generate deterministic request counts.
+    pub request_generation_seed: u64,
     /// Minimum request deadline slack in slots.
     pub deadline_min_slack: i32,
     /// Maximum request deadline slack in slots.
@@ -55,31 +57,6 @@ pub struct SimulationConfig {
     pub generator_realtime_chunk_size: usize,
     /// Expected request count for progress reporting (0 = unknown).
     pub total_requests: usize,
-}
-
-/// Settings for synthetic prehistory and recovery from infeasible batches.
-#[derive(Debug, Clone)]
-pub struct InfeasibilityConfig {
-    /// Whether to use virtual past slots when building the error baseline.
-    pub prehistory_use_virtual_past: bool,
-    /// Prehistory error as a ratio of the configured error threshold.
-    pub prehistory_error_ratio_of_threshold: f64,
-    /// Forecast error as a ratio of the configured error threshold.
-    pub forecast_error_ratio_of_threshold: f64,
-    /// Generate stochastic request counts for virtual prehistory.
-    pub prehistory_stochastic_counts: bool,
-    /// Random seed used for virtual prehistory generation.
-    pub prehistory_random_seed: u64,
-    /// Influence of prehistory mock requests on the error baseline.
-    pub prehistory_mock_influence: f64,
-    /// Recovery policy: "min_error_greedy", "carryover", or "forecast".
-    pub recovery_mode: String,
-    /// Influence of infeasibility mock requests.
-    pub mock_influence: f64,
-    /// Optional fixed error for each infeasibility mock request.
-    pub mock_error_per_request: Option<f64>,
-    /// Influence decay applied to infeasibility mocks at each step.
-    pub mock_influence_decay_step: f64,
 }
 
 /// Hyperparameters and concurrency mode for online swarm solvers.
@@ -135,8 +112,6 @@ pub struct Config {
     pub solver: SolverConfig,
     /// Settings for synthetic and replayed workload execution.
     pub simulation: SimulationConfig,
-    /// Settings for error-budget prehistory and infeasibility recovery.
-    pub infeasibility: InfeasibilityConfig,
     /// Settings for online bandit and ant-colony solvers.
     pub swarm: SwarmConfig,
     /// Settings for progress and diagnostic output.
@@ -214,6 +189,7 @@ impl Default for SimulationConfig {
         Self {
             predicted_requests_per_slot: 60.0,
             request_rate_std_factor: 0.5,
+            request_generation_seed: 4242,
             deadline_min_slack: 0,
             deadline_max_slack: 14,
             skip_empty_slots: true,
@@ -221,23 +197,6 @@ impl Default for SimulationConfig {
             manual_clock: false,
             generator_realtime_chunk_size: 10,
             total_requests: 0,
-        }
-    }
-}
-
-impl Default for InfeasibilityConfig {
-    fn default() -> Self {
-        Self {
-            prehistory_use_virtual_past: false,
-            prehistory_error_ratio_of_threshold: 1.0,
-            forecast_error_ratio_of_threshold: 1.0,
-            prehistory_stochastic_counts: true,
-            prehistory_random_seed: 4242,
-            prehistory_mock_influence: 0.4,
-            recovery_mode: "carryover".to_string(),
-            mock_influence: 0.8,
-            mock_error_per_request: None,
-            mock_influence_decay_step: 0.15,
         }
     }
 }
@@ -278,7 +237,6 @@ impl Default for Config {
         Self {
             solver: SolverConfig::default(),
             simulation: SimulationConfig::default(),
-            infeasibility: InfeasibilityConfig::default(),
             swarm: SwarmConfig::default(),
             logging: LoggingConfig::default(),
             slot_duration_seconds: 10.0,
@@ -355,7 +313,7 @@ impl Config {
     }
 
     /// Creates a borrowed assignment-policy view without exposing unrelated
-    /// simulation, logging, recovery, or online-strategy settings.
+    /// simulation, logging, or online-strategy settings.
     pub fn assignment_policy(&self) -> AssignmentPolicy<'_> {
         AssignmentPolicy {
             flavours: &self.flavours,
@@ -406,11 +364,7 @@ impl Config {
         self.error_window_past = meta.error_window_past;
         self.error_window_future = meta.error_window_future;
         self.error_window_past_decay_slots = meta.error_window_past_decay_slots;
-        self.infeasibility.prehistory_use_virtual_past = meta.prehistory_enabled;
-        self.infeasibility.prehistory_error_ratio_of_threshold = meta.prehistory_error_ratio;
-        self.infeasibility.forecast_error_ratio_of_threshold = meta.prehistory_error_ratio;
-        self.infeasibility.prehistory_mock_influence = meta.prehistory_mock_influence;
-        self.infeasibility.prehistory_random_seed = meta.seed;
+        self.simulation.request_generation_seed = meta.seed;
         if let Some(tiers) = meta.capacity_tiers.as_ref() {
             self.capacity_tiers = tiers.clone();
         }
@@ -440,13 +394,37 @@ mod tests {
         assert_eq!(cfg.simulation.predicted_requests_per_slot, 60.0);
         assert!(cfg.simulation.skip_empty_slots);
         assert!(!cfg.simulation.manual_clock);
-        assert_eq!(cfg.infeasibility.recovery_mode, "carryover");
-        assert_eq!(cfg.infeasibility.mock_influence, 0.8);
+        assert_eq!(cfg.simulation.request_generation_seed, 4242);
         assert_eq!(cfg.swarm.mode, "serialized");
         assert_eq!(cfg.swarm.aco_n_ants, 10);
         assert!(cfg.logging.enable_solver_logging);
         assert_eq!(cfg.total_slots, 24);
         assert_eq!(cfg.max_error_threshold, 4.0);
+    }
+
+    #[test]
+    fn scenario_seed_configures_request_generation() {
+        let metadata = crate::scenario::ScenarioMetadata {
+            total_slots: 8,
+            slot_duration_seconds: 30.0,
+            requests_per_slot: 2.0,
+            request_rate_std_factor: 0.25,
+            deadline_min_slack: 0,
+            deadline_max_slack: 2,
+            max_error_threshold: 4.0,
+            error_window_past: 1,
+            error_window_future: 2,
+            error_window_past_decay_slots: 0,
+            carbon_intensity_cycle_slots: 8,
+            carbon_random_noise_amplitude: 0.0,
+            seed: 901,
+            capacity_tiers: None,
+        };
+        let mut config = Config::default();
+
+        config.apply_scenario_metadata(&metadata);
+
+        assert_eq!(config.simulation.request_generation_seed, 901);
     }
 
     #[test]

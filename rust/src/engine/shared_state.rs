@@ -150,7 +150,7 @@ impl SolverSnapshot {
         }
     }
 
-    /// Assignments for profile-specific carryover/prehistory, in one slot.
+    /// Assignments for one profile in one slot, used to build its historical error baseline.
     pub fn get_profile_requests_in_slot(
         &self,
         profile_id: &QosProfileId,

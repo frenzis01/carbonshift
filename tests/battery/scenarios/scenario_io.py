@@ -219,11 +219,8 @@ def generate_scenario_data(
     error_window_past: int,
     error_window_future: int,
     max_error_threshold: float,
-    prehistory_error_ratio: float,
     carbon_random_noise_amplitude: float = 40.0,
-    prehistory_mock_influence: float = 1.0,
     error_window_past_decay_slots: int = 0,
-    include_prehistory: bool = True,
     carbon_intensity_cycle_slots: int = 24,
     capacity_tiers: Optional[List[Dict[str, Any]]] = None,
     carbon_night_max: float = 160.0,
@@ -244,7 +241,6 @@ def generate_scenario_data(
     Includes:
     - full request set (id, arrival_time, deadline_slot)
     - per-slot carbon forecast
-    - synthetic prehistory slots used by modeled error calculations
 
     ``request_slots`` can limit arrivals to the leading slots while
     ``total_slots`` retains the full planning and forecast horizon. Generated
@@ -359,25 +355,6 @@ def generate_scenario_data(
             req["arrival_time"] + arrival_rng.uniform(0.0, slot_duration_seconds), 6
         )
 
-    prehistory_slots: List[Dict[str, Any]] = []
-    synthetic_error = max_error_threshold * prehistory_error_ratio
-    prehistory_influence = max(0.0, min(1.0, float(prehistory_mock_influence)))
-    if include_prehistory:
-        for slot in range(-error_window_past, 0):
-            mean_rate = rate_per_slot[slot % input_slots]
-            sigma = max(1.0, mean_rate * request_rate_std_factor)
-            raw_count = max(0, int(round(rng.gauss(mean_rate, sigma))))
-            count = int(round(raw_count * prehistory_influence))
-            prehistory_slots.append(
-                {
-                    "slot": slot,
-                    "request_count": count,
-                    "error_per_request": round(synthetic_error, 6),
-                }
-            )
-    else:
-        prehistory_influence = 0.0
-
     requests.sort(key=lambda item: (int(item["arrival_slot"]), float(item["arrival_time"]), int(item["request_id"])))
 
     return {
@@ -395,16 +372,12 @@ def generate_scenario_data(
             "error_window_future": int(error_window_future),
             "error_window_past_decay_slots": int(error_window_past_decay_slots),
             "max_error_threshold": float(max_error_threshold),
-            "prehistory_error_ratio": float(prehistory_error_ratio),
             "carbon_random_noise_amplitude": float(carbon_random_noise_amplitude),
-            "prehistory_mock_influence": prehistory_influence,
-            "prehistory_enabled": bool(include_prehistory),
             "carbon_intensity_cycle_slots": int(carbon_intensity_cycle_slots),
             **({"capacity_tiers": _serialize_capacity_tiers(capacity_tiers)} if capacity_tiers is not None else {}),
         },
         "carbon_forecast": forecast,
         "requests": requests,
-        "prehistory_slots": prehistory_slots,
     }
 
 

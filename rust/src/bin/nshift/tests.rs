@@ -17,9 +17,6 @@ fn make_scenario(requests: Vec<ScenarioRequest>, carbon_forecast: Vec<f64>) -> S
             error_window_past: 0,
             error_window_future: 0,
             error_window_past_decay_slots: 0,
-            prehistory_enabled: false,
-            prehistory_error_ratio: 0.0,
-            prehistory_mock_influence: 0.0,
             carbon_intensity_cycle_slots: 2,
             carbon_random_noise_amplitude: 0.0,
             seed: 1234,
@@ -107,6 +104,7 @@ fn compute_per_request_marks_assignments_with_injected_mock_pool() {
             request_id: i as u64 + 1,
             current_slot: 0,
             is_new_assignment_in_run: true,
+            assigned_with_greedy_fallback: false,
             scheduled_slot: 0,
             flavour_name: "Accurate".into(),
             error: 0.0,
@@ -151,8 +149,9 @@ fn compact_solver_logs_keep_legacy_report_inputs_available() {
         &assignments_path,
         concat!(
             "run_id,current_slot,request_id,qos_profile_id,scheduled_slot,flavour_name,",
-            "flavour_duration_sec,error,carbon_cost,arrival_slot,deadline_slot\n",
-            "run_s0_n1_1,0,1,default,0,Accurate,30,0.0,2.0,0,1\n"
+            "assigned_with_greedy_fallback,flavour_duration_sec,error,carbon_cost,",
+            "arrival_slot,deadline_slot\n",
+            "run_s0_n1_1,0,1,default,0,Accurate,false,30,0.0,2.0,0,1\n"
         ),
     )
     .unwrap();
@@ -167,6 +166,7 @@ fn compact_solver_logs_keep_legacy_report_inputs_available() {
     assert_eq!(runs[0].solver_mode, "dp");
     assert_eq!(assignments.len(), 1);
     assert!(assignments[0].is_new_assignment_in_run);
+    assert!(!assignments[0].assigned_with_greedy_fallback);
 
     std::fs::remove_file(runs_path).unwrap();
     std::fs::remove_file(assignments_path).unwrap();
@@ -316,13 +316,7 @@ fn online_batch_sizes_explicit_value_is_parsed() {
 #[test]
 fn online_batch_sizes_only_sweep_for_ant_colony() {
     let configured = [1, 4, 8];
-    for strategy in [
-        "bandit",
-        "singleton_best",
-        "random_flavour",
-        "random_slot",
-        "random_full",
-    ] {
+    for strategy in ["bandit", "singleton_best", "hazard"] {
         assert_eq!(
             online_batch_sizes_for_strategy(strategy, &configured),
             vec![1]
@@ -396,10 +390,7 @@ fn offline_strategy_names_resolve_to_common_engine_names() {
         canonical_offline_engine_name("offline_singleton_best_accurate").unwrap(),
         ("singleton_best_accurate", "offline_singleton_best_accurate")
     );
-    assert_eq!(
-        canonical_offline_engine_name("random").unwrap(),
-        ("hazard", "hazard")
-    );
+    assert!(canonical_offline_engine_name("random").is_err());
     assert!(canonical_offline_engine_name("not-a-solver").is_err());
 
     let registry = build_solver_registry(&Config::default(), 42).unwrap();
@@ -476,6 +467,37 @@ fn offline_singleton_best_accurate_uses_min_error_flavour_and_cheapest_slot() {
     assert_eq!(best_assignments[0].flavour_name, "Fast");
     assert_eq!(best_assignments[0].scheduled_slot, 1);
     assert_eq!(best_summary.execution_mode, "offline_singleton_best");
+}
+
+#[test]
+fn offline_dp_marks_greedy_fallback_and_reports_its_flavour() {
+    let scenario = make_scenario(vec![make_request(7, 0, 1)], vec![10.0, 1.0]);
+    let mut config = Config::default();
+    config.total_slots = 2;
+    config.error_window_future = 1;
+    config.max_error_threshold = 0.0;
+    config.global_error_constraint_enabled = false;
+    config.flavours = vec![
+        Flavour {
+            name: "FastButInaccurate".to_owned(),
+            error: 10.0,
+            duration: 1.0,
+        },
+        Flavour {
+            name: "LowestError".to_owned(),
+            error: 1.0,
+            duration: 10.0,
+        },
+    ];
+    let registry = build_solver_registry(&config, 42).unwrap();
+
+    let (per_request, _, summary) =
+        run_strategy(&registry, "dp", &scenario, &config, 60.0, false, 1.0).unwrap();
+
+    assert_eq!(per_request.len(), 1);
+    assert!(per_request[0].assigned_with_greedy_fallback);
+    assert_eq!(per_request[0].flavour_name, "LowestError");
+    assert_eq!(summary.requests_assigned_with_greedy_fallback, 1);
 }
 
 #[test]

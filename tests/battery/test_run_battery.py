@@ -26,7 +26,6 @@ def test_battery_runner_defaults_online_swarm_to_parallel_merge(tmp_path):
         tmp_path / "scenario.json",
         [],
         tmp_path / "output",
-        "carryover",
         False,
     )
     try:
@@ -35,6 +34,7 @@ def test_battery_runner_defaults_online_swarm_to_parallel_merge(tmp_path):
         config_path.unlink(missing_ok=True)
 
     assert config["runner"]["online_swarm_mode"] == "merge"
+    assert "infeasibility_recovery_mode" not in config["runner"]
 
 
 def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path):
@@ -351,8 +351,8 @@ def test_folder_name_includes_rollback_token():
 def test_parse_rust_config_defaults_matches_known_values():
     values = rb._parse_rust_config_defaults(rb.RUST_CONFIG_RS)
     assert values["error_window_past"] == "12"
-    assert values["error_window_future"] == "8"
-    assert values["error_window_past_decay_slots"] == "0"
+    assert values["error_window_future"] == "14"
+    assert values["error_window_past_decay_slots"] == "12"
     assert values["dp_pruning_k"] == "1200"
     assert values["max_error_threshold"] == "4.0"
     # String literals should have the Rust `.to_string()` suffix stripped.
@@ -452,7 +452,7 @@ def test_build_top3_section_groups_by_scenario_and_category():
     section = rb._build_top3_section(all_rows, per_n_timing_rows=[])
     assert "### s1" in section
     assert "### s2" in section
-    assert "DP recovery modes" in section
+    assert "DP scheduling runs" in section
     assert "Online alternative strategies" in section
     assert "Offline alternative strategies" in section
     # s2 has no online/offline rows -> placeholder must appear at least once for it.

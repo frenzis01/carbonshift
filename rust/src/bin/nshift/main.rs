@@ -36,21 +36,15 @@
 //!     "flush_partial_batch":          true,
 //!     "include_greedy_baseline":      true,
 //!     "realtime_slots":               false,
-//!     "realtime_speed_scale":         1.0,
-//!     "infeasibility_recovery_mode":  "carryover"
+//!     "realtime_speed_scale":         1.0
 //!   }
 //! }
 //! ```
 //!
 //! **Key runner fields:**
-//! - `infeasibility_recovery_mode` (default: `Config::infeasibility.recovery_mode`, "carryover"):
-//!   one of "min_error_greedy" | "carryover" | "forecast". The error-window constraint is never
-//!   relaxed/removed; on infeasibility the scheduler always falls back directly to
-//!   `greedy_fallback` (accurate flavour, cheapest feasible slot). This setting only controls
-//!   whether/how synthetic mock requests dilute the error baseline used by the primary DP solve.
 //! - `online_strategies`: online strategies to run through the scheduler pipeline, e.g.
-//!   `["bandit", "ant_colony", "singleton_best", "random_flavour", "random_slot",
-//!   "random_full"]`. Independent of the DP phase: set the top-level `batch_sizes` to
+//!   `["bandit", "ant_colony", "singleton_best", "hazard"]`. Independent of the DP phase:
+//!   set the top-level `batch_sizes` to
 //!   `[]` to skip DP entirely and only run online strategies.
 //! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
 //!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent. Only
@@ -59,9 +53,7 @@
 //!   proposals without rollback, repricing each at current slot occupancy.
 //! - `additional_strategies`: common-engine strategies to run once per scenario (no batching or
 //!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "hazard"]`.
-//!   `hazard` is canonical. The old `random` input label remains temporarily for existing
-//!   configurations and is scheduled for removal at the Step 5B online-scheduler cutover; new
-//!   configurations should use `hazard`. These runs are fully independent of `batch_sizes`,
+//!   `hazard` is the canonical stochastic strategy name. These runs are fully independent of `batch_sizes`,
 //!   `rollback_max_consecutive`, and `max_batch_solver_parallelism`.
 //!   `offline_singleton_best` scans feasible slot/flavour pairs and commits the cheapest choice;
 //!   `offline_singleton_best_accurate` uses the same search with only the lowest-error flavour.
@@ -99,8 +91,8 @@
 use carbonshift_rs::config::{AssignmentPolicy, Config};
 use carbonshift_rs::engine::qos::QosProfileId;
 use carbonshift_rs::engine::solver::{
-    CommitReport, ErrorTotals, ErrorWindowInput, QoSProfileInput, SolveInput, SolveRequest,
-    SolverError, SolverRegistry, SolverScope,
+    CommitReport, ErrorTotals, ErrorWindowInput, PlacementOrigin, QoSProfileInput, SolveInput,
+    SolveRequest, SolverError, SolverRegistry, SolverScope,
 };
 use carbonshift_rs::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use carbonshift_rs::generator::{RequestGenerator, RequestGeneratorConfig};
@@ -131,9 +123,6 @@ struct BenchmarkConfig {
     realtime_slots: bool,
     realtime_speed_scale: f64,
     include_greedy_baseline: bool,
-    /// Overrides `Config::infeasibility.recovery_mode` when present; `None`
-    /// keeps the default. One of "min_error_greedy" | "carryover" | "forecast".
-    infeasibility_recovery_mode: Option<String>,
     /// Legacy compatibility field; scheduler proposals now price at commit without rollback.
     rollback_max_consecutive: usize,
     /// Additional common-engine strategies to run (e.g. singleton_best, hazard).
@@ -208,10 +197,6 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .get("include_greedy_baseline")
         .and_then(|x| x.as_bool())
         .unwrap_or(true);
-    let infeasibility_recovery_mode = runner
-        .get("infeasibility_recovery_mode")
-        .and_then(|x| x.as_str())
-        .map(String::from);
     // TODO in run_battery this is set in a tmp config. ideally unify with the same param in config.rs
     let rollback_max_consecutive = runner
         .get("rollback_max_consecutive")
@@ -282,7 +267,6 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         realtime_slots,
         realtime_speed_scale,
         include_greedy_baseline,
-        infeasibility_recovery_mode,
         rollback_max_consecutive,
         additional_strategies,
         online_strategies,
@@ -416,9 +400,6 @@ fn main() {
     // Build a base config that has all scenario parameters applied.
     let mut base_cfg = Config::default();
     base_cfg.apply_scenario_metadata(&scenario.metadata);
-    if let Some(mode) = &bcfg.infeasibility_recovery_mode {
-        base_cfg.infeasibility.recovery_mode = mode.clone();
-    }
     base_cfg.solver.rollback_max_consecutive = bcfg.rollback_max_consecutive;
     base_cfg.solver.batch_timeout_secs = bcfg.batch_timeout_secs;
     if let Some(parallelism) = bcfg.max_batch_solver_parallelism {

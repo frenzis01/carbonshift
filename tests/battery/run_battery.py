@@ -12,17 +12,16 @@ scenario batches, so it can never be used here.
 For each scenario in battery_config.json, generates a deterministic scenario and
 runs the Rust solver across three independent, individually-toggleable phases:
 
-  1. DP        – sweeps `batch_sizes` × `infeasibility_modes`. Skipped entirely
-                 if either list is empty.
+  1. DP        – sweeps `batch_sizes`. Skipped entirely if the list is empty.
   2. Online    – runs `online_strategies` (e.g. "bandit", "ant_colony",
-                 "singleton_best", "random_flavour", "random_slot", "random_full").
+                 "singleton_best", "hazard").
                  Only ant_colony sweeps `online_batch_sizes` (falls back to
                  `batch_sizes` if absent); other strategies use batch size 1.
                  Skipped if `online_strategies` is empty.
                  Independent of the DP phase/`batch_sizes` — e.g. set
                  `batch_sizes: []` to sweep online strategies without running DP.
   3. Offline   – runs `additional_strategies` (e.g. "offline_singleton_best",
-                 "offline_singleton_best_accurate", "random", "ant_colony", "bandit") once per scenario, with no batch-size
+                 "offline_singleton_best_accurate", "hazard", "ant_colony", "bandit") once per scenario, with no batch-size
                  or rollback dependency. Skipped if `additional_strategies` is
                  empty.
 
@@ -41,26 +40,18 @@ trim_future_assignments: bool – optional; when true, extends each scenario's
                                      total_slots, and trims persisted request
                                      outcomes back to that original horizon.
 batch_sizes          : list[int]   – DP phase N values to benchmark; [] skips DP.
-infeasibility_modes  : list[str]   – values of the DP solver's `infeasibility_recovery_mode`
-                                     knob to benchmark: "min_error_greedy" | "carryover" | "forecast".
-                                     The error-window constraint is never relaxed/removed for any
-                                     of these; they only differ in whether/how mock requests dilute
-                                     the error baseline before the primary DP solve. Infeasibility
-                                     always resolves via direct greedy fallback.
 online_strategies    : list[str]   – online strategies to run (e.g. "bandit", "ant_colony",
-                                     "singleton_best", "random_flavour", "random_slot",
-                                     "random_full"); [] skips the online phase.
+                                     "singleton_best", "hazard"); [] skips the online phase.
 online_batch_sizes   : list[int]   – N sweep for online_strategies; falls back to
                                      `batch_sizes` when omitted. Only "ant_colony" uses
                                      this sweep; all other online strategies force N=1.
 additional_strategies: list[str]   – offline strategies to run once per scenario
                                      (e.g. "offline_singleton_best", "offline_singleton_best_accurate",
-                                     "random", "ant_colony", "bandit"); [] skips the
+                                     "hazard", "ant_colony", "bandit"); [] skips the
                                    offline phase.
-                                     "random" selects a feasible slot uniformly and samples
-                                     flavours with probabilities closest to uniform in
-                                     squared distance while targeting the configured mean
-                                     error; it does not guarantee per-run/window QoS.
+                                     "hazard" samples flavours toward the configured mean
+                                     error and favours slots with lower forecast carbon cost,
+                                     including the next capacity-tier multiplier.
 flavours             : list        – optional; overrides Config::default()'s 3 built-in
                                      Accurate/Balanced/Fast flavours for every phase/scenario
                                      in this run. Each entry: {"name": str, "error": float
@@ -109,7 +100,7 @@ from scenario_io import generate_scenario_data, load_json, save_json  # noqa: E4
 
 # ─── constants ────────────────────────────────────────────────────────────────
 # Fallback defaults for the Rust runtime knobs below, mirroring
-# rust/src/config.rs's Config::default(). battery_config.json can override
+# rust/src/engine/config.rs's defaults. battery_config.json can override
 # each of these; they also feed the run-output folder name (see
 # _format_run_folder_name) and the generated README.md.
 DEFAULT_MAX_BATCH_SOLVER_PARALLELISM = 20
@@ -194,7 +185,6 @@ def _generate_scenario(
         max_error_threshold=float(
             scenario_def.get("max_error_threshold", scenario_config.MAX_ERROR_THRESHOLD),
         ),
-        prehistory_error_ratio=float(scenario_config.PREHISTORY_ERROR_RATIO_OF_THRESHOLD),
         capacity_tiers=tiers,
         carbon_inverted=bool(scenario_config.CARBON_INVERTED),
         carbon_shifted_phase=bool(scenario_config.CARBON_SHIFTED_PHASE),
@@ -210,7 +200,6 @@ def _write_rust_config(
     scenario_path: Path,
     batch_sizes: List[int],
     output_dir: Path,
-    infeasibility_recovery_mode: str,
     include_baseline: bool,
     additional_strategies: Optional[List[str]] = None,
     online_strategies: Optional[List[str]] = None,
@@ -230,7 +219,6 @@ def _write_rust_config(
         "include_greedy_baseline": include_baseline,
         "realtime_slots": realtime_slots,
         "realtime_speed_scale": realtime_speed_scale,
-        "infeasibility_recovery_mode": infeasibility_recovery_mode,
         "rollback_max_consecutive": rollback_max_consecutive,
         "max_batch_solver_parallelism": max_batch_solver_parallelism,
         "online_swarm_mode": online_swarm_mode,
@@ -584,7 +572,7 @@ def _run_baseline_only(
     baseline_dir = output_dir / "rust_baseline"
     baseline_dir.mkdir(parents=True, exist_ok=True)
     tmp_config = _write_rust_config(
-        scenario_path, [], baseline_dir, "min_error_greedy", True,
+        scenario_path, [], baseline_dir, True,
         realtime_slots=realtime_slots,
         realtime_speed_scale=realtime_speed_scale,
         max_batch_solver_parallelism=max_batch_solver_parallelism,
@@ -609,7 +597,6 @@ def _run_dp_phase(
     scenario_path: Path,
     scenario_id: str,
     batch_sizes: List[int],
-    modes: List[str],
     output_dir: Path,
     rust_binary: Path,
     baseline_cost: float,
@@ -620,51 +607,51 @@ def _run_dp_phase(
     online_swarm_mode: str = DEFAULT_ONLINE_SWARM_MODE,
     flavours: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Sweep `batch_sizes` × `infeasibility_modes` (the DP phase). Caller
-    ensures both lists are non-empty; the baseline is precomputed and passed
-    in, never recomputed here."""
+    """Sweep DP batch sizes. The baseline is precomputed and passed in."""
     all_rows: List[Dict[str, Any]] = []
     per_n_timing_rows: List[Dict[str, Any]] = []
 
-    for mode in modes:
-        mode_dir = output_dir / f"rust_{mode}"
-        mode_dir.mkdir(parents=True, exist_ok=True)
-        tmp_config = _write_rust_config(
-            scenario_path, batch_sizes, mode_dir, mode, False,
-            realtime_slots=realtime_slots,
-            realtime_speed_scale=realtime_speed_scale,
-            max_batch_solver_parallelism=max_batch_solver_parallelism,
-            rollback_max_consecutive=rollback_max_consecutive,
-            online_swarm_mode=online_swarm_mode,
-            baseline_total_carbon_cost=baseline_cost,
-            flavours=flavours,
-        )
-        _run_rust_binary(rust_binary, tmp_config)
+    dp_dir = output_dir / "rust_dp"
+    dp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_config = _write_rust_config(
+        scenario_path,
+        batch_sizes,
+        dp_dir,
+        False,
+        realtime_slots=realtime_slots,
+        realtime_speed_scale=realtime_speed_scale,
+        max_batch_solver_parallelism=max_batch_solver_parallelism,
+        rollback_max_consecutive=rollback_max_consecutive,
+        online_swarm_mode=online_swarm_mode,
+        baseline_total_carbon_cost=baseline_cost,
+        flavours=flavours,
+    )
+    _run_rust_binary(rust_binary, tmp_config)
 
-        summary_csv = mode_dir / "summary_by_n.csv"
-        if not summary_csv.exists():
-            print(f"    WARNING: {summary_csv} not found; skipping mode={mode}")
-            continue
-        with open(summary_csv, newline="") as f:
-            for row in csv.DictReader(f):
-                n = int(row["batch_size"])
-                avg_slot_err = _avg_slot_error_from_csv(mode_dir / f"N{n}" / "per_timeslot.csv")
-                result_row = _make_result_row(scenario_id, n, mode, row, baseline_cost, avg_slot_err)
-                all_rows.append(result_row)
-                run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
-                per_n_timing_rows.append({
-                    "scenario_id": scenario_id, "mode": mode, "batch_size": n,
-                    "elapsed_seconds": round(run_elapsed, 3),
-                })
-                print(
-                    f"    [rust/{mode}] N={n}: "
-                    f"solver_ms={result_row['solver_time_ms_avg']:.1f}, "
-                    f"carbon={result_row['carbon_cost']:.3f}, "
-                    f"error={result_row['final_global_error']:.3f}, "
-                    f"saving={result_row['carbon_saving']:.1f}%, "
-                    f"elapsed={run_elapsed:.1f}s, "
-                    f"total_rollbacks={result_row['total_rollbacks']}"
-                )
+    summary_csv = dp_dir / "summary_by_n.csv"
+    if not summary_csv.exists():
+        print(f"    WARNING: {summary_csv} not found; skipping DP results")
+        return all_rows, per_n_timing_rows
+    with open(summary_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            n = int(row["batch_size"])
+            avg_slot_err = _avg_slot_error_from_csv(dp_dir / f"N{n}" / "per_timeslot.csv")
+            result_row = _make_result_row(scenario_id, n, "dp", row, baseline_cost, avg_slot_err)
+            all_rows.append(result_row)
+            run_elapsed = float(row.get("run_elapsed_seconds", 0.0))
+            per_n_timing_rows.append({
+                "scenario_id": scenario_id, "mode": "dp", "batch_size": n,
+                "elapsed_seconds": round(run_elapsed, 3),
+            })
+            print(
+                f"    [rust/dp] N={n}: "
+                f"solver_ms={result_row['solver_time_ms_avg']:.1f}, "
+                f"carbon={result_row['carbon_cost']:.3f}, "
+                f"error={result_row['final_global_error']:.3f}, "
+                f"saving={result_row['carbon_saving']:.1f}%, "
+                f"elapsed={run_elapsed:.1f}s, "
+                f"total_rollbacks={result_row['total_rollbacks']}"
+            )
     return all_rows, per_n_timing_rows
 
 
@@ -692,7 +679,7 @@ def _run_online_phase(
     online_dir = output_dir / "rust_online"
     online_dir.mkdir(parents=True, exist_ok=True)
     tmp_config = _write_rust_config(
-        scenario_path, [], online_dir, "min_error_greedy", False,
+        scenario_path, [], online_dir, False,
         online_strategies=online_strategies,
         online_batch_sizes=online_batch_sizes,
         realtime_slots=realtime_slots,
@@ -757,7 +744,7 @@ def _run_offline_phase(
     strat_dir = output_dir / "rust_offline"
     strat_dir.mkdir(parents=True, exist_ok=True)
     tmp_config = _write_rust_config(
-        scenario_path, [], strat_dir, "min_error_greedy", False,
+        scenario_path, [], strat_dir, False,
         additional_strategies=additional_strategies,
         realtime_slots=realtime_slots,
         realtime_speed_scale=realtime_speed_scale,
@@ -849,40 +836,44 @@ _RUST_CONFIG_README_FIELDS: List[tuple[str, str]] = [
     ("dp_pruning_min_batch_size", "DP pruning min batch size"),
     ("dp_pruning_k", "DP pruning k"),
     ("dp_timeout", "DP solver timeout (s)"),
-    ("infeasibility_recovery_mode", "Infeasibility recovery mode"),
-    ("prehistory_use_virtual_past", "Virtual prehistory enabled (default)"),
     ("queue_timeout", "Queue timeout (s)"),
 ]
 
 
 def _parse_rust_config_defaults(config_rs_path: Path) -> Dict[str, str]:
-    """Extract scalar field values from `impl Default for Config` in config.rs.
+    """Extract scalar defaults from Config and its concern-specific groups.
 
     This is intentionally a simple line-based scan (not a Rust parser): it only
-    captures single-line `name: value,` assignments and skips any line
-    containing brackets (`{`, `}`, `[`, `]`), which safely excludes multi-line
-    literals such as `flavours: vec![...]` or `capacity_tiers: vec![...]`.
-    Used only to populate the run README with human-readable defaults, so
-    approximate parsing is acceptable. Returns an empty dict if the file is
-    missing, so callers can render "?" placeholders instead of crashing.
+    captures top-level single-line `name: value,` assignments from the `Self`
+    initializer in each selected Default implementation. Nested defaults are
+    merged after `Config` so simulation and solver settings are also available
+    to the run README.
     """
     if not config_rs_path.exists():
         return {}
     text = config_rs_path.read_text()
-    marker = "impl Default for Config"
-    start = text.find(marker)
-    if start == -1:
-        return {}
-    body = text[start:]
     values: Dict[str, str] = {}
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or "{" in line or "}" in line or "[" in line or "]" in line:
+
+    for type_name in ("Config", "SolverConfig", "SimulationConfig"):
+        start = text.find(f"impl Default for {type_name}")
+        if start == -1:
             continue
-        m = re.match(r"^(\w+):\s*(.+?),\s*(?://.*)?$", line)
-        if m:
-            value = m.group(2).strip().removesuffix(".to_string()")
-            values[m.group(1)] = value
+        initializer = re.search(r"(?m)^\s*Self\s*\{\s*$", text[start:])
+        if initializer is None:
+            continue
+
+        body = text[start + initializer.end() :]
+        brace_depth = 1
+        for line in body.splitlines():
+            stripped = line.strip()
+            if brace_depth == 1 and stripped and "[" not in stripped and "]" not in stripped:
+                match = re.match(r"^(\w+):\s*(.+?),\s*(?://.*)?$", stripped)
+                if match:
+                    value = match.group(2).strip().removesuffix(".to_string()")
+                    values[match.group(1)] = value
+            brace_depth += stripped.count("{") - stripped.count("}")
+            if brace_depth == 0:
+                break
     return values
 
 
@@ -934,7 +925,7 @@ def _build_top3_section(
     scenario_ids = sorted({r["scenario_id"] for r in all_rows})
     categories = [
         (
-            "DP recovery modes — top 3 by carbon cost",
+            "DP scheduling runs — top 3 by carbon cost",
             lambda m: not m.startswith("online_") and not m.startswith("offline_"),
         ),
         ("Online alternative strategies — top 3 by carbon cost", lambda m: m.startswith("online_")),
@@ -961,7 +952,6 @@ def _write_run_readme(
     rollback_max_consecutive: int,
     alt_strategies_enabled: bool,
     batch_sizes: List[int],
-    modes: List[str],
     additional_strategies: List[str],
     online_strategies: List[str],
     online_batch_sizes: Optional[List[int]],
@@ -1008,7 +998,7 @@ def _write_run_readme(
         (
             f"- Online swarm concurrency mode: {online_swarm_mode} "
             f"({'S' if online_swarm_mode != 'merge' else 'M'} token in folder name; "
-            "see Config::online_swarm_mode in rust/src/config.rs)"
+            "see Config::online_swarm_mode in rust/src/engine/config.rs)"
         ),
         "",
         "## Other key runtime parameters",
@@ -1024,12 +1014,11 @@ def _write_run_readme(
         f"- Legacy rollback max consecutive: {rollback_max_consecutive} "
         "(retained for config compatibility; proposal commits are materialized "
         "against live occupancy and are not rolled back or re-solved)",
-        f"- Infeasibility recovery mode: {rust_defaults.get('infeasibility_recovery_mode', '?')}",
         "",
         "## Enabled phases",
         "",
-        f"- DP phase: {'enabled' if (batch_sizes and modes) else 'disabled'} "
-        f"— batch sizes (N): {batch_sizes or 'none'}, infeasibility modes: {modes or 'none'}",
+        f"- DP phase: {'enabled' if batch_sizes else 'disabled'} "
+        f"— batch sizes (N): {batch_sizes or 'none'}",
         f"- Online phase: {'enabled' if online_strategies else 'disabled'} "
         f"— strategies: {online_strategies or 'none'}, "
         f"batch sizes: {online_batch_sizes or ('falls back to DP batch_sizes' if online_strategies else 'n/a')}",
@@ -1060,7 +1049,6 @@ def run_battery(config_path: Path) -> None:
 
     # batch_sizes=[] skips the DP phase entirely (see module docstring).
     batch_sizes: List[int] = [int(n) for n in cfg.get("batch_sizes", [])]
-    modes: List[str] = cfg.get("infeasibility_modes", ["min_error_greedy", "carryover", "forecast"])
     additional_strategies: List[str] = cfg.get("additional_strategies", [])
     online_strategies: List[str] = cfg.get("online_strategies", [])
     online_batch_sizes_raw = cfg.get("online_batch_sizes")
@@ -1068,7 +1056,7 @@ def run_battery(config_path: Path) -> None:
         [int(n) for n in online_batch_sizes_raw] if online_batch_sizes_raw else None
     )
 
-    run_dp = bool(batch_sizes) and bool(modes)
+    run_dp = bool(batch_sizes)
     run_online = bool(online_strategies)
     run_offline = bool(additional_strategies)
 
@@ -1157,7 +1145,7 @@ def run_battery(config_path: Path) -> None:
         save_json(scenario_dir / f"{sid}.json", scenario_data)
 
         if not (run_dp or run_online or run_offline):
-            print("  WARNING: no phase enabled (batch_sizes/infeasibility_modes, "
+            print("  WARNING: no phase enabled (batch_sizes, "
                   "online_strategies and additional_strategies are all empty); skipping.")
             continue
 
@@ -1177,7 +1165,7 @@ def run_battery(config_path: Path) -> None:
 
         if run_dp:
             rows, n_timings = _run_dp_phase(
-                scenario_path, sid, batch_sizes, modes, scenario_dir, rust_binary,
+                scenario_path, sid, batch_sizes, scenario_dir, rust_binary,
                 baseline_cost,
                 realtime_slots=realtime_slots,
                 realtime_speed_scale=realtime_speed_scale,
@@ -1257,7 +1245,6 @@ def run_battery(config_path: Path) -> None:
         rollback_max_consecutive,
         alt_strategies_enabled,
         batch_sizes,
-        modes,
         additional_strategies,
         online_strategies,
         online_batch_sizes,

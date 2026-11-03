@@ -1,4 +1,8 @@
-//! Regression tests for scheduler batching, scheduling, and clock behavior.
+//! Regression tests for common-runtime scheduling and scheduler orchestration.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::engine::qos::{
@@ -7,25 +11,18 @@ use crate::engine::qos::{
 use crate::shared_state::SharedState;
 use crate::types::{Assignment, Flavour, Request};
 
-// ── helpers ───────────────────────────────────────────────────────────────
-
 fn make_config(overrides: impl FnOnce(&mut Config)) -> Config {
-    let mut cfg = Config {
+    let mut config = Config {
         solver: crate::config::SolverConfig {
-            batch_size: 3,
+            batch_size: 1,
             dp_pruning_min_batch_size: 0,
-            dp_pruning_method: "none".to_string(),
+            dp_pruning_method: "none".to_owned(),
             ..crate::config::SolverConfig::default()
         },
         total_slots: 24,
         error_window_past: 4,
         error_window_future: 4,
         max_error_threshold: 4.0,
-        infeasibility: crate::config::InfeasibilityConfig {
-            recovery_mode: "min_error_greedy".to_string(),
-            mock_influence: 0.0,
-            ..crate::config::InfeasibilityConfig::default()
-        },
         logging: crate::config::LoggingConfig {
             verbose: false,
             enable_solver_logging: false,
@@ -34,28 +31,12 @@ fn make_config(overrides: impl FnOnce(&mut Config)) -> Config {
         global_error_constraint_enabled: false,
         ..Config::default()
     };
-    overrides(&mut cfg);
-    cfg
-}
-
-fn make_recovery_state(cfg: &Config) -> RecoveryState {
-    let _ = cfg;
-    RecoveryState::new()
+    overrides(&mut config);
+    config
 }
 
 fn flat_forecast(slots: i32, value: f64) -> Vec<f64> {
     vec![value; slots as usize]
-}
-
-fn req(id: u64, arrival: i32, deadline: i32) -> Request {
-    Request {
-        id,
-        arrival_slot: arrival,
-        arrival_time: 0.0,
-        deadline_slot: deadline,
-        qos_profile: None,
-        qos_profile_id: crate::engine::qos::QosProfileId::default_profile(),
-    }
 }
 
 fn profile(
@@ -82,86 +63,14 @@ fn profile(
     })
 }
 
-fn run_batch_strategy(
-    strategy_name: &str,
-    current_slot: i32,
-    pending: &[Request],
-    cfg: &Config,
-    shared_state: &SharedState,
-    carbon_forecast: &[f64],
-) -> (Vec<Assignment>, SolveContext) {
-    shared_state.set_current_slot(current_slot);
-    let flavour_duration_by_name = cfg
-        .flavours
-        .iter()
-        .map(|f| (f.name.clone(), f.duration))
-        .collect();
-    let qos_profile = pending
-        .first()
-        .and_then(|request| request.qos_profile.clone());
-    let assignment = qos_profile
-        .as_deref()
-        .map(|profile| cfg.assignment_policy_for_profile(profile))
-        .unwrap_or_else(|| cfg.assignment_policy());
-    let recovery_state = make_recovery_state(cfg);
-    let snapshot = shared_state.snapshot_for_solver();
-    let strategy = select_batch_solver(strategy_name);
-    let result = strategy.solve(BatchSolveContext {
-        current_slot,
-        pending,
-        snapshot: &snapshot,
-        assignment: &assignment,
-        solver_config: &cfg.solver,
-        simulation_config: &cfg.simulation,
-        recovery_config: &cfg.infeasibility,
-        recovery_state: &recovery_state,
-        verbose: cfg.logging.verbose,
-        carbon_forecast,
-        flavour_duration_by_name: &flavour_duration_by_name,
-    });
-    (result.candidate_assignments, result.context)
-}
-
-fn call_solve_dp(
-    current_slot: i32,
-    pending: &[Request],
-    cfg: &Config,
-) -> (Vec<Assignment>, SolveContext) {
-    let ss = SharedState::new();
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-    run_batch_strategy("dp", current_slot, pending, cfg, &ss, &forecast)
-}
-
-fn call_solve_dp_with_state(
-    current_slot: i32,
-    pending: &[Request],
-    cfg: &Config,
-    ss: &SharedState,
-) -> (Vec<Assignment>, SolveContext) {
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-    run_batch_strategy("dp", current_slot, pending, cfg, ss, &forecast)
-}
-
-fn call_solve_dp_with_forecast(
-    current_slot: i32,
-    pending: &[Request],
-    cfg: &Config,
-    ss: &SharedState,
-    forecast: &[f64],
-) -> (Vec<Assignment>, SolveContext) {
-    run_batch_strategy("dp", current_slot, pending, cfg, ss, forecast)
-}
-
-// ── tests ─────────────────────────────────────────────────────────────────
-
 #[test]
 fn common_solve_input_uses_global_fixed_occupancy_and_profile_only_errors() {
-    let cfg = make_config(|_| {});
+    let config = make_config(|_| {});
     let mut profile_a = profile(
         "profile-a",
         "text_generation",
-        cfg.flavours.clone(),
-        cfg.max_error_threshold,
+        config.flavours.clone(),
+        config.max_error_threshold,
     );
     Arc::make_mut(&mut profile_a).error_window.future_slots = 2;
     let profile_a_id = profile_a.profile_id.clone();
@@ -205,16 +114,14 @@ fn common_solve_input_uses_global_fixed_occupancy_and_profile_only_errors() {
     ]);
 
     let request = Request::new_for_qos_profile(10, 1, 5, profile_a.clone());
-    let assignment = cfg.assignment_policy_for_profile(&profile_a);
+    let assignment = config.assignment_policy_for_profile(&profile_a);
     let snapshot = shared_state.snapshot_for_solver();
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-    let input = super::solve::build_solve_input_from_snapshot(
+    let forecast = flat_forecast(config.total_slots, 100.0);
+    let input = super::input::build_solve_input_from_snapshot(
         1,
         &[request],
         &snapshot,
         &assignment,
-        &cfg.simulation,
-        &cfg.infeasibility,
         &forecast,
     )
     .unwrap();
@@ -231,329 +138,101 @@ fn common_solve_input_uses_global_fixed_occupancy_and_profile_only_errors() {
     assert!(!input.qos.err_by_slot.contains_key(&2));
     assert_eq!(input.qos.error_window.baseline_err.count, 2.0);
     assert_eq!(input.qos.error_window.baseline_err.sum, 6.0);
-    assert_eq!(input.forecast_max_slot, Some(cfg.total_slots - 1));
+    assert_eq!(input.forecast_max_slot, Some(config.total_slots - 1));
 }
 
-/// All assigned slots must be ≥ current_slot.
 #[test]
-fn test_scheduled_slots_never_before_current_slot() {
-    let cfg = make_config(|_| {});
-    let current_slot = 5;
-    let pending = vec![
-        req(0, current_slot, current_slot + 3),
-        req(1, current_slot, current_slot + 3),
-        req(2, current_slot, current_slot + 4),
-    ];
-
-    let (assignments, _ctx) = call_solve_dp(current_slot, &pending, &cfg);
-
-    assert!(!assignments.is_empty(), "all requests should be scheduled");
-    for a in &assignments {
-        assert!(
-            a.scheduled_slot >= current_slot,
-            "scheduled_slot {} < current_slot {}",
-            a.scheduled_slot,
-            current_slot
-        );
-    }
-}
-
-/// Pre-existing future assignments are always pinned as baseline load and
-/// never become placements in a newly claimed batch.
-#[test]
-fn future_assignments_are_always_pinned_and_excluded_from_the_solve_result() {
-    let cfg = make_config(|_| {});
-    let ss = SharedState::new();
-    let current_slot = 2i32;
-
-    // Pre-place a future assignment (slot 6 > current_slot 2).
-    let future_id = 99u64;
-    ss.add_assignments(vec![Assignment::new(
-        future_id,
-        6,
-        "Fast".to_string(),
-        1.0,
-        5.0,
-        10.0,
-        Some(0),
-        Some(8),
-    )]);
-
-    let pending = vec![
-        req(0, current_slot, current_slot + 3),
-        req(1, current_slot, current_slot + 3),
-        req(2, current_slot, current_slot + 4),
-    ];
-    let (assignments, _ctx) = call_solve_dp_with_state(current_slot, &pending, &cfg, &ss);
-
-    let result_ids: HashSet<u64> = assignments.iter().map(|a| a.request_id).collect();
-    assert!(
-        !result_ids.contains(&future_id),
-        "a pre-existing future assignment must not be re-planned"
-    );
-    for i in 0u64..3 {
-        assert!(result_ids.contains(&i), "pending request {} missing", i);
-    }
-}
-
-/// When all flavours have error > threshold, DP is infeasible.
-/// The greedy fallback must cover all requests and the status must reflect it.
-#[test]
-fn test_greedy_fallback_covers_all_requests() {
-    let cfg = make_config(|c| {
-        c.max_error_threshold = 0.0;
-        c.flavours = vec![Flavour {
-            name: "Only".to_string(),
-            error: 1.0,
-            duration: 10.0,
-        }];
+fn common_solve_input_keeps_real_decayed_history_without_synthetic_prehistory() {
+    let config = make_config(|config| {
+        config.error_window_past = 1;
+        config.error_window_past_decay_slots = 2;
     });
+    let mut qos_profile = profile(
+        "decayed-history",
+        "text_generation",
+        config.flavours.clone(),
+        config.max_error_threshold,
+    );
+    Arc::make_mut(&mut qos_profile).error_window.past_slots = 1;
+    Arc::make_mut(&mut qos_profile)
+        .error_window
+        .past_decay_slots = 2;
+    let profile_id = qos_profile.profile_id.clone();
+    let shared_state = SharedState::new();
+    shared_state.add_assignments(vec![
+        Assignment::new_for_profile(
+            1,
+            1,
+            "Fast".to_owned(),
+            1.0,
+            4.0,
+            1.0,
+            Some(1),
+            Some(1),
+            profile_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            2,
+            0,
+            "Fast".to_owned(),
+            1.0,
+            2.0,
+            1.0,
+            Some(0),
+            Some(0),
+            profile_id.clone(),
+        ),
+    ]);
 
-    let current_slot = 0;
-    let pending = vec![req(0, 0, 5), req(1, 0, 5), req(2, 0, 5)];
-    let (assignments, ctx) = call_solve_dp(current_slot, &pending, &cfg);
-
-    assert_eq!(
-        assignments.len(),
+    let request = Request::new_for_qos_profile(3, 3, 3, qos_profile.clone());
+    let assignment = config.assignment_policy_for_profile(&qos_profile);
+    let snapshot = shared_state.snapshot_for_solver();
+    let input = super::input::build_solve_input_from_snapshot(
         3,
-        "greedy fallback should cover all 3 requests"
-    );
-    assert!(
-        ctx.status.contains("greedy"),
-        "expected greedy status, got: {}",
-        ctx.status
-    );
-    for a in &assignments {
-        assert!(a.scheduled_slot >= 0 && a.scheduled_slot <= 5);
-    }
+        &[request],
+        &snapshot,
+        &assignment,
+        &flat_forecast(config.total_slots, 100.0),
+    )
+    .unwrap();
+
+    assert!((input.qos.error_window.baseline_err.sum - 10.0 / 3.0).abs() < 1e-9);
+    assert!((input.qos.error_window.baseline_err.count - 1.0).abs() < 1e-9);
 }
 
-/// `get_effective_pruning_mode` returns "none" when batch_size < threshold
-/// and the configured method when batch_size >= threshold.
 #[test]
-fn test_pruning_threshold_gate() {
-    let cfg = make_config(|c| {
-        c.solver.dp_pruning_min_batch_size = 5;
-        c.solver.dp_pruning_method = "beam".to_string();
+fn common_worker_reports_greedy_fallback_and_selected_flavour() {
+    let config = make_config(|config| {
+        config.solver.solver_strategy = "dp".to_owned();
+        config.flavours = vec![
+            Flavour {
+                name: "FastButInaccurate".to_owned(),
+                error: 10.0,
+                duration: 1.0,
+            },
+            Flavour {
+                name: "LowestError".to_owned(),
+                error: 1.0,
+                duration: 10.0,
+            },
+        ];
     });
-    assert_eq!(get_effective_pruning_mode(3, &cfg.solver), "none");
-    assert_eq!(get_effective_pruning_mode(5, &cfg.solver), "beam");
-    assert_eq!(get_effective_pruning_mode(10, &cfg.solver), "beam");
-}
-
-/// `get_effective_pruning_mode` returns "none" when the threshold is 0
-/// (disabled), regardless of batch size.
-#[test]
-fn test_pruning_threshold_zero_means_never_prune() {
-    let cfg = make_config(|c| {
-        c.solver.dp_pruning_min_batch_size = 0;
-        c.solver.dp_pruning_method = "beam".to_string();
-    });
-    assert_eq!(get_effective_pruning_mode(100, &cfg.solver), "none");
-}
-
-/// All pending requests should appear in the result even when deadlines vary.
-#[test]
-fn test_all_pending_requests_are_scheduled() {
-    let cfg = make_config(|_| {});
-    let current_slot = 0;
-    let pending = vec![req(10, 0, 2), req(11, 0, 6), req(12, 0, 10)];
-    let (assignments, _ctx) = call_solve_dp(current_slot, &pending, &cfg);
-
-    let result_ids: HashSet<u64> = assignments.iter().map(|a| a.request_id).collect();
-    for id in [10u64, 11, 12] {
-        assert!(result_ids.contains(&id), "request {} not scheduled", id);
-    }
-}
-
-/// A QoS profile owns both its flavour set and error threshold. This makes
-/// per-request override fields unnecessary: the solver receives one immutable
-/// policy snapshot for each homogeneous profile batch.
-#[test]
-fn qos_profile_flavours_and_threshold_reach_the_dp_solver() {
-    let cfg = make_config(|_| {});
-    let current_slot = 0;
-    let cheap = Flavour {
-        name: "Cheap".to_string(),
-        error: 30.0,
-        duration: 5.0,
-    };
-    let accurate = Flavour {
-        name: "Accurate2".to_string(),
-        error: 0.0,
-        duration: 60.0,
-    };
-
-    let policy = profile(
-        "custom-task-policy-v1",
-        "custom_task",
-        vec![cheap, accurate],
-        50.0,
+    let qos_profile = profile(
+        "fallback-test",
+        "text_generation",
+        config.flavours.clone(),
+        0.0,
     );
-    let request = Request::new_for_qos_profile(30, 0, 5, policy);
-    let (assignments, _) = call_solve_dp(current_slot, &[request], &cfg);
-    assert_eq!(assignments.len(), 1);
-    assert_eq!(assignments[0].flavour_name, "Cheap");
-}
-
-/// `advance_to_next_slot` should bump the virtual clock by exactly one
-/// slot, regardless of `manual_clock`/`skip_empty_slots` settings (it's
-/// a direct clock manipulation, not gated by them).
-#[test]
-fn test_advance_to_next_slot_moves_exactly_one_slot() {
-    let cfg = make_config(|c| {
-        c.simulation.manual_clock = true;
-        c.slot_duration_seconds = 1800.0; // 30 minutes
-        c.simulation.slot_speed_scale = 1.0;
-    });
-    let ss = SharedState::new();
-    assert_eq!(ss.get_current_slot(), 0);
-
-    let new_slot = advance_to_next_slot(&ss, cfg.total_slots, cfg.effective_slot_duration_secs());
-    assert_eq!(new_slot, 1);
-    assert_eq!(ss.virtual_elapsed_secs(), 1800.0);
-
-    let new_slot = advance_to_next_slot(&ss, cfg.total_slots, cfg.effective_slot_duration_secs());
-    assert_eq!(new_slot, 2);
-    assert_eq!(ss.virtual_elapsed_secs(), 3600.0);
-}
-
-/// `advance_to_next_slot` never pushes the slot past `total_slots - 1`.
-#[test]
-fn test_advance_to_next_slot_clamped_to_horizon() {
-    let cfg = make_config(|c| {
-        c.simulation.manual_clock = true;
-        c.total_slots = 2;
-    });
-    let ss = SharedState::new();
-    ss.set_virtual_elapsed_ms(
-        ((cfg.total_slots - 1) as u64) * (cfg.slot_duration_seconds * 1000.0) as u64,
-    );
-    ss.set_current_slot(cfg.total_slots - 1);
-
-    let new_slot = advance_to_next_slot(&ss, cfg.total_slots, cfg.effective_slot_duration_secs());
-    assert_eq!(new_slot, cfg.total_slots - 1);
-}
-
-// ── singleton_best tests ──────────────────────────────────────────────
-
-fn call_solve_singleton_best(
-    current_slot: i32,
-    pending: &[Request],
-    cfg: &Config,
-    ss: &SharedState,
-) -> (Vec<Assignment>, SolveContext) {
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-    run_batch_strategy("singleton_best", current_slot, pending, cfg, ss, &forecast)
-}
-
-fn call_solve_singleton_best_with_forecast(
-    current_slot: i32,
-    pending: &[Request],
-    cfg: &Config,
-    ss: &SharedState,
-    forecast: &[f64],
-) -> (Vec<Assignment>, SolveContext) {
-    run_batch_strategy("singleton_best", current_slot, pending, cfg, ss, forecast)
-}
-
-#[test]
-fn batch_solver_registry_resolves_trimmed_case_insensitive_names() {
-    let cfg = make_config(|_| {});
-    let current_slot = 1;
-    let pending = vec![req(1, current_slot, current_slot + 3)];
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
     let shared_state = SharedState::new();
+    shared_state.initialize_capacity_tiers(config.capacity_tiers.clone());
+    shared_state.add_request(Request::new_for_qos_profile(1000, 0, 0, qos_profile));
 
-    let (assignments, context) = run_batch_strategy(
-        " SINGLETON_BEST ",
-        current_slot,
-        &pending,
-        &cfg,
-        &shared_state,
-        &forecast,
+    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
+        &QosProfileId::parse("fallback-test").unwrap(),
+        1,
     );
-
-    assert_eq!(assignments.len(), 1);
-    assert_eq!(context.mode, "singleton_best");
-}
-
-#[test]
-fn random_batch_strategies_apply_their_requested_random_dimensions() {
-    let cfg = make_config(|cfg| {
-        cfg.error_window_future = 3;
-    });
-    let current_slot = 1;
-    let pending = vec![req(1, current_slot, current_slot + 3)];
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-
-    for (strategy, expected_mode) in [
-        ("random_flavour", "random_flavour"),
-        ("random_slot", "random_slot"),
-        ("random_full", "random_full"),
-    ] {
-        let shared_state = SharedState::new();
-        let (assignments, context) = run_batch_strategy(
-            strategy,
-            current_slot,
-            &pending,
-            &cfg,
-            &shared_state,
-            &forecast,
-        );
-        assert_eq!(context.mode, expected_mode);
-        assert_eq!(assignments.len(), 1);
-        assert!((current_slot..=current_slot + 3).contains(&assignments[0].scheduled_slot));
-        if strategy == "random_flavour" {
-            assert_eq!(assignments[0].scheduled_slot, current_slot);
-        }
-        if strategy == "random_slot" {
-            assert_eq!(assignments[0].flavour_name, "Accurate");
-        }
-    }
-}
-
-#[test]
-fn batch_solver_registry_preserves_dp_fallback_for_unknown_names() {
-    let cfg = make_config(|_| {});
-    let current_slot = 1;
-    let pending = vec![req(2, current_slot, current_slot + 3)];
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-    let shared_state = SharedState::new();
-
-    let (assignments, context) = run_batch_strategy(
-        "not_registered",
-        current_slot,
-        &pending,
-        &cfg,
-        &shared_state,
-        &forecast,
-    );
-
-    assert_eq!(assignments.len(), 1);
-    assert!(
-        context.mode.starts_with("dp_"),
-        "unknown strategies must keep the historical DP fallback, got {}",
-        context.mode
-    );
-}
-
-#[test]
-fn common_worker_commits_claimed_batch_and_logs_assignment_counts() {
-    let cfg = make_config(|cfg| {
-        cfg.solver.solver_strategy = "dp".to_string();
-        cfg.solver.batch_size = 1;
-    });
-    let shared_state = SharedState::new();
-    shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
-    let profile_id = QosProfileId::default_profile();
-    shared_state.add_request(req(1000, 0, 1));
-
-    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(&profile_id, 1);
-    assert_eq!(claimed.requests.len(), 1);
-
-    let registry = build_solver_registry(&cfg);
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
+    let registry = build_solver_registry(&config);
+    let forecast = flat_forecast(config.total_slots, 100.0);
     let mutable = Arc::new(Mutex::new(SchedulerMutableState {
         active_workers: 1,
         active_profiles: HashSet::new(),
@@ -563,16 +242,16 @@ fn common_worker_commits_claimed_batch_and_logs_assignment_counts() {
         solver_runtimes: HashMap::new(),
     }));
 
-    let file_prefix = std::env::temp_dir().join(format!(
-        "carbonshift-worker-stats-{}-{}",
+    let prefix = std::env::temp_dir().join(format!(
+        "carbonshift-fallback-metrics-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
     ));
-    let runs_path = file_prefix.with_extension("runs.csv");
-    let assignments_path = file_prefix.with_extension("assignments.csv");
+    let runs_path = prefix.with_extension("runs.csv");
+    let assignments_path = prefix.with_extension("assignments.csv");
     let logger = MetricsLogger::new(
         true,
         runs_path.to_string_lossy().into_owned(),
@@ -584,7 +263,7 @@ fn common_worker_commits_claimed_batch_and_logs_assignment_counts() {
         claimed.requests,
         claimed.snapshot,
         &shared_state,
-        &cfg,
+        &config,
         &registry,
         &forecast,
         &mutable,
@@ -592,208 +271,33 @@ fn common_worker_commits_claimed_batch_and_logs_assignment_counts() {
     );
     assert!(matches!(outcome, BatchWorkerOutcome::Committed));
 
-    let scheduler_state = mutable.lock().unwrap();
-    assert_eq!(scheduler_state.stats.total_scheduled, 1);
-    assert_eq!(scheduler_state.stats.batches_processed, 1);
-    drop(scheduler_state);
-
-    let mut reader = csv::Reader::from_path(&runs_path).unwrap();
-    let headers = reader.headers().unwrap().clone();
-    let run_row = reader.records().next().unwrap().unwrap();
+    let mut assignments_reader = csv::Reader::from_path(&assignments_path).unwrap();
+    let headers = assignments_reader.headers().unwrap().clone();
+    let row = assignments_reader.records().next().unwrap().unwrap();
     let column = |name: &str| headers.iter().position(|header| header == name).unwrap();
-    assert_eq!(run_row.get(column("new_assignments")), Some("1"));
-    assert_eq!(run_row.get(column("solver_status")), Some("ok"));
-    assert_eq!(run_row.get(column("solver_mode")), Some("dp"));
-    for removed_field in [
-        "pending_batch_size",
-        "total_assignments",
-        "replanned_assignments",
-        "mock_recovery_injected_count",
-        "consecutive_rollbacks",
-        "lock_future_assignments",
-        "solver_start_ts",
-        "solver_end_ts",
-        "global_error_before",
-        "global_error_count_before",
-        "profile_error_before",
-        "profile_error_count_before",
-    ] {
-        assert!(
-            !headers.iter().any(|field| field == removed_field),
-            "obsolete run field {removed_field} is still in the CSV header"
-        );
-    }
+    assert_eq!(row.get(column("flavour_name")), Some("LowestError"));
+    assert_eq!(
+        row.get(column("assigned_with_greedy_fallback")),
+        Some("true")
+    );
+    let mut runs_reader = csv::Reader::from_path(&runs_path).unwrap();
+    let run_headers = runs_reader.headers().unwrap().clone();
+    let run_row = runs_reader.records().next().unwrap().unwrap();
+    let fallback_count_column = run_headers
+        .iter()
+        .position(|header| header == "greedy_fallback_assignments")
+        .unwrap();
+    assert_eq!(run_row.get(fallback_count_column), Some("1"));
 
-    drop(reader);
+    drop(assignments_reader);
+    drop(runs_reader);
     drop(logger);
     std::fs::remove_file(runs_path).unwrap();
     std::fs::remove_file(assignments_path).unwrap();
 }
 
 #[test]
-fn profile_batches_ignore_other_profiles_window_errors() {
-    let cfg = make_config(|c| {
-        c.global_error_constraint_enabled = false;
-        c.flavours = vec![
-            Flavour {
-                name: "Accurate".to_string(),
-                error: 0.0,
-                duration: 100.0,
-            },
-            Flavour {
-                name: "Fast".to_string(),
-                error: 15.0,
-                duration: 1.0,
-            },
-        ];
-    });
-    let qa_profile = profile(
-        "qa-standard-v1",
-        "question_answering",
-        cfg.flavours.clone(),
-        20.0,
-    );
-    let ner_profile = profile(
-        "ner-standard-v1",
-        "ner",
-        vec![Flavour {
-            name: "NerFast".to_string(),
-            error: 90.0,
-            duration: 1.0,
-        }],
-        90.0,
-    );
-    let shared_state = SharedState::new();
-    shared_state.add_assignments(vec![Assignment::new_for_profile(
-        900,
-        0,
-        "NerFast".to_string(),
-        1.0,
-        90.0,
-        1.0,
-        Some(0),
-        Some(1),
-        ner_profile.profile_id.clone(),
-    )]);
-    let mut request = Request::new_for_qos_profile(1, 0, 0, qa_profile.clone());
-    request.arrival_time = 0.0;
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-
-    let (assignments, context) =
-        run_batch_strategy("dp", 0, &[request], &cfg, &shared_state, &forecast);
-
-    assert_eq!(assignments.len(), 1);
-    assert_eq!(
-        assignments[0].flavour_name, "Fast",
-        "the unrelated NER window error must not make QA's fast flavour infeasible"
-    );
-    assert_eq!(assignments[0].qos_profile_id, qa_profile.profile_id);
-    assert!(!context.profile_error_constraint_active);
-}
-
-#[test]
-fn cumulative_error_constraint_uses_only_the_selected_profile() {
-    let mut cfg = make_config(|c| c.global_error_constraint_enabled = true);
-    cfg.global_error_constraint_hard = true;
-    let mut qa = (*profile(
-        "qa-cumulative-v1",
-        "question_answering",
-        vec![
-            Flavour {
-                name: "Accurate".to_string(),
-                error: 0.0,
-                duration: 100.0,
-            },
-            Flavour {
-                name: "Fast".to_string(),
-                error: 15.0,
-                duration: 1.0,
-            },
-        ],
-        20.0,
-    ))
-    .clone();
-    qa.cumulative_error = CumulativeErrorPolicy {
-        enabled: true,
-        hard: true,
-    };
-    let qa = Arc::new(qa);
-    let shared_state = SharedState::new();
-    shared_state.add_assignments(vec![Assignment::new_for_profile(
-        902,
-        0,
-        "Fast".to_string(),
-        1.0,
-        90.0,
-        1.0,
-        Some(0),
-        Some(1),
-        qa.profile_id.clone(),
-    )]);
-    let request = Request::new_for_qos_profile(3, 1, 1, qa);
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-
-    let (_, context) = run_batch_strategy("dp", 1, &[request], &cfg, &shared_state, &forecast);
-
-    assert!(
-        context.profile_error_constraint_active,
-        "the selected profile's own cumulative overage must activate its constraint"
-    );
-    assert_eq!(context.profile_error_count_before, 1);
-    assert!((context.profile_error_before - 90.0).abs() < 1e-9);
-}
-
-#[test]
-fn profile_solve_prices_capacity_using_global_cross_profile_occupancy() {
-    let cfg = make_config(|c| {
-        c.global_error_constraint_enabled = false;
-        c.capacity_tiers = vec![
-            crate::types::CapacityTier {
-                max_requests: Some(1),
-                multiplier: 1.0,
-            },
-            crate::types::CapacityTier {
-                max_requests: None,
-                multiplier: 2.0,
-            },
-        ];
-    });
-    let qa_profile = profile(
-        "qa-cost-v1",
-        "question_answering",
-        vec![Flavour {
-            name: "Only".to_string(),
-            error: 0.0,
-            duration: 60.0,
-        }],
-        1.0,
-    );
-    let shared_state = SharedState::new();
-    shared_state.add_assignments(vec![Assignment::new_for_profile(
-        901,
-        0,
-        "Ner".to_string(),
-        1.0,
-        0.0,
-        60.0,
-        Some(0),
-        Some(0),
-        QosProfileId::parse("ner-cost-v1").unwrap(),
-    )]);
-    let request = Request::new_for_qos_profile(2, 0, 0, qa_profile.clone());
-    let forecast = flat_forecast(cfg.total_slots, 100.0);
-
-    let (assignments, _) = run_batch_strategy("dp", 0, &[request], &cfg, &shared_state, &forecast);
-
-    assert_eq!(assignments.len(), 1);
-    assert!(
-        (assignments[0].carbon_cost - 100.0 * 2.0 * 60.0 / 3600.0).abs() < 1e-9,
-        "profile isolation must not isolate global rebound-tier occupancy"
-    );
-}
-
-#[test]
-fn profile_dispatch_round_robins_and_allows_same_profile_batches() {
+fn profile_dispatch_round_robins_and_respects_profile_serialization() {
     let qa = QosProfileId::parse("qa-standard-v1").unwrap();
     let ner = QosProfileId::parse("ner-standard-v1").unwrap();
     let pending = vec![(qa.clone(), 5), (ner.clone(), 5)];
@@ -801,7 +305,7 @@ fn profile_dispatch_round_robins_and_allows_same_profile_batches() {
     let infeasible = HashMap::new();
 
     assert_eq!(
-        next_profile_to_dispatch(&pending, None, &active_profiles, true, &infeasible, 3, 2,),
+        next_profile_to_dispatch(&pending, None, &active_profiles, true, &infeasible, 3, 2),
         Some((ner.clone(), 5))
     );
     assert_eq!(
@@ -816,34 +320,9 @@ fn profile_dispatch_round_robins_and_allows_same_profile_batches() {
         ),
         Some((qa.clone(), 5))
     );
-    assert_eq!(
-        next_profile_to_dispatch(
-            &pending,
-            Some(&qa),
-            &active_profiles,
-            true,
-            &infeasible,
-            3,
-            2,
-        ),
-        Some((ner.clone(), 5))
-    );
 
     let single_profile = vec![(qa.clone(), 10)];
     let active_profiles = HashSet::from([qa.clone()]);
-    assert_eq!(
-        next_profile_to_dispatch(
-            &single_profile,
-            Some(&qa),
-            &active_profiles,
-            true,
-            &infeasible,
-            3,
-            2,
-        ),
-        Some((qa.clone(), 10)),
-        "an active batch must not prevent another same-profile batch from being claimed"
-    );
     assert_eq!(
         next_profile_to_dispatch(
             &single_profile,
@@ -854,234 +333,87 @@ fn profile_dispatch_round_robins_and_allows_same_profile_batches() {
             3,
             2,
         ),
-        None,
-        "the default service constructor keeps same-profile batch serialization"
+        None
     );
-
-    let mut last_infeasible = HashMap::new();
-    last_infeasible.insert(qa.clone(), (3, 10));
     assert_eq!(
         next_profile_to_dispatch(
             &single_profile,
             None,
             &active_profiles,
             true,
-            &last_infeasible,
+            &infeasible,
             3,
             2,
         ),
-        None
-    );
-    let larger_queue = vec![(qa.clone(), 11)];
-    assert_eq!(
-        next_profile_to_dispatch(
-            &larger_queue,
-            None,
-            &active_profiles,
-            true,
-            &last_infeasible,
-            3,
-            2,
-        ),
-        Some((qa, 11)),
-        "a changed queue should make a previously infeasible profile retryable"
+        Some((qa, 10))
     );
 }
 
 #[test]
 fn average_worker_concurrency_uses_worker_busy_time() {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let mut stats = SchedulerStats::default();
     stats.start(start);
     stats.record_worker_count_change(0, 0, start);
-    let two_seconds = start + std::time::Duration::from_secs(2);
+    let two_seconds = start + Duration::from_secs(2);
     stats.record_worker_count_change(0, 2, two_seconds);
-    let five_seconds_later = two_seconds + std::time::Duration::from_secs(3);
+    let five_seconds_later = two_seconds + Duration::from_secs(3);
     stats.record_worker_count_change(2, 0, five_seconds_later);
-    let end = five_seconds_later + std::time::Duration::from_secs(5);
+    let end = five_seconds_later + Duration::from_secs(5);
     stats.finish(0, end);
 
-    assert!(
-        (stats.average_concurrent_workers(0, end) - 2.0).abs() < 1e-9,
-        "idle scheduler time should not dilute average active-worker concurrency"
-    );
-}
-
-/// A single request must be scheduled at/after current_slot, tagged with
-/// the "singleton_best" solver mode.
-#[test]
-fn test_singleton_best_schedules_single_request() {
-    let cfg = make_config(|_| {});
-    let ss = SharedState::new();
-    let current_slot = 3;
-    let pending = vec![req(0, current_slot, current_slot + 4)];
-
-    let (assignments, ctx) = call_solve_singleton_best(current_slot, &pending, &cfg, &ss);
-
-    assert_eq!(assignments.len(), 1);
-    assert!(assignments[0].scheduled_slot >= current_slot);
-    assert_eq!(ctx.mode, "singleton_best");
-    assert_eq!(ctx.status, "ok");
+    assert!((stats.average_concurrent_workers(0, end) - 2.0).abs() < 1e-9);
 }
 
 #[test]
-fn test_batch_solvers_never_assign_before_arrival_slot() {
-    let cfg = make_config(|_| {});
-    let current_slot = 1;
-    let pending = vec![req(5, 3, 6)];
-    let mut forecast = flat_forecast(cfg.total_slots, 100.0);
-    forecast[1] = 1.0;
-    forecast[3] = 20.0;
-    let shared = SharedState::new();
-
-    let (dp_assignments, _) =
-        call_solve_dp_with_forecast(current_slot, &pending, &cfg, &shared, &forecast);
-    let (greedy_assignments, _) = call_solve_singleton_best_with_forecast(
-        current_slot,
-        &pending,
-        &cfg,
-        &SharedState::new(),
-        &forecast,
-    );
-
-    assert_eq!(dp_assignments.len(), 1);
-    assert_eq!(greedy_assignments.len(), 1);
-    assert!(dp_assignments[0].scheduled_slot >= pending[0].arrival_slot);
-    assert!(greedy_assignments[0].scheduled_slot >= pending[0].arrival_slot);
-}
-
-/// For a single request (batch_size=1), the exhaustive greedy scan must
-/// pick the same (slot, flavour, cost) as the DP solver — with only one
-/// request there is no combinatorial ordering effect, so both are
-/// exhaustive searches over the same feasible set.
-///
-/// Uses a non-flat carbon forecast so there is a unique cheapest slot —
-/// with a flat forecast every candidate slot ties on cost and each
-/// solver's internal (unspecified) tie-breaking order may legitimately
-/// differ (DP iterates a HashMap; greedy scans slots ascending).
-#[test]
-fn test_singleton_best_matches_dp_for_single_request() {
-    let cfg = make_config(|_| {});
-    let current_slot = 2;
-    let pending = vec![req(7, current_slot, current_slot + 5)];
-    let mut forecast = flat_forecast(cfg.total_slots, 100.0);
-    forecast[4] = 10.0; // slot 4 is uniquely the cheapest candidate
-
-    let ss_dp = SharedState::new();
-    let (dp_assignments, _) =
-        call_solve_dp_with_forecast(current_slot, &pending, &cfg, &ss_dp, &forecast);
-
-    let ss_greedy = SharedState::new();
-    let (greedy_assignments, _) = call_solve_singleton_best_with_forecast(
-        current_slot,
-        &pending,
-        &cfg,
-        &ss_greedy,
-        &forecast,
-    );
-
-    assert_eq!(dp_assignments.len(), 1);
-    assert_eq!(greedy_assignments.len(), 1);
-    assert_eq!(dp_assignments[0].scheduled_slot, 4);
-    assert_eq!(
-        dp_assignments[0].scheduled_slot,
-        greedy_assignments[0].scheduled_slot
-    );
-    assert_eq!(
-        dp_assignments[0].flavour_name,
-        greedy_assignments[0].flavour_name
-    );
-    assert!((dp_assignments[0].carbon_cost - greedy_assignments[0].carbon_cost).abs() < 1e-9);
-}
-
-/// Requests already committed to a slot must raise the capacity-tier
-/// multiplier for subsequent requests placed in the same slot — the
-/// greedy scan must read this from live shared state, not start "fresh"
-/// every call.
-#[test]
-fn test_singleton_best_respects_existing_slot_load() {
-    let mut cfg = make_config(|_| {});
-    cfg.capacity_tiers = vec![
-        crate::types::CapacityTier {
-            max_requests: Some(1),
-            multiplier: 1.0,
-        },
-        crate::types::CapacityTier {
-            max_requests: None,
-            multiplier: 5.0,
-        },
-    ];
-    let ss = SharedState::new();
-    let current_slot = 0;
-
-    // Pre-fill slot 0 with one committed assignment so the *next* request
-    // placed there would be position=2 → the expensive (5.0×) tier.
-    ss.add_assignments(vec![Assignment::new(
-        42,
-        0,
-        cfg.flavours[0].name.clone(),
-        1.0,
-        cfg.flavours[0].error,
-        cfg.flavours[0].duration,
-        Some(0),
-        Some(0),
-    )]);
-
-    // A request whose only feasible slot is 0 (arrival==deadline==0).
-    let pending = vec![req(1, current_slot, current_slot)];
-    let (assignments, _ctx) = call_solve_singleton_best(current_slot, &pending, &cfg, &ss);
-
-    assert_eq!(assignments.len(), 1);
-    assert_eq!(assignments[0].scheduled_slot, 0);
-    // Cost must reflect the 5.0× multiplier (position 2), not the 1.0× baseline.
-    let cheapest_flavour_duration = cfg
-        .flavours
-        .iter()
-        .map(|flavour| flavour.duration)
-        .min_by(f64::total_cmp)
-        .unwrap();
-    let expected_min_cost =
-        100.0 * 5.0 * cheapest_flavour_duration * cfg.carbon_cost_duration_scale;
-    assert!(
-        assignments[0].carbon_cost >= expected_min_cost - 1e-9,
-        "cost {} should reflect the higher capacity tier (>= {})",
-        assignments[0].carbon_cost,
-        expected_min_cost
-    );
-}
-
-/// Global error constraint must be retrospective (based on the average
-/// error *before* this request), matching solve_dp's step-function
-/// behaviour, and must never exclude every flavour.
-#[test]
-fn test_singleton_best_global_error_constraint_is_retrospective() {
-    let cfg = make_config(|c| {
-        c.global_error_constraint_enabled = true;
-        c.global_error_constraint_hard = true;
-        c.max_error_threshold = 1.0;
+fn advance_to_next_slot_moves_exactly_one_slot() {
+    let config = make_config(|config| {
+        config.simulation.manual_clock = true;
+        config.slot_duration_seconds = 1800.0;
+        config.simulation.slot_speed_scale = 1.0;
     });
-    let ss = SharedState::new();
-    let current_slot = 0;
-
-    // Push the global average error above threshold with a high-error assignment.
-    ss.add_assignments(vec![Assignment::new(
-        1,
-        0,
-        "Slow".to_string(),
-        1.0,
-        10.0,
-        20.0,
-        Some(0),
-        Some(0),
-    )]);
-
-    let pending = vec![req(2, current_slot, current_slot + 3)];
-    let (assignments, ctx) = call_solve_singleton_best(current_slot, &pending, &cfg, &ss);
+    let shared_state = SharedState::new();
+    assert_eq!(shared_state.get_current_slot(), 0);
 
     assert_eq!(
-        assignments.len(),
-        1,
-        "request must still be scheduled under a hard constraint"
+        advance_to_next_slot(
+            &shared_state,
+            config.total_slots,
+            config.effective_slot_duration_secs()
+        ),
+        1
     );
-    assert!(ctx.profile_error_constraint_active);
+    assert_eq!(shared_state.virtual_elapsed_secs(), 1800.0);
+
+    assert_eq!(
+        advance_to_next_slot(
+            &shared_state,
+            config.total_slots,
+            config.effective_slot_duration_secs()
+        ),
+        2
+    );
+    assert_eq!(shared_state.virtual_elapsed_secs(), 3600.0);
+}
+
+#[test]
+fn advance_to_next_slot_is_clamped_to_horizon() {
+    let config = make_config(|config| {
+        config.simulation.manual_clock = true;
+        config.total_slots = 2;
+    });
+    let shared_state = SharedState::new();
+    shared_state.set_virtual_elapsed_ms(
+        ((config.total_slots - 1) as u64) * (config.slot_duration_seconds * 1000.0) as u64,
+    );
+    shared_state.set_current_slot(config.total_slots - 1);
+
+    assert_eq!(
+        advance_to_next_slot(
+            &shared_state,
+            config.total_slots,
+            config.effective_slot_duration_secs()
+        ),
+        config.total_slots - 1
+    );
 }

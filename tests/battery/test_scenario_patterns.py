@@ -28,7 +28,6 @@ def _generate(pattern: str, *, rate: float = 2.5, slots: int = 24):
         error_window_past=2,
         error_window_future=2,
         max_error_threshold=4.0,
-        prehistory_error_ratio=1.0,
         input_pattern=pattern,
     )
 
@@ -37,6 +36,8 @@ def test_flat_pattern_has_seeded_low_count_jitter_and_preserves_total():
     scenario = _generate("flat", rate=60.5, slots=128)
     repeated = _generate("flat", rate=60.5, slots=128)
 
+    assert "prehistory_slots" not in scenario
+    assert not any(key.startswith("prehistory_") for key in scenario["metadata"])
     counts = [0] * 128
     for request in scenario["requests"]:
         counts[request["arrival_slot"]] += 1
