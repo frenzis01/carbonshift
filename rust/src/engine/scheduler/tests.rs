@@ -1,12 +1,17 @@
 //! Regression tests for common-runtime scheduling and scheduler orchestration.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::*;
 use crate::engine::qos::{
     CumulativeErrorPolicy, ErrorWindowPolicy, QosProfile, QosProfileId, TaskKindId,
+};
+use crate::engine::solver::{
+    CommitReport, ProposedPlacement, SolveInput, SolverAlgorithm, SolverError, SolverProposal,
+    SolverRegistry, SolverScope,
 };
 use crate::shared_state::SharedState;
 use crate::types::{Assignment, Flavour, Request};
@@ -61,6 +66,138 @@ fn profile(
             hard: false,
         },
     })
+}
+
+#[derive(Default)]
+struct SolveGateState {
+    entered: usize,
+    released: bool,
+}
+
+#[derive(Default)]
+struct SolveGate {
+    state: Mutex<SolveGateState>,
+    changed: Condvar,
+    active_solves: AtomicUsize,
+    peak_active_solves: AtomicUsize,
+}
+
+impl SolveGate {
+    fn wait_for_two_solves(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        while state.entered < 2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next_state, result) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next_state;
+            if result.timed_out() && state.entered < 2 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+
+    fn enter_and_wait(&self) -> Result<(), SolverError> {
+        let active = self.active_solves.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak_active_solves.fetch_max(active, Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut state = self.state.lock().map_err(|_| SolverError::LockPoisoned)?;
+        state.entered += 1;
+        self.changed.notify_all();
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.active_solves.fetch_sub(1, Ordering::AcqRel);
+                return Err(SolverError::Algorithm(
+                    "test solver timed out waiting for concurrent batch workers".to_owned(),
+                ));
+            }
+            let (next_state, result) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| SolverError::LockPoisoned)?;
+            state = next_state;
+            if result.timed_out() && !state.released {
+                self.active_solves.fetch_sub(1, Ordering::AcqRel);
+                return Err(SolverError::Algorithm(
+                    "test solver timed out waiting for concurrent batch workers".to_owned(),
+                ));
+            }
+        }
+        self.active_solves.fetch_sub(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SchedulerGateState(Vec<u64>);
+
+struct SchedulerGateDelta(Vec<u64>);
+
+struct SchedulerGateAlgorithm {
+    gate: Arc<SolveGate>,
+    settled_batches: Arc<Mutex<Vec<Vec<(u64, f64)>>>>,
+}
+
+impl SolverAlgorithm for SchedulerGateAlgorithm {
+    type State = SchedulerGateState;
+    type Delta = SchedulerGateDelta;
+
+    fn initial_state(&self, _scope: &SolverScope) -> Self::State {
+        SchedulerGateState(Vec::new())
+    }
+
+    fn solve(
+        &self,
+        _snapshot: &Self::State,
+        _scope: &SolverScope,
+        input: &SolveInput,
+    ) -> Result<(SolverProposal, Self::Delta), SolverError> {
+        self.gate.enter_and_wait()?;
+        let placements = input
+            .requests
+            .iter()
+            .map(|request| {
+                ProposedPlacement::new(
+                    request.request_id,
+                    request.arrival_slot.max(input.current_slot),
+                    "Test".to_owned(),
+                )
+            })
+            .collect();
+        let request_ids = input
+            .requests
+            .iter()
+            .map(|request| request.request_id)
+            .collect();
+        Ok((
+            SolverProposal { placements },
+            SchedulerGateDelta(request_ids),
+        ))
+    }
+
+    fn merge(&self, state: &mut Self::State, delta: Self::Delta, report: &CommitReport) {
+        let proposed_ids: HashSet<_> = delta.0.into_iter().collect();
+        let accepted: Vec<_> = report
+            .assignments
+            .iter()
+            .filter(|assignment| proposed_ids.contains(&assignment.request_id))
+            .map(|assignment| (assignment.request_id, assignment.carbon_cost))
+            .collect();
+        state
+            .0
+            .extend(accepted.iter().map(|(request_id, _)| *request_id));
+        self.settled_batches.lock().unwrap().push(accepted);
+    }
 }
 
 #[test]
@@ -293,6 +430,140 @@ fn common_worker_reports_greedy_fallback_and_selected_flavour() {
     drop(logger);
     std::fs::remove_file(runs_path).unwrap();
     std::fs::remove_file(assignments_path).unwrap();
+}
+
+#[test]
+fn online_scheduler_runs_parallel_batches_within_worker_cap_and_merges_final_commit_reports() {
+    let mut config = make_config(|config| {
+        config.total_slots = 4;
+        config.error_window_future = 3;
+        config.solver.batch_size = 1;
+        config.solver.solver_strategy = "test_gate".to_owned();
+        config.solver.max_batch_solver_parallelism = 2;
+        config.simulation.manual_clock = true;
+        config.simulation.skip_empty_slots = false;
+        config.carbon_cost_duration_scale = 1.0;
+        config.flavours = vec![Flavour {
+            name: "Test".to_owned(),
+            error: 1.0,
+            duration: 10.0,
+        }];
+        config.capacity_tiers = vec![
+            crate::types::CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            crate::types::CapacityTier {
+                max_requests: None,
+                multiplier: 2.0,
+            },
+        ];
+    });
+    config.solver.batch_timeout_secs = 0.0;
+    let config = Arc::new(config);
+    let mut qos_profile = profile(
+        "scheduler-parallel-test",
+        "text_generation",
+        config.flavours.clone(),
+        100.0,
+    );
+    Arc::make_mut(&mut qos_profile).error_window.future_slots = 3;
+
+    let gate = Arc::new(SolveGate::default());
+    let settled_batches = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = SolverRegistry::default();
+    let gate_for_factory = Arc::clone(&gate);
+    let settlements_for_factory = Arc::clone(&settled_batches);
+    registry
+        .register("test_gate", move || SchedulerGateAlgorithm {
+            gate: Arc::clone(&gate_for_factory),
+            settled_batches: Arc::clone(&settlements_for_factory),
+        })
+        .unwrap();
+
+    let shared_state = SharedState::new();
+    shared_state.add_requests(
+        (1..=3)
+            .map(|request_id| Request::new_for_qos_profile(request_id, 0, 3, qos_profile.clone()))
+            .collect(),
+    );
+    let metrics_logger = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
+    let forecast = Arc::new(RwLock::new(flat_forecast(config.total_slots, 100.0)));
+    let mut scheduler = BatchScheduler::new_with_parallel_profile_batches(
+        shared_state.clone(),
+        config.clone(),
+        metrics_logger,
+        forecast,
+    );
+    // Replace the built-in registry before starting the scheduler so worker
+    // dispatch, runtime caching, commits, and delta settlement remain real.
+    scheduler.solver_registry = Arc::new(registry);
+    scheduler.start();
+
+    let observed_parallel_solves = gate.wait_for_two_solves(Duration::from_secs(5));
+    gate.release();
+
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < drain_deadline {
+        let stats = scheduler.get_statistics();
+        if shared_state.get_pending_count() == 0
+            && stats.active_batch_workers == 0
+            && shared_state.get_current_assignments().len() == 3
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    scheduler.stop();
+
+    assert!(
+        observed_parallel_solves,
+        "the two first batch solves must overlap before the gate is released"
+    );
+    assert_eq!(gate.peak_active_solves.load(Ordering::Acquire), 2);
+
+    let stats = scheduler.get_statistics();
+    assert_eq!(stats.active_batch_workers, 0);
+    assert_eq!(stats.peak_concurrent_workers, 2);
+    assert_eq!(stats.batches_processed, 3);
+    assert_eq!(shared_state.get_pending_count(), 0);
+
+    let assignments = shared_state.get_current_assignments();
+    assert_eq!(assignments.len(), 3);
+    assert_eq!(
+        shared_state
+            .get_profile_error_stats(&qos_profile.profile_id)
+            .count,
+        3
+    );
+    let mut committed_costs: Vec<_> = assignments
+        .values()
+        .map(|assignment| assignment.carbon_cost)
+        .collect();
+    committed_costs.sort_by(f64::total_cmp);
+    assert_eq!(committed_costs, vec![1_000.0, 2_000.0, 2_000.0]);
+
+    let settled = settled_batches.lock().unwrap();
+    assert_eq!(
+        settled.len(),
+        3,
+        "one accepted delta should settle per batch"
+    );
+    let mut settled_ids_and_costs: Vec<_> = settled.iter().flatten().copied().collect();
+    settled_ids_and_costs.sort_by_key(|(request_id, _)| *request_id);
+    let mut committed_ids_and_costs: Vec<_> = assignments
+        .values()
+        .map(|assignment| (assignment.request_id, assignment.carbon_cost))
+        .collect();
+    committed_ids_and_costs.sort_by_key(|(request_id, _)| *request_id);
+    assert_eq!(settled_ids_and_costs, committed_ids_and_costs);
+    assert_eq!(
+        settled_ids_and_costs
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]
