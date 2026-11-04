@@ -790,7 +790,6 @@ _RUST_CONFIG_README_FIELDS: List[tuple[str, str]] = [
     ("dp_pruning_min_batch_size", "DP pruning min batch size"),
     ("dp_pruning_k", "DP pruning k"),
     ("dp_timeout", "DP solver timeout (s)"),
-    ("queue_timeout", "Queue timeout (s)"),
 ]
 
 

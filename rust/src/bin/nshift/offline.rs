@@ -77,16 +77,31 @@ pub(super) fn project_scenario_to_solve_input(
     let mut requests = scenario.requests.clone();
     requests.sort_by_key(|request| (request.arrival_slot, request.request_id));
 
-    let input = SolveInput {
-        current_slot: 0,
-        requests: requests
-            .iter()
-            .map(|request| SolveRequest {
+    let forecast_max_slot = assignment.total_slots - 1;
+    let requests = requests
+        .iter()
+        .map(|request| {
+            let assignment_deadline_slot = carbonshift_rs::engine::solver::cap_assignment_deadline(
+                request.request_id,
+                request.arrival_slot,
+                request.deadline_slot,
+                0,
+                assignment.error_window_future,
+                forecast_max_slot,
+                assignment.total_slots,
+            )?;
+            Ok(SolveRequest {
                 request_id: request.request_id,
                 arrival_slot: request.arrival_slot,
                 deadline_slot: request.deadline_slot,
+                assignment_deadline_slot,
             })
-            .collect(),
+        })
+        .collect::<Result<Vec<_>, SolverError>>()?;
+
+    let input = SolveInput {
+        current_slot: 0,
+        requests,
         carbon_forecast: scenario.carbon_forecast.clone(),
         capacity_tiers: assignment.capacity_tiers.to_vec(),
         baseline_slot_counts: HashMap::new(),

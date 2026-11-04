@@ -575,6 +575,7 @@ mod tests {
                 request_id: 1,
                 arrival_slot: 0,
                 deadline_slot: 3,
+                assignment_deadline_slot: 3,
             }],
             carbon_forecast: vec![1.0, 4.0, 2.0, 8.0],
             capacity_tiers: vec![CapacityTier {

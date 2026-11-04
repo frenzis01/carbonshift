@@ -370,11 +370,13 @@ mod tests {
                 request_id: 1,
                 arrival_slot: 1,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
             SolveRequest {
                 request_id: 2,
                 arrival_slot: 2,
                 deadline_slot: 2,
+                assignment_deadline_slot: 2,
             },
         ]);
         let (_, delta) = algorithm.solve(&state, &scope, &input).unwrap();
@@ -406,6 +408,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 1,
             deadline_slot: 2,
+            assignment_deadline_slot: 2,
         }]);
         solve_input.qos.cumulative_error_constraint_active = true;
         solve_input.qos.cumulative_err = ErrorTotals {
@@ -434,6 +437,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 1,
             deadline_slot: 1,
+            assignment_deadline_slot: 1,
         }]);
         let (_, delta) = algorithm.solve(&state, &scope, &input).unwrap();
 

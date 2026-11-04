@@ -459,12 +459,79 @@ fn main_loop(
 
         let mut did_something = false;
         let close_slot_flush = shared_state.pending_flush_requested(current_slot);
+        let timeout_ms = (cfg.solver.batch_timeout_secs > 0.0)
+            .then(|| (cfg.solver.batch_timeout_secs * 1000.0).ceil() as u64);
+        let timed_out_profiles = timeout_ms
+            .map(|timeout_ms| {
+                shared_state.timed_out_partial_profiles(
+                    shared_state.virtual_elapsed_ms.load(Ordering::Relaxed),
+                    cfg.solver.batch_size,
+                    timeout_ms,
+                )
+            })
+            .unwrap_or_default();
+        let slot_flush = close_slot_flush || current_slot > last_flush_slot || flush_backlog;
+        let worker_available = active_workers < cfg.solver.max_batch_solver_parallelism;
 
-        let has_full_profile_batch = shared_state
-            .pending_profile_counts()
-            .iter()
-            .any(|(_, count)| *count >= cfg.solver.batch_size);
-        if has_full_profile_batch && active_workers < cfg.solver.max_batch_solver_parallelism {
+        if pending_count > 0 && worker_available && slot_flush {
+            // Flush stranded partial batches either at slot end or when the
+            // service closes a manual-clock slot before advancing its clock.
+            if cfg.logging.verbose {
+                println!("[Scheduler] Flush {pending_count} stale pending (slot={current_slot})");
+            }
+            did_something = dispatch_batch_workers(
+                current_slot,
+                &shared_state,
+                &cfg,
+                &solver_registry,
+                &carbon_forecast,
+                &mutable,
+                &ml,
+                &running,
+                true,
+                allow_same_profile_parallelism,
+                None,
+                &scheduler_thread,
+            );
+            last_flush_slot = current_slot;
+            flush_backlog = has_retryable_profile_pending(&shared_state, &mutable, current_slot);
+        } else if worker_available && !timed_out_profiles.is_empty() {
+            // Partial batches have independent timers per QoS profile: a
+            // young request in one profile must not flush another profile's
+            // queue just because some unrelated request is older. Timeout
+            // flushes get priority over new full batches so a steady stream
+            // of full batches cannot starve an already-aged partial profile.
+            if cfg.logging.verbose {
+                println!(
+                    "[Scheduler] Timeout flush {} aged partial profile batch(es) \
+                     (slot={current_slot})",
+                    timed_out_profiles.len()
+                );
+            }
+            did_something = dispatch_batch_workers(
+                current_slot,
+                &shared_state,
+                &cfg,
+                &solver_registry,
+                &carbon_forecast,
+                &mutable,
+                &ml,
+                &running,
+                true,
+                allow_same_profile_parallelism,
+                timeout_ms,
+                &scheduler_thread,
+            );
+            flush_backlog = has_retryable_profile_pending(&shared_state, &mutable, current_slot);
+        } else if worker_available
+            && has_dispatchable_full_profile_batch(
+                &shared_state,
+                &mutable,
+                current_slot,
+                cfg.solver.batch_size,
+                allow_same_profile_parallelism,
+            )
+        {
             if cfg.logging.verbose {
                 println!(
                     "\n[Scheduler] Slot {current_slot}: {pending_count} pending, \
@@ -483,64 +550,9 @@ fn main_loop(
                 &running,
                 false,
                 allow_same_profile_parallelism,
+                None,
                 &scheduler_thread,
             );
-        } else if pending_count > 0
-            && active_workers < cfg.solver.max_batch_solver_parallelism
-            && (close_slot_flush || current_slot > last_flush_slot || flush_backlog)
-        {
-            // Flush stranded partial batches either at slot end or when the
-            // service closes a manual-clock slot before advancing its clock.
-            if cfg.logging.verbose {
-                println!("[Scheduler] Flush {pending_count} stale pending (slot={current_slot})");
-            }
-            did_something = dispatch_batch_workers(
-                current_slot,
-                &shared_state,
-                &cfg,
-                &solver_registry,
-                &carbon_forecast,
-                &mutable,
-                &ml,
-                &running,
-                true,
-                allow_same_profile_parallelism,
-                &scheduler_thread,
-            );
-            last_flush_slot = current_slot;
-            flush_backlog = has_retryable_profile_pending(&shared_state, &mutable, current_slot);
-        } else if cfg.solver.batch_timeout_secs > 0.0
-            && pending_count > 0
-            && active_workers < cfg.solver.max_batch_solver_parallelism
-        {
-            // Batch timeout: flush if the oldest pending request has been
-            // waiting longer than `batch_timeout_secs` virtual seconds.
-            let virtual_ms = shared_state.virtual_elapsed_ms.load(Ordering::Relaxed);
-            if let Some(age_ms) = shared_state.get_oldest_pending_age_ms(virtual_ms) {
-                if age_ms as f64 >= cfg.solver.batch_timeout_secs * 1000.0 {
-                    if cfg.logging.verbose {
-                        println!(
-                            "[Scheduler] Timeout flush {pending_count} pending \
-                             (age={age_ms}ms, slot={current_slot})"
-                        );
-                    }
-                    did_something = dispatch_batch_workers(
-                        current_slot,
-                        &shared_state,
-                        &cfg,
-                        &solver_registry,
-                        &carbon_forecast,
-                        &mutable,
-                        &ml,
-                        &running,
-                        true,
-                        allow_same_profile_parallelism,
-                        &scheduler_thread,
-                    );
-                    flush_backlog =
-                        has_retryable_profile_pending(&shared_state, &mutable, current_slot);
-                }
-            }
         } else if cfg.simulation.skip_empty_slots
             && pending_count == 0
             && active_workers == 0
@@ -669,17 +681,44 @@ fn has_retryable_profile_pending(
     })
 }
 
+fn has_dispatchable_full_profile_batch(
+    shared_state: &SharedState,
+    mutable: &Arc<Mutex<SchedulerMutableState>>,
+    slot: i32,
+    batch_size: usize,
+    allow_same_profile_parallelism: bool,
+) -> bool {
+    let pending_by_profile = shared_state.pending_profile_counts();
+    let g = mutable.lock().unwrap();
+    pending_by_profile.iter().any(|(profile_id, count)| {
+        *count >= batch_size
+            && (allow_same_profile_parallelism || !g.active_profiles.contains(profile_id))
+            && g.last_infeasible.get(profile_id) != Some(&(slot, *count))
+    })
+}
+
 /// Claim the next eligible batch while the caller owns the scheduler mutex.
 fn claim_next_profile_batch(
     slot: i32,
     min_pending: usize,
     allow_same_profile_parallelism: bool,
+    timeout_flush_after_ms: Option<u64>,
     shared_state: &SharedState,
     cfg: &Config,
     scheduler_state: &mut SchedulerMutableState,
 ) -> Option<(QosProfileId, ClaimedRequestBatch)> {
+    let mut pending_by_profile = shared_state.pending_profile_counts();
+    if let Some(timeout_ms) = timeout_flush_after_ms {
+        let timed_out_profiles = shared_state.timed_out_partial_profiles(
+            shared_state.virtual_elapsed_ms.load(Ordering::Acquire),
+            cfg.solver.batch_size,
+            timeout_ms,
+        );
+        pending_by_profile.retain(|(profile_id, _)| timed_out_profiles.contains(profile_id));
+    }
+
     let (profile_id, pending_count) = next_profile_to_dispatch(
-        &shared_state.pending_profile_counts(),
+        &pending_by_profile,
         scheduler_state.last_dispatched_profile.as_ref(),
         &scheduler_state.active_profiles,
         allow_same_profile_parallelism,
@@ -715,6 +754,7 @@ fn dispatch_batch_workers(
     running: &Arc<AtomicBool>,
     flush: bool,
     allow_same_profile_parallelism: bool,
+    timeout_flush_after_ms: Option<u64>,
     scheduler_thread: &std::thread::Thread,
 ) -> bool {
     let mut dispatched = false;
@@ -737,6 +777,7 @@ fn dispatch_batch_workers(
                 slot,
                 min_pending,
                 allow_same_profile_parallelism,
+                timeout_flush_after_ms,
                 shared_state,
                 cfg,
                 &mut g,
@@ -760,6 +801,7 @@ fn dispatch_batch_workers(
         let ml = ml.clone();
         let running = running.clone();
         let scheduler_thread = scheduler_thread.clone();
+        let timeout_flush_after_ms = timeout_flush_after_ms;
         std::thread::spawn(move || {
             batch_worker_loop(
                 slot,
@@ -767,6 +809,7 @@ fn dispatch_batch_workers(
                 claimed,
                 min_pending,
                 allow_same_profile_parallelism,
+                timeout_flush_after_ms,
                 shared_state,
                 cfg,
                 solver_registry,
@@ -787,6 +830,7 @@ fn batch_worker_loop(
     mut claimed: ClaimedRequestBatch,
     min_pending: usize,
     allow_same_profile_parallelism: bool,
+    timeout_flush_after_ms: Option<u64>,
     shared_state: SharedState,
     cfg: Arc<Config>,
     solver_registry: Arc<SolverRegistry>,
@@ -829,6 +873,7 @@ fn batch_worker_loop(
                 next_slot,
                 min_pending,
                 allow_same_profile_parallelism,
+                timeout_flush_after_ms,
                 &shared_state,
                 &cfg,
                 &mut g,

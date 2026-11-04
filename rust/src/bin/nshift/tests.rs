@@ -65,6 +65,20 @@ fn make_per_req(id: u64, slot: i32) -> PerRequest {
 }
 
 #[test]
+fn offline_projection_caps_assignment_deadline_without_rewriting_caller_deadline() {
+    let scenario = make_scenario(vec![make_request(1, 0, 3)], vec![100.0; 4]);
+    let mut config = Config::default();
+    config.total_slots = 4;
+    config.error_window_future = 1;
+    let assignment = config.assignment_policy();
+
+    let (_, solve_input) = project_scenario_to_solve_input(&scenario, &assignment).unwrap();
+
+    assert_eq!(solve_input.requests[0].deadline_slot, 3);
+    assert_eq!(solve_input.requests[0].assignment_deadline_slot, 1);
+}
+
+#[test]
 fn compute_per_request_joins_batch_status_and_profile_flavour_data() {
     let run_rows = vec![
         SolverRunRow {

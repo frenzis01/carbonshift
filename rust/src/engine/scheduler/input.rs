@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::config::AssignmentPolicy;
 use crate::engine::solver::{
     ErrorTotals, ErrorWindowInput, QoSProfileInput, SolveInput, SolveRequest, SolverError,
+    cap_assignment_deadline,
 };
 use crate::shared_state::SolverSnapshot;
 use crate::types::Request;
@@ -53,6 +54,26 @@ pub(super) fn build_solve_input_from_snapshot(
     let forecast_max_slot = i32::try_from(carbon_forecast.len() - 1).map_err(|_| {
         SolverError::Algorithm("carbon forecast exceeds the supported slot range".to_owned())
     })?;
+    let requests = pending
+        .iter()
+        .map(|request| {
+            let assignment_deadline_slot = cap_assignment_deadline(
+                request.id,
+                request.arrival_slot,
+                request.deadline_slot,
+                current_slot,
+                assignment.error_window_future,
+                forecast_max_slot,
+                assignment.total_slots,
+            )?;
+            Ok(SolveRequest {
+                request_id: request.id,
+                arrival_slot: request.arrival_slot,
+                deadline_slot: request.deadline_slot,
+                assignment_deadline_slot,
+            })
+        })
+        .collect::<Result<Vec<_>, SolverError>>()?;
 
     let mut baseline_slot_counts: HashMap<i32, i64> = HashMap::new();
     for existing in snapshot.get_future_assignments(current_slot) {
@@ -97,14 +118,7 @@ pub(super) fn build_solve_input_from_snapshot(
 
     Ok(SolveInput {
         current_slot,
-        requests: pending
-            .iter()
-            .map(|request| SolveRequest {
-                request_id: request.id,
-                arrival_slot: request.arrival_slot,
-                deadline_slot: request.deadline_slot,
-            })
-            .collect(),
+        requests,
         carbon_forecast: carbon_forecast.to_vec(),
         capacity_tiers: assignment.capacity_tiers.to_vec(),
         baseline_slot_counts,

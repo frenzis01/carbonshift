@@ -7,12 +7,84 @@ use std::sync::{Arc, Mutex};
 use crate::engine::qos::QosProfileId;
 use crate::engine::types::{Assignment, CapacityTier, Flavour};
 
-/// A request's original arrival and deadline slots.
+/// A request's original caller deadline and the effective on-time assignment bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveRequest {
     pub request_id: u64,
     pub arrival_slot: i32,
+    /// The caller's actual deadline, used to determine whether work is late.
     pub deadline_slot: i32,
+    /// The latest normal slot, capped to the request's QoS window and forecast.
+    pub assignment_deadline_slot: i32,
+}
+
+impl SolveRequest {
+    /// Create a request whose initial assignment bound is its caller deadline.
+    ///
+    /// Projection into `SolveInput` replaces that bound with the profile- and
+    /// forecast-capped value immediately before algorithms receive the batch.
+    pub fn new(request_id: u64, arrival_slot: i32, deadline_slot: i32) -> Self {
+        Self {
+            request_id,
+            arrival_slot,
+            deadline_slot,
+            assignment_deadline_slot: deadline_slot,
+        }
+    }
+}
+
+/// Cap one request's on-time assignment range without changing its caller deadline.
+///
+/// The caller deadline remains separate because the solver must still identify
+/// genuinely overdue work and mark it late at the current slot.
+pub fn cap_assignment_deadline(
+    request_id: u64,
+    arrival_slot: i32,
+    deadline_slot: i32,
+    current_slot: i32,
+    future_slots: i32,
+    forecast_max_slot: i32,
+    total_slots: i32,
+) -> Result<i32, SolverError> {
+    if future_slots < 0 || total_slots <= 0 {
+        return Err(SolverError::Algorithm(
+            "assignment window must be non-negative and planning horizon positive".to_owned(),
+        ));
+    }
+
+    let last_planning_slot = total_slots - 1;
+    if current_slot > deadline_slot {
+        if current_slot > forecast_max_slot || current_slot > last_planning_slot {
+            return Err(SolverError::Algorithm(format!(
+                "late request {request_id} has no forecast at current slot {current_slot}"
+            )));
+        }
+        return Ok(current_slot);
+    }
+
+    let arrival_horizon = i64::from(arrival_slot)
+        .checked_add(i64::from(future_slots))
+        .ok_or_else(|| {
+            SolverError::Algorithm(format!(
+                "request {request_id} assignment horizon overflowed"
+            ))
+        })?;
+    let cap = i64::from(deadline_slot)
+        .min(arrival_horizon)
+        .min(i64::from(forecast_max_slot))
+        .min(i64::from(last_planning_slot));
+    let cap = i32::try_from(cap).map_err(|_| {
+        SolverError::Algorithm(format!(
+            "request {request_id} has an invalid capped assignment deadline"
+        ))
+    })?;
+    let earliest = arrival_slot.max(current_slot);
+    if cap < earliest {
+        return Err(SolverError::Algorithm(format!(
+            "request {request_id} starts at slot {earliest}, beyond assignment deadline {cap}"
+        )));
+    }
+    Ok(cap)
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +452,20 @@ fn normalize_name(name: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn assignment_deadline_is_capped_without_changing_late_deadline_semantics() {
+        assert_eq!(cap_assignment_deadline(1, 2, 20, 2, 5, 12, 24).unwrap(), 7);
+        assert_eq!(cap_assignment_deadline(1, 2, 6, 2, 5, 12, 24).unwrap(), 6);
+        assert_eq!(cap_assignment_deadline(1, 2, 20, 2, 8, 4, 24).unwrap(), 4);
+
+        // A passed profile/forecast cap is not itself an SLA breach.
+        assert!(cap_assignment_deadline(1, 2, 20, 8, 5, 12, 24).is_err());
+
+        // Once the caller's actual deadline has passed, late work is handled
+        // at the current slot instead of being made on-time by the cap.
+        assert_eq!(cap_assignment_deadline(1, 2, 7, 8, 5, 12, 24).unwrap(), 8);
+    }
+
     struct UnitEngine;
 
     impl SolverAlgorithm for UnitEngine {
@@ -462,6 +548,7 @@ mod tests {
                 request_id: 7,
                 arrival_slot: 1,
                 deadline_slot: 3,
+                assignment_deadline_slot: 3,
             }],
             carbon_forecast: vec![1.0; 4],
             capacity_tiers: vec![CapacityTier {

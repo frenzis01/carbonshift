@@ -128,6 +128,8 @@ fn common_solve_input_uses_global_fixed_occupancy_and_profile_only_errors() {
 
     assert_eq!(input.qos.profile_id, profile_a_id);
     assert_eq!(input.requests.len(), 1);
+    assert_eq!(input.requests[0].deadline_slot, 5);
+    assert_eq!(input.requests[0].assignment_deadline_slot, 3);
     assert_eq!(input.baseline_slot_counts.get(&1), Some(&1));
     assert_eq!(input.baseline_slot_counts.get(&2), Some(&1));
     assert_eq!(input.baseline_slot_counts.get(&3), Some(&1));
@@ -343,6 +345,74 @@ fn profile_dispatch_round_robins_and_respects_profile_serialization() {
             2,
         ),
         Some((qa, 10))
+    );
+}
+
+#[test]
+fn timeout_flush_can_claim_an_aged_partial_profile_while_another_full_profile_is_active() {
+    let config = make_config(|config| config.solver.batch_size = 2);
+    let full_profile = profile(
+        "timeout-full",
+        "text_generation",
+        config.flavours.clone(),
+        config.max_error_threshold,
+    );
+    let partial_profile = profile(
+        "timeout-partial",
+        "text_generation",
+        config.flavours.clone(),
+        config.max_error_threshold,
+    );
+    let shared_state = SharedState::new();
+    shared_state.add_requests(vec![
+        Request::new_for_qos_profile(1, 0, 3, full_profile.clone()),
+        Request::new_for_qos_profile(2, 0, 3, full_profile.clone()),
+    ]);
+    shared_state.set_virtual_elapsed_ms(500);
+    shared_state.add_request(Request::new_for_qos_profile(
+        3,
+        0,
+        3,
+        partial_profile.clone(),
+    ));
+    shared_state.set_virtual_elapsed_ms(1_500);
+
+    let mutable = Arc::new(Mutex::new(SchedulerMutableState {
+        active_workers: 1,
+        active_profiles: HashSet::from([full_profile.profile_id.clone()]),
+        last_infeasible: HashMap::new(),
+        last_dispatched_profile: None,
+        stats: SchedulerStats::default(),
+        solver_runtimes: HashMap::new(),
+    }));
+
+    assert!(!has_dispatchable_full_profile_batch(
+        &shared_state,
+        &mutable,
+        0,
+        config.solver.batch_size,
+        false,
+    ));
+    let mut scheduler_state = mutable.lock().unwrap();
+    let claimed = claim_next_profile_batch(
+        0,
+        1,
+        false,
+        Some(1_000),
+        &shared_state,
+        &config,
+        &mut scheduler_state,
+    )
+    .expect("the aged partial profile should be eligible for timeout flush");
+    assert_eq!(claimed.0, partial_profile.profile_id);
+    assert_eq!(
+        claimed
+            .1
+            .requests
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>(),
+        vec![3]
     );
 }
 

@@ -205,7 +205,7 @@ impl DpSolver {
                 } else {
                     let arrival_horizon =
                         i64::from(request.arrival_slot) + i64::from(input.error_window_future);
-                    i64::from(request.deadline_slot)
+                    i64::from(request.assignment_deadline_slot)
                         .min(arrival_horizon)
                         .min(i64::from(forecast_cap))
                         .min(i64::from(self.window_size - 1)) as i32
@@ -643,13 +643,14 @@ impl DpSolver {
         let mut assignments = Vec::new();
 
         for request in requests {
-            // Keep the request's arrival as a lower bound, and never extend
-            // beyond the finite horizon even if its supplied deadline does.
+            // Keep the request's arrival as a lower bound and respect the
+            // precomputed profile/forecast assignment deadline.
             let earliest_slot = request.arrival_slot.max(current_slot);
-            let deadline = request
-                .deadline_slot
-                .max(current_slot)
-                .min(self.window_size - 1);
+            let deadline = if current_slot > request.deadline_slot {
+                current_slot
+            } else {
+                request.assignment_deadline_slot.min(self.window_size - 1)
+            };
             // The caller provides one flavour set for the whole QoS-profile batch.
             let fallback_flavour = self
                 .flavours
@@ -795,6 +796,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 0,
             deadline_slot: 4,
+            assignment_deadline_slot: 4,
         }];
         let tiers = no_tiers();
         let counts = HashMap::new();
@@ -822,6 +824,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 2,
             deadline_slot: 4,
+            assignment_deadline_slot: 4,
         }];
         let tiers = no_tiers();
         let counts = HashMap::new();
@@ -851,6 +854,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 0,
             deadline_slot: 4,
+            assignment_deadline_slot: 4,
         }];
         let tiers = no_tiers();
         let counts = HashMap::new();
@@ -882,6 +886,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 2,
             deadline_slot: 4,
+            assignment_deadline_slot: 4,
         }];
         let tiers = no_tiers();
         let base = vec![0; 5];
@@ -1026,6 +1031,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 0,
             deadline_slot: 2,
+            assignment_deadline_slot: 2,
         }];
         let tiers = no_tiers();
         let counts = HashMap::new();
@@ -1079,6 +1085,7 @@ mod tests {
                 request_id: i,
                 arrival_slot: 0,
                 deadline_slot: 23,
+                assignment_deadline_slot: 23,
             })
             .collect();
         let tiers = no_tiers();
@@ -1122,16 +1129,19 @@ mod tests {
                 request_id: 1,
                 arrival_slot: 0,
                 deadline_slot: 0,
+                assignment_deadline_slot: 0,
             },
             SolveRequest {
                 request_id: 2,
                 arrival_slot: 0,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
             SolveRequest {
                 request_id: 3,
                 arrival_slot: 0,
                 deadline_slot: 2,
+                assignment_deadline_slot: 2,
             },
         ];
         let tiers = no_tiers();
@@ -1165,11 +1175,13 @@ mod tests {
                 request_id: 1,
                 arrival_slot: 0,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
             SolveRequest {
                 request_id: 2,
                 arrival_slot: 0,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
         ];
         let tiers = vec![
@@ -1220,6 +1232,7 @@ mod tests {
             request_id: 1,
             arrival_slot: 0,
             deadline_slot: 4,
+            assignment_deadline_slot: 4,
         }];
         let counts = HashMap::new();
         let result = solver.solve_batch(SolveBatchInput {

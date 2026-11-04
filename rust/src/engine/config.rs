@@ -26,9 +26,8 @@ pub struct SolverConfig {
     pub dp_timeout: f64,
     /// Maximum number of batch solver workers.
     pub max_batch_solver_parallelism: usize,
-    /// Maximum wait for work on the solver queue, in seconds.
-    pub queue_timeout: f64,
-    /// Flush a partial batch after this many virtual seconds (0 = disabled).
+    /// Flush partial profile batches after their oldest request has waited this
+    /// many virtual seconds (0 = disabled). A flush still needs an available worker.
     pub batch_timeout_secs: f64,
 }
 
@@ -177,7 +176,6 @@ impl Default for SolverConfig {
             dp_pruning_k: 1200,
             dp_timeout: 30.0,
             max_batch_solver_parallelism: 12,
-            queue_timeout: 1.0,
             batch_timeout_secs: 0.0,
         }
     }

@@ -176,6 +176,10 @@ pub struct ClaimedRequestBatch {
 struct Inner {
     /// Requests waiting to be processed by a batch solver.
     pending: Vec<Request>,
+    /// Virtual enqueue time for each pending request. This is distinct from
+    /// `Request::arrival_time`, which is wall-clock/domain metadata and not a
+    /// reliable timer for the scheduler's virtual clock.
+    pending_since_virtual_ms: HashMap<u64, u64>,
     /// Active assignments (request_id → Assignment).
     assignments: HashMap<u64, Assignment>,
     /// Current time slot (updated by the scheduler loop).
@@ -251,6 +255,7 @@ impl Inner {
     fn new() -> Self {
         Self {
             pending: Vec::new(),
+            pending_since_virtual_ms: HashMap::new(),
             assignments: HashMap::new(),
             current_slot: 0,
             total_received: 0,
@@ -414,6 +419,10 @@ impl SharedState {
     /// Append a new request to the pending queue.
     pub fn add_request(&self, request: Request) {
         let mut g = self.inner.lock().unwrap();
+        let enqueued_at_ms = self.virtual_elapsed_ms.load(Ordering::Acquire);
+        g.pending_since_virtual_ms
+            .entry(request.id)
+            .or_insert(enqueued_at_ms);
         g.pending.push(request);
         g.total_received += 1;
     }
@@ -421,7 +430,13 @@ impl SharedState {
     /// Append multiple requests to the pending queue.
     pub fn add_requests(&self, requests: Vec<Request>) {
         let mut g = self.inner.lock().unwrap();
+        let enqueued_at_ms = self.virtual_elapsed_ms.load(Ordering::Acquire);
         g.total_received += requests.len() as u64;
+        for request in &requests {
+            g.pending_since_virtual_ms
+                .entry(request.id)
+                .or_insert(enqueued_at_ms);
+        }
         g.pending.extend(requests);
     }
 
@@ -511,6 +526,12 @@ impl SharedState {
             return;
         }
         let mut g = self.inner.lock().unwrap();
+        let enqueued_at_ms = self.virtual_elapsed_ms.load(Ordering::Acquire);
+        for request in &requests {
+            g.pending_since_virtual_ms
+                .entry(request.id)
+                .or_insert(enqueued_at_ms);
+        }
         // Prepend: append existing queue to the end of `requests`, then replace.
         requests.extend(g.pending.drain(..));
         g.pending = requests;
@@ -521,22 +542,54 @@ impl SharedState {
         self.inner.lock().unwrap().pending.len()
     }
 
-    /// Virtual age in milliseconds of the oldest pending request, or `None` if
-    /// the queue is empty.  Uses the request's `arrival_time` field (seconds)
-    /// vs. the provided `virtual_ms` for the comparison.
-    pub fn get_oldest_pending_age_ms(&self, virtual_ms: u64) -> Option<u64> {
+    /// Return profiles with an aged partial batch.
+    ///
+    /// Timeout age starts when the request enters the scheduler queue, not at
+    /// its domain `arrival_time`: that value may use wall-clock epoch seconds,
+    /// while this timer follows the scheduler's virtual clock.
+    pub fn timed_out_partial_profiles(
+        &self,
+        virtual_ms: u64,
+        batch_size: usize,
+        timeout_ms: u64,
+    ) -> HashSet<QosProfileId> {
+        if batch_size == 0 || timeout_ms == 0 {
+            return HashSet::new();
+        }
+
         let g = self.inner.lock().unwrap();
-        g.pending.first().map(|r| {
-            let arrival_ms = (r.arrival_time * 1000.0) as u64;
-            virtual_ms.saturating_sub(arrival_ms)
-        })
+        let mut profile_ages: HashMap<QosProfileId, (usize, u64)> = HashMap::new();
+        for request in &g.pending {
+            let enqueued_at_ms = g
+                .pending_since_virtual_ms
+                .get(&request.id)
+                .copied()
+                .unwrap_or(virtual_ms);
+            let age = profile_ages
+                .entry(request.qos_profile_id())
+                .or_insert((0, enqueued_at_ms));
+            age.0 += 1;
+            age.1 = age.1.min(enqueued_at_ms);
+        }
+        profile_ages
+            .into_iter()
+            .filter_map(|(profile_id, (count, oldest_enqueued_at_ms))| {
+                (count < batch_size
+                    && virtual_ms.saturating_sub(oldest_enqueued_at_ms) >= timeout_ms)
+                    .then_some(profile_id)
+            })
+            .collect()
     }
 
     /// Remove and return all pending requests (used after the run ends to
     /// collect unprocessed requests for late scheduling).
     pub fn drain_pending_requests(&self) -> Vec<Request> {
         let mut g = self.inner.lock().unwrap();
-        g.pending.drain(..).collect()
+        let drained: Vec<_> = g.pending.drain(..).collect();
+        for request in &drained {
+            g.pending_since_virtual_ms.remove(&request.id);
+        }
+        drained
     }
 
     /// Record a batch of scheduling decisions.
@@ -1009,6 +1062,9 @@ impl SharedState {
         for assignment in &materialized {
             g.record_assignment(assignment.clone());
         }
+        for request in pending_requests {
+            g.pending_since_virtual_ms.remove(&request.id);
+        }
         Ok(materialized)
     }
 }
@@ -1275,6 +1331,42 @@ mod tests {
 
         state.add_assignments(vec![make_assignment(100, 2, 2.0)]);
         assert!(!batch.snapshot.assignments.contains_key(&100));
+    }
+
+    #[test]
+    fn batch_timeout_tracks_virtual_enqueue_age_per_profile_and_only_partial_batches() {
+        let state = SharedState::new();
+        let default_profile = QosProfileId::default_profile();
+        let partial_profile = Arc::new(test_profile("timeout-partial"));
+        let full_profile = Arc::new(test_profile("timeout-full"));
+        state.add_request(make_request(1, 0, 3));
+
+        state.set_virtual_elapsed_ms(500);
+        state.add_request(Request::new_for_qos_profile(
+            2,
+            0,
+            3,
+            partial_profile.clone(),
+        ));
+        for id in 10..13 {
+            state.add_request(Request::new_for_qos_profile(id, 0, 3, full_profile.clone()));
+        }
+
+        // A claim/requeue must retain the request's original queue age.
+        let claimed = state.claim_pending_requests_for_profile(&default_profile, 1);
+        state.set_virtual_elapsed_ms(900);
+        state.requeue_pending_requests_front(claimed);
+        assert!(state.timed_out_partial_profiles(999, 3, 1_000).is_empty());
+
+        let timed_out = state.timed_out_partial_profiles(1_000, 3, 1_000);
+        assert_eq!(timed_out, HashSet::from([default_profile.clone()]));
+
+        let timed_out = state.timed_out_partial_profiles(1_500, 3, 1_000);
+        assert_eq!(
+            timed_out,
+            HashSet::from([default_profile, partial_profile.profile_id.clone()])
+        );
+        assert!(!timed_out.contains(&full_profile.profile_id));
     }
 
     #[test]

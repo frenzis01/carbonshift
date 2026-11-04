@@ -113,6 +113,7 @@ fn drain_pending_with_dp(
                 request_id: request.id,
                 arrival_slot: request.arrival_slot,
                 deadline_slot: request.deadline_slot,
+                assignment_deadline_slot: request.deadline_slot,
             })
             .collect();
 

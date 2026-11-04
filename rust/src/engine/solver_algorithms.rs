@@ -17,7 +17,7 @@ use crate::engine::random_selection::{
 };
 use crate::engine::solver::{
     CommitReport, ProposedPlacement, SolveInput, SolveRequest, SolverAlgorithm, SolverError,
-    SolverProposal, SolverRegistry, SolverScope,
+    SolverProposal, SolverRegistry, SolverScope, cap_assignment_deadline,
 };
 use crate::types::{CapacityTier, Flavour, get_capacity_multiplier};
 
@@ -129,7 +129,7 @@ impl SolverAlgorithm for DpAlgorithm {
             .map(|request| {
                 let (_, deadline_slot) = request_slot_bounds(input, request, scope)?;
                 Ok(SolveRequest {
-                    deadline_slot,
+                    assignment_deadline_slot: deadline_slot,
                     ..*request
                 })
             })
@@ -936,38 +936,27 @@ fn cap_deadline_inside_forecast(
     scope: &SolverScope,
 ) -> Result<i32, SolverError> {
     if input.current_slot > request.deadline_slot {
-        return Ok(input.current_slot);
+        return cap_assignment_deadline(
+            request.request_id,
+            request.arrival_slot,
+            request.deadline_slot,
+            input.current_slot,
+            input.qos.error_window.future_slots,
+            latest_forecast_slot(input, scope),
+            scope.total_slots as i32,
+        );
     }
 
-    // ErrorWindow.future_slots is the single per-request assignment horizon.
-    // The carbon forecast may extend farther, but it cannot enlarge this
-    // policy limit. Use i64 for the addition so a large valid slot value
-    // cannot overflow i32 before the later horizon cap is applied.
-    let arrival_horizon = i64::from(request.arrival_slot)
-        .checked_add(i64::from(input.qos.error_window.future_slots))
-        .ok_or_else(|| {
-            SolverError::Algorithm(format!(
-                "request {} assignment horizon overflowed",
-                request.request_id
-            ))
-        })?;
-    let cap = i64::from(request.deadline_slot)
-        .min(arrival_horizon)
-        .min(i64::from(latest_forecast_slot(input, scope)));
-    let cap = i32::try_from(cap).map_err(|_| {
-        SolverError::Algorithm(format!(
-            "request {} has an invalid capped deadline",
-            request.request_id
-        ))
-    })?;
-    let earliest = request.arrival_slot.max(input.current_slot);
-    if cap < earliest {
-        return Err(SolverError::Algorithm(format!(
-            "request {} starts at slot {earliest}, beyond forecast-covered deadline {cap}",
-            request.request_id
-        )));
-    }
-    Ok(cap)
+    let derived_cap = cap_assignment_deadline(
+        request.request_id,
+        request.arrival_slot,
+        request.deadline_slot,
+        input.current_slot,
+        input.qos.error_window.future_slots,
+        latest_forecast_slot(input, scope),
+        scope.total_slots as i32,
+    )?;
+    Ok(derived_cap.min(request.assignment_deadline_slot))
 }
 
 fn request_slot_bounds(
@@ -1023,11 +1012,13 @@ mod tests {
                     request_id: 10,
                     arrival_slot: 0,
                     deadline_slot: 3,
+                    assignment_deadline_slot: 3,
                 },
                 SolveRequest {
                     request_id: 11,
                     arrival_slot: 1,
                     deadline_slot: 3,
+                    assignment_deadline_slot: 3,
                 },
             ],
             carbon_forecast: vec![20.0, 10.0, 5.0, 1.0],
@@ -1179,11 +1170,13 @@ mod tests {
                 request_id: 1,
                 arrival_slot: 0,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
             SolveRequest {
                 request_id: 2,
                 arrival_slot: 0,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
         ];
         solve_input.qos.flavours = vec![Flavour {
@@ -1256,11 +1249,13 @@ mod tests {
                 request_id: 1,
                 arrival_slot: 0,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
             SolveRequest {
                 request_id: 2,
                 arrival_slot: 0,
                 deadline_slot: 1,
+                assignment_deadline_slot: 1,
             },
         ];
         solve_input.qos.flavours = vec![
@@ -1343,6 +1338,25 @@ mod tests {
             assert_eq!(placements[0].scheduled_slot, solve_input.current_slot);
             assert_eq!(placements[0].flavour_name, "Safe");
             assert!(placements[0].late);
+        }
+    }
+
+    #[test]
+    fn passed_qos_window_does_not_mark_a_request_late_before_its_actual_deadline() {
+        let mut solve_input = input();
+        solve_input.current_slot = 2;
+        solve_input.requests.truncate(1);
+        solve_input.requests[0].arrival_slot = 0;
+        solve_input.requests[0].deadline_slot = 3;
+        solve_input.requests[0].assignment_deadline_slot = 1;
+        solve_input.qos.error_window.future_slots = 1;
+
+        for name in ["dp", "singleton_best", "hazard"] {
+            let runtime = runtime_for(name);
+            assert!(
+                runtime.propose(&solve_input).is_err(),
+                "{name} must not report late work before the caller's deadline"
+            );
         }
     }
 
