@@ -41,20 +41,15 @@ pub(super) fn augment_with_decayed_past(
 
     for idx in 1..=decay_slots {
         let slot = current_slot - assignment.error_window_past - idx as i32;
-        let assignments = snapshot.get_profile_requests_in_slot(profile_id, slot);
-        if assignments.is_empty() {
+        let stats = snapshot.get_profile_slot_error_stats(profile_id, slot);
+        if stats.count == 0 {
             continue;
         }
 
-        let count = assignments.len() as f64;
-        let average_error = assignments
-            .iter()
-            .map(|assignment| assignment.error)
-            .sum::<f64>()
-            / count;
+        let count = stats.count as f64;
         let weight = (decay_slots - idx + 1) as f64 / denominator;
         weighted_count += count * weight;
-        weighted_error_sum += average_error * count * weight;
+        weighted_error_sum += stats.error_sum * weight;
     }
 
     if weighted_count == 0.0 {

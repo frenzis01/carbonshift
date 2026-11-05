@@ -7,6 +7,7 @@
 //! exponential backoff up to `ServiceConfig::executor_max_retries`, after
 //! which the request is marked `Failed` instead of retried forever.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::engine::types::Assignment;
@@ -26,37 +27,30 @@ pub async fn run(state: AppState) {
         warn_if_near_horizon(&state, current_slot, &mut warned_horizon);
 
         let now = Instant::now();
-        let assignments = state.shared_state.get_current_assignments();
-        let due: Vec<(u64, Assignment)> = {
+        let eligible_ids: HashSet<u64> = {
             let guard = state.tracked.lock().unwrap();
-            assignments
+            guard
                 .iter()
-                .filter(|(id, a)| {
-                    a.scheduled_slot <= current_slot
-                        && guard
-                            .get(*id)
-                            .map(|t| {
-                                // Not `== Scheduled`: `submit_request`'s own poll only
-                                // marks it Scheduled if the assignment shows up within
-                                // its wait timeout — if the DP solver assigns it later
-                                // (e.g. via the close-slot flush in
-                                // manual-clock/emulation mode), the tracked
-                                // status is still `Pending` even though a real
-                                // assignment now exists. Anything not yet
-                                // dispatched/completed/failed is fair game here.
-                                matches!(
-                                    t.status,
-                                    RequestStatus::Pending | RequestStatus::Scheduled
-                                ) && t.next_attempt_at.map(|at| at <= now).unwrap_or(true)
-                            })
-                            .unwrap_or(false)
+                .filter_map(|(request_id, tracked)| {
+                    // Not `== Scheduled`: a close-slot flush can assign work
+                    // after submit_request's initial wait has returned.
+                    let eligible = matches!(
+                        tracked.status,
+                        RequestStatus::Pending | RequestStatus::Scheduled
+                    ) && tracked.next_attempt_at.map(|at| at <= now).unwrap_or(true);
+                    eligible.then_some(*request_id)
                 })
-                .map(|(id, a)| (*id, a.clone()))
                 .collect()
         };
+        // Release the tracked-request lock before acquiring shared scheduler
+        // state. Only the selected IDs are looked up, and only due assignments
+        // are cloned for dispatch.
+        let due: Vec<Assignment> = state
+            .shared_state
+            .assignments_for_ids_due_by(&eligible_ids, current_slot);
 
-        for (request_id, assignment) in due {
-            dispatch_one(&state, request_id, &assignment).await;
+        for assignment in due {
+            dispatch_one(&state, assignment.request_id, &assignment).await;
         }
     }
 }

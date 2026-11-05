@@ -10,28 +10,107 @@
 /// Batch workers hold the capacity-tier read lock through solve and commit;
 /// the administrative setter takes the write lock. This prevents changing
 /// the pricing curve halfway through a batch transaction.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
-use crate::engine::qos::QosProfileId;
+use crate::engine::qos::{ErrorWindowPolicy, QosProfileId};
 use crate::engine::solver::SolverProposal;
 use crate::types::{Assignment, CapacityTier, Flavour, Request, get_capacity_multiplier};
 
+// Assignment IDs grouped by slot and profile
+type AssignmentIdsBySlotProfile = BTreeMap<i32, HashMap<QosProfileId, HashSet<u64>>>;
+
+#[derive(Clone, Copy, Default)]
+struct SlotErrorTotals {
+    error_sum: f64,
+    count: u64,
+}
+
 // ─── solver snapshot ─────────────────────────────────────────────────────────
 
-/// Immutable snapshot of all shared-state data needed by `solve_dp`.
+/// Immutable projection of shared-state data needed by one solver batch.
 ///
 /// Captured in a **single** lock acquisition before the solver starts, so
-/// every read inside the solver (future assignments, window error stats,
-/// per-slot requests, global stats) sees a consistent view of the world at
-/// the moment the batch was dispatched.  The lock is released before the DP
-/// optimiser runs.
+/// future capacity, profile error windows, and cumulative statistics see a
+/// consistent view at the moment the batch was dispatched. The lock is
+/// released before the optimiser runs.
 pub struct SolverSnapshot {
     pub assignments: HashMap<u64, Assignment>,
     pub global_error_sum: f64,
     pub global_assignment_count: u64,
     pub profile_error_stats: HashMap<QosProfileId, GlobalErrorStats>,
+    profile_slot_errors: HashMap<QosProfileId, BTreeMap<i32, SlotErrorTotals>>,
+    global_slot_errors: BTreeMap<i32, SlotErrorTotals>,
+}
+
+struct SolverSnapshotScope {
+    /// Only this profile's error history belongs in the scoped aggregates.
+    profile_id: QosProfileId,
+    /// The batch is solved against this point in virtual time.
+    current_slot: i32,
+    /// Oldest slot needed for the active past window and decayed history.
+    history_from_slot: i32,
+    /// Conservative latest target slot needed for this batch's capacity baseline.
+    assignment_through_slot: i32,
+    /// Latest slot needed to evaluate error windows for candidate assignments.
+    error_through_slot: i32,
+}
+
+/// Compute the slot ranges needed to build one batch's solver snapshot.
+///
+/// The request queue is grouped by profile, so one immutable error-window
+/// policy applies to the whole batch. Assignment rows are needed through a
+/// conservative upper bound on its target slots for capacity pricing. Error
+/// totals need a wider range: the past window plus its decay lookback, and the
+/// candidate slots' future error windows.
+fn solver_snapshot_scope(
+    profile_id: &QosProfileId,
+    requests: &[Request],
+    current_slot: i32,
+    total_slots: i32,
+    error_window: &ErrorWindowPolicy,
+) -> SolverSnapshotScope {
+    // The horizon is finite and zero-indexed, so its last valid slot is
+    // total_slots - 1. Keep the range non-negative even for invalid/empty
+    // horizon values; the solver will reject an invalid planning horizon.
+    let last_planning_slot = total_slots.saturating_sub(1).max(0);
+    let future_slots = error_window.future_slots.max(0);
+
+    // `future_slots` limits a request relative to its arrival slot, not the
+    // scheduler's current slot. Use the latest arrival in the batch so this
+    // remains safe when a client submits work for a future slot. The current
+    // slot is also included because overdue requests may be assigned late now.
+    let latest_arrival_slot = requests
+        .iter()
+        .map(|request| request.arrival_slot)
+        .max()
+        .unwrap_or(current_slot);
+    let assignment_through_slot = current_slot
+        .max(latest_arrival_slot.saturating_add(future_slots))
+        .min(last_planning_slot);
+
+    // A candidate at the latest assignment slot can still be constrained by
+    // its future error window, so include those later slots in the aggregates.
+    let error_through_slot = assignment_through_slot
+        .saturating_add(future_slots)
+        .min(last_planning_slot);
+
+    // Both configured past ranges are non-negative policies. Saturating
+    // arithmetic avoids overflowing slot indices at extreme configurations.
+    let history_slots = error_window
+        .past_slots
+        .max(0)
+        .saturating_add(error_window.past_decay_slots.max(0));
+    let history_from_slot = current_slot.saturating_sub(history_slots);
+
+    SolverSnapshotScope {
+        profile_id: profile_id.clone(),
+        current_slot,
+        history_from_slot,
+        assignment_through_slot,
+        error_through_slot,
+    }
 }
 
 impl SolverSnapshot {
@@ -55,17 +134,19 @@ impl SolverSnapshot {
     ) -> WindowErrorStats {
         let start = center_slot - window_past;
         let end = center_slot + window_future;
-        let mut error_sum = 0.0f64;
-        let mut count = 0u64;
-        for a in self.assignments.values() {
-            if exclude.contains(&a.request_id) {
-                continue;
-            }
-            if a.scheduled_slot >= start && a.scheduled_slot <= end {
-                error_sum += a.error;
-                count += 1;
-            }
-        }
+        let (error_sum, count) = if exclude.is_empty() {
+            sum_slot_error_totals(&self.global_slot_errors, start, end)
+        } else {
+            self.assignments
+                .values()
+                .filter(|assignment| {
+                    !exclude.contains(&assignment.request_id)
+                        && (start..=end).contains(&assignment.scheduled_slot)
+                })
+                .fold((0.0, 0), |(sum, count), assignment| {
+                    (sum + assignment.error, count + 1)
+                })
+        };
         let average = if count > 0 {
             error_sum / count as f64
         } else {
@@ -125,19 +206,23 @@ impl SolverSnapshot {
     ) -> WindowErrorStats {
         let start = center_slot - window_past;
         let end = center_slot + window_future;
-        let mut error_sum = 0.0;
-        let mut count = 0;
-        for assignment in self.assignments.values() {
-            if assignment.qos_profile_id != *profile_id
-                || exclude.contains(&assignment.request_id)
-                || assignment.scheduled_slot < start
-                || assignment.scheduled_slot > end
-            {
-                continue;
-            }
-            error_sum += assignment.error;
-            count += 1;
-        }
+        let (error_sum, count) = if exclude.is_empty() {
+            self.profile_slot_errors
+                .get(profile_id)
+                .map(|slots| sum_slot_error_totals(slots, start, end))
+                .unwrap_or_default()
+        } else {
+            self.assignments
+                .values()
+                .filter(|assignment| {
+                    assignment.qos_profile_id == *profile_id
+                        && !exclude.contains(&assignment.request_id)
+                        && (start..=end).contains(&assignment.scheduled_slot)
+                })
+                .fold((0.0, 0), |(sum, count), assignment| {
+                    (sum + assignment.error, count + 1)
+                })
+        };
         WindowErrorStats {
             error_sum,
             count,
@@ -149,7 +234,7 @@ impl SolverSnapshot {
         }
     }
 
-    /// Assignments for one profile in one slot, used to build its historical error baseline.
+    /// Raw assignments for one profile and slot, when those rows are in this snapshot.
     pub fn get_profile_requests_in_slot(
         &self,
         profile_id: &QosProfileId,
@@ -162,6 +247,48 @@ impl SolverSnapshot {
             })
             .collect()
     }
+
+    /// Compact per-slot error totals for one profile, ordered by slot.
+    pub fn get_profile_error_totals(&self, profile_id: &QosProfileId) -> Vec<(i32, f64, u64)> {
+        self.profile_slot_errors
+            .get(profile_id)
+            .into_iter()
+            .flat_map(|slots| {
+                slots
+                    .iter()
+                    .map(|(slot, totals)| (*slot, totals.error_sum, totals.count))
+            })
+            .collect()
+    }
+
+    /// Error totals for one profile in one slot.
+    pub fn get_profile_slot_error_stats(
+        &self,
+        profile_id: &QosProfileId,
+        slot: i32,
+    ) -> SlotErrorStats {
+        self.profile_slot_errors
+            .get(profile_id)
+            .and_then(|slots| slots.get(&slot))
+            .copied()
+            .map(SlotErrorStats::from)
+            .unwrap_or_default()
+    }
+}
+
+fn sum_slot_error_totals(
+    slots: &BTreeMap<i32, SlotErrorTotals>,
+    start: i32,
+    end: i32,
+) -> (f64, u64) {
+    if start > end {
+        return (0.0, 0);
+    }
+    slots
+        .range(start..=end)
+        .fold((0.0, 0), |(sum, count), (_, totals)| {
+            (sum + totals.error_sum, count + totals.count)
+        })
 }
 
 /// Requests claimed by a worker together with their atomic shared-state snapshot.
@@ -182,6 +309,8 @@ struct Inner {
     pending_since_virtual_ms: HashMap<u64, u64>,
     /// Active assignments (request_id → Assignment).
     assignments: HashMap<u64, Assignment>,
+    /// Index - Assignment IDs grouped by slot and profile.
+    assignment_ids_by_slot_profile: AssignmentIdsBySlotProfile,
     /// Current time slot (updated by the scheduler loop).
     current_slot: i32, // TODO: consider changing to i64 to match other slot representations...
     // Probably won't use 64 bit slots in practice...
@@ -193,6 +322,8 @@ struct Inner {
     global_assignment_count: u64,
     /// Cumulative hard/window QoS totals partitioned by profile.
     profile_error_stats: HashMap<QosProfileId, GlobalErrorStats>,
+    profile_slot_errors: HashMap<QosProfileId, BTreeMap<i32, SlotErrorTotals>>,
+    global_slot_errors: BTreeMap<i32, SlotErrorTotals>,
 }
 
 impl Inner {
@@ -204,6 +335,8 @@ impl Inner {
             // commitment; replanning changes its live assignment, not which
             // historical/profile aggregate it belongs to.
             assignment.qos_profile_id = previous.qos_profile_id.clone();
+            self.unindex_assignment(&previous);
+            self.remove_slot_error_totals(&previous);
             let error_delta = assignment.error - previous.error;
             self.global_error_sum += error_delta;
             let stats = self
@@ -237,7 +370,111 @@ impl Inner {
         } else {
             0.0
         };
+        self.add_slot_error_totals(&assignment);
+        self.index_assignment(&assignment);
         self.assignments.insert(assignment.request_id, assignment);
+    }
+
+    fn add_slot_error_totals(&mut self, assignment: &Assignment) {
+        let global = self
+            .global_slot_errors
+            .entry(assignment.scheduled_slot)
+            .or_default();
+        global.error_sum += assignment.error;
+        global.count += 1;
+
+        let profile = self
+            .profile_slot_errors
+            .entry(assignment.qos_profile_id.clone())
+            .or_default()
+            .entry(assignment.scheduled_slot)
+            .or_default();
+        profile.error_sum += assignment.error;
+        profile.count += 1;
+    }
+
+    fn remove_slot_error_totals(&mut self, assignment: &Assignment) {
+        if let Some(totals) = self.global_slot_errors.get_mut(&assignment.scheduled_slot) {
+            totals.error_sum -= assignment.error;
+            totals.count -= 1;
+            if totals.count == 0 {
+                self.global_slot_errors.remove(&assignment.scheduled_slot);
+            }
+        }
+
+        let mut remove_profile = false;
+        if let Some(slots) = self.profile_slot_errors.get_mut(&assignment.qos_profile_id) {
+            if let Some(totals) = slots.get_mut(&assignment.scheduled_slot) {
+                totals.error_sum -= assignment.error;
+                totals.count -= 1;
+                if totals.count == 0 {
+                    slots.remove(&assignment.scheduled_slot);
+                }
+            }
+            remove_profile = slots.is_empty();
+        }
+        if remove_profile {
+            self.profile_slot_errors.remove(&assignment.qos_profile_id);
+        }
+    }
+
+    fn correct_slot_error(&mut self, profile_id: &QosProfileId, slot: i32, delta: f64) {
+        if let Some(totals) = self.global_slot_errors.get_mut(&slot) {
+            totals.error_sum += delta;
+        }
+        if let Some(totals) = self
+            .profile_slot_errors
+            .get_mut(profile_id)
+            .and_then(|slots| slots.get_mut(&slot))
+        {
+            totals.error_sum += delta;
+        }
+    }
+
+    fn assignment_count_in_slot(&self, slot: i32) -> Result<i64, String> {
+        let Some(by_profile) = self.assignment_ids_by_slot_profile.get(&slot) else {
+            return Ok(0);
+        };
+        by_profile.values().try_fold(0i64, |total, request_ids| {
+            let profile_count = i64::try_from(request_ids.len())
+                .map_err(|_| format!("slot {slot} occupancy exceeds i64"))?;
+            total
+                .checked_add(profile_count)
+                .ok_or_else(|| format!("slot {slot} occupancy exceeds i64"))
+        })
+    }
+
+    fn index_assignment(&mut self, assignment: &Assignment) {
+        self.assignment_ids_by_slot_profile
+            .entry(assignment.scheduled_slot)
+            .or_default()
+            .entry(assignment.qos_profile_id.clone())
+            .or_default()
+            .insert(assignment.request_id);
+    }
+
+    fn unindex_assignment(&mut self, assignment: &Assignment) {
+        let slot = assignment.scheduled_slot;
+        let slot_is_empty = match self.assignment_ids_by_slot_profile.get_mut(&slot) {
+            Some(by_profile) => {
+                let profile_is_empty = match by_profile.get_mut(&assignment.qos_profile_id) {
+                    Some(ids) => {
+                        let removed = ids.remove(&assignment.request_id);
+                        debug_assert!(removed, "assignment index was missing a live request");
+                        ids.is_empty()
+                    }
+                    None => false,
+                };
+                if profile_is_empty {
+                    by_profile.remove(&assignment.qos_profile_id);
+                }
+                by_profile.is_empty()
+            }
+            None => false,
+        };
+        if slot_is_empty {
+            self.assignment_ids_by_slot_profile.remove(&slot);
+        }
     }
 }
 
@@ -257,12 +494,15 @@ impl Inner {
             pending: Vec::new(),
             pending_since_virtual_ms: HashMap::new(),
             assignments: HashMap::new(),
+            assignment_ids_by_slot_profile: BTreeMap::new(),
             current_slot: 0,
             total_received: 0,
             total_scheduled: 0,
             global_error_sum: 0.0,
             global_assignment_count: 0,
             profile_error_stats: HashMap::new(),
+            profile_slot_errors: HashMap::new(),
+            global_slot_errors: BTreeMap::new(),
         }
     }
 }
@@ -488,6 +728,8 @@ impl SharedState {
         &self,
         profile_id: &QosProfileId,
         count: usize,
+        total_slots: i32,
+        default_error_window: &ErrorWindowPolicy,
     ) -> ClaimedRequestBatch {
         let mut g = self.inner.lock().unwrap();
         let profile_pending_count = g
@@ -505,11 +747,75 @@ impl SharedState {
             }
         }
         g.pending = remaining;
+
+        // Requests in this batch share a profile ID. Prefer the immutable
+        // policy captured on the request; unprofiled simulation requests use
+        // the default policy supplied by the scheduler.
+        let error_window = requests
+            .first()
+            .and_then(|request| request.qos_profile.as_ref())
+            .map(|profile| &profile.error_window)
+            .unwrap_or(default_error_window);
+        let scope = solver_snapshot_scope(
+            profile_id,
+            &requests,
+            g.current_slot,
+            total_slots,
+            error_window,
+        );
+
+        // Initialize assignments map for this batch
+        let mut assignments = HashMap::new();
+
+        if scope.current_slot <= scope.assignment_through_slot {
+            // Index lookup copies all profiles in the candidate range: slot
+            // capacity is global even though QoS error budgets are profile-scoped.
+            for (_, by_profile) in g
+                .assignment_ids_by_slot_profile
+                .range(scope.current_slot..=scope.assignment_through_slot)
+            {
+                for request_ids in by_profile.values() {
+                    for request_id in request_ids {
+                        // Insert assignment if present
+                        if let Some(assignment) = g.assignments.get(request_id) {
+                            assignments.insert(*request_id, assignment.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initialize profile slot errors map
+        let mut profile_slot_errors = HashMap::new();
+        if scope.history_from_slot <= scope.error_through_slot {
+            if let Some(slots) = g.profile_slot_errors.get(&scope.profile_id) {
+                // Error history is profile-specific and compact, so copy its
+                // per-slot sums/counts rather than historical Assignment rows.
+                let selected_slots = slots
+                    .range(scope.history_from_slot..=scope.error_through_slot)
+                    .map(|(slot, totals)| (*slot, *totals))
+                    .collect();
+                profile_slot_errors.insert(scope.profile_id.clone(), selected_slots);
+            }
+        }
+
+        // Initialize global slot errors map
+        let global_slot_errors = if scope.history_from_slot <= scope.error_through_slot {
+            g.global_slot_errors
+                .range(scope.history_from_slot..=scope.error_through_slot)
+                .map(|(slot, totals)| (*slot, *totals))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+
         let snapshot = SolverSnapshot {
-            assignments: g.assignments.clone(),
+            assignments,
             global_error_sum: g.global_error_sum,
             global_assignment_count: g.global_assignment_count,
             profile_error_stats: g.profile_error_stats.clone(),
+            profile_slot_errors,
+            global_slot_errors,
         };
         ClaimedRequestBatch {
             requests,
@@ -609,6 +915,144 @@ impl SharedState {
         self.inner.lock().unwrap().assignments.clone()
     }
 
+    /// Get assignment by ID.
+    pub fn get_assignment(&self, id: u64) -> Option<Assignment> {
+        self.inner.lock().unwrap().assignments.get(&id).cloned()
+    }
+
+    /// Get assignments for only the requested IDs.
+    pub fn get_assignments_for_ids(&self, request_ids: &HashSet<u64>) -> HashMap<u64, Assignment> {
+        let guard = self.inner.lock().unwrap();
+        request_ids
+            .iter()
+            .filter_map(|request_id| {
+                guard
+                    .assignments
+                    .get(request_id)
+                    .map(|assignment| (*request_id, assignment.clone()))
+            })
+            .collect()
+    }
+
+    /// Return the subset of the supplied IDs that currently have assignments.
+    pub fn get_assigned_request_ids(&self, request_ids: &HashSet<u64>) -> HashSet<u64> {
+        let guard = self.inner.lock().unwrap();
+        request_ids
+            .iter()
+            .filter(|request_id| guard.assignments.contains_key(*request_id))
+            .copied()
+            .collect()
+    }
+
+    /// Get assignments due by `current_slot`, using the slot index to avoid
+    /// cloning future assignments that are not relevant to the barrier.
+    pub fn get_assignments_due_by(&self, current_slot: i32) -> Vec<Assignment> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .assignment_ids_by_slot_profile
+            .range(..=current_slot)
+            .flat_map(|(_, by_profile)| by_profile.values())
+            .flat_map(|request_ids| request_ids.iter())
+            .filter_map(|request_id| guard.assignments.get(request_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Get assignments within an optional slot range and profile filter.
+    ///
+    /// Slot and profile filters are applied to the index before assignment
+    /// rows are cloned. Flavour filtering remains a caller-side filter because
+    /// the index is intentionally keyed only by slot and QoS profile.
+    pub fn get_assignments_in_range(
+        &self,
+        from_slot: Option<i32>,
+        to_slot: Option<i32>,
+        profile_id: Option<&QosProfileId>,
+    ) -> Vec<Assignment> {
+        let start = from_slot.unwrap_or(i32::MIN);
+        let end = to_slot.unwrap_or(i32::MAX);
+        if start > end {
+            return Vec::new();
+        }
+
+        let guard = self.inner.lock().unwrap();
+        let mut assignments = Vec::new();
+        for (_, by_profile) in guard.assignment_ids_by_slot_profile.range(start..=end) {
+            if let Some(profile_id) = profile_id {
+                if let Some(request_ids) = by_profile.get(profile_id) {
+                    assignments.extend(
+                        request_ids
+                            .iter()
+                            .filter_map(|request_id| guard.assignments.get(request_id).cloned()),
+                    );
+                }
+            } else {
+                for request_ids in by_profile.values() {
+                    assignments.extend(
+                        request_ids
+                            .iter()
+                            .filter_map(|request_id| guard.assignments.get(request_id).cloned()),
+                    );
+                }
+            }
+        }
+        assignments
+    }
+
+    /// Sum committed assignment costs without cloning assignment rows.
+    pub fn total_assignment_carbon_cost(&self, profile_id: Option<&QosProfileId>) -> f64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .assignments
+            .values()
+            .filter(|assignment| {
+                profile_id.map_or(true, |profile_id| assignment.qos_profile_id == *profile_id)
+            })
+            .map(|assignment| assignment.carbon_cost)
+            .sum()
+    }
+
+    /// Carbon costs for selected request IDs, without cloning full assignments.
+    pub fn assignment_carbon_costs_for_ids(&self, request_ids: &HashSet<u64>) -> HashMap<u64, f64> {
+        let guard = self.inner.lock().unwrap();
+        request_ids
+            .iter()
+            .filter_map(|request_id| {
+                guard
+                    .assignments
+                    .get(request_id)
+                    .map(|assignment| (*request_id, assignment.carbon_cost))
+            })
+            .collect()
+    }
+
+    /// IDs of QoS profiles with at least one current assignment.
+    pub fn get_profiles(&self) -> HashSet<QosProfileId> {
+        self.inner
+            .lock()
+            .unwrap()
+            .assignment_ids_by_slot_profile
+            .values()
+            .flat_map(|m| m.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// Return assignments among the requested IDs that are due by this slot.
+    pub fn assignments_for_ids_due_by(
+        &self,
+        request_ids: &HashSet<u64>,
+        current_slot: i32,
+    ) -> Vec<Assignment> {
+        let guard = self.inner.lock().unwrap();
+        request_ids
+            .iter()
+            .filter_map(|request_id| guard.assignments.get(request_id))
+            .filter(|assignment| assignment.scheduled_slot <= current_slot)
+            .cloned()
+            .collect()
+    }
     /// Capture all data needed by `solve_dp` in a **single** lock acquisition.
     ///
     /// Call this once at the start of each solver invocation to get a
@@ -621,17 +1065,20 @@ impl SharedState {
             global_error_sum: g.global_error_sum,
             global_assignment_count: g.global_assignment_count,
             profile_error_stats: g.profile_error_stats.clone(),
+            profile_slot_errors: g.profile_slot_errors.clone(),
+            global_slot_errors: g.global_slot_errors.clone(),
         }
     }
 
     /// All assignments whose `scheduled_slot >= current_slot`.
     pub fn get_future_assignments(&self, current_slot: i32) -> Vec<Assignment> {
-        self.inner
-            .lock()
-            .unwrap()
-            .assignments
-            .values()
-            .filter(|a| a.scheduled_slot >= current_slot)
+        let guard = self.inner.lock().unwrap();
+        guard
+            .assignment_ids_by_slot_profile
+            .range(current_slot..)
+            .flat_map(|(_, by_profile)| by_profile.values())
+            .flat_map(|request_ids| request_ids.iter())
+            .filter_map(|request_id| guard.assignments.get(request_id))
             .cloned()
             .collect()
     }
@@ -653,17 +1100,19 @@ impl SharedState {
         let g = self.inner.lock().unwrap();
         let start = center_slot - window_past;
         let end = center_slot + window_future;
-        let mut error_sum = 0.0f64;
-        let mut count = 0u64;
-        for a in g.assignments.values() {
-            if exclude.contains(&a.request_id) {
-                continue;
-            }
-            if a.scheduled_slot >= start && a.scheduled_slot <= end {
-                error_sum += a.error;
-                count += 1;
-            }
-        }
+        let (error_sum, count) = if exclude.is_empty() {
+            sum_slot_error_totals(&g.global_slot_errors, start, end)
+        } else {
+            g.assignments
+                .values()
+                .filter(|assignment| {
+                    !exclude.contains(&assignment.request_id)
+                        && (start..=end).contains(&assignment.scheduled_slot)
+                })
+                .fold((0.0, 0), |(sum, count), assignment| {
+                    (sum + assignment.error, count + 1)
+                })
+        };
         let average = if count > 0 {
             error_sum / count as f64
         } else {
@@ -685,13 +1134,35 @@ impl SharedState {
         window_future: i32,
         exclude: &HashSet<u64>,
     ) -> WindowErrorStats {
-        self.snapshot_for_solver().get_profile_window_error_stats(
-            profile_id,
-            center_slot,
-            window_past,
-            window_future,
-            exclude,
-        )
+        let g = self.inner.lock().unwrap();
+        let start = center_slot - window_past;
+        let end = center_slot + window_future;
+        let (error_sum, count) = if exclude.is_empty() {
+            g.profile_slot_errors
+                .get(profile_id)
+                .map(|slots| sum_slot_error_totals(slots, start, end))
+                .unwrap_or_default()
+        } else {
+            g.assignments
+                .values()
+                .filter(|assignment| {
+                    assignment.qos_profile_id == *profile_id
+                        && !exclude.contains(&assignment.request_id)
+                        && (start..=end).contains(&assignment.scheduled_slot)
+                })
+                .fold((0.0, 0), |(sum, count), assignment| {
+                    (sum + assignment.error, count + 1)
+                })
+        };
+        WindowErrorStats {
+            error_sum,
+            count,
+            average: if count > 0 {
+                error_sum / count as f64
+            } else {
+                0.0
+            },
+        }
     }
 
     /// Assignment error stats for one slot and QoS profile.
@@ -701,21 +1172,12 @@ impl SharedState {
         slot: i32,
     ) -> SlotErrorStats {
         let g = self.inner.lock().unwrap();
-        let profile_assignments = g.assignments.values().filter(|assignment| {
-            assignment.qos_profile_id == *profile_id && assignment.scheduled_slot == slot
-        });
-        let (count, error_sum) = profile_assignments
-            .fold((0u64, 0.0), |(count, sum), assignment| {
-                (count + 1, sum + assignment.error)
-            });
-        SlotErrorStats {
-            count,
-            average: if count > 0 {
-                error_sum / count as f64
-            } else {
-                0.0
-            },
-        }
+        g.profile_slot_errors
+            .get(profile_id)
+            .and_then(|slots| slots.get(&slot))
+            .copied()
+            .map(SlotErrorStats::from)
+            .unwrap_or_default()
     }
 
     /// Cumulative error stats across all ever-assigned requests.
@@ -768,14 +1230,21 @@ impl SharedState {
     /// scheduled, or was already archived).
     pub fn correct_assignment_error(&self, request_id: u64, actual_error: f64) {
         let mut g = self.inner.lock().unwrap();
-        let Some((profile_id, delta)) = g.assignments.get_mut(&request_id).map(|assignment| {
-            let delta = actual_error - assignment.error;
-            assignment.error = actual_error;
-            (assignment.qos_profile_id.clone(), delta)
-        }) else {
+        let Some((profile_id, scheduled_slot, delta)) =
+            g.assignments.get_mut(&request_id).map(|assignment| {
+                let delta = actual_error - assignment.error;
+                assignment.error = actual_error;
+                (
+                    assignment.qos_profile_id.clone(),
+                    assignment.scheduled_slot,
+                    delta,
+                )
+            })
+        else {
             return;
         };
         g.global_error_sum += delta;
+        g.correct_slot_error(&profile_id, scheduled_slot, delta);
         if let Some(stats) = g.profile_error_stats.get_mut(&profile_id) {
             stats.error_sum += delta;
             stats.avg = if stats.count > 0 {
@@ -813,23 +1282,11 @@ impl SharedState {
     /// TODO: write tests
     pub fn get_slot_error_stats(&self, slot: i32) -> SlotErrorStats {
         let g = self.inner.lock().unwrap();
-        let count = g
-            .assignments
-            .values()
-            .filter(|a| a.scheduled_slot == slot)
-            .count() as u64;
-        let error_sum = g
-            .assignments
-            .values()
-            .filter(|a| a.scheduled_slot == slot)
-            .map(|a| a.error)
-            .sum::<f64>();
-        let average = if count > 0 {
-            error_sum / count as f64
-        } else {
-            0.0
-        };
-        SlotErrorStats { count, average }
+        g.global_slot_errors
+            .get(&slot)
+            .copied()
+            .map(SlotErrorStats::from)
+            .unwrap_or_default()
     }
 
     // ── slot management ───────────────────────────────────────────────────
@@ -856,12 +1313,13 @@ impl SharedState {
 
     /// All assignments whose `scheduled_slot == slot`.
     pub fn get_requests_in_slot(&self, slot: i32) -> Vec<Assignment> {
-        self.inner
-            .lock()
-            .unwrap()
-            .assignments
-            .values()
-            .filter(|a| a.scheduled_slot == slot)
+        let g = self.inner.lock().unwrap();
+        g.assignment_ids_by_slot_profile
+            .get(&slot)
+            .into_iter()
+            .flat_map(|by_profile| by_profile.values())
+            .flat_map(|request_ids| request_ids.iter())
+            .filter_map(|id| g.assignments.get(id))
             .cloned()
             .collect()
     }
@@ -896,9 +1354,17 @@ impl SharedState {
         }
 
         let mut seen_request_ids = HashSet::with_capacity(proposal.placements.len());
-        let mut slot_counts: HashMap<i32, i64> = HashMap::new();
-        for assignment in g.assignments.values() {
-            *slot_counts.entry(assignment.scheduled_slot).or_default() += 1;
+        let mut affected_slots =
+            HashSet::with_capacity(proposal.placements.len().saturating_mul(2));
+        for placement in &proposal.placements {
+            affected_slots.insert(placement.scheduled_slot);
+            if let Some(previous) = g.assignments.get(&placement.req_id) {
+                affected_slots.insert(previous.scheduled_slot);
+            }
+        }
+        let mut slot_counts = HashMap::with_capacity(affected_slots.len());
+        for slot in affected_slots {
+            slot_counts.insert(slot, g.assignment_count_in_slot(slot)?);
         }
         let mut materialized = Vec::with_capacity(proposal.placements.len());
 
@@ -1093,8 +1559,34 @@ pub struct GlobalErrorStats {
 
 #[derive(Debug, Clone)]
 pub struct SlotErrorStats {
+    /// Sum of assignment errors in the slot.
+    pub error_sum: f64,
     pub count: u64,
     pub average: f64,
+}
+
+impl From<SlotErrorTotals> for SlotErrorStats {
+    fn from(totals: SlotErrorTotals) -> Self {
+        Self {
+            error_sum: totals.error_sum,
+            count: totals.count,
+            average: if totals.count > 0 {
+                totals.error_sum / totals.count as f64
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+impl Default for SlotErrorStats {
+    fn default() -> Self {
+        Self {
+            error_sum: 0.0,
+            count: 0,
+            average: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1314,8 +1806,17 @@ mod tests {
         state.add_assignments(vec![make_assignment(99, 2, 1.0)]);
         state.add_requests(vec![make_request(1, 0, 2), make_request(2, 0, 2)]);
 
-        let batch = state
-            .claim_pending_requests_for_profile_with_snapshot(&QosProfileId::default_profile(), 1);
+        let default_error_window = ErrorWindowPolicy {
+            past_slots: 0,
+            future_slots: 2,
+            past_decay_slots: 0,
+        };
+        let batch = state.claim_pending_requests_for_profile_with_snapshot(
+            &QosProfileId::default_profile(),
+            1,
+            24,
+            &default_error_window,
+        );
 
         assert_eq!(
             batch
@@ -1331,6 +1832,174 @@ mod tests {
 
         state.add_assignments(vec![make_assignment(100, 2, 2.0)]);
         assert!(!batch.snapshot.assignments.contains_key(&100));
+    }
+
+    #[test]
+    fn profile_batch_snapshot_uses_profile_window_and_bounded_slot_ranges() {
+        let state = SharedState::new();
+        state.set_current_slot(10);
+        state.add_assignments(vec![
+            make_profiled_assignment(1, 5, 1.0, "window-profile"),
+            make_profiled_assignment(2, 6, 2.0, "window-profile"),
+            make_profiled_assignment(3, 9, 3.0, "window-profile"),
+            make_profiled_assignment(4, 10, 4.0, "window-profile"),
+            make_profiled_assignment(5, 11, 5.0, "window-profile"),
+            make_profiled_assignment(6, 12, 6.0, "window-profile"),
+            make_profiled_assignment(7, 14, 7.0, "window-profile"),
+            make_profiled_assignment(8, 10, 8.0, "other-profile"),
+        ]);
+        let mut profile = test_profile("window-profile");
+        profile.error_window = ErrorWindowPolicy {
+            past_slots: 2,
+            future_slots: 2,
+            past_decay_slots: 2,
+        };
+        state.add_request(Request::new_for_qos_profile(100, 12, 14, Arc::new(profile)));
+
+        let default_error_window = ErrorWindowPolicy {
+            past_slots: 0,
+            future_slots: 0,
+            past_decay_slots: 0,
+        };
+        let batch = state.claim_pending_requests_for_profile_with_snapshot(
+            &QosProfileId::parse("window-profile").unwrap(),
+            1,
+            24,
+            &default_error_window,
+        );
+
+        assert_eq!(
+            batch
+                .snapshot
+                .assignments
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([4, 5, 6, 7, 8])
+        );
+        assert_eq!(
+            batch
+                .snapshot
+                .get_profile_error_totals(&QosProfileId::parse("window-profile").unwrap()),
+            vec![
+                (6, 2.0, 1),
+                (9, 3.0, 1),
+                (10, 4.0, 1),
+                (11, 5.0, 1),
+                (12, 6.0, 1),
+                (14, 7.0, 1)
+            ]
+        );
+
+        let window = batch.snapshot.get_profile_window_error_stats(
+            &QosProfileId::parse("window-profile").unwrap(),
+            10,
+            2,
+            2,
+            &HashSet::new(),
+        );
+        assert_eq!(window.count, 4);
+        assert_eq!(window.error_sum, 18.0);
+    }
+
+    #[test]
+    fn solver_snapshot_scope_clamps_future_arrivals_to_the_planning_horizon() {
+        let profile_id = QosProfileId::parse("horizon-profile").unwrap();
+        let requests = [make_request(1, 23, 23)];
+        let error_window = ErrorWindowPolicy {
+            past_slots: 3,
+            future_slots: 5,
+            past_decay_slots: 2,
+        };
+
+        let scope = solver_snapshot_scope(&profile_id, &requests, 22, 24, &error_window);
+
+        assert_eq!(scope.profile_id, profile_id);
+        assert_eq!(scope.current_slot, 22);
+        assert_eq!(scope.history_from_slot, 17);
+        assert_eq!(scope.assignment_through_slot, 23);
+        assert_eq!(scope.error_through_slot, 23);
+    }
+
+    #[test]
+    fn assignment_index_tracks_insert_replan_and_error_correction() {
+        let state = SharedState::new();
+        let first_profile = QosProfileId::parse("index-profile-a").unwrap();
+        let second_profile = QosProfileId::parse("index-profile-b").unwrap();
+
+        state.add_assignments(vec![
+            make_profiled_assignment(1, 2, 3.0, "index-profile-a"),
+            make_profiled_assignment(2, 2, 4.0, "index-profile-b"),
+            make_profiled_assignment(3, 3, 5.0, "index-profile-a"),
+        ]);
+        let slot_two_ids: HashSet<_> = state
+            .get_requests_in_slot(2)
+            .into_iter()
+            .map(|assignment| assignment.request_id)
+            .collect();
+        assert_eq!(slot_two_ids, HashSet::from([1, 2]));
+        let profile_a_slot_two =
+            state.get_assignments_in_range(Some(2), Some(2), Some(&first_profile));
+        assert_eq!(
+            profile_a_slot_two
+                .iter()
+                .map(|assignment| assignment.request_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        state.add_assignments(vec![make_profiled_assignment(1, 4, 6.0, "index-profile-a")]);
+
+        let slot_two_ids: HashSet<_> = state
+            .get_requests_in_slot(2)
+            .into_iter()
+            .map(|assignment| assignment.request_id)
+            .collect();
+        assert_eq!(slot_two_ids, HashSet::from([2]));
+        assert_eq!(
+            state
+                .get_requests_in_slot(4)
+                .iter()
+                .map(|assignment| assignment.request_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            state.get_profiles(),
+            HashSet::from([first_profile.clone(), second_profile])
+        );
+
+        state.correct_assignment_error(1, 2.0);
+        let slot_four = state.get_requests_in_slot(4);
+        assert_eq!(slot_four.len(), 1);
+        assert_eq!(slot_four[0].error, 2.0);
+    }
+
+    #[test]
+    fn slot_error_aggregates_follow_replacements_and_actual_error_corrections() {
+        let state = SharedState::new();
+        let profile_id = QosProfileId::parse("aggregate-profile").unwrap();
+        state.add_assignments(vec![make_profiled_assignment(
+            1,
+            1,
+            3.0,
+            "aggregate-profile",
+        )]);
+        state.add_assignments(vec![
+            make_profiled_assignment(1, 2, 5.0, "aggregate-profile"),
+            make_profiled_assignment(2, 2, 7.0, "aggregate-profile"),
+        ]);
+
+        assert_eq!(state.get_profile_slot_error_stats(&profile_id, 1).count, 0);
+        let moved = state.get_profile_slot_error_stats(&profile_id, 2);
+        assert_eq!(moved.count, 2);
+        assert_eq!(moved.error_sum, 12.0);
+
+        state.correct_assignment_error(1, 2.0);
+        let corrected = state.get_profile_slot_error_stats(&profile_id, 2);
+        assert_eq!(corrected.count, 2);
+        assert_eq!(corrected.error_sum, 9.0);
+        assert_eq!(state.get_slot_error_stats(2).error_sum, 9.0);
     }
 
     #[test]

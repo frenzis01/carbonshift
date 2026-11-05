@@ -1,6 +1,6 @@
 //! HTTP handlers: job submission, status polling, executor callback, health.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -192,12 +192,7 @@ pub async fn list_qos_profiles(
 ) -> Json<Vec<QosProfileResponse>> {
     // Activity is derived from assignments rather than profile registration:
     // registering a policy alone does not mean it has served any work.
-    let assigned_profiles: std::collections::HashSet<_> = state
-        .shared_state
-        .get_current_assignments()
-        .values()
-        .map(|assignment| assignment.qos_profile_id.clone())
-        .collect();
+    let assigned_profiles: HashSet<_> = state.shared_state.get_profiles();
 
     let profiles = state
         .qos_profiles
@@ -226,9 +221,8 @@ pub async fn get_qos_profile(
     // activity records scheduling use, not successful completion.
     let active = state
         .shared_state
-        .get_current_assignments()
-        .values()
-        .any(|assignment| assignment.qos_profile_id == profile.profile_id);
+        .get_profiles()
+        .contains(&profile.profile_id);
     Ok(Json(QosProfileResponse { profile, active }))
 }
 
@@ -715,17 +709,24 @@ pub async fn advance_slot(
     // Wait until all pending requests are solved and any request due at or before curr_slot
     // has been dispatched to the executor.
     loop {
-        let assignments = state.shared_state.get_current_assignments();
-        let still_dispatching = {
+        let dispatchable_request_ids: HashSet<u64> = {
             let guard = state.tracked.lock().unwrap();
-            state.shared_state.get_pending_count() > 0
-                || assignments.iter().any(|(id, a)| {
-                    a.scheduled_slot <= curr_slot
-                        && guard.get(id).map_or(false, |t| {
-                            matches!(t.status, RequestStatus::Pending | RequestStatus::Scheduled)
-                        })
+            guard
+                .iter()
+                .filter_map(|(request_id, tracked)| {
+                    matches!(
+                        tracked.status,
+                        RequestStatus::Pending | RequestStatus::Scheduled
+                    )
+                    .then_some(*request_id)
                 })
+                .collect()
         };
+        let due_assignments = state
+            .shared_state
+            .assignments_for_ids_due_by(&dispatchable_request_ids, curr_slot);
+        let still_dispatching =
+            state.shared_state.get_pending_count() > 0 || !due_assignments.is_empty();
         if !still_dispatching || tokio::time::Instant::now() >= deadline {
             break;
         }
@@ -832,54 +833,72 @@ pub async fn close_slot(
             callbacks_pending,
             callback_count,
         ) = {
-            let assignments = state.shared_state.get_current_assignments();
-            let tracked = state.tracked.lock().unwrap();
+            let tracked_by_id: HashMap<u64, (i32, RequestStatus, bool)> = {
+                let tracked = state.tracked.lock().unwrap();
+                tracked
+                    .iter()
+                    .map(|(request_id, request)| {
+                        (
+                            *request_id,
+                            (
+                                request.arrival_slot,
+                                request.status,
+                                request.executor_callback_received,
+                            ),
+                        )
+                    })
+                    .collect()
+            };
+            let tracked_ids: HashSet<_> = tracked_by_id.keys().copied().collect();
+            let assigned_ids = state.shared_state.get_assigned_request_ids(&tracked_ids);
+            let due_assignments = state.shared_state.get_assignments_due_by(engine_slot);
+
             // Include every accepted request that arrived in or before the
             // closing slot: a solver may legally schedule it in a later slot,
             // but it still must not be left pending when the slot is closed.
-            let unscheduled = tracked
+            let unscheduled = tracked_by_id
                 .iter()
-                .filter(|(id, request)| {
-                    request.arrival_slot <= engine_slot && !assignments.contains_key(id)
+                .filter(|(request_id, (arrival_slot, _, _))| {
+                    *arrival_slot <= engine_slot && !assigned_ids.contains(request_id)
                 })
                 .count();
             // Only work due by this boundary must finish before advancing.
             // Later assignments remain queued for their own slot transitions.
-            let due_assignments: Vec<_> = assignments
-                .iter()
-                .filter(|(_, assignment)| assignment.scheduled_slot <= engine_slot)
-                .collect();
             let dispatching = due_assignments
                 .iter()
-                .filter(|(id, _)| {
-                    tracked.get(*id).map_or(true, |request| {
-                        matches!(
-                            request.status,
-                            RequestStatus::Pending | RequestStatus::Scheduled
-                        )
-                    })
+                .filter(|assignment| {
+                    tracked_by_id
+                        .get(&assignment.request_id)
+                        .map_or(true, |(_, status, _)| {
+                            matches!(*status, RequestStatus::Pending | RequestStatus::Scheduled)
+                        })
                 })
                 .count();
             // A terminal dispatch failure is not an executor completion. Fail
             // the barrier explicitly instead of counting it as a callback.
-            let dispatch_failed = due_assignments.iter().any(|(id, _)| {
-                tracked.get(*id).is_some_and(|request| {
-                    request.status == RequestStatus::Failed && !request.executor_callback_received
-                })
+            let dispatch_failed = due_assignments.iter().any(|assignment| {
+                tracked_by_id.get(&assignment.request_id).is_some_and(
+                    |(_, status, callback_received)| {
+                        *status == RequestStatus::Failed && !callback_received
+                    },
+                )
             });
             // In dry-run mode there is no external executor and therefore no
             // callback to await; successful dispatch is the terminal action.
             let callbacks_pending = if state.service_cfg.executor_url.is_some() {
                 due_assignments
                     .iter()
-                    .filter(|(id, _)| {
-                        tracked.get(*id).map_or(true, |request| {
-                            !request.executor_callback_received
-                                || !matches!(
-                                    request.status,
-                                    RequestStatus::Completed | RequestStatus::Failed
-                                )
-                        })
+                    .filter(|assignment| {
+                        tracked_by_id.get(&assignment.request_id).map_or(
+                            true,
+                            |(_, status, callback_received)| {
+                                !callback_received
+                                    || !matches!(
+                                        *status,
+                                        RequestStatus::Completed | RequestStatus::Failed
+                                    )
+                            },
+                        )
                     })
                     .count()
             } else {
@@ -887,14 +906,16 @@ pub async fn close_slot(
             };
             let callback_count = due_assignments
                 .iter()
-                .filter(|(id, _)| {
-                    tracked.get(*id).is_some_and(|request| {
-                        request.executor_callback_received
-                            && matches!(
-                                request.status,
-                                RequestStatus::Completed | RequestStatus::Failed
-                            )
-                    })
+                .filter(|assignment| {
+                    tracked_by_id.get(&assignment.request_id).is_some_and(
+                        |(_, status, callback_received)| {
+                            *callback_received
+                                && matches!(
+                                    *status,
+                                    RequestStatus::Completed | RequestStatus::Failed
+                                )
+                        },
+                    )
                 })
                 .count();
             (
@@ -1041,31 +1062,26 @@ pub async fn carbon_intensity(
 /// - `flavour`: filter by flavour name (e.g. "Fast", "Balanced", "Accurate")
 /// - `qos_profile_id`: stable profile ID
 ///
-/// Returns a list of `AssignmentItem` records snapshot from `state.shared_state.get_current_assignments()`.
+/// Slot/profile filters are applied by the shared-state index before rows are cloned.
 pub async fn get_assignments(
     State(_state): State<AppState>,
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<Vec<AssignmentItem>>, ApiError> {
-    // Resolve the profile before reading the full assignment snapshot so a
+    // Resolve the profile before reading assignments so a
     // misspelled profile is reported as an API error, not an empty list.
     let profile = resolve_profile_query(&_state, &_query)?;
-    let curr_assignments = _state.shared_state.get_current_assignments();
-    let filtered_assignments: Vec<_> = curr_assignments
+    let assignments = _state.shared_state.get_assignments_in_range(
+        _query.from_slot,
+        _query.to_slot,
+        profile.as_ref().map(|profile| &profile.profile_id),
+    );
+    let filtered_assignments: Vec<_> = assignments
         .into_iter()
-        .filter(|(_, assignment)| {
-            (_query
-                .from_slot
-                .map_or(true, |from| assignment.scheduled_slot >= from))
-                && (_query
-                    .to_slot
-                    .map_or(true, |to| assignment.scheduled_slot <= to))
-                && (_query
-                    .flavour
-                    .as_ref()
-                    .map_or(true, |flavour| &assignment.flavour_name == flavour))
-                && profile.as_ref().map_or(true, |profile| {
-                    assignment.qos_profile_id == profile.profile_id
-                })
+        .filter(|assignment| {
+            _query
+                .flavour
+                .as_ref()
+                .map_or(true, |flavour| &assignment.flavour_name == flavour)
         })
         .collect();
 
@@ -1074,7 +1090,7 @@ pub async fn get_assignments(
     let items = {
         let mut items: Vec<AssignmentItem> = filtered_assignments
             .into_iter()
-            .map(|(_req_id, assignment)| AssignmentItem {
+            .map(|assignment| AssignmentItem {
                 request_id: assignment.request_id,
                 qos_profile_id: assignment.qos_profile_id.to_string(),
                 scheduled_slot: assignment.scheduled_slot,
@@ -1086,7 +1102,6 @@ pub async fn get_assignments(
                 deadline_slot: assignment.deadline_slot,
                 assignment_time: assignment.assignment_time,
             })
-            // .sort_by_key(|item| (item.scheduled_slot, item.request_id))
             .collect::<Vec<_>>();
 
         items.sort_by_key(|item| (item.scheduled_slot, item.request_id));
@@ -1207,8 +1222,27 @@ pub async fn get_cost_metrics(
     Query(_query): Query<AssignmentsQuery>,
 ) -> Result<Json<CostMetricsResponse>, ApiError> {
     let selected_profile = resolve_profile_query(&_state, &_query)?;
-    let assignments = _state.shared_state.get_current_assignments();
-    let tracked = _state.tracked.lock().unwrap();
+    let tracked: Vec<_> = {
+        let guard = _state.tracked.lock().unwrap();
+        guard
+            .iter()
+            .filter(|(_, request)| {
+                selected_profile
+                    .as_ref()
+                    .map_or(true, |profile| request.qos_profile_id == profile.profile_id)
+            })
+            .map(|(request_id, request)| {
+                (*request_id, request.status, request.baseline_carbon_cost)
+            })
+            .collect()
+    };
+    let tracked_ids: HashSet<_> = tracked
+        .iter()
+        .map(|(request_id, _, _)| *request_id)
+        .collect();
+    let assignment_costs = _state
+        .shared_state
+        .assignment_carbon_costs_for_ids(&tracked_ids);
 
     let mut current_actual_carbon_cost = 0.0;
     let mut current_actual_baseline_carbon_cost = 0.0;
@@ -1218,24 +1252,17 @@ pub async fn get_cost_metrics(
     // Completed requests contribute measured costs; scheduled but unresolved
     // work contributes forecast cost. Failed requests remain in the baseline
     // total but are excluded from both completed actuals and pending forecast.
-    for (req_id, t) in tracked.iter() {
-        if selected_profile
-            .as_ref()
-            .is_some_and(|profile| t.qos_profile_id != profile.profile_id)
-        {
-            continue;
-        }
+    for (request_id, status, baseline_carbon_cost) in &tracked {
+        total_baseline_carbon_cost += baseline_carbon_cost;
 
-        total_baseline_carbon_cost += t.baseline_carbon_cost;
-
-        if t.status == RequestStatus::Completed {
-            current_actual_baseline_carbon_cost += t.baseline_carbon_cost;
-            if let Some(a) = assignments.get(req_id) {
-                current_actual_carbon_cost += a.carbon_cost;
+        if *status == RequestStatus::Completed {
+            current_actual_baseline_carbon_cost += baseline_carbon_cost;
+            if let Some(carbon_cost) = assignment_costs.get(request_id) {
+                current_actual_carbon_cost += carbon_cost;
             }
-        } else if t.status != RequestStatus::Failed {
-            if let Some(a) = assignments.get(req_id) {
-                forecasted_pending_carbon_cost += a.carbon_cost;
+        } else if *status != RequestStatus::Failed {
+            if let Some(carbon_cost) = assignment_costs.get(request_id) {
+                forecasted_pending_carbon_cost += carbon_cost;
             }
         }
     }
@@ -1251,15 +1278,9 @@ pub async fn get_cost_metrics(
         None
     };
 
-    let total_forecasted_carbon_cost: f64 = assignments
-        .values()
-        .filter(|assignment| {
-            selected_profile.as_ref().map_or(true, |profile| {
-                assignment.qos_profile_id == profile.profile_id
-            })
-        })
-        .map(|assignment| assignment.carbon_cost)
-        .sum();
+    let total_forecasted_carbon_cost = _state
+        .shared_state
+        .total_assignment_carbon_cost(selected_profile.as_ref().map(|profile| &profile.profile_id));
 
     Ok(Json(CostMetricsResponse {
         qos_profile_id: selected_profile.map(|profile| profile.profile_id.to_string()),
@@ -1511,11 +1532,7 @@ pub async fn submit_request(
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs_f64(state.service_cfg.submit_wait_timeout_secs);
     loop {
-        if let Some(assignment) = state
-            .shared_state
-            .get_current_assignments()
-            .get(&request_id)
-        {
+        if let Some(assignment) = state.shared_state.get_assignment(request_id) {
             let eta = ((assignment.scheduled_slot - state.shared_state.get_current_slot()).max(0))
                 as f64
                 * eff_slot_dur;
@@ -1654,10 +1671,9 @@ pub async fn get_request_status(
 
     // A request can be accepted before it has an assignment, so scheduled
     // fields are optional even when the tracked request is known.
-    let assignments = state.shared_state.get_current_assignments();
-    let assignment = assignments.get(&request_id);
+    let assignment = state.shared_state.get_assignment(request_id);
     let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
-    let eta = assignment.map(|a| {
+    let eta = assignment.as_ref().map(|a| {
         ((a.scheduled_slot - state.shared_state.get_current_slot()).max(0)) as f64 * eff_slot_dur
     });
 
@@ -1665,11 +1681,11 @@ pub async fn get_request_status(
         request_id,
         qos_profile_id: qos_profile_id.to_string(),
         status,
-        scheduled_slot: assignment.map(|a| a.scheduled_slot),
+        scheduled_slot: assignment.as_ref().map(|a| a.scheduled_slot),
         eta_seconds: eta,
-        flavour: assignment.map(|a| a.flavour_name.clone()),
-        carbon_cost: assignment.map(|a| a.carbon_cost),
-        scheduled_at: assignment.map(|a| a.assignment_time),
+        flavour: assignment.as_ref().map(|a| a.flavour_name.clone()),
+        carbon_cost: assignment.as_ref().map(|a| a.carbon_cost),
+        scheduled_at: assignment.as_ref().map(|a| a.assignment_time),
         baseline_carbon_cost,
         error,
     }))
@@ -1705,7 +1721,8 @@ pub async fn list_request_statuses(
             })
             .collect()
     };
-    let assignments = state.shared_state.get_current_assignments();
+    let request_ids: HashSet<_> = tracked.iter().map(|request| request.0).collect();
+    let assignments = state.shared_state.get_assignments_for_ids(&request_ids);
     let mut responses: Vec<_> = tracked
         .into_iter()
         .map(
@@ -1850,11 +1867,7 @@ pub async fn executor_callback(
     // A missing carbon-intensity or runtime measurement contributes a ratio of
     // one, preserving that part of the original estimate.
     let mut actual_carbon_cost = None;
-    if let Some(assignment) = state
-        .shared_state
-        .get_current_assignments()
-        .get(&request_id)
-    {
+    if let Some(assignment) = state.shared_state.get_assignment(request_id) {
         let ci_ratio = state.carbon_intensity_ratio(assignment.scheduled_slot);
         let time_ratio = match (actual_execution_time_sec, assignment.flavour_duration) {
             (Some(t_exec), dur) if dur > 0.0 => Some(t_exec / dur),

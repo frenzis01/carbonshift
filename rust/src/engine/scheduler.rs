@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use std::sync::RwLock;
 
 use crate::config::Config;
-use crate::engine::qos::QosProfileId;
+use crate::engine::qos::{ErrorWindowPolicy, QosProfileId};
 use crate::engine::solver::{
     CommitReport, PlacementOrigin, SolverError, SolverRegistry, SolverRuntime, SolverScope,
 };
@@ -726,9 +726,16 @@ fn claim_next_profile_batch(
         slot,
         min_pending,
     )?;
+    let default_error_window = ErrorWindowPolicy {
+        past_slots: cfg.error_window_past,
+        future_slots: cfg.error_window_future,
+        past_decay_slots: cfg.error_window_past_decay_slots,
+    };
     let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
         &profile_id,
         pending_count.min(cfg.solver.batch_size),
+        cfg.total_slots,
+        &default_error_window,
     );
     if claimed.requests.len() < min_pending {
         shared_state.requeue_pending_requests_front(claimed.requests);

@@ -89,14 +89,14 @@ pub(super) fn build_solve_input_from_snapshot(
     }
 
     let mut err_by_slot: HashMap<i32, ErrorTotals> = HashMap::new();
-    for existing in snapshot
-        .assignments
-        .values()
-        .filter(|existing| existing.qos_profile_id == profile_id)
-    {
-        let totals = err_by_slot.entry(existing.scheduled_slot).or_default();
-        totals.sum += existing.error;
-        totals.count += 1.0;
+    for (slot, error_sum, count) in snapshot.get_profile_error_totals(&profile_id) {
+        err_by_slot.insert(
+            slot,
+            ErrorTotals {
+                sum: error_sum,
+                count: count as f64,
+            },
+        );
     }
 
     let profile_stats = snapshot.get_profile_error_stats(&profile_id);

@@ -340,6 +340,186 @@ fn common_solve_input_keeps_real_decayed_history() {
 }
 
 #[test]
+fn scoped_snapshot_preserves_solver_inputs_for_its_capacity_and_error_ranges() {
+    let config = make_config(|_| {});
+    let mut selected_profile = profile(
+        "scoped-input",
+        "text_generation",
+        config.flavours.clone(),
+        config.max_error_threshold,
+    );
+    Arc::make_mut(&mut selected_profile).error_window = ErrorWindowPolicy {
+        past_slots: 2,
+        future_slots: 2,
+        past_decay_slots: 2,
+    };
+    let selected_profile_id = selected_profile.profile_id.clone();
+    let other_profile_id = QosProfileId::parse("scoped-input-other").unwrap();
+
+    let shared_state = SharedState::new();
+    shared_state.set_current_slot(10);
+    shared_state.add_assignments(vec![
+        Assignment::new_for_profile(
+            1,
+            6,
+            "Fast".to_owned(),
+            1.0,
+            2.0,
+            10.0,
+            Some(6),
+            Some(14),
+            selected_profile_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            2,
+            9,
+            "Fast".to_owned(),
+            1.0,
+            3.0,
+            10.0,
+            Some(9),
+            Some(14),
+            selected_profile_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            3,
+            10,
+            "Fast".to_owned(),
+            1.0,
+            4.0,
+            10.0,
+            Some(10),
+            Some(14),
+            selected_profile_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            4,
+            12,
+            "Fast".to_owned(),
+            1.0,
+            6.0,
+            10.0,
+            Some(12),
+            Some(14),
+            selected_profile_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            5,
+            14,
+            "Fast".to_owned(),
+            1.0,
+            7.0,
+            10.0,
+            Some(12),
+            Some(14),
+            selected_profile_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            6,
+            20,
+            "Fast".to_owned(),
+            1.0,
+            50.0,
+            10.0,
+            Some(12),
+            Some(20),
+            selected_profile_id.clone(),
+        ),
+        Assignment::new_for_profile(
+            7,
+            10,
+            "Fast".to_owned(),
+            1.0,
+            99.0,
+            10.0,
+            Some(10),
+            Some(14),
+            other_profile_id,
+        ),
+    ]);
+    let request = Request::new_for_qos_profile(100, 12, 14, selected_profile.clone());
+    shared_state.add_request(request);
+
+    let default_error_window = ErrorWindowPolicy {
+        past_slots: config.error_window_past,
+        future_slots: config.error_window_future,
+        past_decay_slots: config.error_window_past_decay_slots,
+    };
+    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
+        &selected_profile_id,
+        1,
+        config.total_slots,
+        &default_error_window,
+    );
+    let full_snapshot = shared_state.snapshot_for_solver();
+    let assignment_policy = config.assignment_policy_for_profile(&selected_profile);
+    let forecast = flat_forecast(config.total_slots, 100.0);
+    let scoped_input = super::input::build_solve_input_from_snapshot(
+        10,
+        &claimed.requests,
+        &claimed.snapshot,
+        &assignment_policy,
+        &forecast,
+    )
+    .unwrap();
+    let full_input = super::input::build_solve_input_from_snapshot(
+        10,
+        &claimed.requests,
+        &full_snapshot,
+        &assignment_policy,
+        &forecast,
+    )
+    .unwrap();
+
+    assert_eq!(
+        scoped_input.requests[0].assignment_deadline_slot,
+        full_input.requests[0].assignment_deadline_slot
+    );
+    for slot in 10..=14 {
+        assert_eq!(
+            scoped_input
+                .baseline_slot_counts
+                .get(&slot)
+                .copied()
+                .unwrap_or_default(),
+            full_input
+                .baseline_slot_counts
+                .get(&slot)
+                .copied()
+                .unwrap_or_default()
+        );
+    }
+    for slot in 6..=16 {
+        let scoped = scoped_input.qos.err_by_slot.get(&slot);
+        let full = full_input.qos.err_by_slot.get(&slot);
+        assert_eq!(
+            scoped.map(|totals| totals.sum),
+            full.map(|totals| totals.sum)
+        );
+        assert_eq!(
+            scoped.map(|totals| totals.count),
+            full.map(|totals| totals.count)
+        );
+    }
+    assert_eq!(
+        scoped_input.qos.error_window.baseline_err.sum,
+        full_input.qos.error_window.baseline_err.sum
+    );
+    assert_eq!(
+        scoped_input.qos.error_window.baseline_err.count,
+        full_input.qos.error_window.baseline_err.count
+    );
+    assert_eq!(
+        scoped_input.qos.cumulative_err.sum,
+        full_input.qos.cumulative_err.sum
+    );
+    assert_eq!(
+        scoped_input.qos.cumulative_err.count,
+        full_input.qos.cumulative_err.count
+    );
+}
+
+#[test]
 fn common_worker_reports_greedy_fallback_and_selected_flavour() {
     let config = make_config(|config| {
         config.solver.solver_strategy = "dp".to_owned();
@@ -366,9 +546,16 @@ fn common_worker_reports_greedy_fallback_and_selected_flavour() {
     shared_state.initialize_capacity_tiers(config.capacity_tiers.clone());
     shared_state.add_request(Request::new_for_qos_profile(1000, 0, 0, qos_profile));
 
+    let default_error_window = ErrorWindowPolicy {
+        past_slots: config.error_window_past,
+        future_slots: config.error_window_future,
+        past_decay_slots: config.error_window_past_decay_slots,
+    };
     let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
         &QosProfileId::parse("fallback-test").unwrap(),
         1,
+        config.total_slots,
+        &default_error_window,
     );
     let registry = build_solver_registry(&config);
     let forecast = flat_forecast(config.total_slots, 100.0);
