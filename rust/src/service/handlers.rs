@@ -11,9 +11,12 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use crate::engine::qos::{QosProfile, QosProfileId, TaskKindId};
-use crate::engine::types::{Flavour, Request as EngineRequest, get_capacity_multiplier};
+use crate::engine::types::{
+    Assignment, Flavour, Request as EngineRequest, get_capacity_multiplier,
+};
+use crate::service::archive::ArchivedRequest;
 use crate::service::models::{
-    AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsResponse,
+    AssignmentItem, AssignmentsQuery, CallerCallbackPayload, CostMetricsQuery, CostMetricsResponse,
     ErrorHistoryResponse, ExecutorCallbackPayload, HorizonResponse, QosProfileResponse,
     QosProfilesQuery, RegisterQosProfilePayload, RequestStatus, RequestStatusResponse,
     SetCapacityTiersPayload, SlotDetailResponse, SlotErrorItem, StatsResponse,
@@ -472,9 +475,14 @@ fn resolve_profile_query(
     state: &AppState,
     query: &AssignmentsQuery,
 ) -> Result<Option<QosProfile>, ApiError> {
-    let Some(profile_id) = query
-        .qos_profile_id
-        .as_deref()
+    resolve_profile_id_query(state, query.qos_profile_id.as_deref())
+}
+
+fn resolve_profile_id_query(
+    state: &AppState,
+    raw_profile_id: Option<&str>,
+) -> Result<Option<QosProfile>, ApiError> {
+    let Some(profile_id) = raw_profile_id
         .map(QosProfileId::parse)
         .transpose()
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
@@ -486,6 +494,36 @@ fn resolve_profile_query(
         .get(&profile_id)
         .map(Some)
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown QoS profile"))
+}
+
+/// Validate a caller-provided, zero-based inclusive slot interval against the
+/// finite planning horizon before any archive or assignment reads occur.
+fn validate_slot_range(from: i32, to: i32, total_slots: i32) -> Result<(), ApiError> {
+    if total_slots <= 0 {
+        return Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Planning horizon must contain at least one slot",
+        ));
+    }
+    if from < 0 || to < 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "`from_slot` and `to_slot` must be >= 0",
+        ));
+    }
+    if from > to {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "`from_slot` cannot be greater than `to_slot`",
+        ));
+    }
+    if from >= total_slots || to >= total_slots {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "`from_slot` or `to_slot` exceeds the planning horizon",
+        ));
+    }
+    Ok(())
 }
 
 /// Snapshot the finite planning horizon and derive the readiness fraction
@@ -984,26 +1022,46 @@ pub async fn carbon_forecast(State(state): State<AppState>) -> Json<serde_json::
 }
 
 /// `GET /v1/stats` — counts of tracked requests by lifecycle status.
-pub async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
-    let guard = state.tracked.lock().unwrap();
-    let mut s = StatsResponse {
-        total: guard.len(),
-        ..Default::default()
+pub async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, ApiError> {
+    let (mut stats, live_request_ids) = {
+        let guard = state.tracked.lock().unwrap();
+        let mut s = StatsResponse {
+            total: guard.len(),
+            ..Default::default()
+        };
+        for t in guard.values() {
+            match t.status {
+                RequestStatus::Pending => s.pending += 1,
+                RequestStatus::Scheduled => s.scheduled += 1,
+                RequestStatus::Dispatched => s.dispatched += 1,
+                RequestStatus::Completed => s.completed += 1,
+                RequestStatus::Failed => s.failed += 1,
+            }
+        }
+        let live_request_ids = guard.keys().copied().collect::<HashSet<_>>();
+        (s, live_request_ids)
     };
-    for t in guard.values() {
-        match t.status {
-            RequestStatus::Pending => s.pending += 1,
-            RequestStatus::Scheduled => s.scheduled += 1,
-            RequestStatus::Dispatched => s.dispatched += 1,
-            RequestStatus::Completed => s.completed += 1,
-            RequestStatus::Failed => s.failed += 1,
+
+    // Archive and live rows overlap between append and eviction. Count an ID
+    // only once, preferring the live lifecycle state during that interval.
+    for r in read_archived_requests(&state)? {
+        if live_request_ids.contains(&r.request.request_id) {
+            continue;
+        }
+        stats.total += 1;
+        match r.request.status {
+            RequestStatus::Pending => stats.pending += 1,
+            RequestStatus::Scheduled => stats.scheduled += 1,
+            RequestStatus::Dispatched => stats.dispatched += 1,
+            RequestStatus::Completed => stats.completed += 1,
+            RequestStatus::Failed => stats.failed += 1,
         }
     }
-    drop(guard);
+
     let g = state.shared_state.get_global_error_stats();
-    s.global_error_count = g.count;
-    s.global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
-    Json(s)
+    stats.global_error_count = g.count;
+    stats.global_error_avg = if g.count > 0 { Some(g.avg) } else { None };
+    Ok(Json(stats))
 }
 
 /// `GET /v1/carbon_intensity` — the carbon intensity up to a requested slot,
@@ -1067,51 +1125,103 @@ pub async fn carbon_intensity(
 ///
 /// Slot/profile filters are applied by the shared-state index before rows are cloned.
 pub async fn get_assignments(
-    State(_state): State<AppState>,
-    Query(_query): Query<AssignmentsQuery>,
+    State(state): State<AppState>,
+    Query(query): Query<AssignmentsQuery>,
 ) -> Result<Json<Vec<AssignmentItem>>, ApiError> {
     // Resolve the profile before reading assignments so a
     // misspelled profile is reported as an API error, not an empty list.
-    let profile = resolve_profile_query(&_state, &_query)?;
-    let assignments = _state.shared_state.get_assignments_in_range(
-        _query.from_slot,
-        _query.to_slot,
+    let profile = resolve_profile_query(&state, &query)?;
+    // Slot IDs are zero-based and the planning horizon is finite. Use that
+    // domain range when callers omit bounds; an inverted explicit range is
+    // treated as an empty result by the indexed query below.
+    let from = query.from_slot.unwrap_or(0);
+    let to = query
+        .to_slot
+        .unwrap_or(state.scheduler.total_slots.saturating_sub(1));
+    validate_slot_range(from, to, state.scheduler.total_slots)?;
+    let assignments = state.shared_state.get_assignments_in_range(
+        Some(from),
+        Some(to),
         profile.as_ref().map(|profile| &profile.profile_id),
     );
-    let filtered_assignments: Vec<_> = assignments
+
+    // Only the intersection with settled slots could already be archived.
+    // If `from` is beyond the watermark, skip opening/scanning the file.
+    let archive_to = to.min(state.shared_state.get_settled_through_slot());
+    let archived = if from <= archive_to {
+        read_archived_assignments(&state, from, archive_to)?
+    } else {
+        Vec::new()
+    };
+
+    // Prefer a live row if append succeeded but eviction has not yet run.
+    let mut by_id: HashMap<u64, AssignmentItem> = assignments
         .into_iter()
         .filter(|assignment| {
-            _query
+            query
                 .flavour
                 .as_ref()
                 .map_or(true, |flavour| &assignment.flavour_name == flavour)
         })
+        .map(assignment_item)
+        .map(|item| (item.request_id, item))
         .collect();
+    for item in archived {
+        let matches_profile = profile.as_ref().map_or(true, |profile| {
+            item.qos_profile_id == profile.profile_id.to_string()
+        });
+        let matches_flavour = query
+            .flavour
+            .as_ref()
+            .map_or(true, |flavour| &item.flavour_name == flavour);
+        if matches_profile && matches_flavour {
+            by_id.entry(item.request_id).or_insert(item);
+        }
+    }
 
-    // Sort after mapping from the hash-backed state to give API consumers a
-    // stable order across polls and process runs.
-    let items = {
-        let mut items: Vec<AssignmentItem> = filtered_assignments
-            .into_iter()
-            .map(|assignment| AssignmentItem {
-                request_id: assignment.request_id,
-                qos_profile_id: assignment.qos_profile_id.to_string(),
-                scheduled_slot: assignment.scheduled_slot,
-                flavour_name: assignment.flavour_name,
-                carbon_cost: assignment.carbon_cost,
-                error: assignment.error,
-                flavour_duration: assignment.flavour_duration,
-                arrival_slot: assignment.arrival_slot,
-                deadline_slot: assignment.deadline_slot,
-                assignment_time: assignment.assignment_time,
-            })
-            .collect::<Vec<_>>();
-
-        items.sort_by_key(|item| (item.scheduled_slot, item.request_id));
-        items
-    };
+    let mut items: Vec<_> = by_id.into_values().collect();
+    items.sort_by_key(|item| (item.scheduled_slot, item.request_id));
 
     Ok(Json(items))
+}
+
+fn assignment_item(assignment: Assignment) -> AssignmentItem {
+    AssignmentItem {
+        request_id: assignment.request_id,
+        qos_profile_id: assignment.qos_profile_id.to_string(),
+        scheduled_slot: assignment.scheduled_slot,
+        flavour_name: assignment.flavour_name,
+        carbon_cost: assignment.carbon_cost,
+        error: assignment.error,
+        flavour_duration: assignment.flavour_duration,
+        arrival_slot: assignment.arrival_slot,
+        deadline_slot: assignment.deadline_slot,
+        assignment_time: assignment.assignment_time,
+    }
+}
+
+fn read_archived_assignments(
+    state: &AppState,
+    from_slot: i32,
+    to_slot: i32,
+) -> Result<Vec<AssignmentItem>, ApiError> {
+    let Some(archive) = state.request_archive.as_ref() else {
+        return Ok(Vec::new());
+    };
+    archive
+        .read_assignments_in_range(from_slot, to_slot)
+        .map_err(|error| {
+            tracing::error!(
+                from_slot,
+                to_slot,
+                %error,
+                "could not read archived assignment history"
+            );
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not read archived assignment history",
+            )
+        })
 }
 
 /// `GET /v1/slots/:slot` — fine-grained breakdown and status for a specific time slot.
@@ -1161,10 +1271,27 @@ pub async fn get_slot_detail(
         return Err(api_error(StatusCode::BAD_REQUEST, "Slot exceeds horizon"));
     }
 
-    // Aggregate committed assignments from every profile. Capacity tiers are
-    // global, so slot occupancy is also global even when the error policy is
-    // profile-scoped.
-    let assignments = _state.shared_state.get_requests_in_slot(_slot);
+    // Settled slots may already have been evicted from the live map. Only
+    // those slots need an archive read; newer slots are guaranteed live.
+    let mut assignments_by_id: HashMap<u64, AssignmentItem> = _state
+        .shared_state
+        .get_requests_in_slot(_slot)
+        .into_iter()
+        .map(assignment_item)
+        .map(|assignment| (assignment.request_id, assignment))
+        .collect();
+    if _slot <= _state.shared_state.get_settled_through_slot() {
+        for assignment in read_archived_assignments(&_state, _slot, _slot)? {
+            // A live row wins during the append-before-evict interval.
+            assignments_by_id
+                .entry(assignment.request_id)
+                .or_insert(assignment);
+        }
+    }
+    let assignments: Vec<_> = assignments_by_id.into_values().collect();
+
+    // Aggregate assignments from every profile. Capacity tiers are global,
+    // so slot occupancy is global even when error budgets are profile-scoped.
     // compute flavour counts
     let flavour_counts: HashMap<String, usize> =
         assignments
@@ -1221,12 +1348,12 @@ pub async fn get_slot_detail(
 /// An optional `qos_profile_id` restricts request totals to one profile. The
 /// returned `capacity_tiers` are always global because slot occupancy is shared.
 pub async fn get_cost_metrics(
-    State(_state): State<AppState>,
-    Query(_query): Query<AssignmentsQuery>,
+    State(state): State<AppState>,
+    Query(query): Query<CostMetricsQuery>,
 ) -> Result<Json<CostMetricsResponse>, ApiError> {
-    let selected_profile = resolve_profile_query(&_state, &_query)?;
-    let tracked: Vec<_> = {
-        let guard = _state.tracked.lock().unwrap();
+    let selected_profile = resolve_profile_id_query(&state, query.qos_profile_id.as_deref())?;
+    let live_requests: Vec<_> = {
+        let guard = state.tracked.lock().unwrap();
         guard
             .iter()
             .filter(|(_, request)| {
@@ -1235,37 +1362,95 @@ pub async fn get_cost_metrics(
                     .map_or(true, |profile| request.qos_profile_id == profile.profile_id)
             })
             .map(|(request_id, request)| {
-                (*request_id, request.status, request.baseline_carbon_cost)
+                (
+                    *request_id,
+                    request.status,
+                    request.qos_profile_id.to_string(),
+                    request.baseline_carbon_cost,
+                    request.actual_baseline_carbon_cost,
+                    request.actual_carbon_cost,
+                )
             })
             .collect()
     };
-    let tracked_ids: HashSet<_> = tracked
+    let live_ids: HashSet<_> = live_requests
         .iter()
-        .map(|(request_id, _, _)| *request_id)
+        .map(|(request_id, ..)| *request_id)
         .collect();
-    let assignment_costs = _state
+    let live_assignment_costs = state
         .shared_state
-        .assignment_carbon_costs_for_ids(&tracked_ids);
+        .assignment_carbon_costs_for_ids(&live_ids);
+
+    // Archive and live rows overlap briefly between append and eviction.
+    // Insert archive rows first and live rows second so live state wins.
+    let mut requests_by_id: HashMap<
+        u64,
+        (RequestStatus, f64, Option<f64>, Option<f64>, Option<f64>),
+    > = HashMap::new();
+    let archived = read_archived_requests(&state)?;
+    for row in archived {
+        if selected_profile
+            .as_ref()
+            .is_some_and(|profile| row.request.qos_profile_id != profile.profile_id.to_string())
+        {
+            continue;
+        }
+        let archived_assignment_cost = row.assignment.map(|assignment| assignment.carbon_cost);
+        requests_by_id.entry(row.request.request_id).or_insert((
+            row.request.status,
+            row.request.baseline_carbon_cost,
+            row.request.actual_baseline_carbon_cost,
+            row.request.actual_carbon_cost,
+            archived_assignment_cost,
+        ));
+    }
+    for (
+        request_id,
+        status,
+        _profile_id,
+        baseline_carbon_cost,
+        actual_baseline_carbon_cost,
+        actual_carbon_cost,
+    ) in live_requests
+    {
+        requests_by_id.insert(
+            request_id,
+            (
+                status,
+                baseline_carbon_cost,
+                actual_baseline_carbon_cost,
+                actual_carbon_cost,
+                live_assignment_costs.get(&request_id).copied(),
+            ),
+        );
+    }
 
     let mut current_actual_carbon_cost = 0.0;
     let mut current_actual_baseline_carbon_cost = 0.0;
     let mut forecasted_pending_carbon_cost = 0.0;
     let mut total_baseline_carbon_cost = 0.0;
+    let mut total_forecasted_carbon_cost = 0.0;
 
     // Completed requests contribute measured costs; scheduled but unresolved
     // work contributes forecast cost. Failed requests remain in the baseline
     // total but are excluded from both completed actuals and pending forecast.
-    for (request_id, status, baseline_carbon_cost) in &tracked {
-        total_baseline_carbon_cost += baseline_carbon_cost;
+    for (status, baseline_carbon_cost, actual_baseline, actual_carbon, assignment_cost) in
+        requests_by_id.values()
+    {
+        total_baseline_carbon_cost += *baseline_carbon_cost;
+        if let Some(carbon_cost) = assignment_cost {
+            total_forecasted_carbon_cost += *carbon_cost;
+        }
 
         if *status == RequestStatus::Completed {
-            current_actual_baseline_carbon_cost += baseline_carbon_cost;
-            if let Some(carbon_cost) = assignment_costs.get(request_id) {
+            current_actual_baseline_carbon_cost +=
+                (*actual_baseline).unwrap_or(*baseline_carbon_cost);
+            if let Some(carbon_cost) = (*actual_carbon).or(*assignment_cost) {
                 current_actual_carbon_cost += carbon_cost;
             }
         } else if *status != RequestStatus::Failed {
-            if let Some(carbon_cost) = assignment_costs.get(request_id) {
-                forecasted_pending_carbon_cost += carbon_cost;
+            if let Some(carbon_cost) = assignment_cost {
+                forecasted_pending_carbon_cost += *carbon_cost;
             }
         }
     }
@@ -1281,10 +1466,6 @@ pub async fn get_cost_metrics(
         None
     };
 
-    let total_forecasted_carbon_cost = _state
-        .shared_state
-        .total_assignment_carbon_cost(selected_profile.as_ref().map(|profile| &profile.profile_id));
-
     Ok(Json(CostMetricsResponse {
         qos_profile_id: selected_profile.map(|profile| profile.profile_id.to_string()),
         current_actual_carbon_cost,
@@ -1293,7 +1474,7 @@ pub async fn get_cost_metrics(
         forecasted_pending_carbon_cost,
         total_forecasted_carbon_cost,
         total_baseline_carbon_cost,
-        capacity_tiers: _state.shared_state.capacity_tiers_snapshot(),
+        capacity_tiers: state.shared_state.capacity_tiers_snapshot(),
     }))
 }
 
@@ -1311,25 +1492,7 @@ pub async fn get_error_history(
 
     let from = _query.from_slot.unwrap_or(0);
     let to = _query.to_slot.unwrap_or(current_slot);
-
-    if from > to {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "`from_slot` cannot be greater than `to_slot`",
-        ));
-    }
-    if to < 0 || from < 0 {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "`from_slot` and `to_slot` must be >= 0",
-        ));
-    }
-    if to >= horizon {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "`to_slot` exceeds the horizon",
-        ));
-    }
+    validate_slot_range(from, to, horizon)?;
 
     let selected_profile = resolve_profile_query(&_state, &_query)?;
     let selected_profile_id = selected_profile.as_ref().map(|profile| &profile.profile_id);
@@ -1378,7 +1541,7 @@ pub async fn get_error_history(
         } else {
             _state.shared_state.get_slot_error_stats(s)
         };
-        running_error_sum += stats.average * (stats.count as f64);
+        running_error_sum += stats.error_sum;
         running_count += stats.count;
     }
 
@@ -1390,7 +1553,10 @@ pub async fn get_error_history(
         } else {
             _state.shared_state.get_slot_error_stats(slot)
         };
-        running_error_sum += stats.average * (stats.count as f64);
+        // Per-slot aggregates survive assignment eviction, so error history
+        // does not need to rescan request archive rows. Use the stored sum
+        // directly rather than reconstructing it from a rounded average.
+        running_error_sum += stats.error_sum;
         running_count += stats.count;
 
         let cumulative_error = if running_count > 0 {
@@ -1660,17 +1826,34 @@ pub async fn get_request_status(
     // the lock before reading engine assignments and building the response.
     let tracked_status = {
         let guard = state.tracked.lock().unwrap();
-        let t = guard
-            .get(&request_id)
-            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
-        (
-            t.status,
-            t.error.clone(),
-            t.baseline_carbon_cost,
-            t.qos_profile_id.clone(),
-        )
+        guard.get(&request_id).map(|request| {
+            (
+                request.status,
+                request.error.clone(),
+                request.baseline_carbon_cost,
+                request.qos_profile_id.to_string(),
+            )
+        })
     };
-    let (status, error, baseline_carbon_cost, qos_profile_id) = tracked_status;
+
+    let (status, error, baseline_carbon_cost, qos_profile_id) = match tracked_status {
+        Some(tracked_status) => tracked_status,
+        None => {
+            let archived = read_archived_requests(&state)?;
+            let request = archived
+                .iter()
+                .find(|row| row.request.request_id == request_id)
+                .map(|row| &row.request)
+                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
+
+            (
+                request.status,
+                request.error.clone(),
+                request.baseline_carbon_cost,
+                request.qos_profile_id.clone(),
+            )
+        }
+    };
 
     // A request can be accepted before it has an assignment, so scheduled
     // fields are optional even when the tracked request is known.
@@ -1682,7 +1865,7 @@ pub async fn get_request_status(
 
     Ok(Json(RequestStatusResponse {
         request_id,
-        qos_profile_id: qos_profile_id.to_string(),
+        qos_profile_id,
         status,
         scheduled_slot: assignment.as_ref().map(|a| a.scheduled_slot),
         eta_seconds: eta,
@@ -1697,7 +1880,7 @@ pub async fn get_request_status(
 /// `GET /v1/requests` — list scheduler-owned state for every tracked request.
 pub async fn list_request_statuses(
     State(state): State<AppState>,
-) -> Json<Vec<TrackedRequestResponse>> {
+) -> Result<Json<Vec<TrackedRequestResponse>>, ApiError> {
     let tracked: Vec<_> = {
         let guard = state.tracked.lock().unwrap();
         guard
@@ -1722,7 +1905,7 @@ pub async fn list_request_statuses(
     };
     let request_ids: HashSet<_> = tracked.iter().map(|request| request.0).collect();
     let assignments = state.shared_state.get_assignments_for_ids(&request_ids);
-    let mut responses: Vec<_> = tracked
+    let responses: Vec<_> = tracked
         .into_iter()
         .map(
             |(
@@ -1761,8 +1944,41 @@ pub async fn list_request_statuses(
             },
         )
         .collect();
-    responses.sort_by_key(|request| request.request_id);
-    Json(responses)
+
+    let archived_rows = read_archived_requests(&state)?;
+    let mut by_id: HashMap<u64, TrackedRequestResponse> = archived_rows
+        .into_iter()
+        .map(|row| (row.request.request_id, row.request))
+        .collect();
+
+    for live_row in responses {
+        by_id.insert(live_row.request_id, live_row); // live wins
+    }
+
+    let mut rows: Vec<_> = by_id.into_values().collect();
+    rows.sort_by_key(|row| row.request_id);
+
+    Ok(Json(rows))
+}
+
+/// Read archived rows for history endpoints.
+///
+/// Embedded/test AppState instances may intentionally have persistence
+/// disabled; those instances have no archived history. In production, archive
+/// read failures must be surfaced rather than silently returning incomplete
+/// results.
+fn read_archived_requests(state: &AppState) -> Result<Vec<ArchivedRequest>, ApiError> {
+    let Some(archive) = state.request_archive.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    archive.read_all().map_err(|error| {
+        tracing::error!(%error, "could not read request archive");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not read archived request history",
+        )
+    })
 }
 
 /// `POST /v1/callback/{id}` — result callback from the executor.

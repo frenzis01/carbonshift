@@ -16,6 +16,7 @@ use carbonshift_rs::engine::qos::QosProfileId;
 use carbonshift_rs::engine::scheduler::BatchScheduler;
 use carbonshift_rs::engine::shared_state::SharedState;
 use carbonshift_rs::engine::types::Assignment;
+use carbonshift_rs::service::archive::{ArchivedRequest, RequestArchive};
 use carbonshift_rs::service::server::build_router;
 use carbonshift_rs::service::state::{AppState, ServiceConfig, TrackedRequest};
 
@@ -1247,6 +1248,229 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
     assert_eq!(history["slots"][0]["request_count"], 1);
     assert_eq!(history["slots"][0]["average_error"], 10.0);
     assert_eq!(history["slots"][0]["window_error"], 10.0);
+}
+
+#[tokio::test]
+async fn assignment_and_error_history_reject_invalid_slot_ranges() {
+    let app = build_router(test_state(test_service_cfg()));
+    for (uri, expected_status) in [
+        ("/v1/assignments?from_slot=-1", StatusCode::BAD_REQUEST),
+        (
+            "/v1/assignments?from_slot=4&to_slot=3",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/v1/assignments?to_slot=50", StatusCode::BAD_REQUEST),
+        (
+            "/v1/metrics/error-history?from_slot=-1",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/metrics/error-history?from_slot=4&to_slot=3",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/metrics/error-history?to_slot=50",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status, "URI: {uri}");
+    }
+
+    // Cost metrics have no slot-range semantics, so their dedicated query
+    // DTO rejects assignment-only parameters instead of silently ignoring them.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics/costs?from_slot=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn assignment_and_slot_endpoints_merge_settled_archive_rows_with_live_rows() {
+    let shared_state = SharedState::new();
+    shared_state.add_assignments(vec![Assignment::new(
+        41,
+        1,
+        "Fast".to_owned(),
+        9.0,
+        2.0,
+        10.0,
+        Some(0),
+        Some(1),
+    )]);
+    shared_state.advance_settled_through_slot(1);
+
+    let directory = std::env::temp_dir().join(format!(
+        "carbonshift-handler-archive-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let archive = Arc::new(RequestArchive::open(&directory).unwrap());
+    for (request_id, slot, cost) in [(40, 0, 1.0), (41, 1, 100.0)] {
+        let item = carbonshift_rs::service::models::AssignmentItem {
+            request_id,
+            qos_profile_id: "default-text-generation".to_owned(),
+            scheduled_slot: slot,
+            flavour_name: "Fast".to_owned(),
+            carbon_cost: cost,
+            error: 2.0,
+            flavour_duration: 10.0,
+            arrival_slot: Some(0),
+            deadline_slot: Some(1),
+            assignment_time: 123.0,
+        };
+        archive
+            .append_once(&ArchivedRequest {
+                schema_version: 1,
+                run_id: archive.run_id().to_owned(),
+                request: carbonshift_rs::service::models::TrackedRequestResponse {
+                    request_id,
+                    task: Some("text_generation".to_owned()),
+                    qos_profile_id: "default-text-generation".to_owned(),
+                    status: carbonshift_rs::service::models::RequestStatus::Completed,
+                    arrival_slot: 0,
+                    scheduled_slot: Some(slot),
+                    flavour: Some("Fast".to_owned()),
+                    carbon_cost: Some(cost),
+                    actual_carbon_cost: Some(cost),
+                    baseline_carbon_cost: 2.0,
+                    actual_baseline_carbon_cost: Some(2.0),
+                    actual_error_pct: Some(2.0),
+                    execution_time_sec: Some(1.0),
+                    baseline_execution_time_sec: Some(1.0),
+                    scheduled_at: Some(123.0),
+                    error: None,
+                },
+                assignment: Some(item),
+            })
+            .unwrap();
+    }
+
+    let cfg = Arc::new(test_engine_config());
+    let mut state = AppState::new(
+        shared_state,
+        cfg.clone(),
+        test_service_cfg(),
+        test_forecast(cfg.total_slots),
+    );
+    state.request_archive = Some(archive);
+    let app = build_router(state.clone());
+
+    let assignments = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/assignments?from_slot=1&to_slot=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assignments.status(), StatusCode::OK);
+    let assignments = json_body(assignments).await;
+    assert_eq!(assignments.as_array().unwrap().len(), 1);
+    assert_eq!(assignments[0]["request_id"], 41);
+    // The live row wins over its archived copy during append-before-evict.
+    assert_eq!(assignments[0]["carbon_cost"], 9.0);
+
+    let slot = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/slots/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(slot.status(), StatusCode::OK);
+    let slot = json_body(slot).await;
+    assert_eq!(slot["total_requests"], 1);
+    assert_eq!(slot["total_carbon_cost"], 9.0);
+
+    drop(state);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn cost_metrics_include_archived_request_and_assignment_totals() {
+    let directory = std::env::temp_dir().join(format!(
+        "carbonshift-cost-archive-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let archive = Arc::new(RequestArchive::open(&directory).unwrap());
+    archive
+        .append_once(&ArchivedRequest {
+            schema_version: 1,
+            run_id: archive.run_id().to_owned(),
+            request: carbonshift_rs::service::models::TrackedRequestResponse {
+                request_id: 90,
+                task: Some("text_generation".to_owned()),
+                qos_profile_id: "default-text-generation".to_owned(),
+                status: carbonshift_rs::service::models::RequestStatus::Completed,
+                arrival_slot: 0,
+                scheduled_slot: Some(0),
+                flavour: Some("Fast".to_owned()),
+                carbon_cost: Some(3.0),
+                actual_carbon_cost: Some(4.0),
+                baseline_carbon_cost: 10.0,
+                actual_baseline_carbon_cost: Some(8.0),
+                actual_error_pct: Some(1.0),
+                execution_time_sec: Some(1.0),
+                baseline_execution_time_sec: Some(2.0),
+                scheduled_at: Some(123.0),
+                error: None,
+            },
+            assignment: Some(carbonshift_rs::service::models::AssignmentItem {
+                request_id: 90,
+                qos_profile_id: "default-text-generation".to_owned(),
+                scheduled_slot: 0,
+                flavour_name: "Fast".to_owned(),
+                carbon_cost: 3.0,
+                error: 1.0,
+                flavour_duration: 1.0,
+                arrival_slot: Some(0),
+                deadline_slot: Some(1),
+                assignment_time: 123.0,
+            }),
+        })
+        .unwrap();
+
+    let mut state = test_state(test_service_cfg());
+    state.request_archive = Some(archive);
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics/costs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = json_body(response).await;
+    assert_eq!(metrics["current_actual_carbon_cost"], 4.0);
+    assert_eq!(metrics["current_actual_baseline_carbon_cost"], 8.0);
+    assert_eq!(metrics["total_baseline_carbon_cost"], 10.0);
+    assert_eq!(metrics["total_forecasted_carbon_cost"], 3.0);
+
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]

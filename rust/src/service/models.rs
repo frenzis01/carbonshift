@@ -247,6 +247,15 @@ pub struct AssignmentsQuery {
     pub qos_profile_id: Option<String>,
 }
 
+/// Profile filter for cost metrics; slot filters do not apply to cost totals.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CostMetricsQuery {
+    /// Optional stable QoS budget ID; absent means all profiles.
+    #[serde(default)]
+    pub qos_profile_id: Option<String>,
+}
+
 /// DTO for a single assignment returned in `GET /v1/assignments`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AssignmentItem {

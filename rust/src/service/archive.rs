@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -124,6 +124,55 @@ impl RequestArchive {
         archived_ids.insert(request_id);
         Ok(true)
     }
+
+    /// Read all archived requests from the file.
+    /// Returns all archived requests as a vector.
+    pub fn read_all(&self) -> io::Result<Vec<ArchivedRequest>> {
+        let file = std::fs::File::open(&self.path)?;
+        let mut rows = Vec::new();
+
+        for (line_index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            rows.push(parse_archive_line(line?, line_index + 1)?);
+        }
+
+        Ok(rows)
+    }
+
+    /// Read archived assignment rows in an inclusive slot range.
+    ///
+    /// The JSONL file is scanned sequentially, but only matching assignments
+    /// are retained. This avoids materializing every historical request DTO
+    /// for assignment and slot endpoints.
+    pub fn read_assignments_in_range(
+        &self,
+        from_slot: i32,
+        to_slot: i32,
+    ) -> io::Result<Vec<AssignmentItem>> {
+        if from_slot > to_slot {
+            return Ok(Vec::new());
+        }
+
+        let file = std::fs::File::open(&self.path)?;
+        let mut assignments = Vec::new();
+        for (line_index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let row = parse_archive_line(line?, line_index + 1)?;
+            if let Some(assignment) = row.assignment {
+                if (from_slot..=to_slot).contains(&assignment.scheduled_slot) {
+                    assignments.push(assignment);
+                }
+            }
+        }
+        Ok(assignments)
+    }
+}
+
+fn parse_archive_line(line: String, line_number: usize) -> io::Result<ArchivedRequest> {
+    serde_json::from_str(&line).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid archive JSON at line {line_number}: {error}"),
+        )
+    })
 }
 
 #[cfg(test)]
