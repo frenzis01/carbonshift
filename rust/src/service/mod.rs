@@ -6,6 +6,8 @@
 //! arrives, and relays the executor's callback result back to the original
 //! caller.
 
+pub mod archive;
+pub mod archive_coordinator;
 pub mod auth;
 pub mod dispatcher;
 pub mod handlers;

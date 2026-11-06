@@ -8,7 +8,7 @@
 /// scheduler state is protected by `Arc<Mutex<SchedulerMutableState>>`.
 /// Each QoS profile has a cached runtime. Runtime state and worker counters use
 /// separate locks, and solver work runs without holding the scheduler lock.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as IoWrite;
 use std::sync::{
     Arc, Mutex,
@@ -133,6 +133,10 @@ enum BatchWorkerOutcome {
 /// All mutable scheduler state shared between the main loop and workers.
 struct SchedulerMutableState {
     active_workers: usize,
+    /// Number of claimed batches that can still commit work for each claim slot.
+    /// this is needed to track which slots are still active
+    /// and archive those that aren't active anymore
+    active_batch_slots: BTreeMap<i32, usize>,
     /// Used when a caller opts to serialize batches for each QoS profile.
     active_profiles: HashSet<QosProfileId>,
     /// Anti-storm guard scoped to a profile's pending queue.
@@ -141,6 +145,44 @@ struct SchedulerMutableState {
     last_dispatched_profile: Option<QosProfileId>,
     stats: SchedulerStats,
     solver_runtimes: HashMap<QosProfileId, Arc<dyn SolverRuntime>>,
+}
+
+impl SchedulerMutableState {
+    fn batch_started(&mut self, slot: i32) {
+        let count = self.active_batch_slots.entry(slot).or_default();
+        *count = count
+            .checked_add(1)
+            .expect("active batch count overflowed usize");
+    }
+
+    fn batch_finished(&mut self, slot: i32) {
+        let remove_slot = {
+            let count = self
+                .active_batch_slots
+                .get_mut(&slot)
+                .expect("finished batch slot was not active");
+            *count = count
+                .checked_sub(1)
+                .expect("active batch count underflowed");
+            *count == 0
+        };
+        if remove_slot {
+            self.active_batch_slots.remove(&slot);
+        }
+    }
+
+    /// A slot is settled only when no claimed worker can still commit into it.
+    /// Future work is claimed against `current_slot`, so it cannot make an
+    /// earlier slot mutable again.
+    fn settled_through_slot(&self, current_slot: i32) -> i32 {
+        let oldest_active_slot = self
+            .active_batch_slots
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(current_slot);
+        current_slot.min(oldest_active_slot).saturating_sub(1)
+    }
 }
 
 // ─── public result type ──────────────────────────────────────────────────────
@@ -261,6 +303,7 @@ impl BatchScheduler {
             running: Arc::new(AtomicBool::new(false)),
             mutable: Arc::new(Mutex::new(SchedulerMutableState {
                 active_workers: 0,
+                active_batch_slots: BTreeMap::new(),
                 active_profiles: HashSet::new(),
                 last_infeasible: HashMap::new(),
                 last_dispatched_profile: None,
@@ -396,6 +439,7 @@ fn main_loop(
     let mut last_flush_slot: i32 = -1;
     let mut flush_backlog = false;
     let mut last_skip_slot: i32 = -1;
+    let mut last_published_current_slot = shared_state.get_current_slot();
     let mut last_progress_wall_ms: u64 = 0;
     let mut printed_progress = false;
     // Delta-based wall-clock tracking so we can *freeze* virtual time (instead
@@ -456,6 +500,12 @@ fn main_loop(
         // waits.
         let current_slot = ((elapsed / eff_slot_dur) as i32).min(cfg.total_slots - 1);
         shared_state.set_current_slot(current_slot);
+        if current_slot != last_published_current_slot {
+            let scheduler_state = mutable.lock().unwrap();
+            shared_state
+                .advance_settled_through_slot(scheduler_state.settled_through_slot(current_slot));
+            last_published_current_slot = current_slot;
+        }
 
         let mut did_something = false;
         let close_slot_flush = shared_state.pending_flush_requested(current_slot);
@@ -797,6 +847,8 @@ fn dispatch_batch_workers(
                 .record_worker_count_change(active_workers, active_workers + 1, now);
             g.active_workers += 1;
             g.stats.peak_concurrent_workers = g.stats.peak_concurrent_workers.max(g.active_workers);
+            g.batch_started(slot);
+            shared_state.advance_settled_through_slot(g.settled_through_slot(slot));
             claimed
         };
 
@@ -873,6 +925,7 @@ fn batch_worker_loop(
             }
         }
         g.active_profiles.remove(&profile_id);
+        g.batch_finished(slot);
 
         let next_slot = shared_state.get_current_slot();
         let next_batch = if running.load(Ordering::Relaxed) {
@@ -889,6 +942,8 @@ fn batch_worker_loop(
             None
         };
         if let Some((next_profile_id, next_claimed)) = next_batch {
+            g.batch_started(next_slot);
+            shared_state.advance_settled_through_slot(g.settled_through_slot(next_slot));
             profile_id = next_profile_id;
             claimed = next_claimed;
             slot = next_slot;
@@ -904,7 +959,9 @@ fn batch_worker_loop(
         if !running.load(Ordering::Relaxed) && g.active_workers == 0 {
             g.stats.finish(0, now);
         }
+        let settled_through_slot = g.settled_through_slot(next_slot);
         drop(g);
+        shared_state.advance_settled_through_slot(settled_through_slot);
         scheduler_thread.unpark();
         return;
     }

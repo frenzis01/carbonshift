@@ -82,7 +82,7 @@ pub struct SubmitRequestPayload {
 }
 
 /// Status returned to callers, mirroring `TrackedRequest`'s lifecycle.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestStatus {
     /// Accepted, waiting for the batch solver to assign a slot.
@@ -123,7 +123,7 @@ pub struct RequestStatusResponse {
 ///
 /// Unlike the submit response, this summary is intended for monitoring every
 /// request without consulting the caller that originally submitted it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TrackedRequestResponse {
     pub request_id: u64,
     pub task: Option<String>,

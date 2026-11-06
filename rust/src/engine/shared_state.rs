@@ -536,6 +536,9 @@ pub struct SharedState {
     /// Used by the scheduler's skip-empty-slots logic to avoid skipping a slot
     /// before the generator has had a chance to add its requests.
     generator_processed_slot: Arc<AtomicI32>,
+    /// Highest slot guaranteed not to receive any later solver commits.
+    /// Published by `BatchScheduler` after accounting for active batch slots.
+    settled_through_slot: Arc<AtomicI32>,
     /// Slot whose client submissions have closed and whose partial batch must
     /// be flushed without advancing the manual clock.
     flush_requested_slot: Arc<AtomicI32>,
@@ -549,6 +552,7 @@ impl SharedState {
             capacity_tier_revision: Arc::new(AtomicU64::new(0)),
             virtual_elapsed_ms: Arc::new(AtomicU64::new(0)),
             generator_processed_slot: Arc::new(AtomicI32::new(-1)),
+            settled_through_slot: Arc::new(AtomicI32::new(-1)),
             flush_requested_slot: Arc::new(AtomicI32::new(-1)),
         }
     }
@@ -1081,6 +1085,52 @@ impl SharedState {
             .filter_map(|request_id| guard.assignments.get(request_id))
             .cloned()
             .collect()
+    }
+
+    /// Highest slot that is known to be settled across every solver worker.
+    ///
+    /// This is distinct from `current_slot`: a worker may still be solving a
+    /// batch claimed at an earlier slot and commit an assignment into it.
+    pub fn get_settled_through_slot(&self) -> i32 {
+        self.settled_through_slot.load(Ordering::Acquire)
+    }
+
+    /// Publish a settled-slot watermark without allowing it to move backwards.
+    ///
+    /// The scheduler computes the value from its per-slot active-batch counts.
+    /// Manual-clock close-slot barriers may also advance it after they have
+    /// drained scheduling, dispatch, and callbacks for the closed slot.
+    pub fn advance_settled_through_slot(&self, slot: i32) {
+        self.settled_through_slot.fetch_max(slot, Ordering::AcqRel);
+    }
+
+    /// Evict an assignment if its slot is settled.
+    /// Returns the assignment if removed.
+    /// Needed to free up memory and archive old stuff
+    pub fn evict_settled_assignment(
+        &self,
+        request_id: u64,
+        settled_through_slot: i32,
+    ) -> Result<Option<Assignment>, String> {
+        let mut inner = self.inner.lock().unwrap();
+
+        let Some(assignment) = inner.assignments.get(&request_id).cloned() else {
+            return Ok(None); // Already evicted; safe for a retry.
+        };
+
+        if assignment.scheduled_slot > settled_through_slot {
+            return Err(format!(
+                "request {request_id} is scheduled in unsettled slot {}",
+                assignment.scheduled_slot
+            ));
+        }
+
+        inner.unindex_assignment(&assignment);
+        inner.assignments.remove(&request_id);
+
+        // Keep global/profile cumulative and per-slot error totals: they represent
+        // history and must continue to constrain QoS after row eviction.
+        Ok(Some(assignment))
     }
 
     // ── error stats ───────────────────────────────────────────────────────
@@ -2000,6 +2050,38 @@ mod tests {
         assert_eq!(corrected.count, 2);
         assert_eq!(corrected.error_sum, 9.0);
         assert_eq!(state.get_slot_error_stats(2).error_sum, 9.0);
+    }
+
+    #[test]
+    fn evict_settled_assignment_removes_live_row_but_preserves_error_history() {
+        let state = SharedState::new();
+        let profile_id = QosProfileId::parse("archive-profile").unwrap();
+        state.add_assignments(vec![make_profiled_assignment(1, 3, 7.5, "archive-profile")]);
+
+        assert!(
+            state
+                .evict_settled_assignment(1, 2)
+                .unwrap_err()
+                .contains("unsettled slot")
+        );
+        assert!(state.get_assignment(1).is_some());
+
+        let removed = state.evict_settled_assignment(1, 3).unwrap().unwrap();
+        assert_eq!(removed.request_id, 1);
+        assert!(state.get_assignment(1).is_none());
+        assert!(state.get_requests_in_slot(3).is_empty());
+
+        let profile_slot = state.get_profile_slot_error_stats(&profile_id, 3);
+        assert_eq!(profile_slot.count, 1);
+        assert_eq!(profile_slot.error_sum, 7.5);
+        let global_slot = state.get_slot_error_stats(3);
+        assert_eq!(global_slot.count, 1);
+        assert_eq!(global_slot.error_sum, 7.5);
+        let cumulative = state.get_profile_error_stats(&profile_id);
+        assert_eq!(cumulative.count, 1);
+        assert_eq!(cumulative.error_sum, 7.5);
+
+        assert!(state.evict_settled_assignment(1, 3).unwrap().is_none());
     }
 
     #[test]

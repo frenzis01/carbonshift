@@ -14,6 +14,7 @@ use crate::engine::qos::{
 use crate::engine::shared_state::SharedState;
 use crate::engine::types::Flavour;
 use crate::metrics_logger::MetricsLogger;
+use crate::service::archive::RequestArchive;
 use crate::service::models::RequestStatus;
 use chrono::{SecondsFormat, Utc};
 
@@ -83,6 +84,8 @@ pub fn wall_clock_alignment(
 /// no notion of HTTP callbacks.
 pub struct TrackedRequest {
     pub callback_url: Option<String>,
+    /// Small task label retained for history responses after the large payload is dropped.
+    pub task: Option<String>,
     pub payload: serde_json::Value,
     pub status: RequestStatus,
     pub error: Option<String>,
@@ -124,8 +127,13 @@ impl TrackedRequest {
         arrival_slot: i32,
         qos_profile_id: QosProfileId,
     ) -> Self {
+        let task = payload
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         Self {
             callback_url,
+            task,
             payload,
             status: RequestStatus::Pending,
             error: None,
@@ -183,6 +191,9 @@ pub struct ServiceConfig {
     /// to send to the executor. Lower this (e.g. to 10-20ms) for snappier
     /// "fake time" emulation tests; the default is fine for real-time use.
     pub dispatcher_poll_interval_ms: u64,
+    /// Directory where the production service creates one settled-request
+    /// JSONL archive per process run.
+    pub request_archive_dir: String,
 }
 
 /// The subset of scheduler configuration needed by the HTTP service.
@@ -350,6 +361,9 @@ pub struct AppState {
     pub qos_profiles: QosProfileRegistry,
     /// Optional sink for immutable profile definitions received by the service.
     pub profile_metrics_logger: Option<Arc<MetricsLogger>>,
+    /// `None` for tests/embedded callers that intentionally disable persistence.
+    /// The production binary always supplies an opened per-run archive.
+    pub request_archive: Option<Arc<RequestArchive>>,
     pub http: reqwest::Client,
     pub service_cfg: Arc<ServiceConfig>,
     pub tracked: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
@@ -391,7 +405,7 @@ impl AppState {
         service_cfg: ServiceConfig,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
-        Self::new_inner(shared_state, cfg, service_cfg, carbon_forecast, None)
+        Self::new_inner(shared_state, cfg, service_cfg, carbon_forecast, None, None)
     }
 
     /// Construct service state with the shared metrics logger so the profile
@@ -409,6 +423,26 @@ impl AppState {
             service_cfg,
             carbon_forecast,
             Some(metrics_logger),
+            None,
+        )
+    }
+
+    /// Construct service state with its persistent per-run request archive.
+    pub fn new_with_metrics_logger_and_archive(
+        shared_state: SharedState,
+        cfg: Arc<Config>,
+        service_cfg: ServiceConfig,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
+        metrics_logger: Arc<MetricsLogger>,
+        request_archive: Arc<RequestArchive>,
+    ) -> Self {
+        Self::new_inner(
+            shared_state,
+            cfg,
+            service_cfg,
+            carbon_forecast,
+            Some(metrics_logger),
+            Some(request_archive),
         )
     }
 
@@ -418,6 +452,7 @@ impl AppState {
         service_cfg: ServiceConfig,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
         profile_metrics_logger: Option<Arc<MetricsLogger>>,
+        request_archive: Option<Arc<RequestArchive>>,
     ) -> Self {
         // Tests and integrations can construct AppState without a live
         // BatchScheduler. Initialize the shared policy here too; in the
@@ -442,6 +477,7 @@ impl AppState {
             scheduler: ServiceSchedulerConfig::from_config(&cfg),
             qos_profiles,
             profile_metrics_logger,
+            request_archive,
             http: reqwest::Client::new(),
             service_cfg: Arc::new(service_cfg),
             tracked: Arc::new(Mutex::new(HashMap::new())),
@@ -628,6 +664,7 @@ mod tests {
                 executor_retry_max_ms: 100,
                 horizon_ready_threshold: 0.9,
                 dispatcher_poll_interval_ms: 20,
+                request_archive_dir: "/tmp/carbonshift-archive".to_string(),
             },
             Arc::new(RwLock::new(vec![100.0; 10])),
         );

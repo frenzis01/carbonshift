@@ -44,6 +44,35 @@ fn flat_forecast(slots: i32, value: f64) -> Vec<f64> {
     vec![value; slots as usize]
 }
 
+#[test]
+fn settled_watermark_waits_for_old_batches_and_never_moves_backwards() {
+    let mut scheduler_state = SchedulerMutableState {
+        active_workers: 1,
+        active_batch_slots: BTreeMap::from([(3, 1)]),
+        active_profiles: HashSet::new(),
+        last_infeasible: HashMap::new(),
+        last_dispatched_profile: None,
+        stats: SchedulerStats::default(),
+        solver_runtimes: HashMap::new(),
+    };
+    let shared_state = SharedState::new();
+
+    let watermark = scheduler_state.settled_through_slot(5);
+    assert_eq!(watermark, 2);
+    shared_state.advance_settled_through_slot(watermark);
+
+    scheduler_state.batch_finished(3);
+    scheduler_state.batch_started(5);
+    let watermark = scheduler_state.settled_through_slot(5);
+    assert_eq!(watermark, 4);
+    shared_state.advance_settled_through_slot(watermark);
+
+    scheduler_state.batch_finished(5);
+    shared_state.advance_settled_through_slot(scheduler_state.settled_through_slot(5));
+    shared_state.advance_settled_through_slot(1);
+    assert_eq!(shared_state.get_settled_through_slot(), 4);
+}
+
 fn profile(
     profile_id: &str,
     task_kind: &str,
@@ -561,6 +590,7 @@ fn common_worker_reports_greedy_fallback_and_selected_flavour() {
     let forecast = flat_forecast(config.total_slots, 100.0);
     let mutable = Arc::new(Mutex::new(SchedulerMutableState {
         active_workers: 1,
+        active_batch_slots: BTreeMap::from([(0, 1)]),
         active_profiles: HashSet::new(),
         last_infeasible: HashMap::new(),
         last_dispatched_profile: None,
@@ -837,6 +867,7 @@ fn timeout_flush_can_claim_an_aged_partial_profile_while_another_full_profile_is
 
     let mutable = Arc::new(Mutex::new(SchedulerMutableState {
         active_workers: 1,
+        active_batch_slots: BTreeMap::from([(0, 1)]),
         active_profiles: HashSet::from([full_profile.profile_id.clone()]),
         last_infeasible: HashMap::new(),
         last_dispatched_profile: None,

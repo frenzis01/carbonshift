@@ -20,6 +20,10 @@
 //!   requires an `X-Executor-Token` header matching this value.
 //! - `CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS` (default `0`): allow
 //!   `callback_url`s pointing at loopback/private addresses (dev/test only).
+//! - `CARBONSHIFT_ARCHIVE_DIR` (default `/tmp/carbonshift-archive`): parent
+//!   directory for per-run request logs. Each run creates a readable UTC
+//!   timestamp directory with a two-digit hexadecimal suffix. The older
+//!   `REQUEST_ARCHIVE_DIR` name is accepted as an alias.
 //! - `EXECUTOR_MAX_RETRIES` (default `5`), `EXECUTOR_RETRY_BASE_MS` (default
 //!   `500`), `EXECUTOR_RETRY_MAX_MS` (default `30000`): dispatcher retry
 //!   policy (exponential backoff) before giving up and marking a request
@@ -45,6 +49,7 @@
 //! Shuts down gracefully on SIGINT or SIGTERM (the latter is what
 //! `docker stop`/Kubernetes send), letting in-flight requests finish.
 
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -52,6 +57,7 @@ use carbonshift_rs::engine::config::Config;
 use carbonshift_rs::engine::metrics_logger::MetricsLogger;
 use carbonshift_rs::engine::scheduler::BatchScheduler;
 use carbonshift_rs::engine::shared_state::SharedState;
+use carbonshift_rs::service::archive::RequestArchive;
 use carbonshift_rs::service::dispatcher;
 use carbonshift_rs::service::server::build_router;
 use carbonshift_rs::service::state::{AppState, ServiceConfig, wall_clock_alignment};
@@ -190,8 +196,6 @@ async fn main() {
         shared_state.set_virtual_elapsed_ms(alignment.elapsed_in_slot_ms);
         Some(alignment)
     };
-    scheduler.start();
-
     let service_cfg = ServiceConfig {
         executor_url,
         self_base_url,
@@ -214,17 +218,32 @@ async fn main() {
         dispatcher_poll_interval_ms: env_or("DISPATCHER_POLL_INTERVAL_MS", "200")
             .parse()
             .expect("DISPATCHER_POLL_INTERVAL_MS must be an integer"),
+        request_archive_dir: env_or(
+            "CARBONSHIFT_ARCHIVE_DIR",
+            &env_or("REQUEST_ARCHIVE_DIR", "/tmp/carbonshift-archive"),
+        ),
     };
-    let state = AppState::new_with_metrics_logger(
+    // Open the run archive before starting the scheduler or accepting HTTP.
+    let request_archive = Arc::new(
+        RequestArchive::open(Path::new(&service_cfg.request_archive_dir))
+            .unwrap_or_else(|error| panic!("cannot open request archive: {error}")),
+    );
+    tracing::info!(
+        archive_run_id = %request_archive.run_id(),
+        "opened per-run request archive"
+    );
+    let state = AppState::new_with_metrics_logger_and_archive(
         shared_state,
         cfg,
         service_cfg,
         shared_carbon_forecast,
         metrics_logger,
+        request_archive,
     );
     if let Some(alignment) = realtime_alignment {
         state.set_wall_clock_alignment(alignment);
     }
+    scheduler.start();
     tokio::spawn(dispatcher::run(state.clone()));
 
     let app = build_router(state);

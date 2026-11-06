@@ -32,6 +32,7 @@ fn test_service_cfg() -> ServiceConfig {
         executor_retry_max_ms: 100,
         horizon_ready_threshold: 0.9,
         dispatcher_poll_interval_ms: 20,
+        request_archive_dir: String::new(),
     }
 }
 

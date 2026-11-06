@@ -135,6 +135,11 @@ async fn dispatch_one(state: &AppState, request_id: u64, assignment: &Assignment
 
 fn set_status(state: &AppState, request_id: u64, status: RequestStatus, error: Option<String>) {
     if let Some(t) = state.tracked.lock().unwrap().get_mut(&request_id) {
+        if matches!(status, RequestStatus::Dispatched | RequestStatus::Failed) {
+            // The payload is only needed while a dispatch may be retried.
+            // Keep the task label separately for history responses.
+            t.payload = serde_json::Value::Null;
+        }
         if !t.executor_callback_received {
             t.status = status;
             t.error = error;
@@ -165,6 +170,7 @@ fn record_failure(state: &AppState, request_id: u64, error: String) {
             "dispatch failed after {} attempt(s): {error}",
             t.dispatch_attempts
         ));
+        t.payload = serde_json::Value::Null;
         tracing::error!(request_id, attempts = t.dispatch_attempts, %error, "giving up dispatching to executor");
     } else {
         let delay = backoff_delay(t.dispatch_attempts, base_ms, max_ms);
@@ -191,6 +197,45 @@ pub fn backoff_delay(attempt: u32, base_ms: u64, max_ms: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, RwLock};
+
+    use crate::engine::config::Config;
+    use crate::engine::qos::QosProfileId;
+    use crate::engine::shared_state::SharedState;
+    use crate::service::state::{ServiceConfig, TrackedRequest};
+
+    fn test_state(max_retries: u32) -> AppState {
+        AppState::new(
+            SharedState::new(),
+            Arc::new(Config::default()),
+            ServiceConfig {
+                executor_url: None,
+                self_base_url: "http://localhost:8080".to_owned(),
+                submit_wait_timeout_secs: 0.1,
+                allow_private_callbacks: false,
+                api_key: None,
+                executor_token: None,
+                executor_max_retries: max_retries,
+                executor_retry_base_ms: 10,
+                executor_retry_max_ms: 100,
+                horizon_ready_threshold: 0.9,
+                dispatcher_poll_interval_ms: 20,
+                request_archive_dir: String::new(),
+            },
+            Arc::new(RwLock::new(Vec::new())),
+        )
+    }
+
+    fn tracked_request() -> TrackedRequest {
+        TrackedRequest::new(
+            None,
+            serde_json::json!({"task": "text_generation", "input": "large prompt"}),
+            1.0,
+            10.0,
+            0,
+            QosProfileId::default_profile(),
+        )
+    }
 
     #[test]
     fn backoff_grows_exponentially_and_caps() {
@@ -207,5 +252,43 @@ mod tests {
     fn backoff_never_overflows_on_large_attempt_counts() {
         let d = backoff_delay(1000, 100, 60_000);
         assert_eq!(d, Duration::from_millis(60_000));
+    }
+
+    #[test]
+    fn accepted_dispatch_releases_payload_but_keeps_task_label() {
+        let state = test_state(3);
+        state.tracked.lock().unwrap().insert(1, tracked_request());
+
+        set_status(&state, 1, RequestStatus::Dispatched, None);
+
+        let tracked = state.tracked.lock().unwrap();
+        let request = tracked.get(&1).unwrap();
+        assert_eq!(request.payload, serde_json::Value::Null);
+        assert_eq!(request.task.as_deref(), Some("text_generation"));
+    }
+
+    #[test]
+    fn payload_is_kept_for_retries_then_released_after_final_failure() {
+        let state = test_state(2);
+        state.tracked.lock().unwrap().insert(1, tracked_request());
+
+        record_failure(&state, 1, "temporary".to_owned());
+        assert!(
+            !state
+                .tracked
+                .lock()
+                .unwrap()
+                .get(&1)
+                .unwrap()
+                .payload
+                .is_null()
+        );
+
+        record_failure(&state, 1, "final".to_owned());
+        let tracked = state.tracked.lock().unwrap();
+        let request = tracked.get(&1).unwrap();
+        assert_eq!(request.status, RequestStatus::Failed);
+        assert_eq!(request.payload, serde_json::Value::Null);
+        assert_eq!(request.task.as_deref(), Some("text_generation"));
     }
 }

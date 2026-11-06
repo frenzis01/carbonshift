@@ -937,6 +937,9 @@ pub async fn close_slot(
         // This is the close-slot acknowledgement consumed by the provider.
         // Report only after scheduling, dispatch, and callback barriers pass.
         if unscheduled == 0 && dispatching == 0 && callbacks_pending == 0 {
+            // The admission fence and drain barrier prove that no accepted
+            // work can still create an assignment or callback for this slot.
+            state.shared_state.advance_settled_through_slot(engine_slot);
             return Ok(Json(serde_json::json!({
                 "current_slot": body.current_slot,
                 "closed": true,
@@ -1705,11 +1708,7 @@ pub async fn list_request_statuses(
                     request.status,
                     request.qos_profile_id.to_string(),
                     request.arrival_slot,
-                    request
-                        .payload
-                        .get("task")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned),
+                    request.task.clone(),
                     request.baseline_carbon_cost,
                     request.actual_baseline_carbon_cost,
                     request.actual_carbon_cost,
@@ -1920,7 +1919,9 @@ pub async fn executor_callback(
             None
         };
 
-        (t.callback_url.clone(), actual_baseline)
+        // The URL is no longer needed after this callback has been forwarded;
+        // release it while retaining the small result metadata for history.
+        (t.callback_url.take(), actual_baseline)
     };
 
     // Forward caller notification in the background. The executor callback
@@ -2052,6 +2053,7 @@ mod tests {
             executor_retry_max_ms: 100,
             horizon_ready_threshold: 0.9,
             dispatcher_poll_interval_ms: 20,
+            request_archive_dir: String::new(),
         };
         let state = AppState::new(SharedState::new(), cfg.clone(), service_cfg, forecast);
 
@@ -2086,6 +2088,7 @@ mod tests {
             executor_retry_max_ms: 100,
             horizon_ready_threshold: 0.9,
             dispatcher_poll_interval_ms: 20,
+            request_archive_dir: String::new(),
         };
         let state = AppState::new(SharedState::new(), cfg, service_cfg, forecast);
         state
