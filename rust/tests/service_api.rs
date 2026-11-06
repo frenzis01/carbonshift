@@ -1386,7 +1386,44 @@ async fn assignment_and_slot_endpoints_merge_settled_archive_rows_with_live_rows
     // The live row wins over its archived copy during append-before-evict.
     assert_eq!(assignments[0]["carbon_cost"], 9.0);
 
+    let combined = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/v1/assignments?from_slot=0&to_slot=1&flavour=Fast&qos_profile_id=default-text-generation",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(combined.status(), StatusCode::OK);
+    let combined = json_body(combined).await;
+    assert_eq!(combined.as_array().unwrap().len(), 2);
+    assert_eq!(combined[0]["request_id"], 40);
+    assert_eq!(combined[1]["request_id"], 41);
+    assert_eq!(combined[1]["carbon_cost"], 9.0);
+
+    let archived_request = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/requests/40")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_request.status(), StatusCode::OK);
+    let archived_request = json_body(archived_request).await;
+    assert_eq!(archived_request["scheduled_slot"], 0);
+    assert_eq!(archived_request["carbon_cost"], 1.0);
+
+    // Once the live copy is evicted, slot detail falls back to the archive.
+    state.shared_state.evict_settled_assignment(41, 1).unwrap();
     let slot = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/v1/slots/1")
@@ -1398,7 +1435,21 @@ async fn assignment_and_slot_endpoints_merge_settled_archive_rows_with_live_rows
     assert_eq!(slot.status(), StatusCode::OK);
     let slot = json_body(slot).await;
     assert_eq!(slot["total_requests"], 1);
-    assert_eq!(slot["total_carbon_cost"], 9.0);
+    assert_eq!(slot["total_carbon_cost"], 100.0);
+
+    let history = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics/error-history?from_slot=1&to_slot=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.status(), StatusCode::OK);
+    let history = json_body(history).await;
+    assert_eq!(history["slots"][0]["request_count"], 1);
+    assert_eq!(history["slots"][0]["average_error"], 2.0);
 
     drop(state);
     std::fs::remove_dir_all(directory).unwrap();
@@ -1469,6 +1520,39 @@ async fn cost_metrics_include_archived_request_and_assignment_totals() {
     assert_eq!(metrics["current_actual_baseline_carbon_cost"], 8.0);
     assert_eq!(metrics["total_baseline_carbon_cost"], 10.0);
     assert_eq!(metrics["total_forecasted_carbon_cost"], 3.0);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn malformed_request_archive_is_reported_as_internal_error() {
+    let directory = std::env::temp_dir().join(format!(
+        "carbonshift-corrupt-archive-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let archive = Arc::new(RequestArchive::open(&directory).unwrap());
+    let path = directory.join(archive.run_id()).join("requests.jsonl");
+    std::fs::write(path, b"{not valid json}\n").unwrap();
+
+    let mut state = test_state(test_service_cfg());
+    state.request_archive = Some(archive);
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/requests")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json_body(response).await;
+    assert_eq!(body["error"], "Could not read archived request history");
 
     std::fs::remove_dir_all(directory).unwrap();
 }

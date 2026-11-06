@@ -1836,42 +1836,65 @@ pub async fn get_request_status(
         })
     };
 
-    let (status, error, baseline_carbon_cost, qos_profile_id) = match tracked_status {
-        Some(tracked_status) => tracked_status,
-        None => {
-            let archived = read_archived_requests(&state)?;
-            let request = archived
-                .iter()
-                .find(|row| row.request.request_id == request_id)
-                .map(|row| &row.request)
-                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
+    let (status, error, baseline_carbon_cost, qos_profile_id, archived_assignment) =
+        match tracked_status {
+            Some((status, error, baseline_carbon_cost, qos_profile_id)) => {
+                (status, error, baseline_carbon_cost, qos_profile_id, None)
+            }
+            None => {
+                let archived = read_archived_requests(&state)?;
+                let row = archived
+                    .iter()
+                    .find(|row| row.request.request_id == request_id)
+                    .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "unknown request_id"))?;
 
-            (
-                request.status,
-                request.error.clone(),
-                request.baseline_carbon_cost,
-                request.qos_profile_id.clone(),
-            )
-        }
-    };
+                (
+                    row.request.status,
+                    row.request.error.clone(),
+                    row.request.baseline_carbon_cost,
+                    row.request.qos_profile_id.clone(),
+                    row.assignment.clone(),
+                )
+            }
+        };
 
     // A request can be accepted before it has an assignment, so scheduled
     // fields are optional even when the tracked request is known.
     let assignment = state.shared_state.get_assignment(request_id);
+    let scheduled_slot = assignment
+        .as_ref()
+        .map(|item| item.scheduled_slot)
+        .or_else(|| archived_assignment.as_ref().map(|item| item.scheduled_slot));
     let eff_slot_dur = state.scheduler.effective_slot_duration_secs;
-    let eta = assignment.as_ref().map(|a| {
-        ((a.scheduled_slot - state.shared_state.get_current_slot()).max(0)) as f64 * eff_slot_dur
-    });
+    let eta = scheduled_slot
+        .map(|slot| ((slot - state.shared_state.get_current_slot()).max(0)) as f64 * eff_slot_dur);
 
     Ok(Json(RequestStatusResponse {
         request_id,
         qos_profile_id,
         status,
-        scheduled_slot: assignment.as_ref().map(|a| a.scheduled_slot),
+        scheduled_slot,
         eta_seconds: eta,
-        flavour: assignment.as_ref().map(|a| a.flavour_name.clone()),
-        carbon_cost: assignment.as_ref().map(|a| a.carbon_cost),
-        scheduled_at: assignment.as_ref().map(|a| a.assignment_time),
+        flavour: assignment
+            .as_ref()
+            .map(|item| item.flavour_name.clone())
+            .or_else(|| {
+                archived_assignment
+                    .as_ref()
+                    .map(|item| item.flavour_name.clone())
+            }),
+        carbon_cost: assignment
+            .as_ref()
+            .map(|item| item.carbon_cost)
+            .or_else(|| archived_assignment.as_ref().map(|item| item.carbon_cost)),
+        scheduled_at: assignment
+            .as_ref()
+            .map(|item| item.assignment_time)
+            .or_else(|| {
+                archived_assignment
+                    .as_ref()
+                    .map(|item| item.assignment_time)
+            }),
         baseline_carbon_cost,
         error,
     }))

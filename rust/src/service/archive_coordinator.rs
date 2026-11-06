@@ -165,7 +165,94 @@ fn is_settled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::config::Config;
     use crate::engine::qos::QosProfileId;
+    use crate::engine::shared_state::SharedState;
+    use crate::service::archive::RequestArchive;
+    use crate::service::models::AssignmentItem;
+    use crate::service::state::ServiceConfig;
+    use std::sync::{Arc, RwLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn archive_directory(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "carbonshift-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn app_state(archive: Arc<RequestArchive>, executor: bool) -> AppState {
+        let mut config = Config::default();
+        config.total_slots = 8;
+        let config = Arc::new(config);
+        let service_cfg = ServiceConfig {
+            executor_url: executor.then(|| "http://executor/dispatch".to_owned()),
+            self_base_url: "http://localhost:8080".to_owned(),
+            submit_wait_timeout_secs: 0.1,
+            allow_private_callbacks: false,
+            api_key: None,
+            executor_token: None,
+            executor_max_retries: 3,
+            executor_retry_base_ms: 10,
+            executor_retry_max_ms: 100,
+            horizon_ready_threshold: 0.9,
+            dispatcher_poll_interval_ms: 20,
+            request_archive_dir: String::new(),
+        };
+        let mut state = AppState::new(
+            SharedState::new(),
+            config,
+            service_cfg,
+            Arc::new(RwLock::new(vec![100.0; 8])),
+        );
+        state.request_archive = Some(archive);
+        state
+    }
+
+    fn insert_tracked(state: &AppState, id: u64, request: TrackedRequest) {
+        state.tracked.lock().unwrap().insert(id, request);
+    }
+
+    fn archived_row(archive: &RequestArchive, assignment: &Assignment) -> ArchivedRequest {
+        ArchivedRequest {
+            schema_version: 1,
+            run_id: archive.run_id().to_owned(),
+            request: TrackedRequestResponse {
+                request_id: assignment.request_id,
+                task: Some("text_generation".to_owned()),
+                qos_profile_id: assignment.qos_profile_id.to_string(),
+                status: RequestStatus::Completed,
+                arrival_slot: assignment.arrival_slot.unwrap_or(0),
+                scheduled_slot: Some(assignment.scheduled_slot),
+                flavour: Some(assignment.flavour_name.clone()),
+                carbon_cost: Some(assignment.carbon_cost),
+                actual_carbon_cost: Some(assignment.carbon_cost),
+                baseline_carbon_cost: 2.0,
+                actual_baseline_carbon_cost: Some(2.0),
+                actual_error_pct: Some(assignment.error),
+                execution_time_sec: Some(1.0),
+                baseline_execution_time_sec: Some(1.0),
+                scheduled_at: Some(assignment.assignment_time),
+                error: None,
+            },
+            assignment: Some(AssignmentItem {
+                request_id: assignment.request_id,
+                qos_profile_id: assignment.qos_profile_id.to_string(),
+                scheduled_slot: assignment.scheduled_slot,
+                flavour_name: assignment.flavour_name.clone(),
+                carbon_cost: assignment.carbon_cost,
+                error: assignment.error,
+                flavour_duration: assignment.flavour_duration,
+                arrival_slot: assignment.arrival_slot,
+                deadline_slot: assignment.deadline_slot,
+                assignment_time: assignment.assignment_time,
+            }),
+        }
+    }
 
     fn tracked(status: RequestStatus, callback_received: bool) -> TrackedRequest {
         let mut request = TrackedRequest::new(
@@ -217,5 +304,118 @@ mod tests {
             3,
             true,
         ));
+    }
+
+    #[test]
+    fn sweep_keeps_executor_request_live_until_callback() {
+        let directory = archive_directory("sweep-inflight");
+        let archive = Arc::new(RequestArchive::open(&directory).unwrap());
+        let state = app_state(archive.clone(), true);
+        state.shared_state.add_assignments(vec![assignment(0)]);
+        state.shared_state.advance_settled_through_slot(0);
+        insert_tracked(&state, 1, tracked(RequestStatus::Dispatched, false));
+
+        sweep_once(&state).unwrap();
+
+        assert!(archive.read_all().unwrap().is_empty());
+        assert!(state.shared_state.get_assignment(1).is_some());
+        assert!(state.tracked.lock().unwrap().contains_key(&1));
+        drop(state);
+        drop(archive);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sweep_keeps_assignment_in_unsettled_slot_live() {
+        let directory = archive_directory("sweep-unsettled");
+        let archive = Arc::new(RequestArchive::open(&directory).unwrap());
+        let state = app_state(archive.clone(), false);
+        state.shared_state.add_assignments(vec![assignment(0)]);
+        state.shared_state.advance_settled_through_slot(-1);
+        insert_tracked(&state, 1, tracked(RequestStatus::Dispatched, false));
+
+        sweep_once(&state).unwrap();
+
+        assert!(archive.read_all().unwrap().is_empty());
+        assert!(state.shared_state.get_assignment(1).is_some());
+        assert!(state.tracked.lock().unwrap().contains_key(&1));
+        drop(state);
+        drop(archive);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sweep_archives_then_evicts_and_keeps_error_aggregates() {
+        let directory = archive_directory("sweep-completed");
+        let archive = Arc::new(RequestArchive::open(&directory).unwrap());
+        let state = app_state(archive.clone(), true);
+        let assignment = Assignment::new_for_profile(
+            1,
+            0,
+            "Fast".to_owned(),
+            1.0,
+            4.5,
+            1.0,
+            Some(0),
+            Some(1),
+            QosProfileId::default_profile(),
+        );
+        state.shared_state.add_assignments(vec![assignment]);
+        state.shared_state.advance_settled_through_slot(0);
+        insert_tracked(&state, 1, tracked(RequestStatus::Completed, true));
+
+        sweep_once(&state).unwrap();
+
+        let rows = archive.read_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request.request_id, 1);
+        assert!(state.shared_state.get_assignment(1).is_none());
+        assert!(!state.tracked.lock().unwrap().contains_key(&1));
+
+        let profile_id = QosProfileId::default_profile();
+        let error = state
+            .shared_state
+            .get_profile_slot_error_stats(&profile_id, 0);
+        assert_eq!(error.count, 1);
+        assert_eq!(error.error_sum, 4.5);
+        assert_eq!(state.shared_state.get_slot_error_stats(0).count, 1);
+        assert_eq!(
+            state
+                .shared_state
+                .get_profile_error_stats(&profile_id)
+                .count,
+            1
+        );
+
+        drop(state);
+        drop(archive);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn append_then_failed_eviction_can_retry_without_duplicate_archive_row() {
+        let directory = archive_directory("sweep-retry");
+        let archive = RequestArchive::open(&directory).unwrap();
+        let shared_state = SharedState::new();
+        let assignment = assignment(3);
+        shared_state.add_assignments(vec![assignment.clone()]);
+        let row = archived_row(&archive, &assignment);
+
+        assert!(archive.append_once(&row).unwrap());
+        assert!(shared_state.evict_settled_assignment(1, 2).is_err());
+        assert!(!archive.append_once(&row).unwrap());
+        assert_eq!(archive.read_all().unwrap().len(), 1);
+
+        assert!(
+            shared_state
+                .evict_settled_assignment(1, 3)
+                .unwrap()
+                .is_some()
+        );
+        assert!(shared_state.get_assignment(1).is_none());
+        assert_eq!(archive.read_all().unwrap().len(), 1);
+
+        drop(archive);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
