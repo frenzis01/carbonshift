@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -349,6 +350,79 @@ def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
     assert previous_run.is_dir()
     assert not (output_root / f"{battery_id}_incomplete").exists()
     assert (output_root / f"{battery_id}_completed").is_dir()
+
+
+@pytest.mark.skipif(mr.os.name != "posix", reason="tests POSIX process-group interrupt")
+def test_run_battery_forwards_interrupt_and_waits_for_child(monkeypatch):
+    observed = {}
+
+    class FakeProcess:
+        pid = 12345
+
+        def __init__(self):
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise KeyboardInterrupt
+            observed["wait_timeout"] = timeout
+            return -signal.SIGINT
+
+        def poll(self):
+            return None
+
+    process = FakeProcess()
+
+    def fake_popen(command, *, cwd, start_new_session):
+        observed["command"] = command
+        observed["cwd"] = cwd
+        observed["start_new_session"] = start_new_session
+        return process
+
+    monkeypatch.setattr(mr.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        mr.os,
+        "killpg",
+        lambda pid, sig: observed.update(killpg=(pid, sig)),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        mr.run_battery()
+
+    assert observed["start_new_session"] is (mr.os.name == "posix")
+    if mr.os.name == "posix":
+        assert observed["killpg"] == (process.pid, signal.SIGINT)
+    assert observed["wait_timeout"] == 10
+    assert process.wait_calls == 2
+
+
+def test_multiple_runs_default_patterns_is_a_single_pattern_not_characters():
+    assert mr.INPUT_PATTERNS == ("sinusoidal",)
+    patterned = mr._with_input_pattern({"scenarios": [{"id": "tiny"}]}, mr.INPUT_PATTERNS[0])
+    assert patterned["scenarios"][0]["input_pattern"] == "sinusoidal"
+
+
+def test_main_reports_interrupt_without_traceback_and_restores_config(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "battery_config.json"
+    config_path.write_text("{}")
+    base_config = {"battery_id": "original"}
+    saved = []
+
+    monkeypatch.setattr(mr, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(mr, "load_config", lambda _path: base_config)
+    monkeypatch.setattr(mr, "save_config", lambda _path, cfg: saved.append(cfg.copy()))
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mr, "run_phase", interrupt)
+
+    assert mr.main(["--phase", "dp", "--input-pattern", "sinusoidal"]) == 130
+    assert saved == [base_config]
+    captured = capsys.readouterr()
+    assert "Interrupted by user" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_folder_name_scale_with_leading_zero():

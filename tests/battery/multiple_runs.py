@@ -26,8 +26,9 @@ For every grid point the script:
   3. saves it back to `battery_config.json`
   4. invokes `python tests/battery/run_battery.py`
 
-By default, every selected phase is run once for each input pattern:
-`sinusoidal` and `flat`. Pattern IDs are included in scenario and battery
+By default, every selected phase is run once with the `sinusoidal` input
+pattern. `--input-pattern flat` selects the flat pattern instead; the two can
+also be requested together. Pattern IDs are included in scenario and battery
 names to keep their output files separate.
 
 On Ctrl+C, the newly created folder for the interrupted run is removed unless
@@ -43,6 +44,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -110,7 +113,9 @@ OFFLINE_CONTENT: Dict[str, Any] = {
     ],
 }
 
-INPUT_PATTERNS = ("flat",)
+SUPPORTED_INPUT_PATTERNS = ("sinusoidal", "flat")
+# Select which supported scenario pattern(s) the default sweep runs.
+INPUT_PATTERNS = ("sinusoidal",)
 
 # ─── phase-specific knob grids ─────────────────────────────────────────────────
 # DP + online strategies: parallelism x threshold.
@@ -159,7 +164,7 @@ def save_config(path: Path, cfg: Dict[str, Any]) -> None:
 
 def _with_input_pattern(cfg: Dict[str, Any], input_pattern: str) -> Dict[str, Any]:
     """Return a config copy whose scenarios identify one simulation pattern."""
-    if input_pattern not in INPUT_PATTERNS:
+    if input_pattern not in SUPPORTED_INPUT_PATTERNS:
         raise ValueError(f"Unknown input pattern: {input_pattern!r}")
 
     patterned_cfg = dict(cfg)
@@ -175,10 +180,40 @@ def _with_input_pattern(cfg: Dict[str, Any], input_pattern: str) -> Dict[str, An
 
 
 def run_battery() -> int:
-    """Invoke run_battery.py from the repository root."""
+    """Invoke run_battery.py, stopping its process tree cleanly on Ctrl+C."""
     cmd = [sys.executable, str(RUN_BATTERY_SCRIPT.relative_to(REPO_ROOT))]
     print(f"Running: {' '.join(cmd)}")
-    return subprocess.call(cmd, cwd=REPO_ROOT)
+    process = subprocess.Popen(
+        cmd,
+        cwd=REPO_ROOT,
+        # Isolate the child tree so Ctrl+C can be forwarded once, then fully
+        # waited for before the caller removes an incomplete output directory.
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        return process.wait()
+    except KeyboardInterrupt:
+        if process.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGINT)
+                elif hasattr(signal, "CTRL_BREAK_EVENT"):
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        raise
 
 
 def _run_output_root(cfg: Dict[str, Any]) -> Path:
@@ -309,16 +344,16 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="cfg_test16",
+        default="cfg_test00",
         help="Prefix used to build each run's battery_id "
         "(final id is '<prefix>_<pattern>_<phase>_<grid-index>').",
     )
     parser.add_argument(
         "--input-pattern",
         nargs="+",
-        choices=INPUT_PATTERNS,
+        choices=SUPPORTED_INPUT_PATTERNS,
         default=list(INPUT_PATTERNS),
-        help="Simulation request pattern(s) to sweep (default: sinusoidal and flat).",
+        help="Simulation request pattern(s) to sweep (default: sinusoidal).",
     )
     args = parser.parse_args(argv)
 
@@ -339,6 +374,14 @@ def main(argv: List[str] | None = None) -> int:
                 )
                 if status != 0:
                     overall_status = status
+    except KeyboardInterrupt:
+        print(
+            "\nInterrupted by user. The active child process was stopped, "
+            "incomplete output was cleaned, and the original battery config "
+            "was restored.",
+            file=sys.stderr,
+        )
+        overall_status = 130
     finally:
         # Always restore the on-disk config to its pre-run state so repeated
         # invocations (or manual edits) aren't clobbered by the last grid
