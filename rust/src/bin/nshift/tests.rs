@@ -511,6 +511,64 @@ fn offline_dp_marks_greedy_fallback_and_reports_its_flavour() {
 }
 
 #[test]
+fn online_nshift_writes_settled_per_request_rows_without_returning_a_row_vector() {
+    let scenario = make_scenario(
+        vec![
+            make_request(3, 0, 1),
+            make_request(1, 0, 1),
+            make_request(2, 0, 1),
+        ],
+        vec![100.0, 50.0],
+    );
+    let mut config = Config::default();
+    config.total_slots = 2;
+    config.slot_duration_seconds = 60.0;
+    config.solver.batch_size = 1;
+    config.global_error_constraint_enabled = false;
+    config.logging.enable_progress_display = false;
+
+    let run_dir = std::env::temp_dir().join(format!(
+        "nshift-settled-output-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (_batch_timings, summary, per_timeslot) =
+        run_single_n(&scenario, &config, 1, false, 1.0, &run_dir, false);
+
+    assert_eq!(summary.reqs_total, 3);
+    assert_eq!(summary.reqs_scheduled, 3);
+    assert_eq!(per_timeslot.len(), 2);
+
+    let mut reader = csv::Reader::from_path(run_dir.join("per_request.csv")).unwrap();
+    let headers = reader.headers().unwrap().clone();
+    let column = |name: &str| headers.iter().position(|header| header == name).unwrap();
+    let slot_column = column("scheduled_slot");
+    let id_column = column("request_id");
+    let records = reader.records().map(Result::unwrap).collect::<Vec<_>>();
+    assert_eq!(records.len(), 3);
+    for pair in records.windows(2) {
+        let previous_slot = pair[0][slot_column].parse::<i32>().unwrap();
+        let current_slot = pair[1][slot_column].parse::<i32>().unwrap();
+        let previous_id = pair[0][id_column].parse::<u64>().unwrap();
+        let current_id = pair[1][id_column].parse::<u64>().unwrap();
+        assert!(
+            (previous_slot, previous_id) <= (current_slot, current_id),
+            "settled per-request output must be slot/request ordered"
+        );
+    }
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_dir.join("per_request.json")).unwrap()).unwrap();
+    assert_eq!(json["rows"].as_array().unwrap().len(), 3);
+    assert!(run_dir.join("assignments_runtime.csv").exists());
+    assert!(!run_dir.join("_solver_assignments.csv").exists());
+    std::fs::remove_dir_all(run_dir).unwrap();
+}
+
+#[test]
 fn offline_common_engine_commit_prices_each_next_capacity_position() {
     let scenario = make_scenario(
         vec![make_request(1, 0, 0), make_request(2, 0, 0)],

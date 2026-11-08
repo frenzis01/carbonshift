@@ -23,9 +23,11 @@ pub(super) struct SolverRunRow {
     pub(super) run_sequence: u64,
     pub(super) new_assignments: usize,
     pub(super) solver_elapsed_ms: f64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) solver_status: String,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(super) struct AssignmentRow {
     pub(super) run_id: String,
@@ -169,6 +171,7 @@ pub(super) fn read_solver_runs(path: &Path) -> Vec<SolverRunRow> {
     rows
 }
 
+#[cfg(test)]
 pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
     let Ok(mut rdr) = csv::Reader::from_path(path) else {
         return Vec::new();
@@ -238,6 +241,7 @@ pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
 
 // ─── metrics computation ──────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub(super) fn compute_per_request(
     assignments: &[AssignmentRow],
     runs_by_id: &HashMap<String, &SolverRunRow>,
@@ -288,35 +292,106 @@ pub(super) fn compute_per_request(
     v
 }
 
-pub(super) fn compute_batch_timings(
+/// Compute batch timing rows while retaining only one slot per solver run,
+/// rather than materializing every solver assignment row in memory.
+pub(super) fn compute_batch_timings_from_csv(
     runs: &[SolverRunRow],
-    assignments: &[AssignmentRow],
+    assignments_path: &Path,
     batch_size_n: usize,
-) -> Vec<BatchTiming> {
+) -> Result<Vec<BatchTiming>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut reader = csv::Reader::from_path(assignments_path)?;
+    let headers = reader.headers()?.clone();
+    let run_id_column = headers
+        .iter()
+        .position(|header| header == "run_id")
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing run_id"))?;
+    let slot_column = headers
+        .iter()
+        .position(|header| header == "current_slot")
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing current_slot")
+        })?;
     let mut slot_by_run = HashMap::new();
-    for assignment in assignments {
-        slot_by_run
-            .entry(assignment.run_id.as_str())
-            .or_insert(assignment.current_slot);
+    for record in reader.records() {
+        let record = record?;
+        let run_id = record.get(run_id_column).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing row run_id")
+        })?;
+        let slot = record
+            .get(slot_column)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing row slot")
+            })?
+            .parse::<i32>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        slot_by_run.entry(run_id.to_owned()).or_insert(slot);
     }
 
-    let mut timings: Vec<BatchTiming> = runs
+    let mut timings = runs
         .iter()
-        .map(|r| BatchTiming {
-            batch_sequence: r.run_sequence,
-            batch_size_n,
-            effective_batch_size: r.new_assignments,
-            slot: *slot_by_run
-                .get(r.run_id.as_str())
-                .expect("each successful solver run must have assignment rows"),
-            pending_before: r.new_assignments,
-            solver_elapsed_ms: r.solver_elapsed_ms,
-            scheduled: r.new_assignments > 0,
-            flush_partial_batch: r.new_assignments < batch_size_n,
+        .map(|run| {
+            let slot = slot_by_run.get(&run.run_id).copied().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("solver run {} has no assignment rows", run.run_id),
+                )
+            })?;
+            Ok(BatchTiming {
+                batch_sequence: run.run_sequence,
+                batch_size_n,
+                effective_batch_size: run.new_assignments,
+                slot,
+                pending_before: run.new_assignments,
+                solver_elapsed_ms: run.solver_elapsed_ms,
+                scheduled: run.new_assignments > 0,
+                flush_partial_batch: run.new_assignments < batch_size_n,
+            })
         })
-        .collect();
-    timings.sort_by_key(|t| t.batch_sequence);
-    timings
+        .collect::<Result<Vec<_>, std::io::Error>>()?;
+    timings.sort_by_key(|timing| timing.batch_sequence);
+    Ok(timings)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SlotErrorAggregate {
+    pub(super) error_sum: f64,
+    pub(super) count: u64,
+}
+
+/// Bounded-size per-slot errors used after assignment rows have been evicted.
+pub(super) fn compute_per_timeslot_from_aggregates(
+    slot_errors: &[SlotErrorAggregate],
+    error_window_past: i32,
+    error_window_future: i32,
+) -> Vec<PerTimeslot> {
+    (0..slot_errors.len())
+        .map(|slot| {
+            let slot = slot as i32;
+            let window_start = slot - error_window_past;
+            let window_end = slot + error_window_future;
+            let start = window_start.max(0) as usize;
+            let end = window_end.min(slot_errors.len() as i32 - 1).max(-1);
+            let mut error_sum = 0.0;
+            let mut count = 0u64;
+            if start <= end as usize && end >= 0 {
+                for aggregate in &slot_errors[start..=end as usize] {
+                    error_sum += aggregate.error_sum;
+                    count += aggregate.count;
+                }
+            }
+            PerTimeslot {
+                timeslot: slot,
+                window_start,
+                window_end,
+                reqs_count: count as f64,
+                window_avg_error: if count > 0 {
+                    error_sum / count as f64
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
 }
 
 pub(super) fn compute_per_timeslot(
@@ -356,6 +431,63 @@ pub(super) fn compute_per_timeslot(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RangeAccumulator {
+    count: usize,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl RangeAccumulator {
+    fn add(&mut self, value: f64) {
+        if self.count == 0 {
+            self.min = value;
+            self.max = value;
+        } else {
+            self.min = self.min.min(value);
+            self.max = self.max.max(value);
+        }
+        self.sum += value;
+        self.count += 1;
+    }
+
+    fn min_max_avg(self) -> (f64, f64, f64) {
+        if self.count == 0 {
+            (0.0, 0.0, 0.0)
+        } else {
+            (self.min, self.max, self.sum / self.count as f64)
+        }
+    }
+}
+
+/// Incremental summary inputs for online nshift; one row is folded as soon as
+/// its slot is finalized instead of retaining all PerRequest values.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PerRequestSummaryAccumulator {
+    pub(super) count: usize,
+    total_carbon_cost: f64,
+    total_error: f64,
+    queue_wait_seconds: RangeAccumulator,
+    final_wait_seconds: RangeAccumulator,
+    fallback_count: usize,
+    late_count: usize,
+    max_lateness_slots: i32,
+}
+
+impl PerRequestSummaryAccumulator {
+    pub(super) fn record(&mut self, request: &PerRequest) {
+        self.count += 1;
+        self.total_carbon_cost += request.carbon_cost;
+        self.total_error += request.error;
+        self.queue_wait_seconds.add(request.queue_wait_seconds);
+        self.final_wait_seconds.add(request.final_wait_seconds);
+        self.fallback_count += usize::from(request.fallback_assigned);
+        self.late_count += usize::from(request.late_assigned);
+        self.max_lateness_slots = self.max_lateness_slots.max(request.lateness_slots);
+    }
+}
+
 pub(super) fn min_max_avg(v: &[f64]) -> (f64, f64, f64) {
     if v.is_empty() {
         return (0.0, 0.0, 0.0);
@@ -380,10 +512,43 @@ pub(super) fn compute_summary(
     peak_concurrent_workers: usize,
     avg_concurrent_workers: f64,
 ) -> RunSummary {
-    let scheduled = per_req.len();
-    let total_carbon: f64 = per_req.iter().map(|r| r.carbon_cost).sum();
+    let mut request_summary = PerRequestSummaryAccumulator::default();
+    for request in per_req {
+        request_summary.record(request);
+    }
+    compute_summary_from_accumulator(
+        mode,
+        batch_size,
+        realtime_slots,
+        realtime_speed_scale,
+        request_summary,
+        batch_timings,
+        total_received,
+        baseline_flavour_name,
+        baseline_flavour_duration,
+        baseline_flavour_error,
+        peak_concurrent_workers,
+        avg_concurrent_workers,
+    )
+}
+
+pub(super) fn compute_summary_from_accumulator(
+    mode: &str,
+    batch_size: usize,
+    realtime_slots: bool,
+    realtime_speed_scale: f64,
+    request_summary: PerRequestSummaryAccumulator,
+    batch_timings: &[BatchTiming],
+    total_received: usize,
+    baseline_flavour_name: &str,
+    baseline_flavour_duration: f64,
+    baseline_flavour_error: f64,
+    peak_concurrent_workers: usize,
+    avg_concurrent_workers: f64,
+) -> RunSummary {
+    let scheduled = request_summary.count;
     let avg_error = if scheduled > 0 {
-        per_req.iter().map(|r| r.error).sum::<f64>() / scheduled as f64
+        request_summary.total_error / scheduled as f64
     } else {
         0.0
     };
@@ -394,21 +559,8 @@ pub(super) fn compute_summary(
             .map(|b| b.solver_elapsed_ms)
             .collect::<Vec<_>>(),
     );
-    let (qw_min, qw_max, qw_avg) = min_max_avg(
-        &per_req
-            .iter()
-            .map(|r| r.queue_wait_seconds)
-            .collect::<Vec<_>>(),
-    );
-    let (fw_min, fw_max, fw_avg) = min_max_avg(
-        &per_req
-            .iter()
-            .map(|r| r.final_wait_seconds)
-            .collect::<Vec<_>>(),
-    );
-    let greedy = per_req.iter().filter(|r| r.fallback_assigned).count();
-    let reqs_late = per_req.iter().filter(|r| r.late_assigned).count();
-    let max_lateness_slots = per_req.iter().map(|r| r.lateness_slots).max().unwrap_or(0);
+    let (qw_min, qw_max, qw_avg) = request_summary.queue_wait_seconds.min_max_avg();
+    let (fw_min, fw_max, fw_avg) = request_summary.final_wait_seconds.min_max_avg();
 
     RunSummary {
         execution_mode: mode.to_string(),
@@ -421,12 +573,12 @@ pub(super) fn compute_summary(
         reqs_total: total_received,
         reqs_scheduled: scheduled,
         reqs_unscheduled: total_received.saturating_sub(scheduled),
-        reqs_late,
-        max_lateness_slots,
+        reqs_late: request_summary.late_count,
+        max_lateness_slots: request_summary.max_lateness_slots,
         batches_executed: batch_timings.len(),
-        total_carbon_cost: total_carbon,
+        total_carbon_cost: request_summary.total_carbon_cost,
         global_average_error: avg_error,
-        reqs_fallback_assigned: greedy,
+        reqs_fallback_assigned: request_summary.fallback_count,
         peak_concurrent_workers,
         avg_concurrent_workers,
         solver_time_ms_min: st_min,
@@ -560,6 +712,27 @@ pub(super) fn write_run_outputs(
     batch_timings: &[BatchTiming],
     per_timeslot: &[PerTimeslot],
 ) {
+    write_run_outputs_inner(run_dir, summary, Some(per_req), batch_timings, per_timeslot);
+}
+
+/// Write metadata tables for a run whose per-request CSV/JSON were already
+/// streamed by the settled-slot finalizer.
+pub(super) fn write_streamed_run_outputs(
+    run_dir: &Path,
+    summary: &RunSummary,
+    batch_timings: &[BatchTiming],
+    per_timeslot: &[PerTimeslot],
+) {
+    write_run_outputs_inner(run_dir, summary, None, batch_timings, per_timeslot);
+}
+
+fn write_run_outputs_inner(
+    run_dir: &Path,
+    summary: &RunSummary,
+    per_req: Option<&[PerRequest]>,
+    batch_timings: &[BatchTiming],
+    per_timeslot: &[PerTimeslot],
+) {
     std::fs::create_dir_all(run_dir).expect("Cannot create run output dir");
     write_output_schema_manifest(run_dir);
 
@@ -576,8 +749,9 @@ pub(super) fn write_run_outputs(
         w.flush().unwrap();
     }
 
-    // per_request.csv + per_request.json
-    {
+    // Vector-based runs still use this compatibility writer. Online nshift
+    // writes these files incrementally as slots settle and passes `None`.
+    if let Some(per_req) = per_req {
         let header = [
             "request_id",
             "qos_profile_id",
@@ -724,7 +898,7 @@ pub(super) fn write_run_outputs(
 
     // assignments_runtime.csv — Python-compatible format
     // Columns: request_id, QoS profile, scheduled slot, flavour, cost, assignment time
-    {
+    if let Some(per_req) = per_req {
         use std::time::{SystemTime, UNIX_EPOCH};
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)

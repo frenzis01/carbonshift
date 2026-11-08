@@ -54,6 +54,7 @@ fn settled_watermark_waits_for_old_batches_and_never_moves_backwards() {
         last_dispatched_profile: None,
         stats: SchedulerStats::default(),
         solver_runtimes: HashMap::new(),
+        assignment_commit_observer: None,
     };
     let shared_state = SharedState::new();
 
@@ -596,6 +597,7 @@ fn common_worker_reports_greedy_fallback_and_selected_flavour() {
         last_dispatched_profile: None,
         stats: SchedulerStats::default(),
         solver_runtimes: HashMap::new(),
+        assignment_commit_observer: None,
     }));
 
     let prefix = std::env::temp_dir().join(format!(
@@ -873,6 +875,7 @@ fn timeout_flush_can_claim_an_aged_partial_profile_while_another_full_profile_is
         last_dispatched_profile: None,
         stats: SchedulerStats::default(),
         solver_runtimes: HashMap::new(),
+        assignment_commit_observer: None,
     }));
 
     assert!(!has_dispatchable_full_profile_batch(

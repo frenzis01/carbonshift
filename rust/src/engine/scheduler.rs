@@ -130,6 +130,26 @@ enum BatchWorkerOutcome {
     Infeasible,
 }
 
+/// Receives the small batch/reporting context needed by an optional runner
+/// after placements have been committed and priced.
+///
+/// The live service does not install an observer. Online simulation runners
+/// can use one to retain only report metadata for assignments whose slots are
+/// not yet settled, without teaching `SharedState` about reporting records.
+pub trait AssignmentCommitObserver: Send + Sync {
+    /// Called once per successfully committed batch, after solver feedback and
+    /// the unique batch sequence are known.
+    fn assignments_committed(
+        &self,
+        current_slot: i32,
+        batch_sequence: u64,
+        solver_status: &str,
+        fallback_request_ids: &HashSet<u64>,
+        late_request_ids: &HashSet<u64>,
+        assignments: &[Assignment],
+    );
+}
+
 /// All mutable scheduler state shared between the main loop and workers.
 struct SchedulerMutableState {
     active_workers: usize,
@@ -145,6 +165,9 @@ struct SchedulerMutableState {
     last_dispatched_profile: Option<QosProfileId>,
     stats: SchedulerStats,
     solver_runtimes: HashMap<QosProfileId, Arc<dyn SolverRuntime>>,
+    /// Optional runner-specific reporting hook. The live service leaves this
+    /// unset; nshift installs a sink that retains only unsettled report context.
+    assignment_commit_observer: Option<Arc<dyn AssignmentCommitObserver>>,
 }
 
 impl SchedulerMutableState {
@@ -262,7 +285,14 @@ impl BatchScheduler {
         metrics_logger: Arc<MetricsLogger>,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
-        Self::new_inner(shared_state, cfg, metrics_logger, carbon_forecast, false)
+        Self::new_inner(
+            shared_state,
+            cfg,
+            metrics_logger,
+            carbon_forecast,
+            false,
+            None,
+        )
     }
 
     /// Create a scheduler that may solve multiple batches from one QoS profile
@@ -279,7 +309,34 @@ impl BatchScheduler {
         metrics_logger: Arc<MetricsLogger>,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
     ) -> Self {
-        Self::new_inner(shared_state, cfg, metrics_logger, carbon_forecast, true)
+        Self::new_inner(
+            shared_state,
+            cfg,
+            metrics_logger,
+            carbon_forecast,
+            true,
+            None,
+        )
+    }
+
+    /// Create an online simulation scheduler that reports committed assignment
+    /// context to a runner-owned sink. The observer runs after commit and must
+    /// not be used by service code for request lifecycle or engine decisions.
+    pub fn new_with_parallel_profile_batches_and_observer(
+        shared_state: SharedState,
+        cfg: Arc<Config>,
+        metrics_logger: Arc<MetricsLogger>,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
+        assignment_commit_observer: Arc<dyn AssignmentCommitObserver>,
+    ) -> Self {
+        Self::new_inner(
+            shared_state,
+            cfg,
+            metrics_logger,
+            carbon_forecast,
+            true,
+            Some(assignment_commit_observer),
+        )
     }
 
     fn new_inner(
@@ -288,6 +345,7 @@ impl BatchScheduler {
         metrics_logger: Arc<MetricsLogger>,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
         allow_same_profile_parallelism: bool,
+        assignment_commit_observer: Option<Arc<dyn AssignmentCommitObserver>>,
     ) -> Self {
         // Offline schedulers have no REST AppState to initialize the runtime
         // policy. For the live service this is idempotent with AppState::new.
@@ -309,6 +367,7 @@ impl BatchScheduler {
                 last_dispatched_profile: None,
                 stats: SchedulerStats::default(),
                 solver_runtimes: HashMap::new(),
+                assignment_commit_observer,
             })),
             allow_same_profile_parallelism,
             metrics_logger,
@@ -1213,6 +1272,22 @@ fn batch_worker_entry(
         g.stats.last_solver_elapsed_ms = elapsed_ms;
         g.stats.solver_runs
     };
+
+    // Reporting context is delivered only after a successful SharedState
+    // commit. The callback runs without scheduler/shared-state locks, so the
+    // nshift sink can retain a small request-keyed context until its slot is
+    // finalized without coupling the engine to PerRequest or file formats.
+    let assignment_commit_observer = mutable.lock().unwrap().assignment_commit_observer.clone();
+    if let Some(observer) = assignment_commit_observer {
+        observer.assignments_committed(
+            slot,
+            run_sequence,
+            status,
+            &fallback_request_ids,
+            &late_request_ids,
+            &committed,
+        );
+    }
 
     if cfg.logging.verbose {
         let avg_error: f64 =

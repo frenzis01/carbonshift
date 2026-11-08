@@ -98,7 +98,9 @@ use carbonshift_rs::metrics_logger::{MetricsLogger, write_qos_profile_catalog};
 use carbonshift_rs::scenario::{Scenario, ScenarioRequest};
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;
-use carbonshift_rs::types::{Assignment, CapacityTier, Flavour, get_capacity_multiplier};
+#[cfg(test)]
+use carbonshift_rs::types::CapacityTier;
+use carbonshift_rs::types::{Assignment, Flavour, get_capacity_multiplier};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -275,6 +277,7 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
 /// concurrent batches solve with slightly different snapshot baselines,
 /// ensuring a consistent per-request breakdown that matches the true final
 /// slot occupancies.
+#[cfg(test)]
 fn recompute_carbon_costs(
     per_req: &mut [PerRequest],
     final_assignments: &HashMap<u64, Assignment>,
@@ -474,7 +477,7 @@ fn main() {
         let run_dir = bcfg.output_dir.join(format!("N{batch_size}"));
         let n_t0 = std::time::Instant::now();
 
-        let (per_req, batch_timings, mut summary) = run_single_n(
+        let (batch_timings, mut summary, per_ts) = run_single_n(
             &scenario,
             &base_cfg,
             batch_size,
@@ -494,13 +497,7 @@ fn main() {
             summary.carbon_cost_saving_vs_baseline_pct = pct;
         }
 
-        let per_ts = compute_per_timeslot(
-            &per_req,
-            scenario.metadata.total_slots,
-            scenario.metadata.error_window_past,
-            scenario.metadata.error_window_future,
-        );
-        write_run_outputs(&run_dir, &summary, &per_req, &batch_timings, &per_ts);
+        write_streamed_run_outputs(&run_dir, &summary, &batch_timings, &per_ts);
 
         println!(
             "Completed N={batch_size}: solver_ms_avg={:.3}, total_carbon={:.3}, \
@@ -548,7 +545,7 @@ fn main() {
             let mut online_base_cfg = base_cfg.clone();
             online_base_cfg.solver.solver_strategy = strategy.clone();
 
-            let (per_req, batch_timings, mut summary) = run_single_n(
+            let (batch_timings, mut summary, per_ts) = run_single_n(
                 &scenario,
                 &online_base_cfg,
                 batch_size,
@@ -567,13 +564,7 @@ fn main() {
                 summary.carbon_cost_saving_vs_baseline_pct = pct;
             }
 
-            let per_ts = compute_per_timeslot(
-                &per_req,
-                scenario.metadata.total_slots,
-                scenario.metadata.error_window_past,
-                scenario.metadata.error_window_future,
-            );
-            write_run_outputs(&run_dir, &summary, &per_req, &batch_timings, &per_ts);
+            write_streamed_run_outputs(&run_dir, &summary, &batch_timings, &per_ts);
 
             println!(
                 "Completed online_strategy={strategy} N={batch_size}: solver_ms_avg={:.3}, \

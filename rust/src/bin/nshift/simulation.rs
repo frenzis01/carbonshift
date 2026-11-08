@@ -1,6 +1,354 @@
 //! Streaming scheduler simulation and baseline execution for nshift.
 
 use super::*;
+use carbonshift_rs::scheduler::AssignmentCommitObserver;
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Mutex;
+
+#[derive(Debug, Clone)]
+struct PendingPerRequestContext {
+    included_in_batch_slot: i32,
+    batch_sequence: u64,
+    assignment_solver_status: String,
+    fallback_assigned: bool,
+    late_assigned: bool,
+}
+
+/// Nshift-only metadata that is needed to form a notebook report row after
+/// the assignment itself becomes immutable. Context is removed as its slot is
+/// finalized, so this map covers only work that is not settled yet.
+#[derive(Default)]
+struct PendingPerRequestContexts {
+    by_request_id: Mutex<HashMap<u64, PendingPerRequestContext>>,
+}
+
+impl PendingPerRequestContexts {
+    fn get(&self, request_id: u64) -> Option<PendingPerRequestContext> {
+        self.by_request_id.lock().unwrap().get(&request_id).cloned()
+    }
+
+    fn remove(&self, request_id: u64) {
+        self.by_request_id.lock().unwrap().remove(&request_id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_request_id.lock().unwrap().len()
+    }
+}
+
+impl AssignmentCommitObserver for PendingPerRequestContexts {
+    fn assignments_committed(
+        &self,
+        current_slot: i32,
+        batch_sequence: u64,
+        solver_status: &str,
+        fallback_request_ids: &HashSet<u64>,
+        late_request_ids: &HashSet<u64>,
+        assignments: &[carbonshift_rs::types::Assignment],
+    ) {
+        let mut contexts = self.by_request_id.lock().unwrap();
+        for assignment in assignments {
+            // Recommit replaces the context too: the final report must describe
+            // the latest committed placement, not an earlier proposal.
+            contexts.insert(
+                assignment.request_id,
+                PendingPerRequestContext {
+                    included_in_batch_slot: current_slot,
+                    batch_sequence,
+                    assignment_solver_status: solver_status.to_owned(),
+                    fallback_assigned: fallback_request_ids.contains(&assignment.request_id),
+                    late_assigned: late_request_ids.contains(&assignment.request_id),
+                },
+            );
+        }
+    }
+}
+
+/// Writes final per-request rows in settled-slot order and retains only
+/// run-level/slot-level aggregates after each settled row has been flushed.
+/// 
+/// Sorts each slot’s assignments by request ID, computes canonical global-capacity 
+/// prices, streams rows to per_request.csv, per_request.json, and assignments_runtime.csv,
+/// flushes before eviction, and updates summary and per-slot error aggregates.
+struct SettledPerRequestWriter {
+    csv: csv::Writer<std::fs::File>,
+    json: std::io::BufWriter<std::fs::File>,
+    runtime_csv: csv::Writer<std::fs::File>,
+    runtime_timestamp: String,
+    first_json_row: bool,
+    summary: PerRequestSummaryAccumulator,
+    slot_errors: Vec<SlotErrorAggregate>,
+    next_slot: i32,
+    contexts: Arc<PendingPerRequestContexts>,
+}
+
+impl SettledPerRequestWriter {
+    fn create(
+        run_dir: &Path,
+        total_slots: i32,
+        contexts: Arc<PendingPerRequestContexts>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        std::fs::create_dir_all(run_dir)?;
+        let mut csv = csv::Writer::from_path(run_dir.join("per_request.csv"))?;
+        csv.write_record([
+            "request_id",
+            "qos_profile_id",
+            "arrival_time",
+            "arrival_slot",
+            "deadline_slot",
+            "included_in_batch_slot",
+            "batch_sequence",
+            "scheduled_slot",
+            "queue_wait_slots",
+            "queue_wait_seconds",
+            "final_wait_slots",
+            "final_wait_seconds",
+            "flavour_name",
+            "carbon_cost",
+            "assignment_solver_status",
+            "fallback_assigned",
+            "late_assigned",
+        ])?;
+
+        // Keep the existing JSON wrapper/schema while streaming one JSON row at
+        // a time. This avoids building the old full `Vec<Value>` in RAM.
+        let mut json =
+            std::io::BufWriter::new(std::fs::File::create(run_dir.join("per_request.json"))?);
+        json.write_all(br#"{"rows":["#)?;
+
+        let runtime_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs_f64()
+            .to_string();
+        let mut runtime_csv = csv::Writer::from_path(run_dir.join("assignments_runtime.csv"))?;
+        runtime_csv.write_record([
+            "request_id",
+            "qos_profile_id",
+            "scheduled_slot",
+            "flavour",
+            "carbon_cost",
+            "assignment_time",
+        ])?;
+        runtime_csv.flush()?;
+        Ok(Self {
+            csv,
+            json,
+            runtime_csv,
+            runtime_timestamp,
+            first_json_row: true,
+            summary: PerRequestSummaryAccumulator::default(),
+            slot_errors: vec![SlotErrorAggregate::default(); total_slots.max(0) as usize],
+            next_slot: 0,
+            contexts,
+        })
+    }
+
+    fn finalize_through(
+        &mut self,
+        shared_state: &SharedState,
+        settled_through_slot: i32,
+        carbon_forecast: &[f64],
+        tiers: &[carbonshift_rs::types::CapacityTier],
+        duration_scale: f64,
+        slot_duration_seconds: f64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        while self.next_slot <= settled_through_slot {
+            let slot = self.next_slot;
+            let carbon_intensity = *carbon_forecast.get(slot as usize).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("missing carbon forecast for settled slot {slot}"),
+                )
+            })?;
+            let mut assignments = shared_state.get_requests_in_slot(slot);
+            assignments.sort_by_key(|assignment| assignment.request_id);
+
+            let mut rows = Vec::with_capacity(assignments.len());
+            for (index, assignment) in assignments.iter().enumerate() {
+                let context = self.contexts.get(assignment.request_id).ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "missing nshift reporting context for request {}",
+                        assignment.request_id
+                    ))
+                })?;
+                let position = i64::try_from(index + 1)?;
+                let multiplier = get_capacity_multiplier(tiers, position);
+                let arrival_slot = assignment.arrival_slot.unwrap_or(slot);
+                let deadline_slot = assignment.deadline_slot.unwrap_or(slot);
+                let queue_wait_slots = (context.included_in_batch_slot - arrival_slot).max(0);
+                let final_wait_slots = (slot - arrival_slot).max(0);
+                rows.push(PerRequest {
+                    request_id: assignment.request_id,
+                    qos_profile_id: assignment.qos_profile_id.to_string(),
+                    arrival_time: arrival_slot as f64 * slot_duration_seconds,
+                    arrival_slot,
+                    deadline_slot,
+                    included_in_batch_slot: context.included_in_batch_slot,
+                    batch_sequence: context.batch_sequence,
+                    scheduled_slot: slot,
+                    queue_wait_slots,
+                    queue_wait_seconds: queue_wait_slots as f64 * slot_duration_seconds,
+                    final_wait_slots,
+                    final_wait_seconds: final_wait_slots as f64 * slot_duration_seconds,
+                    flavour_name: assignment.flavour_name.clone(),
+                    error: assignment.error,
+                    carbon_cost: carbon_intensity
+                        * multiplier
+                        * assignment.flavour_duration
+                        * duration_scale,
+                    assignment_solver_status: context.assignment_solver_status,
+                    fallback_assigned: context.fallback_assigned,
+                    late_assigned: context.late_assigned,
+                    lateness_slots: (slot - deadline_slot).max(0),
+                });
+            }
+
+            // Flush all report views for this slot before releasing the
+            // assignment rows needed to derive them. A write error is fatal to
+            // this run; the caller must not continue with partially missing
+            // output and evicted state.
+            self.write_rows(&rows)?;
+            self.flush_slot()?;
+
+            for assignment in &assignments {
+                let removed = shared_state
+                    .evict_settled_assignment(assignment.request_id, slot)
+                    .map_err(std::io::Error::other)?;
+                if removed.is_none() {
+                    return Err(std::io::Error::other(format!(
+                        "settled assignment {} disappeared before eviction",
+                        assignment.request_id
+                    ))
+                    .into());
+                }
+            }
+            for row in &rows {
+                self.contexts.remove(row.request_id);
+                self.record_summary(row)?;
+            }
+            self.next_slot = self.next_slot.checked_add(1).ok_or_else(|| {
+                std::io::Error::other("settled-slot finalizer overflowed slot index")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn write_rows(
+        &mut self,
+        rows: &[PerRequest],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for row in rows {
+            self.csv.write_record([
+                row.request_id.to_string(),
+                row.qos_profile_id.clone(),
+                row.arrival_time.to_string(),
+                row.arrival_slot.to_string(),
+                row.deadline_slot.to_string(),
+                row.included_in_batch_slot.to_string(),
+                row.batch_sequence.to_string(),
+                row.scheduled_slot.to_string(),
+                row.queue_wait_slots.to_string(),
+                row.queue_wait_seconds.to_string(),
+                row.final_wait_slots.to_string(),
+                row.final_wait_seconds.to_string(),
+                row.flavour_name.clone(),
+                row.carbon_cost.to_string(),
+                row.assignment_solver_status.clone(),
+                row.fallback_assigned.to_string(),
+                row.late_assigned.to_string(),
+            ])?;
+            if !self.first_json_row {
+                self.json.write_all(b",")?;
+            }
+            serde_json::to_writer(&mut self.json, &per_request_json_row(row))?;
+            self.first_json_row = false;
+            self.runtime_csv.write_record([
+                row.request_id.to_string(),
+                row.qos_profile_id.clone(),
+                row.scheduled_slot.to_string(),
+                row.flavour_name.clone(),
+                row.carbon_cost.to_string(),
+                self.runtime_timestamp.clone(),
+            ])?;
+        }
+        Ok(())
+    }
+
+    fn flush_slot(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.csv.flush()?;
+        self.json.flush()?;
+        self.runtime_csv.flush()?;
+        Ok(())
+    }
+
+    fn record_summary(
+        &mut self,
+        row: &PerRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.summary.record(row);
+        let slot_index = usize::try_from(row.scheduled_slot)?;
+        let aggregate = self.slot_errors.get_mut(slot_index).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "PerRequest slot {} is outside the configured horizon",
+                    row.scheduled_slot
+                ),
+            )
+        })?;
+        aggregate.error_sum += row.error;
+        aggregate.count += 1;
+        Ok(())
+    }
+
+    fn write_late_rows(
+        &mut self,
+        rows: &mut [PerRequest],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        rows.sort_by_key(|row| (row.scheduled_slot, row.request_id));
+        self.write_rows(rows)?;
+        self.flush_slot()?;
+        for row in rows {
+            self.record_summary(row)?;
+        }
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+    ) -> Result<
+        (PerRequestSummaryAccumulator, Vec<SlotErrorAggregate>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.json.write_all(b"]}")?;
+        self.flush_slot()?;
+        Ok((self.summary, self.slot_errors))
+    }
+}
+
+fn per_request_json_row(row: &PerRequest) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": row.request_id,
+        "qos_profile_id": row.qos_profile_id,
+        "arrival_time": row.arrival_time,
+        "arrival_slot": row.arrival_slot,
+        "deadline_slot": row.deadline_slot,
+        "included_in_batch_slot": row.included_in_batch_slot,
+        "batch_sequence": row.batch_sequence,
+        "scheduled_slot": row.scheduled_slot,
+        "queue_wait_slots": row.queue_wait_slots,
+        "queue_wait_seconds": row.queue_wait_seconds,
+        "final_wait_slots": row.final_wait_slots,
+        "final_wait_seconds": row.final_wait_seconds,
+        "flavour_name": row.flavour_name,
+        "carbon_cost": row.carbon_cost,
+        "assignment_solver_status": row.assignment_solver_status,
+        "fallback_assigned": row.fallback_assigned,
+        "late_assigned": row.late_assigned,
+    })
+}
 
 /// Greedy baseline: assign each request immediately on arrival to the "best"
 /// flavour (lowest error; mirrors Python's `run_greedy_baseline`).
@@ -175,7 +523,7 @@ pub(super) fn run_single_n(
     realtime_speed_scale: f64,
     run_dir: &Path,
     verbose: bool,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+) -> (Vec<BatchTiming>, RunSummary, Vec<PerTimeslot>) {
     // Build per-run config.
     let mut cfg = base_cfg.clone();
     cfg.solver.batch_size = batch_size;
@@ -207,6 +555,10 @@ pub(super) fn run_single_n(
     // MetricsLogger (which appends) starts with a clean slate.
     let _ = std::fs::remove_file(&tmp_runs);
     let _ = std::fs::remove_file(&tmp_assignments);
+    let report_contexts = Arc::new(PendingPerRequestContexts::default());
+    let mut per_request_writer =
+        SettledPerRequestWriter::create(run_dir, cfg.total_slots, report_contexts.clone())
+            .unwrap_or_else(|error| panic!("cannot create settled PerRequest output: {error}"));
 
     let shared_state = SharedState::new();
     let ml = Arc::new(MetricsLogger::new(
@@ -219,11 +571,12 @@ pub(super) fn run_single_n(
     let generator_cfg = RequestGeneratorConfig::from_config(&cfg);
     let mut generator =
         RequestGenerator::new_from_scenario(shared_state.clone(), generator_cfg, by_slot);
-    let mut sched = BatchScheduler::new_with_parallel_profile_batches(
+    let mut sched = BatchScheduler::new_with_parallel_profile_batches_and_observer(
         shared_state.clone(),
         cfg.clone(),
         ml,
         Arc::new(RwLock::new(scenario.carbon_forecast.clone())),
+        report_contexts.clone(),
     );
 
     sched.start();
@@ -243,6 +596,16 @@ pub(super) fn run_single_n(
     let last_slot = cfg.total_slots - 1;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
+        per_request_writer
+            .finalize_through(
+                &shared_state,
+                shared_state.get_settled_through_slot(),
+                &scenario.carbon_forecast,
+                &base_cfg.capacity_tiers,
+                base_cfg.carbon_cost_duration_scale,
+                base_cfg.slot_duration_seconds,
+            )
+            .unwrap_or_else(|error| panic!("cannot finalize settled PerRequest rows: {error}"));
         if shared_state.generator_processed_slot() >= last_slot {
             break;
         }
@@ -257,6 +620,16 @@ pub(super) fn run_single_n(
     loop {
         let stats = sched.get_statistics();
         let pending = shared_state.get_pending_count();
+        per_request_writer
+            .finalize_through(
+                &shared_state,
+                shared_state.get_settled_through_slot(),
+                &scenario.carbon_forecast,
+                &base_cfg.capacity_tiers,
+                base_cfg.carbon_cost_duration_scale,
+                base_cfg.slot_duration_seconds,
+            )
+            .unwrap_or_else(|error| panic!("cannot finalize settled PerRequest rows: {error}"));
         if (pending == 0 && stats.active_batch_workers == 0)
             || std::time::Instant::now() > drain_deadline
         {
@@ -269,64 +642,55 @@ pub(super) fn run_single_n(
     let sched_stats = sched.get_statistics();
     sched.stop();
 
+    // `stop` has joined the scheduler and drained every solver worker, so no
+    // later batch can write into the final slot. Publish and finalize the
+    // remaining horizon explicitly; the regular watermark is conservative
+    // and normally remains one slot behind the active clock.
+    shared_state.advance_settled_through_slot(last_slot);
+    per_request_writer
+        .finalize_through(
+            &shared_state,
+            last_slot,
+            &scenario.carbon_forecast,
+            &base_cfg.capacity_tiers,
+            base_cfg.carbon_cost_duration_scale,
+            base_cfg.slot_duration_seconds,
+        )
+        .unwrap_or_else(|error| panic!("cannot finalize final PerRequest rows: {error}"));
+
     let total_received = shared_state.get_statistics().total_received as usize;
     // Post-process Rust CSVs into Python-compatible tables.
     let runs = read_solver_runs(&tmp_runs);
-    let assignment_rows = read_solver_assignments(&tmp_assignments);
-    let runs_by_id: HashMap<String, &SolverRunRow> =
-        runs.iter().map(|r| (r.run_id.clone(), r)).collect();
-    let default_profile_id = QosProfileId::default_profile().to_string();
-    let flavour_errors: HashMap<(String, String), f64> = base_cfg
-        .flavours
-        .iter()
-        .map(|flavour| {
-            (
-                (default_profile_id.clone(), flavour.name.clone()),
-                flavour.error,
-            )
-        })
-        .collect();
-
-    let mut per_req = compute_per_request(
-        &assignment_rows,
-        &runs_by_id,
-        &flavour_errors,
-        base_cfg.slot_duration_seconds,
-    );
+    let batch_timings = compute_batch_timings_from_csv(&runs, &tmp_assignments, batch_size)
+        .unwrap_or_else(|error| panic!("cannot read solver batch timing rows: {error}"));
     // Drain any requests that never made it into a batch (e.g., deadline
     // expired while waiting in the pending queue) and schedule them late.
     let remaining = shared_state.drain_pending_requests();
     if !remaining.is_empty() {
-        let late = schedule_late_requests(
+        let mut late = schedule_late_requests(
             remaining,
             &scenario.carbon_forecast,
             &base_cfg.assignment_policy(),
             base_cfg.slot_duration_seconds,
         );
-        per_req.extend(late);
+        per_request_writer
+            .write_late_rows(&mut late)
+            .unwrap_or_else(|error| panic!("cannot write late PerRequest rows: {error}"));
     }
-    // Correct per-request carbon costs using final committed state to eliminate
-    // concurrent-baseline drift (see recompute_carbon_costs for details).
-    let final_assignments = shared_state.get_current_assignments();
-    recompute_carbon_costs(
-        &mut per_req,
-        &final_assignments,
-        &scenario.carbon_forecast,
-        &base_cfg.capacity_tiers,
-        base_cfg.carbon_cost_duration_scale,
-    );
-    let batch_timings = compute_batch_timings(&runs, &assignment_rows, batch_size);
+    let (request_summary, slot_errors) = per_request_writer
+        .finish()
+        .unwrap_or_else(|error| panic!("cannot finalize PerRequest output files: {error}"));
     let exec_mode = if cfg.solver.solver_strategy == "dp" || cfg.solver.solver_strategy.is_empty() {
         "nshift_dp".to_string()
     } else {
         format!("nshift_{}", cfg.solver.solver_strategy)
     };
-    let summary = compute_summary(
+    let summary = compute_summary_from_accumulator(
         &exec_mode,
         batch_size,
         realtime_slots,
         realtime_speed_scale,
-        &per_req,
+        request_summary,
         &batch_timings,
         total_received,
         "",
@@ -334,6 +698,11 @@ pub(super) fn run_single_n(
         0.0,
         sched_stats.peak_concurrent_workers,
         sched_stats.avg_concurrent_workers,
+    );
+    let per_timeslot = compute_per_timeslot_from_aggregates(
+        &slot_errors,
+        cfg.error_window_past,
+        cfg.error_window_future,
     );
 
     // Clean up temp files.
@@ -345,7 +714,7 @@ pub(super) fn run_single_n(
     // the numbers are always 100%.
     if !cfg.logging.verbose {
         let total = scenario.requests.len();
-        let scheduled = per_req.len();
+        let scheduled = summary.reqs_scheduled;
         let pct = if total > 0 {
             scheduled as f64 / total as f64 * 100.0
         } else {
@@ -357,7 +726,160 @@ pub(super) fn run_single_n(
         );
     }
 
-    (per_req, batch_timings, summary)
+    (batch_timings, summary, per_timeslot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carbonshift_rs::engine::qos::QosProfileId;
+    use carbonshift_rs::types::{Assignment, CapacityTier};
+
+    fn test_assignment(id: u64, duration: f64, error: f64) -> Assignment {
+        Assignment::new_for_profile(
+            id,
+            0,
+            "Fast".to_owned(),
+            0.0,
+            error,
+            duration,
+            Some(0),
+            Some(1),
+            QosProfileId::default_profile(),
+        )
+    }
+
+    fn expected_per_request(assignment: &Assignment) -> PerRequest {
+        PerRequest {
+            request_id: assignment.request_id,
+            qos_profile_id: assignment.qos_profile_id.to_string(),
+            arrival_time: 0.0,
+            arrival_slot: 0,
+            deadline_slot: 1,
+            included_in_batch_slot: 0,
+            batch_sequence: 7,
+            scheduled_slot: 0,
+            queue_wait_slots: 0,
+            queue_wait_seconds: 0.0,
+            final_wait_slots: 0,
+            final_wait_seconds: 0.0,
+            flavour_name: assignment.flavour_name.clone(),
+            error: assignment.error,
+            carbon_cost: 0.0,
+            assignment_solver_status: "ok".to_owned(),
+            fallback_assigned: assignment.request_id == 2,
+            late_assigned: false,
+            lateness_slots: 0,
+        }
+    }
+
+    #[test]
+    fn settled_writer_matches_whole_run_canonical_pricing_and_evicts_rows() {
+        let state = SharedState::new();
+        let assignments = vec![test_assignment(2, 20.0, 2.0), test_assignment(1, 10.0, 1.0)];
+        state.add_assignments(assignments.clone());
+        state.advance_settled_through_slot(0);
+
+        let tiers = vec![
+            CapacityTier {
+                max_requests: Some(1),
+                multiplier: 1.0,
+            },
+            CapacityTier {
+                max_requests: None,
+                multiplier: 3.0,
+            },
+        ];
+        let forecast = [50.0];
+        let scale = 1.0;
+        let context = Arc::new(PendingPerRequestContexts::default());
+        context.assignments_committed(
+            0,
+            7,
+            "ok",
+            &HashSet::from([2]),
+            &HashSet::new(),
+            &assignments,
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "nshift-settled-per-request-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut writer = SettledPerRequestWriter::create(&directory, 1, context.clone()).unwrap();
+
+        let mut expected = assignments
+            .iter()
+            .map(expected_per_request)
+            .collect::<Vec<_>>();
+        let original_assignments: HashMap<_, _> = assignments
+            .iter()
+            .map(|assignment| (assignment.request_id, assignment.clone()))
+            .collect();
+        super::super::recompute_carbon_costs(
+            &mut expected,
+            &original_assignments,
+            &forecast,
+            &tiers,
+            scale,
+        );
+
+        writer
+            .finalize_through(&state, 0, &forecast, &tiers, scale, 60.0)
+            .unwrap();
+        assert!(state.get_current_assignments().is_empty());
+        assert_eq!(context.len(), 0);
+
+        let (summary, slot_errors) = writer.finish().unwrap();
+        assert_eq!(summary.count, 2);
+        assert_eq!(slot_errors[0].count, 2);
+        assert_eq!(slot_errors[0].error_sum, 3.0);
+
+        let mut reader = csv::Reader::from_path(directory.join("per_request.csv")).unwrap();
+        let headers = reader.headers().unwrap().clone();
+        let column = |name: &str| headers.iter().position(|header| header == name).unwrap();
+        let request_id_column = column("request_id");
+        let cost_column = column("carbon_cost");
+        let batch_sequence_column = column("batch_sequence");
+        let status_column = column("assignment_solver_status");
+        let fallback_column = column("fallback_assigned");
+        let records = reader.records().map(Result::unwrap).collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record[request_id_column].parse::<u64>().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(records[0].get(batch_sequence_column), Some("7"));
+        assert_eq!(records[0].get(status_column), Some("ok"));
+        assert_eq!(records[0].get(fallback_column), Some("false"));
+        assert_eq!(records[1].get(fallback_column), Some("true"));
+        let actual: HashMap<u64, f64> = records
+            .iter()
+            .map(|record| {
+                (
+                    record[request_id_column].parse().unwrap(),
+                    record[cost_column].parse().unwrap(),
+                )
+            })
+            .collect();
+        let expected: HashMap<u64, f64> = expected
+            .into_iter()
+            .map(|row| (row.request_id, row.carbon_cost))
+            .collect();
+        assert_eq!(actual, expected);
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("per_request.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
