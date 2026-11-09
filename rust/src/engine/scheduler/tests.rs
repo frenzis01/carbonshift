@@ -625,7 +625,7 @@ fn common_worker_reports_greedy_fallback_and_selected_flavour() {
         &registry,
         &forecast,
         &mutable,
-        &logger,
+        Some(&logger),
     );
     assert!(matches!(outcome, BatchWorkerOutcome::Committed));
 

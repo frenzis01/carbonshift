@@ -254,7 +254,8 @@ pub struct BatchScheduler {
     mutable: Arc<Mutex<SchedulerMutableState>>,
     /// Whether multiple batches for one QoS profile may solve concurrently.
     allow_same_profile_parallelism: bool,
-    pub metrics_logger: Arc<MetricsLogger>,
+    /// Optional per-batch metrics sink; `None` avoids logger work on hot paths.
+    pub metrics_logger: Option<Arc<MetricsLogger>>,
     main_thread: Option<JoinHandle<()>>,
 }
 
@@ -294,7 +295,7 @@ impl BatchScheduler {
         Self::new_inner(
             shared_state,
             cfg,
-            metrics_logger,
+            Some(metrics_logger),
             carbon_forecast,
             false,
             None,
@@ -306,9 +307,9 @@ impl BatchScheduler {
     /// with its queue claim; proposals are committed as-is, with carbon costs
     /// recalculated against live slot occupancy.
     ///
-    /// The `nshift` DP and online benchmark phases use this constructor to
-    /// exercise the configured worker cap. The default constructor retains
-    /// the live service's one-worker-per-profile behavior.
+    /// Simulation runners use this constructor to exercise the configured
+    /// worker cap. The default constructor retains the live service's
+    /// one-worker-per-profile behavior.
     pub fn new_with_parallel_profile_batches(
         shared_state: SharedState,
         cfg: Arc<Config>,
@@ -318,7 +319,7 @@ impl BatchScheduler {
         Self::new_inner(
             shared_state,
             cfg,
-            metrics_logger,
+            Some(metrics_logger),
             carbon_forecast,
             true,
             None,
@@ -338,7 +339,24 @@ impl BatchScheduler {
         Self::new_inner(
             shared_state,
             cfg,
-            metrics_logger,
+            Some(metrics_logger),
+            carbon_forecast,
+            true,
+            Some(assignment_commit_observer),
+        )
+    }
+
+    /// Create an online simulation scheduler without per-batch metrics logging.
+    pub fn new_with_parallel_profile_batches_and_observer_without_metrics(
+        shared_state: SharedState,
+        cfg: Arc<Config>,
+        carbon_forecast: Arc<RwLock<Vec<f64>>>,
+        assignment_commit_observer: Arc<dyn AssignmentCommitObserver>,
+    ) -> Self {
+        Self::new_inner(
+            shared_state,
+            cfg,
+            None,
             carbon_forecast,
             true,
             Some(assignment_commit_observer),
@@ -348,7 +366,7 @@ impl BatchScheduler {
     fn new_inner(
         shared_state: SharedState,
         cfg: Arc<Config>,
-        metrics_logger: Arc<MetricsLogger>,
+        metrics_logger: Option<Arc<MetricsLogger>>,
         carbon_forecast: Arc<RwLock<Vec<f64>>>,
         allow_same_profile_parallelism: bool,
         assignment_commit_observer: Option<Arc<dyn AssignmentCommitObserver>>,
@@ -500,7 +518,7 @@ fn main_loop(
     solver_registry: Arc<SolverRegistry>,
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
-    ml: Arc<MetricsLogger>,
+    ml: Option<Arc<MetricsLogger>>,
     allow_same_profile_parallelism: bool,
 ) {
     let wall_start = Instant::now();
@@ -878,7 +896,7 @@ fn dispatch_batch_workers(
     solver_registry: &Arc<SolverRegistry>,
     carbon_forecast: &Arc<RwLock<Vec<f64>>>,
     mutable: &Arc<Mutex<SchedulerMutableState>>,
-    ml: &Arc<MetricsLogger>,
+    ml: &Option<Arc<MetricsLogger>>,
     running: &Arc<AtomicBool>,
     flush: bool,
     allow_same_profile_parallelism: bool,
@@ -966,7 +984,7 @@ fn batch_worker_loop(
     solver_registry: Arc<SolverRegistry>,
     carbon_forecast: Arc<RwLock<Vec<f64>>>,
     mutable: Arc<Mutex<SchedulerMutableState>>,
-    ml: Arc<MetricsLogger>,
+    ml: Option<Arc<MetricsLogger>>,
     running: Arc<AtomicBool>,
     scheduler_thread: std::thread::Thread,
 ) {
@@ -982,7 +1000,7 @@ fn batch_worker_loop(
             &solver_registry,
             &forecast,
             &mutable,
-            &ml,
+            ml.as_deref(),
         );
 
         let mut g = mutable.lock().unwrap();
@@ -1089,7 +1107,7 @@ fn batch_worker_entry(
     solver_registry: &SolverRegistry,
     carbon_forecast: &[f64],
     mutable: &Arc<Mutex<SchedulerMutableState>>,
-    ml: &MetricsLogger,
+    ml: Option<&MetricsLogger>,
 ) -> BatchWorkerOutcome {
     let capacity_tiers_guard = shared_state.capacity_tiers_guard();
     let capacity_tiers = capacity_tiers_guard
@@ -1319,7 +1337,7 @@ fn batch_worker_entry(
     }
 
     // Build and emit metrics log row.
-    if ml.enabled {
+    if let Some(ml) = ml.filter(|logger| logger.enabled) {
         // Only log the NEW assignments from this batch — not all existing
         // assignments.  The old code fetched get_current_assignments() here
         // (all-time O(N) entries) and iterated every batch, producing

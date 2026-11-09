@@ -531,9 +531,6 @@ pub(super) fn run_single_n(
         cfg.simulation.skip_empty_slots = false;
         cfg.simulation.slot_speed_scale = realtime_speed_scale;
     }
-    // Scheduler counters supply summary timing; per-batch CSV rows only add
-    // string-map allocations and file opens to this high-volume path.
-    cfg.logging.enable_solver_logging = false;
     cfg.simulation.total_requests = scenario.requests.len();
 
     let cfg = Arc::new(cfg);
@@ -546,16 +543,14 @@ pub(super) fn run_single_n(
     let mut finalized_through_slot = -1;
 
     let shared_state = SharedState::new();
-    let ml = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
 
     let by_slot = scenario.requests_by_slot();
     let generator_cfg = RequestGeneratorConfig::from_config(&cfg);
     let mut generator =
         RequestGenerator::new_from_scenario(shared_state.clone(), generator_cfg, by_slot);
-    let mut sched = BatchScheduler::new_with_parallel_profile_batches_and_observer(
+    let mut sched = BatchScheduler::new_with_parallel_profile_batches_and_observer_without_metrics(
         shared_state.clone(),
         cfg.clone(),
-        ml,
         Arc::new(RwLock::new(scenario.carbon_forecast.clone())),
         report_contexts.clone(),
     );

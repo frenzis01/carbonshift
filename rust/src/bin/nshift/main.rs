@@ -93,7 +93,7 @@ use carbonshift_rs::engine::solver::{
 };
 use carbonshift_rs::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use carbonshift_rs::generator::{RequestGenerator, RequestGeneratorConfig};
-use carbonshift_rs::metrics_logger::{MetricsLogger, write_qos_profile_catalog};
+use carbonshift_rs::metrics_logger::write_qos_profile_catalog;
 use carbonshift_rs::scenario::{Scenario, ScenarioRequest};
 use carbonshift_rs::scheduler::BatchScheduler;
 use carbonshift_rs::shared_state::SharedState;

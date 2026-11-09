@@ -15,35 +15,6 @@ pub(super) fn write_output_schema_manifest(directory: &Path) {
     .expect("Cannot write output schema manifest");
 }
 
-// ─── row types (post-processed metrics) ──────────────────────────────────────
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(super) struct SolverRunRow {
-    pub(super) run_id: String,
-    pub(super) run_sequence: u64,
-    pub(super) new_assignments: usize,
-    #[cfg_attr(test, allow(dead_code))]
-    pub(super) solver_elapsed_ms: f64,
-    pub(super) solver_status: String,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(super) struct AssignmentRow {
-    pub(super) run_id: String,
-    pub(super) request_id: u64,
-    pub(super) current_slot: i32,
-    pub(super) qos_profile_id: String,
-    pub(super) fallback_assigned: bool,
-    pub(super) late_assigned: bool,
-    pub(super) scheduled_slot: i32,
-    pub(super) flavour_name: String,
-    pub(super) carbon_cost: f64,
-    pub(super) arrival_slot: i32,
-    pub(super) deadline_slot: i32,
-}
-
 // Python-compatible per_request row
 pub(super) struct PerRequest {
     pub(super) request_id: u64,
@@ -68,7 +39,7 @@ pub(super) struct PerRequest {
     pub(super) lateness_slots: i32,
 }
 
-/// Constant-size solver timing statistics accumulated while scanning run rows.
+/// Constant-size solver timing statistics used in run summaries.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SolverTimingSummary {
     pub(super) count: usize,
@@ -169,176 +140,6 @@ pub(super) struct RunSummary {
     pub(super) carbon_cost_saving_vs_baseline_pct: f64,
     /// Wall-clock seconds spent on this single N run (0.0 for the greedy baseline).
     pub(super) run_elapsed_seconds: f64,
-}
-
-// ─── CSV readers ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-pub(super) fn read_solver_runs(path: &Path) -> Vec<SolverRunRow> {
-    let Ok(mut rdr) = csv::Reader::from_path(path) else {
-        return Vec::new();
-    };
-    let headers: Vec<String> = match rdr.headers() {
-        Ok(h) => h.iter().map(|s| s.to_string()).collect(),
-        Err(_) => return Vec::new(),
-    };
-    let idx = |name: &str| headers.iter().position(|h| h == name);
-    let i_run_id = idx("run_id");
-    let i_seq = idx("run_sequence");
-    let i_new = idx("new_assignments");
-    let i_ms = idx("solver_elapsed_ms");
-    let i_status = idx("solver_status");
-    for (field, index) in [
-        ("run_id", i_run_id),
-        ("run_sequence", i_seq),
-        ("new_assignments", i_new),
-        ("solver_elapsed_ms", i_ms),
-        ("solver_status", i_status),
-    ] {
-        assert!(
-            index.is_some(),
-            "solver-run CSV missing schema-v2 field {field}"
-        );
-    }
-
-    let mut rows = Vec::new();
-    for result in rdr.records() {
-        let Ok(rec) = result else { continue };
-        let g = |i: Option<usize>| i.and_then(|j| rec.get(j)).unwrap_or("").to_string();
-        let gf = |i: Option<usize>| g(i).parse::<f64>().unwrap_or(0.0);
-        let gi = |i: Option<usize>| g(i).parse::<i64>().unwrap_or(0);
-        rows.push(SolverRunRow {
-            run_id: g(i_run_id),
-            run_sequence: gi(i_seq) as u64,
-            new_assignments: gi(i_new) as usize,
-            solver_elapsed_ms: gf(i_ms),
-            solver_status: g(i_status),
-        });
-    }
-    rows
-}
-
-#[cfg(test)]
-#[cfg(test)]
-pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
-    let Ok(mut rdr) = csv::Reader::from_path(path) else {
-        return Vec::new();
-    };
-    let headers: Vec<String> = match rdr.headers() {
-        Ok(h) => h.iter().map(|s| s.to_string()).collect(),
-        Err(_) => return Vec::new(),
-    };
-    let idx = |name: &str| headers.iter().position(|h| h == name);
-    let i_run_id = idx("run_id");
-    let i_rid = idx("request_id");
-    let i_slot = idx("current_slot");
-    let i_profile = idx("qos_profile_id");
-    let i_fallback = idx("fallback_assigned");
-    let i_late = idx("late_assigned");
-    let i_sched = idx("scheduled_slot");
-    let i_flav = idx("flavour_name");
-    let i_cost = idx("carbon_cost");
-    let i_arr = idx("arrival_slot");
-    let i_dead = idx("deadline_slot");
-    for (field, index) in [
-        ("run_id", i_run_id),
-        ("current_slot", i_slot),
-        ("request_id", i_rid),
-        ("qos_profile_id", i_profile),
-        ("fallback_assigned", i_fallback),
-        ("late_assigned", i_late),
-        ("scheduled_slot", i_sched),
-        ("flavour_name", i_flav),
-        ("carbon_cost", i_cost),
-        ("arrival_slot", i_arr),
-        ("deadline_slot", i_dead),
-    ] {
-        assert!(
-            index.is_some(),
-            "solver-assignment CSV missing schema-v2 field {field}"
-        );
-    }
-
-    let mut rows = Vec::new();
-    for result in rdr.records() {
-        let Ok(rec) = result else { continue };
-        let g = |i: Option<usize>| i.and_then(|j| rec.get(j)).unwrap_or("").to_string();
-        let gi = |i: Option<usize>| g(i).parse::<i64>().unwrap_or(0);
-        let is_true = |index: Option<usize>| {
-            index.is_some_and(|index| {
-                let value = g(Some(index)).to_lowercase();
-                value == "true" || value == "1"
-            })
-        };
-        rows.push(AssignmentRow {
-            run_id: g(i_run_id),
-            request_id: gi(i_rid) as u64,
-            current_slot: gi(i_slot) as i32,
-            qos_profile_id: g(i_profile),
-            fallback_assigned: is_true(i_fallback),
-            late_assigned: is_true(i_late),
-            scheduled_slot: gi(i_sched) as i32,
-            flavour_name: g(i_flav),
-            carbon_cost: g(i_cost).parse::<f64>().unwrap_or(0.0),
-            arrival_slot: gi(i_arr) as i32,
-            deadline_slot: gi(i_dead) as i32,
-        });
-    }
-    rows
-}
-
-// ─── metrics computation ──────────────────────────────────────────────────────
-
-#[cfg(test)]
-#[cfg(test)]
-pub(super) fn compute_per_request(
-    assignments: &[AssignmentRow],
-    runs_by_id: &HashMap<String, &SolverRunRow>,
-    flavour_errors: &HashMap<(String, String), f64>,
-    slot_dur: f64,
-) -> Vec<PerRequest> {
-    let mut seen: HashMap<u64, PerRequest> = HashMap::new();
-    for a in assignments {
-        seen.entry(a.request_id).or_insert_with(|| {
-            let run = runs_by_id.get(a.run_id.as_str());
-            let batch_seq = run.map(|r| r.run_sequence).unwrap_or(0);
-            let solver_status = run.map(|r| r.solver_status.clone()).unwrap_or_default();
-            let queue_wait_slots = (a.current_slot - a.arrival_slot).max(0);
-            let final_wait_slots = (a.scheduled_slot - a.arrival_slot).max(0);
-            let error = *flavour_errors
-                .get(&(a.qos_profile_id.clone(), a.flavour_name.clone()))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "QoS flavour catalog is missing profile '{}' flavour '{}'",
-                        a.qos_profile_id, a.flavour_name
-                    )
-                });
-            PerRequest {
-                request_id: a.request_id,
-                qos_profile_id: a.qos_profile_id.clone(),
-                arrival_time: a.arrival_slot as f64 * slot_dur,
-                arrival_slot: a.arrival_slot,
-                deadline_slot: a.deadline_slot,
-                included_in_batch_slot: a.current_slot,
-                batch_sequence: batch_seq,
-                scheduled_slot: a.scheduled_slot,
-                queue_wait_slots,
-                queue_wait_seconds: queue_wait_slots as f64 * slot_dur,
-                final_wait_slots,
-                final_wait_seconds: final_wait_slots as f64 * slot_dur,
-                flavour_name: a.flavour_name.clone(),
-                error,
-                carbon_cost: a.carbon_cost,
-                assignment_solver_status: solver_status,
-                fallback_assigned: a.fallback_assigned,
-                late_assigned: a.late_assigned,
-                lateness_slots: (a.scheduled_slot - a.deadline_slot).max(0),
-            }
-        });
-    }
-    let mut v: Vec<PerRequest> = seen.into_values().collect();
-    v.sort_by_key(|r| r.request_id);
-    v
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -711,6 +512,7 @@ fn write_run_outputs_inner(
     per_timeslot: &[PerTimeslot],
 ) {
     std::fs::create_dir_all(run_dir).expect("Cannot create run output dir");
+    // Clear legacy files when a run directory is reused; current nshift never writes them.
     for obsolete_file in [
         "batch_timings.csv",
         "batch_timings.json",
