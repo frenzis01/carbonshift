@@ -2162,6 +2162,7 @@ pub async fn executor_callback(
         // release it while retaining the small result metadata for history.
         (t.callback_url.take(), actual_baseline)
     };
+    state.notify_archive_sweep();
 
     // Forward caller notification in the background. The executor callback
     // returns promptly even if a client callback is slow or unavailable.

@@ -9,20 +9,48 @@ use crate::{
 use std::collections::{HashMap, HashSet};
 use std::{error::Error, io, time::Duration};
 
-/// Periodically sweeps the archive
+/// Checks the settled-slot watermark periodically and sweeps only after it
+/// advances. Lifecycle notifications retry skipped work after callbacks, while
+/// failed sweeps are retried on the next tick.
 pub async fn run(state: AppState, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
+    let mut last_swept_through_slot = state.shared_state.get_settled_through_slot();
+    let mut retry_pending = false;
 
     loop {
-        ticker.tick().await;
-        let state = state.clone();
+        let lifecycle_retry = tokio::select! {
+            _ = ticker.tick() => false,
+            _ = state.archive_sweep_notify.notified() => true,
+        };
+        let settled_through_slot = state.shared_state.get_settled_through_slot();
+        if !sweep_is_due(
+            last_swept_through_slot,
+            settled_through_slot,
+            retry_pending || lifecycle_retry,
+        ) {
+            continue;
+        }
 
+        let state = state.clone();
         match tokio::task::spawn_blocking(move || sweep_once(&state)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(%error, "archive sweep failed"),
-            Err(error) => tracing::error!(%error, "archive sweep task failed"),
+            Ok(Ok(())) => {
+                last_swept_through_slot = settled_through_slot;
+                retry_pending = false;
+            }
+            Ok(Err(error)) => {
+                retry_pending = true;
+                tracing::error!(%error, "archive sweep failed");
+            }
+            Err(error) => {
+                retry_pending = true;
+                tracing::error!(%error, "archive sweep task failed");
+            }
         }
     }
+}
+
+fn sweep_is_due(last_swept_through_slot: i32, settled_through_slot: i32, retry: bool) -> bool {
+    retry || last_swept_through_slot != settled_through_slot
 }
 
 fn sweep_once(state: &AppState) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -270,6 +298,14 @@ mod tests {
 
     fn assignment(slot: i32) -> Assignment {
         Assignment::new(1, slot, "Fast".to_owned(), 1.0, 1.0, 1.0, Some(3), Some(5))
+    }
+
+    #[test]
+    fn coordinator_sweeps_on_watermark_advances_and_retries_failures() {
+        assert!(!sweep_is_due(-1, -1, false));
+        assert!(!sweep_is_due(4, 4, false));
+        assert!(sweep_is_due(4, 5, false));
+        assert!(sweep_is_due(4, 4, true));
     }
 
     #[test]

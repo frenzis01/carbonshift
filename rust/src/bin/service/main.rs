@@ -51,16 +51,16 @@
 
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use carbonshift_rs::engine::config::Config;
 use carbonshift_rs::engine::metrics_logger::MetricsLogger;
 use carbonshift_rs::engine::scheduler::BatchScheduler;
 use carbonshift_rs::engine::shared_state::SharedState;
 use carbonshift_rs::service::archive::RequestArchive;
-use carbonshift_rs::service::dispatcher;
 use carbonshift_rs::service::server::build_router;
 use carbonshift_rs::service::state::{AppState, ServiceConfig, wall_clock_alignment};
+use carbonshift_rs::service::{archive_coordinator, dispatcher};
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -245,6 +245,10 @@ async fn main() {
     }
     scheduler.start();
     tokio::spawn(dispatcher::run(state.clone()));
+    tokio::spawn(archive_coordinator::run(
+        state.clone(),
+        Duration::from_millis(100),
+    ));
 
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&listen_addr)

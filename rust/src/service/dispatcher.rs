@@ -134,16 +134,29 @@ async fn dispatch_one(state: &AppState, request_id: u64, assignment: &Assignment
 }
 
 fn set_status(state: &AppState, request_id: u64, status: RequestStatus, error: Option<String>) {
-    if let Some(t) = state.tracked.lock().unwrap().get_mut(&request_id) {
-        if matches!(status, RequestStatus::Dispatched | RequestStatus::Failed) {
-            // The payload is only needed while a dispatch may be retried.
-            // Keep the task label separately for history responses.
-            t.payload = serde_json::Value::Null;
+    let dry_run_dispatch =
+        state.service_cfg.executor_url.is_none() && status == RequestStatus::Dispatched;
+    let should_notify = {
+        let mut tracked = state.tracked.lock().unwrap();
+        if let Some(t) = tracked.get_mut(&request_id) {
+            if matches!(status, RequestStatus::Dispatched | RequestStatus::Failed) {
+                // The payload is only needed while a dispatch may be retried.
+                // Keep the task label separately for history responses.
+                t.payload = serde_json::Value::Null;
+            }
+            if !t.executor_callback_received {
+                t.status = status;
+                t.error = error;
+                dry_run_dispatch
+            } else {
+                false
+            }
+        } else {
+            false
         }
-        if !t.executor_callback_received {
-            t.status = status;
-            t.error = error;
-        }
+    };
+    if should_notify {
+        state.notify_archive_sweep();
     }
 }
 

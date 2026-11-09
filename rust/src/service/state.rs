@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Notify;
 
 use crate::engine::config::Config;
 use crate::engine::qos::{
@@ -364,6 +365,7 @@ pub struct AppState {
     /// `None` for tests/embedded callers that intentionally disable persistence.
     /// The production binary always supplies an opened per-run archive.
     pub request_archive: Option<Arc<RequestArchive>>,
+    pub(crate) archive_sweep_notify: Arc<Notify>,
     pub http: reqwest::Client,
     pub service_cfg: Arc<ServiceConfig>,
     pub tracked: Arc<Mutex<HashMap<u64, TrackedRequest>>>,
@@ -478,6 +480,7 @@ impl AppState {
             qos_profiles,
             profile_metrics_logger,
             request_archive,
+            archive_sweep_notify: Arc::new(Notify::new()),
             http: reqwest::Client::new(),
             service_cfg: Arc::new(service_cfg),
             tracked: Arc::new(Mutex::new(HashMap::new())),
@@ -487,6 +490,10 @@ impl AppState {
             closed_through_slot: Arc::new(Mutex::new(-1)),
             next_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub(crate) fn notify_archive_sweep(&self) {
+        self.archive_sweep_notify.notify_one();
     }
 
     pub fn next_request_id(&self) -> u64 {
