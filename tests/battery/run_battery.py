@@ -15,8 +15,8 @@ runs the Rust solver across three independent, individually-toggleable phases:
   1. DP        – sweeps `batch_sizes`. Skipped entirely if the list is empty.
   2. Online    – runs `online_strategies` (e.g. "bandit", "ant_colony",
                  "singleton_best", "hazard").
-                 Only ant_colony sweeps `online_batch_sizes` (falls back to
-                 `batch_sizes` if absent); other strategies use batch size 1.
+                 ant_colony, bandit, hazard, and singleton_best sweep
+                 `online_batch_sizes` (falls back to `batch_sizes` if absent).
                  Skipped if `online_strategies` is empty.
                  Independent of the DP phase/`batch_sizes` — e.g. set
                  `batch_sizes: []` to sweep online strategies without running DP.
@@ -43,8 +43,8 @@ batch_sizes          : list[int]   – DP phase N values to benchmark; [] skips 
 online_strategies    : list[str]   – online strategies to run (e.g. "bandit", "ant_colony",
                                      "singleton_best", "hazard"); [] skips the online phase.
 online_batch_sizes   : list[int]   – N sweep for online_strategies; falls back to
-                                     `batch_sizes` when omitted. Only "ant_colony" uses
-                                     this sweep; all other online strategies force N=1.
+                                     `batch_sizes` when omitted. ant_colony, bandit,
+                                     hazard, and singleton_best use this sweep.
 additional_strategies: list[str]   – offline strategies to run once per scenario
                                      (e.g. "offline_singleton_best", "offline_singleton_best_accurate",
                                      "hazard", "ant_colony", "bandit"); [] skips the

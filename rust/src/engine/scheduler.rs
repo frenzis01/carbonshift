@@ -48,6 +48,8 @@ struct SchedulerStats {
     solver_total_time_ms: f64,
     solver_total_requests: u64,
     last_solver_elapsed_ms: f64,
+    min_solver_elapsed_ms: f64,
+    max_solver_elapsed_ms: f64,
     peak_concurrent_workers: usize,
     /// Integral of active worker count over scheduler wall time, in worker-seconds.
     worker_time_area_secs: f64,
@@ -221,6 +223,10 @@ pub struct SchedulerStatistics {
     pub solver_runs: u64,
     /// Duration of the most recent solver invocation, in milliseconds.
     pub last_solver_elapsed_ms: f64,
+    /// Shortest successful solver invocation, in milliseconds.
+    pub min_solver_elapsed_ms: f64,
+    /// Longest successful solver invocation, in milliseconds.
+    pub max_solver_elapsed_ms: f64,
     /// Total solver time divided by successful batches.
     pub avg_solver_ms_per_batch: f64,
     /// Total solver time divided by newly scheduled requests.
@@ -455,6 +461,12 @@ impl BatchScheduler {
             total_scheduled: m.stats.total_scheduled,
             solver_runs: runs,
             last_solver_elapsed_ms: m.stats.last_solver_elapsed_ms,
+            min_solver_elapsed_ms: if runs > 0 {
+                m.stats.min_solver_elapsed_ms
+            } else {
+                0.0
+            },
+            max_solver_elapsed_ms: m.stats.max_solver_elapsed_ms,
             avg_solver_ms_per_batch: if runs > 0 { time_ms / runs as f64 } else { 0.0 },
             avg_solver_ms_per_request: if reqs > 0 { time_ms / reqs as f64 } else { 0.0 },
             active_batch_workers: m.active_workers,
@@ -1264,6 +1276,13 @@ fn batch_worker_entry(
     // Update scheduler counters and capture this run's unique sequence number.
     let run_sequence = {
         let mut g = mutable.lock().unwrap();
+        if g.stats.solver_runs == 0 {
+            g.stats.min_solver_elapsed_ms = elapsed_ms;
+            g.stats.max_solver_elapsed_ms = elapsed_ms;
+        } else {
+            g.stats.min_solver_elapsed_ms = g.stats.min_solver_elapsed_ms.min(elapsed_ms);
+            g.stats.max_solver_elapsed_ms = g.stats.max_solver_elapsed_ms.max(elapsed_ms);
+        }
         g.stats.solver_runs += 1;
         g.stats.batches_processed += 1;
         g.stats.total_scheduled += assigned_count as u64;

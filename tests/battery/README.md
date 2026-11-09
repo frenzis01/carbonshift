@@ -100,8 +100,9 @@ Set `hazard`, `bandit`, `ant_colony`, or `singleton_best` in
 `online_strategies` to run it through the streaming scheduler. The same engine
 implementations are available offline through `additional_strategies`.
 
-Only `ant_colony` uses the `online_batch_sizes` sweep. Other online strategies
-use batch size 1.
+`ant_colony`, `bandit`, `hazard`, and `singleton_best` use the
+`online_batch_sizes` sweep. Batch size changes when request-level strategies
+observe committed feedback, so compare both runtime and scheduling quality.
 
 Example:
 

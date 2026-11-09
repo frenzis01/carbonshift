@@ -381,7 +381,7 @@ pub(super) fn convert_engine_results_to_outputs(
     realtime_slots: bool,
     realtime_speed_scale: f64,
     solver_elapsed_ms: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+) -> (Vec<PerRequest>, RunSummary) {
     placements.sort_by_key(|placement| (placement.arrival_slot, placement.assignment.request_id));
 
     let most_accurate = assignment
@@ -390,7 +390,6 @@ pub(super) fn convert_engine_results_to_outputs(
         .min_by(|left, right| left.error.total_cmp(&right.error))
         .expect("a valid engine input has at least one flavour");
     let mut per_request = Vec::with_capacity(placements.len());
-    let mut batch_timings = Vec::with_capacity(1);
 
     for placement in &placements {
         let assignment_result = &placement.assignment;
@@ -427,16 +426,8 @@ pub(super) fn convert_engine_results_to_outputs(
             lateness_slots,
         });
     }
-    batch_timings.push(BatchTiming {
-        batch_sequence: 1,
-        batch_size_n: 0,
-        effective_batch_size: per_request.len(),
-        slot: 0,
-        pending_before: scenario.requests.len(),
-        solver_elapsed_ms,
-        scheduled: per_request.len() == scenario.requests.len(),
-        flush_partial_batch: false,
-    });
+    let mut solver_timings = SolverTimingSummary::default();
+    solver_timings.record(solver_elapsed_ms);
 
     let summary = compute_summary(
         strategy_name,
@@ -444,7 +435,7 @@ pub(super) fn convert_engine_results_to_outputs(
         realtime_slots,
         realtime_speed_scale,
         &per_request,
-        &batch_timings,
+        solver_timings,
         scenario.requests.len(),
         &most_accurate.name,
         most_accurate.duration,
@@ -452,7 +443,7 @@ pub(super) fn convert_engine_results_to_outputs(
         0,
         0.0,
     );
-    (per_request, batch_timings, summary)
+    (per_request, summary)
 }
 
 /// Normalize offline labels at the runner boundary, then create and run the
@@ -484,7 +475,7 @@ pub(super) fn run_strategy(
     slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
-) -> Result<(Vec<PerRequest>, Vec<BatchTiming>, RunSummary), SolverError> {
+) -> Result<(Vec<PerRequest>, RunSummary), SolverError> {
     let (engine_name, output_name) = canonical_offline_engine_name(name)?;
     let assignment = config.assignment_policy();
     let (scope, solve_input) = project_scenario_to_solve_input(scenario, &assignment)?;

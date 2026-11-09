@@ -68,8 +68,8 @@ impl AssignmentCommitObserver for PendingPerRequestContexts {
 
 /// Writes final per-request rows in settled-slot order and retains only
 /// run-level/slot-level aggregates after each settled row has been flushed.
-/// 
-/// Sorts each slot’s assignments by request ID, computes canonical global-capacity 
+///
+/// Sorts each slot’s assignments by request ID, computes canonical global-capacity
 /// prices, streams rows to per_request.csv, per_request.json, and assignments_runtime.csv,
 /// flushes before eviction, and updates summary and per-slot error aggregates.
 struct SettledPerRequestWriter {
@@ -358,7 +358,7 @@ pub(super) fn run_greedy_baseline(
     slot_duration_seconds: f64,
     realtime_slots: bool,
     realtime_speed_scale: f64,
-) -> (Vec<PerRequest>, Vec<BatchTiming>, RunSummary) {
+) -> (Vec<PerRequest>, RunSummary) {
     let flav = assignment
         .flavours
         .iter()
@@ -371,7 +371,6 @@ pub(super) fn run_greedy_baseline(
     let scale = assignment.carbon_cost_duration_scale;
 
     let mut per_req: Vec<PerRequest> = Vec::new();
-    let mut batch_timings: Vec<BatchTiming> = Vec::new();
     let mut seq: u64 = 0;
 
     for (slot, requests) in by_slot.iter().enumerate() {
@@ -407,27 +406,18 @@ pub(super) fn run_greedy_baseline(
                 late_assigned: false,
                 lateness_slots: 0,
             });
-            batch_timings.push(BatchTiming {
-                batch_sequence: seq,
-                batch_size_n: 0,
-                effective_batch_size: 1,
-                slot: slot as i32,
-                pending_before: 1,
-                solver_elapsed_ms: 0.0,
-                scheduled: true,
-                flush_partial_batch: false,
-            });
         }
     }
 
     let total_requests: usize = by_slot.iter().map(|s| s.len()).sum();
+    let solver_timings = SolverTimingSummary::zero_elapsed_samples(total_requests);
     let summary = compute_summary(
         "greedy_baseline_immediate",
         0,
         realtime_slots,
         realtime_speed_scale,
         &per_req,
-        &batch_timings,
+        solver_timings,
         total_requests,
         &flav.name,
         flav.duration,
@@ -435,7 +425,7 @@ pub(super) fn run_greedy_baseline(
         0,   // peak_concurrent_workers
         0.0, // avg_concurrent_workers
     );
-    (per_req, batch_timings, summary)
+    (per_req, summary)
 }
 
 /// Greedy late scheduling: assign pending requests that remained unprocessed
@@ -523,7 +513,7 @@ pub(super) fn run_single_n(
     realtime_speed_scale: f64,
     run_dir: &Path,
     verbose: bool,
-) -> (Vec<BatchTiming>, RunSummary, Vec<PerTimeslot>) {
+) -> (RunSummary, Vec<PerTimeslot>) {
     // Build per-run config.
     let mut cfg = base_cfg.clone();
     cfg.solver.batch_size = batch_size;
@@ -541,31 +531,22 @@ pub(super) fn run_single_n(
         cfg.simulation.skip_empty_slots = false;
         cfg.simulation.slot_speed_scale = realtime_speed_scale;
     }
-    cfg.logging.enable_solver_logging = true;
-    let tmp_runs = run_dir.join("_solver_runs.csv");
-    let tmp_assignments = run_dir.join("_solver_assignments.csv");
-    cfg.logging.solver_runs_file = tmp_runs.to_str().unwrap().to_string();
-    cfg.logging.solver_assignments_file = tmp_assignments.to_str().unwrap().to_string();
+    // Scheduler counters supply summary timing; per-batch CSV rows only add
+    // string-map allocations and file opens to this high-volume path.
+    cfg.logging.enable_solver_logging = false;
     cfg.simulation.total_requests = scenario.requests.len();
 
     let cfg = Arc::new(cfg);
 
     std::fs::create_dir_all(run_dir).unwrap();
-    // Remove any stale temp files from a previous interrupted run so the
-    // MetricsLogger (which appends) starts with a clean slate.
-    let _ = std::fs::remove_file(&tmp_runs);
-    let _ = std::fs::remove_file(&tmp_assignments);
     let report_contexts = Arc::new(PendingPerRequestContexts::default());
     let mut per_request_writer =
         SettledPerRequestWriter::create(run_dir, cfg.total_slots, report_contexts.clone())
             .unwrap_or_else(|error| panic!("cannot create settled PerRequest output: {error}"));
+    let mut finalized_through_slot = -1;
 
     let shared_state = SharedState::new();
-    let ml = Arc::new(MetricsLogger::new(
-        true,
-        tmp_runs.to_str().unwrap().to_string(),
-        tmp_assignments.to_str().unwrap().to_string(),
-    ));
+    let ml = Arc::new(MetricsLogger::new(false, String::new(), String::new()));
 
     let by_slot = scenario.requests_by_slot();
     let generator_cfg = RequestGeneratorConfig::from_config(&cfg);
@@ -596,16 +577,20 @@ pub(super) fn run_single_n(
     let last_slot = cfg.total_slots - 1;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        per_request_writer
-            .finalize_through(
-                &shared_state,
-                shared_state.get_settled_through_slot(),
-                &scenario.carbon_forecast,
-                &base_cfg.capacity_tiers,
-                base_cfg.carbon_cost_duration_scale,
-                base_cfg.slot_duration_seconds,
-            )
-            .unwrap_or_else(|error| panic!("cannot finalize settled PerRequest rows: {error}"));
+        let settled_through_slot = shared_state.get_settled_through_slot();
+        if settled_through_slot > finalized_through_slot {
+            per_request_writer
+                .finalize_through(
+                    &shared_state,
+                    settled_through_slot,
+                    &scenario.carbon_forecast,
+                    &base_cfg.capacity_tiers,
+                    base_cfg.carbon_cost_duration_scale,
+                    base_cfg.slot_duration_seconds,
+                )
+                .unwrap_or_else(|error| panic!("cannot finalize settled PerRequest rows: {error}"));
+            finalized_through_slot = settled_through_slot;
+        }
         if shared_state.generator_processed_slot() >= last_slot {
             break;
         }
@@ -620,16 +605,20 @@ pub(super) fn run_single_n(
     loop {
         let stats = sched.get_statistics();
         let pending = shared_state.get_pending_count();
-        per_request_writer
-            .finalize_through(
-                &shared_state,
-                shared_state.get_settled_through_slot(),
-                &scenario.carbon_forecast,
-                &base_cfg.capacity_tiers,
-                base_cfg.carbon_cost_duration_scale,
-                base_cfg.slot_duration_seconds,
-            )
-            .unwrap_or_else(|error| panic!("cannot finalize settled PerRequest rows: {error}"));
+        let settled_through_slot = shared_state.get_settled_through_slot();
+        if settled_through_slot > finalized_through_slot {
+            per_request_writer
+                .finalize_through(
+                    &shared_state,
+                    settled_through_slot,
+                    &scenario.carbon_forecast,
+                    &base_cfg.capacity_tiers,
+                    base_cfg.carbon_cost_duration_scale,
+                    base_cfg.slot_duration_seconds,
+                )
+                .unwrap_or_else(|error| panic!("cannot finalize settled PerRequest rows: {error}"));
+            finalized_through_slot = settled_through_slot;
+        }
         if (pending == 0 && stats.active_batch_workers == 0)
             || std::time::Instant::now() > drain_deadline
         {
@@ -639,8 +628,8 @@ pub(super) fn run_single_n(
     }
 
     generator.stop();
-    let sched_stats = sched.get_statistics();
     sched.stop();
+    let sched_stats = sched.get_statistics();
 
     // `stop` has joined the scheduler and drained every solver worker, so no
     // later batch can write into the final slot. Publish and finalize the
@@ -659,10 +648,12 @@ pub(super) fn run_single_n(
         .unwrap_or_else(|error| panic!("cannot finalize final PerRequest rows: {error}"));
 
     let total_received = shared_state.get_statistics().total_received as usize;
-    // Post-process Rust CSVs into Python-compatible tables.
-    let runs = read_solver_runs(&tmp_runs);
-    let batch_timings = compute_batch_timings_from_csv(&runs, &tmp_assignments, batch_size)
-        .unwrap_or_else(|error| panic!("cannot read solver batch timing rows: {error}"));
+    let solver_timing_summary = SolverTimingSummary::from_scheduler_stats(
+        sched_stats.solver_runs as usize,
+        sched_stats.min_solver_elapsed_ms,
+        sched_stats.max_solver_elapsed_ms,
+        sched_stats.avg_solver_ms_per_batch,
+    );
     // Drain any requests that never made it into a batch (e.g., deadline
     // expired while waiting in the pending queue) and schedule them late.
     let remaining = shared_state.drain_pending_requests();
@@ -685,13 +676,13 @@ pub(super) fn run_single_n(
     } else {
         format!("nshift_{}", cfg.solver.solver_strategy)
     };
-    let summary = compute_summary_from_accumulator(
+    let summary = compute_summary_from_accumulators(
         &exec_mode,
         batch_size,
         realtime_slots,
         realtime_speed_scale,
         request_summary,
-        &batch_timings,
+        solver_timing_summary,
         total_received,
         "",
         0.0,
@@ -704,10 +695,6 @@ pub(super) fn run_single_n(
         cfg.error_window_past,
         cfg.error_window_future,
     );
-
-    // Clean up temp files.
-    let _ = std::fs::remove_file(&tmp_runs);
-    let _ = std::fs::remove_file(&tmp_assignments);
 
     // Print a definitive final progress line overwriting whatever partial
     // line the main_loop left behind.  This runs after late scheduling so
@@ -726,7 +713,7 @@ pub(super) fn run_single_n(
         );
     }
 
-    (batch_timings, summary, per_timeslot)
+    (summary, per_timeslot)
 }
 
 #[cfg(test)]

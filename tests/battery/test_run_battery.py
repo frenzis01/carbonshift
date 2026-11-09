@@ -61,6 +61,22 @@ def test_output_schema_guard_accepts_only_the_declared_version(tmp_path):
         require_output_schema(tmp_path, schema_name="carbonshift.nshift")
 
 
+def test_multiple_runs_keeps_request_strategies_in_per_request_batch_sweep():
+    assert mr.PER_REQUEST_ONLINE_CONTENT["online_strategies"] == [
+        "bandit",
+        "singleton_best",
+        "hazard",
+    ]
+    assert mr.PER_REQUEST_ONLINE_CONTENT["online_batch_sizes"] == [
+        1,
+        8,
+        96,
+        256,
+        1024,
+    ]
+    assert mr.SWARM_ONLINE_CONTENT["online_strategies"] == ["ant_colony"]
+
+
 def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path):
     scenario = rb._generate_scenario(
         {"id": "window", "seed": 1, "total_slots": 2, "requests_per_slot": 1.0},

@@ -47,8 +47,8 @@
 //!   set the top-level `batch_sizes` to
 //!   `[]` to skip DP entirely and only run online strategies.
 //! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
-//!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent. Only
-//!   "ant_colony" uses the configured sweep; all other online strategies use batch size 1.
+//!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent.
+//!   "ant_colony", "bandit", "hazard", and "singleton_best" use the configured sweep.
 //! - `additional_strategies`: common-engine strategies to run once per scenario (no batching or
 //!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "hazard"]`.
 //!   `hazard` is the canonical stochastic strategy name. These runs are fully independent of `batch_sizes`,
@@ -81,8 +81,7 @@
 //!   summary_by_n.json, summary_by_n.csv
 //!   baseline_summary.json, baseline_summary.csv
 //!   baseline_greedy/ { summary.{json,csv} per_request.{json,csv}
-//!                      per_timeslot.{json,csv} batch_timings.{json,csv}
-//!                      assignments_runtime.csv }
+//!                      per_timeslot.{json,csv} assignments_runtime.csv }
 //!   N<n>/  { same files as above }
 //! ```
 
@@ -131,7 +130,7 @@ struct BenchmarkConfig {
     /// sweep). Falls back to `batch_sizes` when absent, so existing configs keep working
     /// unchanged. This lets a battery run online strategies (e.g. bandit/ant_colony) without
     /// also running the DP phase (`batch_sizes: []`), or with a different N sweep than DP's.
-    /// Ignored for "singleton_best", which always forces `[1]` (its only supported batch size).
+    /// Honoured by the supported online strategies; unknown strategies use singleton batches.
     online_batch_sizes: Option<Vec<usize>>,
     /// If > 0: flush a partial batch after this many seconds without a new request.
     batch_timeout_secs: f64,
@@ -317,10 +316,16 @@ fn recompute_carbon_costs(
 
 // ─── strategy sweep helpers ──────────────────────────────────────────────────
 
-/// Only ACO makes meaningful use of online batch-size sweeps; every other
-/// online strategy is deliberately run as a sequence of singleton batches.
+/// These algorithms choose each request's placement sequentially, but can
+/// amortize scheduler setup by receiving several requests in one solve.
+fn supports_online_batch_size_sweep(strategy: &str) -> bool {
+    ["ant_colony", "bandit", "hazard", "singleton_best"]
+        .iter()
+        .any(|supported| strategy.eq_ignore_ascii_case(supported))
+}
+
 fn online_batch_sizes_for_strategy(strategy: &str, configured: &[usize]) -> Vec<usize> {
-    if strategy.eq_ignore_ascii_case("ant_colony") {
+    if supports_online_batch_size_sweep(strategy) {
         configured.to_vec()
     } else {
         vec![1]
@@ -437,7 +442,7 @@ fn main() {
 
     // ── greedy baseline ────────────────────────────────────────────────────
     if bcfg.include_greedy_baseline {
-        let (per_req, batch_timings, summary) = run_greedy_baseline(
+        let (per_req, summary) = run_greedy_baseline(
             &scenario,
             &base_cfg.assignment_policy(),
             base_cfg.slot_duration_seconds,
@@ -452,7 +457,7 @@ fn main() {
             scenario.metadata.error_window_future,
         );
         let run_dir = bcfg.output_dir.join("baseline_greedy");
-        write_run_outputs(&run_dir, &summary, &per_req, &batch_timings, &per_ts);
+        write_run_outputs(&run_dir, &summary, &per_req, &per_ts);
         // Top-level baseline files
         std::fs::write(
             bcfg.output_dir.join("baseline_summary.json"),
@@ -477,7 +482,7 @@ fn main() {
         let run_dir = bcfg.output_dir.join(format!("N{batch_size}"));
         let n_t0 = std::time::Instant::now();
 
-        let (batch_timings, mut summary, per_ts) = run_single_n(
+        let (mut summary, per_ts) = run_single_n(
             &scenario,
             &base_cfg,
             batch_size,
@@ -497,7 +502,7 @@ fn main() {
             summary.carbon_cost_saving_vs_baseline_pct = pct;
         }
 
-        write_streamed_run_outputs(&run_dir, &summary, &batch_timings, &per_ts);
+        write_streamed_run_outputs(&run_dir, &summary, &per_ts);
 
         println!(
             "Completed N={batch_size}: solver_ms_avg={:.3}, total_carbon={:.3}, \
@@ -523,14 +528,14 @@ fn main() {
         .clone()
         .unwrap_or_else(|| bcfg.batch_sizes.clone());
     for strategy in &bcfg.online_strategies {
-        // Every online strategy except ACO makes one request-level decision at
-        // a time, so only ACO has a meaningful batch-size sweep.
+        // Request-level solvers retain their sequential decision policies,
+        // while allowing the scheduler to amortize per-batch setup.
         let batch_sizes_for_strategy =
             online_batch_sizes_for_strategy(strategy, &online_batch_sizes_base);
-        if !strategy.eq_ignore_ascii_case("ant_colony") && online_batch_sizes_base.as_slice() != [1]
+        if !supports_online_batch_size_sweep(strategy) && online_batch_sizes_base.as_slice() != [1]
         {
             println!(
-                "[Info] online strategy '{strategy}' processes one request at a time; \
+                "[Info] online strategy '{strategy}' does not support batch-size sweeps; \
                  ignoring configured batch_sizes and using batch_size=1."
             );
         }
@@ -545,7 +550,7 @@ fn main() {
             let mut online_base_cfg = base_cfg.clone();
             online_base_cfg.solver.solver_strategy = strategy.clone();
 
-            let (batch_timings, mut summary, per_ts) = run_single_n(
+            let (mut summary, per_ts) = run_single_n(
                 &scenario,
                 &online_base_cfg,
                 batch_size,
@@ -564,7 +569,7 @@ fn main() {
                 summary.carbon_cost_saving_vs_baseline_pct = pct;
             }
 
-            write_streamed_run_outputs(&run_dir, &summary, &batch_timings, &per_ts);
+            write_streamed_run_outputs(&run_dir, &summary, &per_ts);
 
             println!(
                 "Completed online_strategy={strategy} N={batch_size}: solver_ms_avg={:.3}, \
@@ -603,7 +608,7 @@ fn main() {
             .output_dir
             .join(format!("strategy_{output_strategy_name}"));
         let strat_t0 = std::time::Instant::now();
-        let (per_req, batch_timings, mut summary) = run_strategy(
+        let (per_req, mut summary) = run_strategy(
             &common_engine_registry,
             strategy,
             &scenario,
@@ -629,7 +634,7 @@ fn main() {
             scenario.metadata.error_window_past,
             scenario.metadata.error_window_future,
         );
-        write_run_outputs(&strat_dir, &summary, &per_req, &batch_timings, &per_ts);
+        write_run_outputs(&strat_dir, &summary, &per_req, &per_ts);
         println!(
             "Completed strategy={strategy}: total_carbon={:.3}, global_error={:.3}, \
              saving_vs_baseline={:.3}",

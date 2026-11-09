@@ -4,13 +4,12 @@
   "_trim_future_assignments_comment": "Optional. When true, requests are still generated only in each scenario's total_slots, but the planning horizon and carbon forecast extend by ERROR_WINDOW_FUTURE slots. Assignments and request-level metrics beyond the configured total_slots are trimmed; reqs_in counts scenario inputs and reqs_out counts retained assignments.",
   "trim_future_assignments": true,
   "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat keeps a nearly constant rate with seeded 5%-of-rate slot-count jitter and the same rounded horizon total. Both retain random sub-slot arrival times. multiple_runs.py sweeps both by default. This does not configure client emulation.",
-  "battery_id": "cfg_test00_sinusoidal_per_request_0",
-  "batch_sizes": [],
-  "online_strategies": [
-    "singleton_best",
-    "hazard"
+  "battery_id": "cfg_test4_dp_0",
+  "batch_sizes": [
+    4
   ],
-  "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. Only ant_colony uses this sweep; all other online strategies force N=1.",
+  "online_strategies": [],
+  "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. ant_colony, bandit, hazard, and singleton_best use this sweep.",
   "online_batch_sizes__": [
     1,
     4,
@@ -43,7 +42,7 @@
   "realtime_speed_scale": 1.0,
   "scenarios": [
     {
-      "id": "high_load_1500_92_sinusoidal",
+      "id": "high_load_1500_92",
       "seed": 92,
       "requests_per_slot": 1500.0,
       "total_slots": 72,
@@ -65,7 +64,7 @@
       "max_error_threshold": 4.0
     },
     {
-      "id": "xhigh_load_2000_120_sinusoidal",
+      "id": "xhigh_load_2000_120",
       "seed": 120,
       "requests_per_slot": 2000.0,
       "total_slots": 72,

@@ -155,7 +155,8 @@ fn schema_v2_solver_logs_parse_required_fields() {
             "run_id,run_sequence,solver_mode,solver_status,new_assignments,",
             "fallback_assigned_count,solver_elapsed_ms,total_carbon_cost,",
             "error_window_avg_after,error_window_avg_after_real\n",
-            "run_n1_1,1,dp,ok,1,0,1.5,2.0,0.0,0.0\n"
+            "run_n1_1,1,dp,ok,1,0,1.5,2.0,0.0,0.0\n",
+            "run_n2_2,2,dp,ok,2,1,4.0,6.0,0.0,0.0\n"
         ),
     )
     .unwrap();
@@ -165,7 +166,9 @@ fn schema_v2_solver_logs_parse_required_fields() {
             "run_id,current_slot,request_id,qos_profile_id,scheduled_slot,flavour_name,",
             "fallback_assigned,late_assigned,carbon_cost,",
             "arrival_slot,deadline_slot\n",
-            "run_n1_1,0,1,default-text-generation,0,Accurate,true,false,2.0,0,1\n"
+            "run_n1_1,0,1,default-text-generation,0,Accurate,true,false,2.0,0,1\n",
+            "run_n2_2,1,2,default-text-generation,1,Balanced,false,false,3.0,0,2\n",
+            "run_n2_2,1,3,default-text-generation,1,Fast,false,false,3.0,0,2\n"
         ),
     )
     .unwrap();
@@ -173,9 +176,9 @@ fn schema_v2_solver_logs_parse_required_fields() {
     let runs = super::reporting::read_solver_runs(&runs_path);
     let assignments = super::reporting::read_solver_assignments(&assignments_path);
 
-    assert_eq!(runs.len(), 1);
+    assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].new_assignments, 1);
-    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments.len(), 3);
     assert!(assignments[0].fallback_assigned);
 
     std::fs::remove_file(runs_path).unwrap();
@@ -324,17 +327,17 @@ fn online_batch_sizes_explicit_value_is_parsed() {
 }
 
 #[test]
-fn online_batch_sizes_only_sweep_for_ant_colony() {
+fn online_batch_sizes_sweep_for_all_supported_strategies() {
     let configured = [1, 4, 8];
-    for strategy in ["bandit", "singleton_best", "hazard"] {
+    for strategy in ["ant_colony", "bandit", "hazard", "singleton_best"] {
         assert_eq!(
             online_batch_sizes_for_strategy(strategy, &configured),
-            vec![1]
+            configured
         );
     }
     assert_eq!(
-        online_batch_sizes_for_strategy("ant_colony", &configured),
-        configured
+        online_batch_sizes_for_strategy("unknown", &configured),
+        vec![1]
     );
 }
 
@@ -449,7 +452,7 @@ fn offline_singleton_best_accurate_uses_min_error_flavour_and_cheapest_slot() {
 
     let registry =
         build_solver_registry(&config, scenario.metadata.seed ^ HAZARD_SEED_SALT).unwrap();
-    let (assignments, _, summary) = run_strategy(
+    let (assignments, summary) = run_strategy(
         &registry,
         "offline_singleton_best_accurate",
         &scenario,
@@ -464,7 +467,7 @@ fn offline_singleton_best_accurate_uses_min_error_flavour_and_cheapest_slot() {
     assert_eq!(assignments[0].scheduled_slot, 1);
     assert_eq!(summary.execution_mode, "offline_singleton_best_accurate");
 
-    let (best_assignments, _, best_summary) = run_strategy(
+    let (best_assignments, best_summary) = run_strategy(
         &registry,
         "offline_singleton_best",
         &scenario,
@@ -501,7 +504,7 @@ fn offline_dp_marks_greedy_fallback_and_reports_its_flavour() {
     ];
     let registry = build_solver_registry(&config, 42).unwrap();
 
-    let (per_request, _, summary) =
+    let (per_request, summary) =
         run_strategy(&registry, "dp", &scenario, &config, 60.0, false, 1.0).unwrap();
 
     assert_eq!(per_request.len(), 1);
@@ -535,12 +538,20 @@ fn online_nshift_writes_settled_per_request_rows_without_returning_a_row_vector(
             .unwrap()
             .as_nanos()
     ));
-    let (_batch_timings, summary, per_timeslot) =
-        run_single_n(&scenario, &config, 1, false, 1.0, &run_dir, false);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("batch_timings.csv"), "stale").unwrap();
+    std::fs::write(run_dir.join("batch_timings.json"), "stale").unwrap();
+    let (summary, per_timeslot) = run_single_n(&scenario, &config, 1, false, 1.0, &run_dir, false);
+    write_streamed_run_outputs(&run_dir, &summary, &per_timeslot);
 
     assert_eq!(summary.reqs_total, 3);
     assert_eq!(summary.reqs_scheduled, 3);
+    assert_eq!(summary.batches_executed, 3);
+    assert!(summary.solver_time_ms_min <= summary.solver_time_ms_avg);
+    assert!(summary.solver_time_ms_avg <= summary.solver_time_ms_max);
     assert_eq!(per_timeslot.len(), 2);
+    assert!(!run_dir.join("batch_timings.csv").exists());
+    assert!(!run_dir.join("batch_timings.json").exists());
 
     let mut reader = csv::Reader::from_path(run_dir.join("per_request.csv")).unwrap();
     let headers = reader.headers().unwrap().clone();
@@ -564,8 +575,56 @@ fn online_nshift_writes_settled_per_request_rows_without_returning_a_row_vector(
         serde_json::from_slice(&std::fs::read(run_dir.join("per_request.json")).unwrap()).unwrap();
     assert_eq!(json["rows"].as_array().unwrap().len(), 3);
     assert!(run_dir.join("assignments_runtime.csv").exists());
+    assert!(!run_dir.join("_solver_runs.csv").exists());
     assert!(!run_dir.join("_solver_assignments.csv").exists());
     std::fs::remove_dir_all(run_dir).unwrap();
+}
+
+#[test]
+fn online_request_level_solvers_batch_and_report_stats_without_log_files() {
+    let scenario = make_scenario(
+        (0..6).map(|id| make_request(id, 0, 1)).collect(),
+        vec![100.0, 50.0],
+    );
+    for strategy in ["bandit", "hazard", "singleton_best"] {
+        let mut config = Config::default();
+        config.total_slots = 2;
+        config.slot_duration_seconds = 60.0;
+        config.solver.solver_strategy = strategy.to_owned();
+        config.global_error_constraint_enabled = false;
+        config.logging.enable_progress_display = false;
+
+        let run_dir = std::env::temp_dir().join(format!(
+            "nshift-{strategy}-batched-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (summary, per_timeslot) =
+            run_single_n(&scenario, &config, 3, false, 1.0, &run_dir, false);
+        write_streamed_run_outputs(&run_dir, &summary, &per_timeslot);
+
+        assert_eq!(summary.reqs_scheduled, 6, "{strategy}");
+        assert_eq!(summary.batches_executed, 2, "{strategy}");
+        assert!(
+            summary.solver_time_ms_min <= summary.solver_time_ms_avg,
+            "{strategy}"
+        );
+        assert!(
+            summary.solver_time_ms_avg <= summary.solver_time_ms_max,
+            "{strategy}"
+        );
+        assert!(!run_dir.join("_solver_runs.csv").exists(), "{strategy}");
+        assert!(
+            !run_dir.join("_solver_assignments.csv").exists(),
+            "{strategy}"
+        );
+        assert!(!run_dir.join("batch_timings.csv").exists(), "{strategy}");
+        assert!(!run_dir.join("batch_timings.json").exists(), "{strategy}");
+        std::fs::remove_dir_all(run_dir).unwrap();
+    }
 }
 
 #[test]
@@ -597,7 +656,7 @@ fn offline_common_engine_commit_prices_each_next_capacity_position() {
     }];
     let registry = build_solver_registry(&config, 42).unwrap();
 
-    let (assignments, _, _) = run_strategy(
+    let (assignments, _) = run_strategy(
         &registry,
         "singleton_best",
         &scenario,
@@ -632,7 +691,7 @@ fn offline_common_runner_executes_bandit_and_aco_through_the_registry() {
     let registry = build_solver_registry(&config, 42).unwrap();
 
     for strategy in ["bandit", "ant_colony"] {
-        let (assignments, _, summary) =
+        let (assignments, summary) =
             run_strategy(&registry, strategy, &scenario, &config, 60.0, false, 1.0).unwrap();
 
         assert_eq!(assignments.len(), 2);
@@ -668,7 +727,7 @@ fn offline_output_preserves_the_proposal_late_flag() {
             .unwrap();
     assert!(materialized[0].late);
 
-    let (per_request, _, summary) = convert_engine_results_to_outputs(
+    let (per_request, summary) = convert_engine_results_to_outputs(
         materialized,
         "test",
         &scenario,
@@ -736,9 +795,9 @@ fn hazard_is_seeded_and_targets_threshold_in_expectation() {
     config.error_window_future = 1;
     let registry =
         build_solver_registry(&config, scenario.metadata.seed ^ HAZARD_SEED_SALT).unwrap();
-    let (assignments, _, _) =
+    let (assignments, _) =
         run_strategy(&registry, "hazard", &scenario, &config, 60.0, false, 1.0).unwrap();
-    let (repeated, _, _) =
+    let (repeated, _) =
         run_strategy(&registry, "hazard", &scenario, &config, 60.0, false, 1.0).unwrap();
     let average_error = assignments
         .iter()

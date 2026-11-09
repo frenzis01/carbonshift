@@ -5,10 +5,12 @@ Run `run_battery.py` across several PHASE-AWARE parameter grids.
 Each phase of the Rust battery harness (see run_battery.py's module docstring)
 is sensitive to a different subset of runtime knobs:
 
-  - DP and request-level online strategies: sensitive to
-    `max_batch_solver_parallelism`.
-  - Bandit and ant_colony online strategies: use the same parallel merge
-    behavior and are sensitive to `max_batch_solver_parallelism`.
+  - Every online strategy is sensitive to `max_batch_solver_parallelism`.
+  - The `online` phase is the joint-batch ACO sweep.
+  - The `per_request` phase keeps Bandit, singleton-best, and Hazard grouped
+    by their request-level decision policy, while sweeping their batch size.
+    A batch still processes requests sequentially where the algorithm does so;
+    it changes how often scheduler setup and committed feedback occur.
   - offline strategies (offline_singleton_best, offline_singleton_best_accurate,
     hazard, bandit, ant_colony): run each scenario synchronously, without the
     online worker pool, and are insensitive to online worker parallelism.
@@ -89,15 +91,15 @@ DP_CONTENT: Dict[str, Any] = {
 
 SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
-    "online_strategies": ["bandit", "ant_colony"],
+    "online_strategies": ["ant_colony"],
     "online_batch_sizes": [8,96,256,1024],
     "additional_strategies": [],
 }
 
 PER_REQUEST_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
-    "online_strategies": ["singleton_best", "hazard"],
-    # The online runner forces N=1 for these request-level policies.
+    "online_strategies": ["bandit", "singleton_best", "hazard"],
+    "online_batch_sizes": [1, 8, 96, 256, 1024],
     "additional_strategies": [],
 }
 
@@ -126,7 +128,7 @@ _PARALLELISM_X_THRESHOLD = [
         "max_batch_solver_parallelism": parallelism,
         "max_error_threshold": threshold,
     }
-    for parallelism in (12,)
+    for parallelism in (20,)
     for threshold in (4.0,)
 ]
 

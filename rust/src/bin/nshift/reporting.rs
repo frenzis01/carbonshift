@@ -17,13 +17,14 @@ pub(super) fn write_output_schema_manifest(directory: &Path) {
 
 // ─── row types (post-processed metrics) ──────────────────────────────────────
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(super) struct SolverRunRow {
     pub(super) run_id: String,
     pub(super) run_sequence: u64,
     pub(super) new_assignments: usize,
+    #[cfg_attr(test, allow(dead_code))]
     pub(super) solver_elapsed_ms: f64,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) solver_status: String,
 }
 
@@ -67,15 +68,60 @@ pub(super) struct PerRequest {
     pub(super) lateness_slots: i32,
 }
 
-pub(super) struct BatchTiming {
-    pub(super) batch_sequence: u64,
-    pub(super) batch_size_n: usize,
-    pub(super) effective_batch_size: usize,
-    pub(super) slot: i32,
-    pub(super) pending_before: usize,
-    pub(super) solver_elapsed_ms: f64,
-    pub(super) scheduled: bool,
-    pub(super) flush_partial_batch: bool,
+/// Constant-size solver timing statistics accumulated while scanning run rows.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SolverTimingSummary {
+    pub(super) count: usize,
+    pub(super) min_ms: f64,
+    pub(super) max_ms: f64,
+    sum_ms: f64,
+}
+
+impl SolverTimingSummary {
+    pub(super) fn zero_elapsed_samples(count: usize) -> Self {
+        Self {
+            count,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn from_scheduler_stats(
+        count: usize,
+        min_ms: f64,
+        max_ms: f64,
+        average_ms: f64,
+    ) -> Self {
+        if count == 0 {
+            Self::default()
+        } else {
+            Self {
+                count,
+                min_ms,
+                max_ms,
+                sum_ms: average_ms * count as f64,
+            }
+        }
+    }
+
+    pub(super) fn record(&mut self, elapsed_ms: f64) {
+        if self.count == 0 {
+            self.min_ms = elapsed_ms;
+            self.max_ms = elapsed_ms;
+        } else {
+            self.min_ms = self.min_ms.min(elapsed_ms);
+            self.max_ms = self.max_ms.max(elapsed_ms);
+        }
+        self.sum_ms += elapsed_ms;
+        self.count += 1;
+    }
+
+    pub(super) fn average_ms(self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_ms / self.count as f64
+        }
+    }
 }
 
 pub(super) struct PerTimeslot {
@@ -127,6 +173,7 @@ pub(super) struct RunSummary {
 
 // ─── CSV readers ──────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub(super) fn read_solver_runs(path: &Path) -> Vec<SolverRunRow> {
     let Ok(mut rdr) = csv::Reader::from_path(path) else {
         return Vec::new();
@@ -171,6 +218,7 @@ pub(super) fn read_solver_runs(path: &Path) -> Vec<SolverRunRow> {
     rows
 }
 
+#[cfg(test)]
 #[cfg(test)]
 pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
     let Ok(mut rdr) = csv::Reader::from_path(path) else {
@@ -242,6 +290,7 @@ pub(super) fn read_solver_assignments(path: &Path) -> Vec<AssignmentRow> {
 // ─── metrics computation ──────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[cfg(test)]
 pub(super) fn compute_per_request(
     assignments: &[AssignmentRow],
     runs_by_id: &HashMap<String, &SolverRunRow>,
@@ -290,66 +339,6 @@ pub(super) fn compute_per_request(
     let mut v: Vec<PerRequest> = seen.into_values().collect();
     v.sort_by_key(|r| r.request_id);
     v
-}
-
-/// Compute batch timing rows while retaining only one slot per solver run,
-/// rather than materializing every solver assignment row in memory.
-pub(super) fn compute_batch_timings_from_csv(
-    runs: &[SolverRunRow],
-    assignments_path: &Path,
-    batch_size_n: usize,
-) -> Result<Vec<BatchTiming>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut reader = csv::Reader::from_path(assignments_path)?;
-    let headers = reader.headers()?.clone();
-    let run_id_column = headers
-        .iter()
-        .position(|header| header == "run_id")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing run_id"))?;
-    let slot_column = headers
-        .iter()
-        .position(|header| header == "current_slot")
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing current_slot")
-        })?;
-    let mut slot_by_run = HashMap::new();
-    for record in reader.records() {
-        let record = record?;
-        let run_id = record.get(run_id_column).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing row run_id")
-        })?;
-        let slot = record
-            .get(slot_column)
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing row slot")
-            })?
-            .parse::<i32>()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        slot_by_run.entry(run_id.to_owned()).or_insert(slot);
-    }
-
-    let mut timings = runs
-        .iter()
-        .map(|run| {
-            let slot = slot_by_run.get(&run.run_id).copied().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("solver run {} has no assignment rows", run.run_id),
-                )
-            })?;
-            Ok(BatchTiming {
-                batch_sequence: run.run_sequence,
-                batch_size_n,
-                effective_batch_size: run.new_assignments,
-                slot,
-                pending_before: run.new_assignments,
-                solver_elapsed_ms: run.solver_elapsed_ms,
-                scheduled: run.new_assignments > 0,
-                flush_partial_batch: run.new_assignments < batch_size_n,
-            })
-        })
-        .collect::<Result<Vec<_>, std::io::Error>>()?;
-    timings.sort_by_key(|timing| timing.batch_sequence);
-    Ok(timings)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -488,23 +477,13 @@ impl PerRequestSummaryAccumulator {
     }
 }
 
-pub(super) fn min_max_avg(v: &[f64]) -> (f64, f64, f64) {
-    if v.is_empty() {
-        return (0.0, 0.0, 0.0);
-    }
-    let min = v.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let avg = v.iter().sum::<f64>() / v.len() as f64;
-    (min, max, avg)
-}
-
 pub(super) fn compute_summary(
     mode: &str,
     batch_size: usize,
     realtime_slots: bool,
     realtime_speed_scale: f64,
     per_req: &[PerRequest],
-    batch_timings: &[BatchTiming],
+    solver_timings: SolverTimingSummary,
     total_received: usize,
     baseline_flavour_name: &str,
     baseline_flavour_duration: f64,
@@ -516,13 +495,13 @@ pub(super) fn compute_summary(
     for request in per_req {
         request_summary.record(request);
     }
-    compute_summary_from_accumulator(
+    compute_summary_from_accumulators(
         mode,
         batch_size,
         realtime_slots,
         realtime_speed_scale,
         request_summary,
-        batch_timings,
+        solver_timings,
         total_received,
         baseline_flavour_name,
         baseline_flavour_duration,
@@ -532,13 +511,13 @@ pub(super) fn compute_summary(
     )
 }
 
-pub(super) fn compute_summary_from_accumulator(
+pub(super) fn compute_summary_from_accumulators(
     mode: &str,
     batch_size: usize,
     realtime_slots: bool,
     realtime_speed_scale: f64,
     request_summary: PerRequestSummaryAccumulator,
-    batch_timings: &[BatchTiming],
+    solver_timings: SolverTimingSummary,
     total_received: usize,
     baseline_flavour_name: &str,
     baseline_flavour_duration: f64,
@@ -553,12 +532,13 @@ pub(super) fn compute_summary_from_accumulator(
         0.0
     };
 
-    let (st_min, st_max, st_avg) = min_max_avg(
-        &batch_timings
-            .iter()
-            .map(|b| b.solver_elapsed_ms)
-            .collect::<Vec<_>>(),
-    );
+    let st_min = if solver_timings.count > 0 {
+        solver_timings.min_ms
+    } else {
+        0.0
+    };
+    let st_max = solver_timings.max_ms;
+    let st_avg = solver_timings.average_ms();
     let (qw_min, qw_max, qw_avg) = request_summary.queue_wait_seconds.min_max_avg();
     let (fw_min, fw_max, fw_avg) = request_summary.final_wait_seconds.min_max_avg();
 
@@ -575,7 +555,7 @@ pub(super) fn compute_summary_from_accumulator(
         reqs_unscheduled: total_received.saturating_sub(scheduled),
         reqs_late: request_summary.late_count,
         max_lateness_slots: request_summary.max_lateness_slots,
-        batches_executed: batch_timings.len(),
+        batches_executed: solver_timings.count,
         total_carbon_cost: request_summary.total_carbon_cost,
         global_average_error: avg_error,
         reqs_fallback_assigned: request_summary.fallback_count,
@@ -709,10 +689,9 @@ pub(super) fn write_run_outputs(
     run_dir: &Path,
     summary: &RunSummary,
     per_req: &[PerRequest],
-    batch_timings: &[BatchTiming],
     per_timeslot: &[PerTimeslot],
 ) {
-    write_run_outputs_inner(run_dir, summary, Some(per_req), batch_timings, per_timeslot);
+    write_run_outputs_inner(run_dir, summary, Some(per_req), per_timeslot);
 }
 
 /// Write metadata tables for a run whose per-request CSV/JSON were already
@@ -720,20 +699,30 @@ pub(super) fn write_run_outputs(
 pub(super) fn write_streamed_run_outputs(
     run_dir: &Path,
     summary: &RunSummary,
-    batch_timings: &[BatchTiming],
     per_timeslot: &[PerTimeslot],
 ) {
-    write_run_outputs_inner(run_dir, summary, None, batch_timings, per_timeslot);
+    write_run_outputs_inner(run_dir, summary, None, per_timeslot);
 }
 
 fn write_run_outputs_inner(
     run_dir: &Path,
     summary: &RunSummary,
     per_req: Option<&[PerRequest]>,
-    batch_timings: &[BatchTiming],
     per_timeslot: &[PerTimeslot],
 ) {
     std::fs::create_dir_all(run_dir).expect("Cannot create run output dir");
+    for obsolete_file in [
+        "batch_timings.csv",
+        "batch_timings.json",
+        "_solver_runs.csv",
+        "_solver_assignments.csv",
+    ] {
+        match std::fs::remove_file(run_dir.join(obsolete_file)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("Cannot remove obsolete {obsolete_file}: {error}"),
+        }
+    }
     write_output_schema_manifest(run_dir);
 
     // summary.json + summary.csv
@@ -849,48 +838,6 @@ fn write_run_outputs_inner(
         w.flush().unwrap();
         std::fs::write(
             run_dir.join("per_timeslot.json"),
-            serde_json::to_string_pretty(&serde_json::json!({"rows":jrows})).unwrap(),
-        )
-        .unwrap();
-    }
-
-    // batch_timings.csv + batch_timings.json
-    {
-        let header = [
-            "batch_sequence",
-            "batch_size_n",
-            "effective_batch_size",
-            "slot",
-            "pending_before",
-            "solver_elapsed_ms",
-            "scheduled",
-            "flush_partial_batch",
-        ];
-        let mut w = csv::Writer::from_path(run_dir.join("batch_timings.csv")).unwrap();
-        w.write_record(header).unwrap();
-        let mut jrows = Vec::new();
-        for b in batch_timings {
-            w.write_record(&[
-                b.batch_sequence.to_string(),
-                b.batch_size_n.to_string(),
-                b.effective_batch_size.to_string(),
-                b.slot.to_string(),
-                b.pending_before.to_string(),
-                b.solver_elapsed_ms.to_string(),
-                b.scheduled.to_string(),
-                b.flush_partial_batch.to_string(),
-            ])
-            .unwrap();
-            jrows.push(serde_json::json!({
-                "batch_sequence":b.batch_sequence,"batch_size_n":b.batch_size_n,
-                "effective_batch_size":b.effective_batch_size,"slot":b.slot,
-                "pending_before":b.pending_before,"solver_elapsed_ms":b.solver_elapsed_ms,
-                "scheduled":b.scheduled,"flush_partial_batch":b.flush_partial_batch,
-            }));
-        }
-        w.flush().unwrap();
-        std::fs::write(
-            run_dir.join("batch_timings.json"),
             serde_json::to_string_pretty(&serde_json::json!({"rows":jrows})).unwrap(),
         )
         .unwrap();
