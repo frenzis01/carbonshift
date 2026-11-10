@@ -18,7 +18,7 @@ pub struct SolverConfig {
     pub solver_strategy: String,
     /// DP pruning method: "beam", "kbest", or "none".
     pub dp_pruning_method: String,
-    /// Apply pruning only for batches at least this large (0 = disabled).
+    /// Apply pruning only for batches at least this large.
     pub dp_pruning_min_batch_size: usize,
     /// Number of states to keep during pruning.
     pub dp_pruning_k: usize,
@@ -172,8 +172,8 @@ impl Default for SolverConfig {
             batch_size: 4,
             solver_strategy: "dp".to_string(),
             dp_pruning_method: "beam".to_string(),
-            dp_pruning_min_batch_size: 8,
-            dp_pruning_k: 1200,
+            dp_pruning_min_batch_size: 6,
+            dp_pruning_k: 3500,
             dp_timeout: 30.0,
             max_batch_solver_parallelism: 12,
             batch_timeout_secs: 0.0,

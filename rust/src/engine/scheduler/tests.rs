@@ -475,12 +475,14 @@ fn scoped_snapshot_preserves_solver_inputs_for_its_capacity_and_error_ranges() {
         future_slots: config.error_window_future,
         past_decay_slots: config.error_window_past_decay_slots,
     };
-    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
-        &selected_profile_id,
-        1,
-        config.total_slots,
-        &default_error_window,
-    );
+    let claimed = shared_state
+        .claim_pending_requests_for_profile_with_snapshot(
+            &selected_profile_id,
+            1,
+            config.total_slots,
+            &default_error_window,
+        )
+        .unwrap();
     let full_snapshot = shared_state.snapshot_for_solver();
     let assignment_policy = config.assignment_policy_for_profile(&selected_profile);
     let forecast = flat_forecast(config.total_slots, 100.0);
@@ -581,12 +583,14 @@ fn common_worker_reports_greedy_fallback_and_selected_flavour() {
         future_slots: config.error_window_future,
         past_decay_slots: config.error_window_past_decay_slots,
     };
-    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
-        &QosProfileId::parse("fallback-test").unwrap(),
-        1,
-        config.total_slots,
-        &default_error_window,
-    );
+    let claimed = shared_state
+        .claim_pending_requests_for_profile_with_snapshot(
+            &QosProfileId::parse("fallback-test").unwrap(),
+            1,
+            config.total_slots,
+            &default_error_window,
+        )
+        .unwrap();
     let registry = build_solver_registry(&config);
     let forecast = flat_forecast(config.total_slots, 100.0);
     let mutable = Arc::new(Mutex::new(SchedulerMutableState {

@@ -36,7 +36,8 @@ struct SlotErrorTotals {
 /// consistent view at the moment the batch was dispatched. The lock is
 /// released before the optimiser runs.
 pub struct SolverSnapshot {
-    pub assignments: HashMap<u64, Assignment>,
+    /// Global occupancy by slot for capacity-tier pricing.
+    pub baseline_slot_counts: HashMap<i32, i64>,
     pub global_error_sum: f64,
     pub global_assignment_count: u64,
     pub profile_error_stats: HashMap<QosProfileId, GlobalErrorStats>,
@@ -60,10 +61,10 @@ struct SolverSnapshotScope {
 /// Compute the slot ranges needed to build one batch's solver snapshot.
 ///
 /// The request queue is grouped by profile, so one immutable error-window
-/// policy applies to the whole batch. Assignment rows are needed through a
-/// conservative upper bound on its target slots for capacity pricing. Error
-/// totals need a wider range: the past window plus its decay lookback, and the
-/// candidate slots' future error windows.
+/// policy applies to the whole batch. Global occupancy counts are needed
+/// through a conservative upper bound on its target slots for capacity
+/// pricing. Error totals need a wider range: the past window plus its decay
+/// lookback, and the candidate slots' future error windows.
 fn solver_snapshot_scope(
     profile_id: &QosProfileId,
     requests: &[Request],
@@ -114,15 +115,6 @@ fn solver_snapshot_scope(
 }
 
 impl SolverSnapshot {
-    /// Assignments scheduled at or after `current_slot`.
-    pub fn get_future_assignments(&self, current_slot: i32) -> Vec<Assignment> {
-        self.assignments
-            .values()
-            .filter(|a| a.scheduled_slot >= current_slot)
-            .cloned()
-            .collect()
-    }
-
     /// Weighted error stats for the window
     /// `[center − window_past, center + window_future]`.
     pub fn get_window_error_stats(
@@ -130,23 +122,10 @@ impl SolverSnapshot {
         center_slot: i32,
         window_past: i32,
         window_future: i32,
-        exclude: &HashSet<u64>,
     ) -> WindowErrorStats {
         let start = center_slot - window_past;
         let end = center_slot + window_future;
-        let (error_sum, count) = if exclude.is_empty() {
-            sum_slot_error_totals(&self.global_slot_errors, start, end)
-        } else {
-            self.assignments
-                .values()
-                .filter(|assignment| {
-                    !exclude.contains(&assignment.request_id)
-                        && (start..=end).contains(&assignment.scheduled_slot)
-                })
-                .fold((0.0, 0), |(sum, count), assignment| {
-                    (sum + assignment.error, count + 1)
-                })
-        };
+        let (error_sum, count) = sum_slot_error_totals(&self.global_slot_errors, start, end);
         let average = if count > 0 {
             error_sum / count as f64
         } else {
@@ -157,14 +136,6 @@ impl SolverSnapshot {
             count,
             average,
         }
-    }
-
-    /// All assignments in exactly `slot`.
-    pub fn get_requests_in_slot(&self, slot: i32) -> Vec<&Assignment> {
-        self.assignments
-            .values()
-            .filter(|a| a.scheduled_slot == slot)
-            .collect()
     }
 
     /// Cumulative error stats.
@@ -202,27 +173,14 @@ impl SolverSnapshot {
         center_slot: i32,
         window_past: i32,
         window_future: i32,
-        exclude: &HashSet<u64>,
     ) -> WindowErrorStats {
         let start = center_slot - window_past;
         let end = center_slot + window_future;
-        let (error_sum, count) = if exclude.is_empty() {
-            self.profile_slot_errors
-                .get(profile_id)
-                .map(|slots| sum_slot_error_totals(slots, start, end))
-                .unwrap_or_default()
-        } else {
-            self.assignments
-                .values()
-                .filter(|assignment| {
-                    assignment.qos_profile_id == *profile_id
-                        && !exclude.contains(&assignment.request_id)
-                        && (start..=end).contains(&assignment.scheduled_slot)
-                })
-                .fold((0.0, 0), |(sum, count), assignment| {
-                    (sum + assignment.error, count + 1)
-                })
-        };
+        let (error_sum, count) = self
+            .profile_slot_errors
+            .get(profile_id)
+            .map(|slots| sum_slot_error_totals(slots, start, end))
+            .unwrap_or_default();
         WindowErrorStats {
             error_sum,
             count,
@@ -232,20 +190,6 @@ impl SolverSnapshot {
                 0.0
             },
         }
-    }
-
-    /// Raw assignments for one profile and slot, when those rows are in this snapshot.
-    pub fn get_profile_requests_in_slot(
-        &self,
-        profile_id: &QosProfileId,
-        slot: i32,
-    ) -> Vec<&Assignment> {
-        self.assignments
-            .values()
-            .filter(|assignment| {
-                assignment.qos_profile_id == *profile_id && assignment.scheduled_slot == slot
-            })
-            .collect()
     }
 
     /// Compact per-slot error totals for one profile, ordered by slot.
@@ -442,6 +386,25 @@ impl Inner {
                 .checked_add(profile_count)
                 .ok_or_else(|| format!("slot {slot} occupancy exceeds i64"))
         })
+    }
+
+    fn assignment_counts_in_range(
+        &self,
+        from_slot: i32,
+        through_slot: i32,
+    ) -> Result<HashMap<i32, i64>, String> {
+        let slots: Vec<_> = self
+            .assignment_ids_by_slot_profile
+            .range(from_slot..=through_slot)
+            .map(|(slot, _)| *slot)
+            .collect();
+        slots
+            .into_iter()
+            .map(|slot| {
+                self.assignment_count_in_slot(slot)
+                    .map(|count| (slot, count))
+            })
+            .collect()
     }
 
     fn index_assignment(&mut self, assignment: &Assignment) {
@@ -734,7 +697,7 @@ impl SharedState {
         count: usize,
         total_slots: i32,
         default_error_window: &ErrorWindowPolicy,
-    ) -> ClaimedRequestBatch {
+    ) -> Result<ClaimedRequestBatch, String> {
         let mut g = self.inner.lock().unwrap();
         let profile_pending_count = g
             .pending
@@ -768,26 +731,24 @@ impl SharedState {
             error_window,
         );
 
-        // Initialize assignments map for this batch
-        let mut assignments = HashMap::new();
-
-        if scope.current_slot <= scope.assignment_through_slot {
-            // Index lookup copies all profiles in the candidate range: slot
-            // capacity is global even though QoS error budgets are profile-scoped.
-            for (_, by_profile) in g
-                .assignment_ids_by_slot_profile
-                .range(scope.current_slot..=scope.assignment_through_slot)
-            {
-                for request_ids in by_profile.values() {
-                    for request_id in request_ids {
-                        // Insert assignment if present
-                        if let Some(assignment) = g.assignments.get(request_id) {
-                            assignments.insert(*request_id, assignment.clone());
-                        }
-                    }
-                }
+        // Capacity pricing needs only global occupancy counts. Sum the
+        // per-profile ID-bucket lengths so the snapshot contains one count
+        // per occupied slot instead of cloning every Assignment row.
+        let baseline_slot_counts = if scope.current_slot <= scope.assignment_through_slot {
+            g.assignment_counts_in_range(scope.current_slot, scope.assignment_through_slot)
+        } else {
+            Ok(HashMap::new())
+        };
+        let baseline_slot_counts = match baseline_slot_counts {
+            Ok(counts) => counts,
+            Err(error) => {
+                // Snapshot construction failed after the claim. Restore the
+                // claimed requests before surfacing the explicit error.
+                requests.extend(g.pending.drain(..));
+                g.pending = requests;
+                return Err(error);
             }
-        }
+        };
 
         // Initialize profile slot errors map
         let mut profile_slot_errors = HashMap::new();
@@ -814,18 +775,18 @@ impl SharedState {
         };
 
         let snapshot = SolverSnapshot {
-            assignments,
+            baseline_slot_counts,
             global_error_sum: g.global_error_sum,
             global_assignment_count: g.global_assignment_count,
             profile_error_stats: g.profile_error_stats.clone(),
             profile_slot_errors,
             global_slot_errors,
         };
-        ClaimedRequestBatch {
+        Ok(ClaimedRequestBatch {
             requests,
             profile_pending_count,
             snapshot,
-        }
+        })
     }
 
     /// Return `requests` to the front of the pending queue (preserving order).
@@ -1064,8 +1025,11 @@ impl SharedState {
     /// method returns.
     pub fn snapshot_for_solver(&self) -> SolverSnapshot {
         let g = self.inner.lock().unwrap();
+        let baseline_slot_counts = g
+            .assignment_counts_in_range(i32::MIN, i32::MAX)
+            .expect("slot occupancy must fit the scheduler count type");
         SolverSnapshot {
-            assignments: g.assignments.clone(),
+            baseline_slot_counts,
             global_error_sum: g.global_error_sum,
             global_assignment_count: g.global_assignment_count,
             profile_error_stats: g.profile_error_stats.clone(),
@@ -1386,7 +1350,6 @@ impl SharedState {
         &self,
         proposal: &SolverProposal,
         pending_requests: &[Request],
-        snapshot: &SolverSnapshot,
         profile_id: &QosProfileId,
         current_slot: i32,
         flavours: &[Flavour],
@@ -1440,27 +1403,15 @@ impl SharedState {
                 )
             })?;
 
-            let (arrival_slot, deadline_slot, request_profile_id) =
-                if let Some(request) = pending_by_id.get(&placement.req_id) {
-                    (
-                        request.arrival_slot,
-                        request.deadline_slot,
-                        request.qos_profile_id(),
-                    )
-                } else if let Some(assignment) = snapshot.assignments.get(&placement.req_id) {
-                    (
-                        assignment.arrival_slot.unwrap_or(current_slot),
-                        assignment
-                            .deadline_slot
-                            .unwrap_or(assignment.scheduled_slot.max(current_slot)),
-                        assignment.qos_profile_id.clone(),
-                    )
-                } else {
-                    return Err(format!(
-                        "solver proposal references unknown request {}",
-                        placement.req_id
-                    ));
-                };
+            let request = pending_by_id.get(&placement.req_id).ok_or_else(|| {
+                format!(
+                    "solver proposal references unclaimed request {}",
+                    placement.req_id
+                )
+            })?;
+            let arrival_slot = request.arrival_slot;
+            let deadline_slot = request.deadline_slot;
+            let request_profile_id = request.qos_profile_id();
             if request_profile_id != *profile_id {
                 return Err(format!(
                     "solver proposal request {} belongs to profile {}, not {}",
@@ -1861,12 +1812,14 @@ mod tests {
             future_slots: 2,
             past_decay_slots: 0,
         };
-        let batch = state.claim_pending_requests_for_profile_with_snapshot(
-            &QosProfileId::default_profile(),
-            1,
-            24,
-            &default_error_window,
-        );
+        let batch = state
+            .claim_pending_requests_for_profile_with_snapshot(
+                &QosProfileId::default_profile(),
+                1,
+                24,
+                &default_error_window,
+            )
+            .unwrap();
 
         assert_eq!(
             batch
@@ -1877,11 +1830,11 @@ mod tests {
             vec![1]
         );
         assert_eq!(batch.profile_pending_count, 2);
-        assert!(batch.snapshot.assignments.contains_key(&99));
+        assert_eq!(batch.snapshot.baseline_slot_counts.get(&2), Some(&1));
         assert_eq!(state.get_pending_count(), 1);
 
         state.add_assignments(vec![make_assignment(100, 2, 2.0)]);
-        assert!(!batch.snapshot.assignments.contains_key(&100));
+        assert_eq!(batch.snapshot.baseline_slot_counts.get(&2), Some(&1));
     }
 
     #[test]
@@ -1911,21 +1864,18 @@ mod tests {
             future_slots: 0,
             past_decay_slots: 0,
         };
-        let batch = state.claim_pending_requests_for_profile_with_snapshot(
-            &QosProfileId::parse("window-profile").unwrap(),
-            1,
-            24,
-            &default_error_window,
-        );
+        let batch = state
+            .claim_pending_requests_for_profile_with_snapshot(
+                &QosProfileId::parse("window-profile").unwrap(),
+                1,
+                24,
+                &default_error_window,
+            )
+            .unwrap();
 
         assert_eq!(
-            batch
-                .snapshot
-                .assignments
-                .keys()
-                .copied()
-                .collect::<HashSet<_>>(),
-            HashSet::from([4, 5, 6, 7, 8])
+            batch.snapshot.baseline_slot_counts,
+            HashMap::from([(10, 2), (11, 1), (12, 1), (14, 1)])
         );
         assert_eq!(
             batch
@@ -1946,7 +1896,6 @@ mod tests {
             10,
             2,
             2,
-            &HashSet::new(),
         );
         assert_eq!(window.count, 4);
         assert_eq!(window.error_sum, 18.0);
@@ -2286,10 +2235,9 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_snapshots_both_commit_and_price_at_current_occupancy() {
+    fn concurrent_commits_price_at_current_occupancy() {
         let state = SharedState::new();
         let profile_id = QosProfileId::default_profile();
-        let snapshot = Arc::new(state.snapshot_for_solver());
         let barrier = Arc::new(Barrier::new(2));
         let flavours = Arc::new(vec![Flavour {
             name: "Accurate".to_string(),
@@ -2311,7 +2259,6 @@ mod tests {
         let workers: Vec<_> = (0..2)
             .map(|id| {
                 let state = state.clone();
-                let snapshot = snapshot.clone();
                 let barrier = barrier.clone();
                 let profile_id = profile_id.clone();
                 let flavours = flavours.clone();
@@ -2326,7 +2273,6 @@ mod tests {
                     state.materialize_and_commit_proposal(
                         &proposal,
                         &[request],
-                        &snapshot,
                         &profile_id,
                         0,
                         &flavours,
@@ -2356,7 +2302,6 @@ mod tests {
     fn proposal_validation_rejects_out_of_window_on_time_placements() {
         let state = SharedState::new();
         let profile_id = QosProfileId::default_profile();
-        let snapshot = state.snapshot_for_solver();
         let pending = [Request::new(1, 0, 1)];
         let proposal = SolverProposal {
             placements: vec![ProposedPlacement::new(1, 2, "Accurate".to_string())],
@@ -2371,7 +2316,6 @@ mod tests {
             .materialize_and_commit_proposal(
                 &proposal,
                 &pending,
-                &snapshot,
                 &profile_id,
                 0,
                 &flavours,
@@ -2386,10 +2330,41 @@ mod tests {
     }
 
     #[test]
+    fn proposal_validation_rejects_unclaimed_ids_even_if_already_assigned() {
+        let state = SharedState::new();
+        state.add_assignments(vec![make_assignment(99, 0, 1.0)]);
+        let profile_id = QosProfileId::default_profile();
+        let pending = [Request::new(1, 0, 0)];
+        let proposal = SolverProposal {
+            placements: vec![ProposedPlacement::new(99, 0, "Balanced".to_owned())],
+        };
+        let flavours = [Flavour {
+            name: "Balanced".to_owned(),
+            error: 0.0,
+            duration: 10.0,
+        }];
+
+        let error = state
+            .materialize_and_commit_proposal(
+                &proposal,
+                &pending,
+                &profile_id,
+                0,
+                &flavours,
+                &[100.0],
+                &[],
+                1.0,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("references unclaimed request 99"));
+        assert_eq!(state.get_assignment(99).unwrap().carbon_cost, 1.0);
+    }
+
+    #[test]
     fn proposal_validation_accepts_late_placement_at_current_slot() {
         let state = SharedState::new();
         let profile_id = QosProfileId::default_profile();
-        let snapshot = state.snapshot_for_solver();
         let pending = [Request::new(1, 0, 0)];
         let proposal = SolverProposal {
             placements: vec![ProposedPlacement::late(1, 1, "Accurate".to_string())],
@@ -2404,7 +2379,6 @@ mod tests {
             .materialize_and_commit_proposal(
                 &proposal,
                 &pending,
-                &snapshot,
                 &profile_id,
                 1,
                 &flavours,
@@ -2422,7 +2396,6 @@ mod tests {
     fn incomplete_proposal_is_rejected_without_partial_commit() {
         let state = SharedState::new();
         let profile_id = QosProfileId::default_profile();
-        let snapshot = state.snapshot_for_solver();
         let pending = [Request::new(1, 0, 0), Request::new(2, 0, 0)];
         let proposal = SolverProposal {
             placements: vec![ProposedPlacement::new(1, 0, "Accurate".to_string())],
@@ -2437,7 +2410,6 @@ mod tests {
             .materialize_and_commit_proposal(
                 &proposal,
                 &pending,
-                &snapshot,
                 &profile_id,
                 0,
                 &flavours,
@@ -2464,21 +2436,25 @@ mod tests {
 
         let snap = state.snapshot_for_solver();
 
-        // Future assignments from snapshot match those from direct call.
-        let mut direct = state.get_future_assignments(5);
-        let mut from_snap = snap.get_future_assignments(5);
-        direct.sort_by_key(|a| a.request_id);
-        from_snap.sort_by_key(|a| a.request_id);
-        assert_eq!(direct.len(), from_snap.len());
-        for (d, s) in direct.iter().zip(from_snap.iter()) {
-            assert_eq!(d.request_id, s.request_id);
-            assert_eq!(d.scheduled_slot, s.scheduled_slot);
-        }
+        // The snapshot keeps only per-slot occupancy counts, not assignment rows.
+        let expected_counts = state.get_future_assignments(5).into_iter().fold(
+            HashMap::new(),
+            |mut counts, assignment| {
+                *counts.entry(assignment.scheduled_slot).or_insert(0) += 1;
+                counts
+            },
+        );
+        let snapshot_counts = snap
+            .baseline_slot_counts
+            .iter()
+            .filter(|(slot, _)| **slot >= 5)
+            .map(|(slot, count)| (*slot, *count))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(snapshot_counts, expected_counts);
 
         // Window error stats match.
-        let excl = HashSet::new();
-        let direct_ws = state.get_window_error_stats(5, 3, 3, &excl);
-        let snap_ws = snap.get_window_error_stats(5, 3, 3, &excl);
+        let direct_ws = state.get_window_error_stats(5, 3, 3, &HashSet::new());
+        let snap_ws = snap.get_window_error_stats(5, 3, 3);
         assert!((direct_ws.error_sum - snap_ws.error_sum).abs() < 1e-12);
         assert_eq!(direct_ws.count, snap_ws.count);
 
@@ -2488,9 +2464,8 @@ mod tests {
         assert!((direct_gs.error_sum - snap_gs.error_sum).abs() < 1e-12);
         assert_eq!(direct_gs.count, snap_gs.count);
 
-        // Per-slot lookup.
-        assert_eq!(snap.get_requests_in_slot(3).len(), 1);
-        assert_eq!(snap.get_requests_in_slot(4).len(), 1);
-        assert_eq!(snap.get_requests_in_slot(99).len(), 0);
+        assert_eq!(snap.baseline_slot_counts.get(&3), Some(&1));
+        assert_eq!(snap.baseline_slot_counts.get(&4), Some(&1));
+        assert_eq!(snap.baseline_slot_counts.get(&99), None);
     }
 }

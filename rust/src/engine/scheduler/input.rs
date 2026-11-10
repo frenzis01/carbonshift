@@ -1,6 +1,6 @@
 //! Convert a claim-time scheduler snapshot into the common solver contract.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::config::AssignmentPolicy;
 use crate::engine::solver::{
@@ -75,18 +75,12 @@ pub(super) fn build_solve_input_from_snapshot(
         })
         .collect::<Result<Vec<_>, SolverError>>()?;
 
-    let mut baseline_slot_counts: HashMap<i32, i64> = HashMap::new();
-    for existing in snapshot.get_future_assignments(current_slot) {
-        let count = baseline_slot_counts
-            .entry(existing.scheduled_slot)
-            .or_insert(0);
-        *count = count.checked_add(1).ok_or_else(|| {
-            SolverError::Algorithm(format!(
-                "slot {} baseline occupancy overflowed i64",
-                existing.scheduled_slot
-            ))
-        })?;
-    }
+    let baseline_slot_counts = snapshot
+        .baseline_slot_counts
+        .iter()
+        .filter(|(slot, _)| **slot >= current_slot)
+        .map(|(slot, count)| (*slot, *count))
+        .collect();
 
     let mut err_by_slot: HashMap<i32, ErrorTotals> = HashMap::new();
     for (slot, error_sum, count) in snapshot.get_profile_error_totals(&profile_id) {
@@ -105,7 +99,6 @@ pub(super) fn build_solve_input_from_snapshot(
         current_slot,
         assignment.error_window_past,
         assignment.error_window_future,
-        &HashSet::new(),
     );
     let baseline = ErrorBaseline::new(window.error_sum, window.count as f64);
     let baseline =

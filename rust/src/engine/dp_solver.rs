@@ -291,6 +291,13 @@ impl DpSolver {
 
         let start = Instant::now();
 
+        // compute_sequential_solution sorts requests by deadline, to assign first
+        // the ones which are more constrained. Even though here is not that necessary,
+        // we still sort them here for consistency
+        // sort requests by deadline
+        let mut requests: Vec<_> = input.requests.iter().enumerate().collect();
+        requests.sort_by_key(|(_, r)| r.assignment_deadline_slot);
+
         // Process requests in order. Each transition tries every flavour and
         // legal slot, then merges paths that reach the same accounting state.
         for (req_idx, request) in input.requests.iter().enumerate() {
@@ -522,8 +529,12 @@ impl DpSolver {
         let mut keys = vec![key.clone()];
         let mut assignments = Vec::new();
 
-        for (req_idx, request) in input.requests.iter().enumerate() {
-            let deadline = deadlines[req_idx];
+        // sort requests by deadline
+        let mut requests: Vec<_> = input.requests.iter().enumerate().collect();
+        requests.sort_by_key(|(_, r)| r.assignment_deadline_slot);
+
+        for (i, (req_idx, request)) in requests.iter().enumerate() {
+            let deadline = deadlines[*req_idx];
             let earliest_slot = request.arrival_slot.max(input.current_slot);
             let mut best: Option<(f64, &Flavour, i32)> = None;
 

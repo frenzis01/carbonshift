@@ -870,12 +870,21 @@ fn claim_next_profile_batch(
         future_slots: cfg.error_window_future,
         past_decay_slots: cfg.error_window_past_decay_slots,
     };
-    let claimed = shared_state.claim_pending_requests_for_profile_with_snapshot(
+    let claimed = match shared_state.claim_pending_requests_for_profile_with_snapshot(
         &profile_id,
         pending_count.min(cfg.solver.batch_size),
         cfg.total_slots,
         &default_error_window,
-    );
+    ) {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            eprintln!("Could not capture slot occupancy snapshot: {error}");
+            scheduler_state
+                .last_infeasible
+                .insert(profile_id, (slot, pending_count));
+            return None;
+        }
+    };
     if claimed.requests.len() < min_pending {
         shared_state.requeue_pending_requests_front(claimed.requests);
         return None;
@@ -1232,7 +1241,6 @@ fn batch_worker_entry(
     let committed = match shared_state.materialize_and_commit_proposal(
         &pending_proposal.proposal,
         &pending,
-        &snapshot,
         &profile_id,
         slot,
         assignment.flavours,
