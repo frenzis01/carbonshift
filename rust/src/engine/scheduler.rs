@@ -307,9 +307,10 @@ impl BatchScheduler {
     /// with its queue claim; proposals are committed as-is, with carbon costs
     /// recalculated against live slot occupancy.
     ///
-    /// Simulation runners use this constructor to exercise the configured
-    /// worker cap. The default constructor retains the live service's
-    /// one-worker-per-profile behavior.
+    /// The live service and simulation runners use this constructor so the
+    /// configured worker cap can be used across batches from the same profile.
+    /// [`BatchScheduler::new`] retains per-profile serialization for callers
+    /// that require it.
     pub fn new_with_parallel_profile_batches(
         shared_state: SharedState,
         cfg: Arc<Config>,

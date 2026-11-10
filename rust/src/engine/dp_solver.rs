@@ -97,6 +97,65 @@ pub struct SolveBatchInput<'a> {
     pub forecast_max_slot: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DeadlineOrderedRequest<'a> {
+    input_index: usize,
+    request: &'a SolveRequest,
+    effective_deadline_slot: i32,
+}
+
+/// Normalize each request's effective bound once and use that same ordering
+/// for the warm-start path and every DP layer.
+/// assignment_deadline_slot already provides a valid and capped deadline,
+/// but we still normalize as a defensive approach.
+fn order_requests_by_effective_deadline<'a>(
+    requests: &'a [SolveRequest],
+    current_slot: i32,
+    future_slots: i32,
+    forecast_cap: i32,
+    window_size: i32,
+) -> Option<Vec<DeadlineOrderedRequest<'a>>> {
+    if future_slots < 0 || window_size <= 0 {
+        return None;
+    }
+
+    let last_slot = window_size - 1;
+    let mut ordered = Vec::with_capacity(requests.len());
+    for (input_index, request) in requests.iter().enumerate() {
+        let effective_deadline_slot = if current_slot > request.deadline_slot {
+            current_slot
+        } else {
+            let arrival_horizon = i64::from(request.arrival_slot) + i64::from(future_slots);
+            let deadline = i64::from(request.assignment_deadline_slot)
+                .min(i64::from(request.deadline_slot))
+                .min(arrival_horizon)
+                .min(i64::from(forecast_cap))
+                .min(i64::from(last_slot));
+            i32::try_from(deadline).ok()?
+        };
+
+        if request.arrival_slot.max(current_slot) > effective_deadline_slot {
+            return None;
+        }
+
+        ordered.push(DeadlineOrderedRequest {
+            input_index,
+            request,
+            effective_deadline_slot,
+        });
+    }
+
+    ordered.sort_by_key(|item| {
+        (
+            item.effective_deadline_slot,
+            item.request.arrival_slot,
+            item.request.request_id,
+            item.input_index,
+        )
+    });
+    Some(ordered)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ErrorWindowBaseline {
     /// Sum of errors already present in the profile's active window.
@@ -191,37 +250,18 @@ impl DpSolver {
             .min(self.window_size - 1)
             .max(input.current_slot);
 
-        // Keep the assignment horizon in one place: each request may be
-        // scheduled through arrival + its profile's future-window size. The
-        // forecast cap can shorten that range, but never expand it.
-        let deadlines: Vec<i32> = input
-            .requests
-            .iter()
-            .map(|request| {
-                if input.current_slot > request.deadline_slot {
-                    // Preserve late work at the current slot for the existing
-                    // late/fallback handling.
-                    input.current_slot
-                } else {
-                    let arrival_horizon =
-                        i64::from(request.arrival_slot) + i64::from(input.error_window_future);
-                    i64::from(request.assignment_deadline_slot)
-                        .min(arrival_horizon)
-                        .min(i64::from(forecast_cap))
-                        .min(i64::from(self.window_size - 1)) as i32
-                }
-            })
-            .collect();
-        if input
-            .requests
-            .iter()
-            .zip(&deadlines)
-            .any(|(request, deadline)| request.arrival_slot.max(input.current_slot) > *deadline)
-        {
-            // At least one request has no legal slot, so expanding a partial
-            // batch would only produce assignments that the caller cannot use.
+        // `assignment_deadline_slot` is already capped in the common solver
+        // path. Reapply the arrival, forecast, and horizon caps defensively
+        // for direct callers, then sort once so warm keys match DP prefixes.
+        let Some(ordered_requests) = order_requests_by_effective_deadline(
+            &input.requests,
+            input.current_slot,
+            input.error_window_future,
+            forecast_cap,
+            self.window_size,
+        ) else {
             return vec![];
-        }
+        };
 
         // Copy fixed assignments into an indexed array; state transitions can
         // then price each candidate slot without repeatedly looking up a map.
@@ -243,7 +283,7 @@ impl DpSolver {
         // good upper bound on cost.
         let (warm_assignments, warm_keys) = self.compute_sequential_solution(
             &input,
-            &deadlines,
+            &ordered_requests,
             &base_counts,
             &tiers,
             initial_error_sum_bp,
@@ -252,30 +292,10 @@ impl DpSolver {
             window_end,
         );
 
-        // NOTE: a single request is *not* special-cased here anymore. The
-        // sequential/warm-start solution above only ever tracks the single
-        // cheapest (flavour, slot) pair — it has no notion of the error
-        // constraint while picking it. A previous shortcut returned that one
-        // candidate directly (rejecting the whole request as infeasible if
-        // it happened to violate the error threshold), which meant it never
-        // considered a slightly costlier but constraint-satisfying
-        // alternative. The general per-request DP layer below evaluates
-        // *every* (flavour, slot) pair as its own candidate state and only
-        // filters by the error threshold at the end (same as for N>1), so
-        // falling through here fixes that without adding new logic.
-
-        // `compute_sequential_solution` picks purely by minimum cost — it has
-        // no notion of `max_error_threshold` at all (unlike `SingletonBestAlgorithm`
-        // and `greedy_fallback`, which both skip/avoid infeasible candidates
-        // and only fall back to the most-accurate flavour as a last resort).
-        // So `warm_assignments` is *not* guaranteed to respect the constraint,
-        // even though it is used below as a real returned answer (DP dead-end,
-        // DP timeout). Check its final accumulated error once, up front, and
-        // reuse this single verdict at every such site: if it violates the
-        // threshold, treat it exactly like the end-of-loop feasibility filter
-        // does — signal genuine infeasibility (`vec![]`) instead of silently
-        // returning a constraint-violating solution, so the caller routes to
-        // `greedy_fallback` (same rule, applied consistently everywhere).
+        // The warm start enforces the running error threshold greedily, but
+        // cannot choose a temporarily over-budget flavour expecting later
+        // requests to compensate. The joint DP keeps those alternatives and
+        // checks feasibility on complete paths.
         let warm_is_feasible = input.max_error_threshold.map_or(true, |threshold| {
             warm_keys.last().map_or(true, |k| {
                 let ec = k.error_count();
@@ -291,17 +311,11 @@ impl DpSolver {
 
         let start = Instant::now();
 
-        // compute_sequential_solution sorts requests by deadline, to assign first
-        // the ones which are more constrained. Even though here is not that necessary,
-        // we still sort them here for consistency
-        // sort requests by deadline
-        let mut requests: Vec<_> = input.requests.iter().enumerate().collect();
-        requests.sort_by_key(|(_, r)| r.assignment_deadline_slot);
-
-        // Process requests in order. Each transition tries every flavour and
-        // legal slot, then merges paths that reach the same accounting state.
-        for (req_idx, request) in input.requests.iter().enumerate() {
-            let deadline = deadlines[req_idx];
+        // Process the same effective-deadline order as the warm start so each
+        // warm key describes the matching DP-layer prefix.
+        for (layer_index, ordered_request) in ordered_requests.iter().enumerate() {
+            let request = ordered_request.request;
+            let deadline = ordered_request.effective_deadline_slot;
             let earliest_slot = request.arrival_slot.max(input.current_slot);
             let mut dp_curr: HashMap<DpStateKey, (f64, Vec<RequestAssignment>)> = HashMap::new();
 
@@ -405,7 +419,7 @@ impl DpSolver {
                 }
 
                 // Locate the warm-start state for this layer.
-                let warm_key = &warm_keys[req_idx + 1];
+                let warm_key = &warm_keys[layer_index + 1];
                 let warm_idx = items.iter().position(|(k, _)| k == warm_key);
 
                 // If the warm state is outside the top-K, reserve one slot for it.
@@ -515,7 +529,7 @@ impl DpSolver {
     fn compute_sequential_solution(
         &self,
         input: &SolveBatchInput<'_>,
-        deadlines: &[i32],
+        ordered_requests: &[DeadlineOrderedRequest<'_>],
         base_counts: &[i64],
         tiers: &[CapacityTier],
         initial_error_sum_bp: i64,
@@ -529,12 +543,9 @@ impl DpSolver {
         let mut keys = vec![key.clone()];
         let mut assignments = Vec::new();
 
-        // sort requests by deadline
-        let mut requests: Vec<_> = input.requests.iter().enumerate().collect();
-        requests.sort_by_key(|(_, r)| r.assignment_deadline_slot);
-
-        for (i, (req_idx, request)) in requests.iter().enumerate() {
-            let deadline = deadlines[*req_idx];
+        for ordered_request in ordered_requests {
+            let request = ordered_request.request;
+            let deadline = ordered_request.effective_deadline_slot;
             let earliest_slot = request.arrival_slot.max(input.current_slot);
             let mut best: Option<(f64, &Flavour, i32)> = None;
 
@@ -784,6 +795,44 @@ mod tests {
         counts: &'a HashMap<i32, i64>,
     ) -> SolveBatchInput<'a> {
         make_input_with_maps(requests, current_slot, tiers, counts)
+    }
+
+    #[test]
+    fn requests_are_ordered_by_normalized_assignment_deadline() {
+        let requests = [
+            SolveRequest {
+                request_id: 4,
+                arrival_slot: 0,
+                deadline_slot: 7,
+                assignment_deadline_slot: 7,
+            },
+            SolveRequest {
+                request_id: 1,
+                arrival_slot: 0,
+                deadline_slot: 7,
+                assignment_deadline_slot: 1,
+            },
+            SolveRequest {
+                request_id: 3,
+                arrival_slot: 1,
+                deadline_slot: 7,
+                assignment_deadline_slot: 7,
+            },
+            SolveRequest {
+                request_id: 2,
+                arrival_slot: 0,
+                deadline_slot: 7,
+                assignment_deadline_slot: 7,
+            },
+        ];
+
+        let ordered = order_requests_by_effective_deadline(&requests, 0, 2, 7, 8).unwrap();
+        let order: Vec<_> = ordered
+            .iter()
+            .map(|request| (request.request.request_id, request.effective_deadline_slot))
+            .collect();
+
+        assert_eq!(order, vec![(1, 1), (2, 2), (4, 2), (3, 3)]);
     }
 
     #[test]

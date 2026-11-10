@@ -176,7 +176,7 @@ async fn main() {
     ));
 
     // No RequestGenerator: HTTP submissions feed `shared_state` directly.
-    let mut scheduler = BatchScheduler::new(
+    let mut scheduler = BatchScheduler::new_with_parallel_profile_batches(
         shared_state.clone(),
         cfg.clone(),
         Arc::clone(&metrics_logger),
