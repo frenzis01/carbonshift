@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 FLAT_REQUEST_JITTER_STD_FACTOR = 0.05
+CARBON_REQUEST_ALIGNMENTS = ("in-phase", "phase-opposition", "phase-shifted")
+REQUEST_PATTERN_STARTS = ("low", "high")
 
 
 def _serialize_capacity_tiers(tiers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -60,15 +62,15 @@ def _request_rate_per_slot(
     sunset_fraction: float = 0.78,
     transition_slope: float = 20.0,
     night_floor_ratio: float = 0.40,
+    inverted: bool = False,
 ) -> List[float]:
     """
-    Compute the mean request rate for each slot following the same daylight cycle
-    as carbon intensity.
+    Compute the mean request rate for each slot following a daylight cycle.
 
     The returned values are scaled so their average over ``total_slots`` equals
-    ``requests_per_slot``.  ``night_floor_ratio`` controls how many requests
-    arrive during the night valley as a fraction of the daytime peak rate
-    (before averaging), mirroring the carbon-intensity night/day ratio.
+    ``requests_per_slot``.      ``night_floor_ratio`` controls the low part of the wave as a fraction of
+    its peak before averaging. With ``inverted=True``, that low part is during
+    the day instead of at night.
     """
     cycle = max(1, int(carbon_intensity_cycle_slots))
 
@@ -84,7 +86,8 @@ def _request_rate_per_slot(
 
     # Map [0..max_df] → [night_floor_ratio..1.0]
     cycle_shape = [
-        night_floor_ratio + (1.0 - night_floor_ratio) * (v / max_df)
+        night_floor_ratio
+        + (1.0 - night_floor_ratio) * (1.0 - v / max_df if inverted else v / max_df)
         for v in cycle_shape
     ]
 
@@ -92,6 +95,29 @@ def _request_rate_per_slot(
     scale = requests_per_slot / avg_shape if avg_shape > 0 else requests_per_slot
 
     return [cycle_shape[slot % cycle] * scale for slot in range(total_slots)]
+
+
+def _resolve_carbon_wave_flags(
+    alignment: str,
+    request_pattern_start: str,
+    carbon_night_max: float,
+    carbon_day_min: float,
+    phase_shift_fraction: float,
+) -> tuple[bool, float]:
+    if alignment not in CARBON_REQUEST_ALIGNMENTS:
+        raise ValueError(f"Unknown carbon request alignment: {alignment!r}")
+    if request_pattern_start not in REQUEST_PATTERN_STARTS:
+        raise ValueError(f"Unknown request pattern start: {request_pattern_start!r}")
+    if not math.isfinite(phase_shift_fraction) or not 0.0 <= phase_shift_fraction <= 0.5:
+        raise ValueError("carbon phase shift fraction must be between 0 and 0.5")
+
+    requests_high_by_day = request_pattern_start == "low"
+    if alignment == "phase-opposition":
+        requests_high_by_day = not requests_high_by_day
+    carbon_high_by_day_without_inversion = carbon_day_min > carbon_night_max
+    carbon_inverted = carbon_high_by_day_without_inversion != requests_high_by_day
+    phase_shift = phase_shift_fraction if alignment == "phase-shifted" else 0.0
+    return carbon_inverted, phase_shift
 
 
 def generate_carbon_intensity_forecast(
@@ -106,7 +132,7 @@ def generate_carbon_intensity_forecast(
     noise_std: float = 2.0,
     noise_persistence: float = 0.95,
     inverted: bool = False,
-    phase_shifted: bool = False,
+    phase_shift_fraction: float = 0.0,
 ) -> List[float]:
     """
     Generate synthetic carbon intensity data with realistic day/night plateaus.
@@ -141,6 +167,12 @@ def generate_carbon_intensity_forecast(
         Higher values -> steeper transitions.
         Lower values -> smoother transitions.
 
+    inverted:
+        Reverse the normal day/night carbon wave.
+
+    phase_shift_fraction:
+        Shift the carbon wave forward by this fraction of a cycle, in [0, 1).
+
     noise_std:
         Standard deviation of the short-term fluctuations.
 
@@ -157,6 +189,8 @@ def generate_carbon_intensity_forecast(
     rng = random.Random(seed)
 
     cycle = max(1, int(carbon_intensity_cycle_slots))
+    if not math.isfinite(phase_shift_fraction) or not 0.0 <= phase_shift_fraction < 1.0:
+        raise ValueError("phase_shift_fraction must be finite and in [0, 1)")
 
     forecast: List[float] = []
 
@@ -165,8 +199,7 @@ def generate_carbon_intensity_forecast(
     for slot in range(total_slots):
         x = (slot % cycle) / cycle
 
-        if phase_shifted:
-            x = (x + 0.25) % 1.0
+        x = (x + phase_shift_fraction) % 1.0
 
         rise = 1.0 / (
             1.0 + math.exp(
@@ -223,15 +256,16 @@ def generate_scenario_data(
     error_window_past_decay_slots: int = 0,
     carbon_intensity_cycle_slots: int = 24,
     capacity_tiers: Optional[List[Dict[str, Any]]] = None,
-    carbon_night_max: float = 160.0,
-    carbon_day_min: float = 70.0,
+    carbon_night_max: float = 75.0,
+    carbon_day_min: float = 170.0,
     carbon_sunrise_fraction: float = 0.30,
     carbon_sunset_fraction: float = 0.78,
     carbon_transition_slope: float = 20.0,
     carbon_noise_std: float = 1.5,
     carbon_noise_persistence: float = 0.97,
-    carbon_inverted: bool = False,
-    carbon_shifted_phase: bool = False,
+    carbon_request_alignment: str = "phase-shifted",
+    request_pattern_start: str = "low",
+    carbon_phase_shift_fraction: float = 0.25,
     request_night_floor_ratio: float = 0.40,
     input_pattern: str = "sinusoidal",
 ) -> Dict[str, Any]:
@@ -246,19 +280,25 @@ def generate_scenario_data(
     ``total_slots`` retains the full planning and forecast horizon. Generated
     deadlines may use that full horizon.
 
-    ``input_pattern`` controls request arrivals only: ``sinusoidal`` follows
-    the carbon daylight shape, while ``flat`` adds small, deterministic
-    Gaussian slot-count jitter (5% of the target rate) and preserves the
-    rounded total request count. Both patterns retain random sub-slot arrival
-    jitter.
-    The ``carbon_*`` and ``request_night_floor_ratio`` parameters shape the
-    daylight wave (see `generate_carbon_intensity_forecast` /
-    `_request_rate_per_slot`). Their defaults match `scenario_config.py`;
-    callers (e.g. `generate_scenario.py`) should pass explicit values sourced
-    from that module rather than relying on these hardcoded fallbacks.
+    ``input_pattern`` controls request arrivals: ``sinusoidal`` follows the
+    daylight shape and ``flat`` adds small, deterministic Gaussian slot-count
+    jitter (5% of the target rate), preserving the rounded total. Both retain
+    random sub-slot arrival jitter.
+
+    For sinusoidal inputs, ``request_pattern_start`` selects low demand at
+    night/high by day or its inverse. ``carbon_request_alignment`` sets carbon
+    intensity in phase, opposed, or shifted by a quarter cycle relative to
+    that request wave.
     """
     if input_pattern not in {"flat", "sinusoidal"}:
         raise ValueError(f"Unknown input pattern: {input_pattern!r}")
+    carbon_inverted, phase_shift_fraction = _resolve_carbon_wave_flags(
+        carbon_request_alignment,
+        request_pattern_start,
+        carbon_night_max,
+        carbon_day_min,
+        carbon_phase_shift_fraction,
+    )
 
     input_slots = total_slots if request_slots is None else int(request_slots)
     if not 1 <= input_slots <= total_slots:
@@ -280,7 +320,7 @@ def generate_scenario_data(
         noise_std=carbon_noise_std,
         noise_persistence=carbon_noise_persistence,
         inverted=carbon_inverted,
-        phase_shifted=carbon_shifted_phase,
+        phase_shift_fraction=phase_shift_fraction,
     )
 
     requests: List[Dict[str, Any]] = []
@@ -296,6 +336,7 @@ def generate_scenario_data(
             sunset_fraction=carbon_sunset_fraction,
             transition_slope=carbon_transition_slope,
             night_floor_ratio=request_night_floor_ratio,
+            inverted=request_pattern_start == "high",
         )
         request_counts = []
         for mean_rate in rate_per_slot:
@@ -361,6 +402,9 @@ def generate_scenario_data(
         "metadata": {
             "seed": int(seed),
             "input_pattern": input_pattern,
+            "carbon_request_alignment": carbon_request_alignment,
+            "request_pattern_start": request_pattern_start,
+            "carbon_phase_shift_fraction": float(carbon_phase_shift_fraction),
             "total_slots": int(total_slots),
             **({"input_total_slots": input_slots} if input_slots < total_slots else {}),
             "slot_duration_seconds": float(slot_duration_seconds),

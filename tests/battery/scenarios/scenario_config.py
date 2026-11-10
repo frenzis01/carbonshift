@@ -41,6 +41,15 @@ ERROR_WINDOW_PAST: int = 12
 ERROR_WINDOW_FUTURE: int = 14
 ERROR_WINDOW_PAST_DECAY_SLOTS: int = 0
 
+# ── request/carbon sinusoidal relationship ────────────────────────────────────
+# Carbon alignment relative to the request wave: "in-phase", "phase-opposition",
+# or "phase-shifted" (a quarter-cycle shift between the first two).
+CARBON_REQUEST_ALIGNMENT: str = "phase-shifted"
+# Fraction of one cycle, from in-phase (0.0) toward phase opposition (0.5).
+CARBON_PHASE_SHIFT_FRACTION: float = 0.25
+# "low" means low requests at night and high requests by day; "high" inverts it.
+REQUEST_PATTERN_START: str = "low"
+
 # ── carbon intensity daylight wave ───────────────────────────────────────────
 # Period (slots) of the sinusoidal carbon-intensity wave. 24 == one daily cycle
 # when each slot represents one hour.
@@ -58,14 +67,10 @@ CARBON_SUNSET_FRACTION: float = 0.78
 CARBON_TRANSITION_SLOPE: float = 20.0
 CARBON_NOISE_STD: float = 1.5
 CARBON_NOISE_PERSISTENCE: float = 0.97
-CARBON_INVERTED: bool = True
-CARBON_SHIFTED_PHASE: bool = False
 
 # ── request-rate daylight wave ───────────────────────────────────────────────
-# Requests follow the same sunrise/sunset/transition_slope shape as carbon
-# intensity (see CARBON_* above). REQUEST_NIGHT_FLOOR_RATIO controls how low
-# the night valley dips relative to the daytime peak, before the whole curve
-# is rescaled so its average equals PREDICTED_REQUESTS_PER_SLOT.
+# REQUEST_NIGHT_FLOOR_RATIO controls the low part of the request wave before
+# the curve is rescaled so its average equals PREDICTED_REQUESTS_PER_SLOT.
 REQUEST_NIGHT_FLOOR_RATIO: float = 0.40
 
 # ── capacity tiers (rebound effect) ──────────────────────────────────────────

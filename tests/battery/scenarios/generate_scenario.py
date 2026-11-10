@@ -40,6 +40,9 @@ def generate_and_save_scenario(
     carbon_intensity_cycle_slots: Optional[int] = None,
     capacity_tiers: Optional[list] = None,
     input_pattern: str = cfg.INPUT_PATTERN,
+    carbon_request_alignment: str = cfg.CARBON_REQUEST_ALIGNMENT,
+    carbon_phase_shift_fraction: float = cfg.CARBON_PHASE_SHIFT_FRACTION,
+    request_pattern_start: str = cfg.REQUEST_PATTERN_START,
 ) -> Dict[str, Any]:
     if error_window_past_decay_slots is None:
         error_window_past_decay_slots = int(cfg.ERROR_WINDOW_PAST_DECAY_SLOTS)
@@ -69,8 +72,9 @@ def generate_and_save_scenario(
         carbon_transition_slope=float(cfg.CARBON_TRANSITION_SLOPE),
         carbon_noise_std=float(cfg.CARBON_NOISE_STD),
         carbon_noise_persistence=float(cfg.CARBON_NOISE_PERSISTENCE),
-        carbon_inverted=bool(cfg.CARBON_INVERTED),
-        carbon_shifted_phase=bool(cfg.CARBON_SHIFTED_PHASE),
+        carbon_request_alignment=carbon_request_alignment,
+        carbon_phase_shift_fraction=carbon_phase_shift_fraction,
+        request_pattern_start=request_pattern_start,
         request_night_floor_ratio=float(cfg.REQUEST_NIGHT_FLOOR_RATIO),
         input_pattern=input_pattern,
     )
@@ -119,7 +123,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--carbon-intensity-cycle-slots",
         type=int,
         default=int(cfg.CARBON_INTENSITY_CYCLE_SLOTS),
-        help="Period (slots) of the carbon wave; sinusoidal requests follow its daylight shape.",
+        help="Period (slots) of the carbon/request waves; their relative phase is configurable.",
     )
     return parser
 

@@ -69,6 +69,10 @@ scenarios            : list        – each entry has:
     input_pattern        : str     – "sinusoidal" (default) or "flat"; flat distributes
                                      requests nearly evenly with low count jitter, preserves
                                      the rounded total, and keeps sub-slot jitter
+    carbon_request_alignment: str  – sinusoidal-only relationship to the carbon wave:
+                                     "in-phase", "phase-opposition", "phase-shifted"
+    carbon_phase_shift_fraction: float – shifted-wave offset in [0.0, 0.5]
+    request_pattern_start: str     – sinusoidal-only request orientation: "low" or "high"
     capacity_tiers       : list    – optional; falls back to scenarios/scenario_config.py defaults
 """
 from __future__ import annotations
@@ -163,8 +167,24 @@ def _generate_scenario(
             scenario_def.get("max_error_threshold", scenario_config.MAX_ERROR_THRESHOLD),
         ),
         capacity_tiers=tiers,
-        carbon_inverted=bool(scenario_config.CARBON_INVERTED),
-        carbon_shifted_phase=bool(scenario_config.CARBON_SHIFTED_PHASE),
+        carbon_request_alignment=str(
+            scenario_def.get(
+                "carbon_request_alignment",
+                scenario_config.CARBON_REQUEST_ALIGNMENT,
+            )
+        ),
+        carbon_phase_shift_fraction=float(
+            scenario_def.get(
+                "carbon_phase_shift_fraction",
+                scenario_config.CARBON_PHASE_SHIFT_FRACTION,
+            )
+        ),
+        request_pattern_start=str(
+            scenario_def.get(
+                "request_pattern_start",
+                scenario_config.REQUEST_PATTERN_START,
+            )
+        ),
         input_pattern=str(scenario_def.get("input_pattern", scenario_config.INPUT_PATTERN)),
     )
     save_json(output_path, data)
@@ -541,6 +561,11 @@ def _make_result_row(
     }
 
 
+def _format_carbon_saving(result_row: Dict[str, Any]) -> str:
+    saving = result_row["baseline_carbon_cost"] - result_row["carbon_cost"]
+    return f"{saving:.3f} gCO2 ({result_row['carbon_saving']:.1f}%)"
+
+
 def _run_baseline_only(
     scenario_path: Path,
     output_dir: Path,
@@ -625,7 +650,7 @@ def _run_dp_phase(
                 f"solver_ms={result_row['solver_time_ms_avg']:.1f}, "
                 f"carbon={result_row['carbon_cost']:.3f}, "
                 f"error={result_row['final_global_error']:.3f}, "
-                f"saving={result_row['carbon_saving']:.1f}%, "
+                f"saving={_format_carbon_saving(result_row)}, "
                 f"elapsed={run_elapsed:.1f}s"
             )
     return all_rows, per_n_timing_rows
@@ -686,7 +711,7 @@ def _run_online_phase(
                 f"solver_ms={result_row['solver_time_ms_avg']:.1f}, "
                 f"carbon={result_row['carbon_cost']:.3f}, "
                 f"error={result_row['final_global_error']:.3f}, "
-                f"saving={result_row['carbon_saving']:.1f}%, "
+                f"saving={_format_carbon_saving(result_row)}, "
                 f"elapsed={run_elapsed:.1f}s"
             )
     return all_rows, per_n_timing_rows
@@ -745,7 +770,7 @@ def _run_offline_phase(
                 f"    [rust/{strategy_label}]: "
                 f"carbon={result_row['carbon_cost']:.3f}, "
                 f"error={result_row['final_global_error']:.3f}, "
-                f"saving={result_row['carbon_saving']:.1f}%, "
+                f"saving={_format_carbon_saving(result_row)}, "
                 f"elapsed={run_elapsed:.1f}s"
             )
     return all_rows, per_n_timing_rows
@@ -759,20 +784,19 @@ def _format_run_folder_name(
     max_batch_solver_parallelism: int,
     realtime_slots: bool,
     realtime_speed_scale: float,
-    alt_strategies_enabled: bool,
 ) -> str:
     """Build the per-run results subfolder name.
 
-    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>_<realtime_scale>_<altstratT|F>
-    - realtime_scale is "0" when realtime_slots is disabled, otherwise the
-      configured speed scale with its decimal point stripped (0.5 -> "05").
-    - altstrat is "T" if any online/additional alternative strategy is enabled.
+    Format: <battery_id>_<mmdd>_<hhmm>_<parallelism>[_<realtime_scale>]
+    The configured realtime scale (with its decimal point stripped) is included
+    only when realtime slot pacing is enabled.
     """
     mmdd = start_dt.strftime("%m%d")
     hhmm = start_dt.strftime("%H%M")
-    scale_token = str(realtime_speed_scale).replace(".", "") if realtime_slots else "0"
-    altstrat_token = "T" if alt_strategies_enabled else "F"
-    return f"{battery_id}_{mmdd}_{hhmm}_{max_batch_solver_parallelism}_{scale_token}_{altstrat_token}"
+    parts = [battery_id, mmdd, hhmm, str(max_batch_solver_parallelism)]
+    if realtime_slots:
+        parts.append(str(realtime_speed_scale).replace(".", ""))
+    return "_".join(parts)
 
 
 # Rust scalar Config fields worth surfacing in the run README, mapped to a
@@ -1019,7 +1043,7 @@ def run_battery(config_path: Path) -> None:
 
     run_folder_name = _format_run_folder_name(
         battery_id, start_dt, max_batch_solver_parallelism,
-        realtime_slots, realtime_speed_scale, alt_strategies_enabled,
+        realtime_slots, realtime_speed_scale,
     )
     output_dir = base_output_dir / run_folder_name
     output_dir.mkdir(parents=True, exist_ok=True)

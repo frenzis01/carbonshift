@@ -44,6 +44,16 @@ def test_battery_runner_does_not_emit_obsolete_runtime_controls(tmp_path):
     assert "infeasibility_recovery_mode" not in config["runner"]
 
 
+def test_carbon_saving_formatter_reports_amount_and_percentage():
+    result_row = {
+        "baseline_carbon_cost": 1000.0,
+        "carbon_cost": 500.0,
+        "carbon_saving": 50.0,
+    }
+
+    assert rb._format_carbon_saving(result_row) == "500.000 gCO2 (50.0%)"
+
+
 def test_output_schema_guard_accepts_only_the_declared_version(tmp_path):
     manifest_path = tmp_path / "output_schema.json"
     manifest_path.write_text(
@@ -88,6 +98,26 @@ def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path)
     assert scenario["metadata"]["error_window_future"] == 14
     assert "input_total_slots" not in scenario["metadata"]
     assert len(scenario["carbon_forecast"]) == 2
+
+
+def test_generated_scenario_uses_sinusoidal_wave_overrides(tmp_path):
+    scenario = rb._generate_scenario(
+        {
+            "id": "wave",
+            "seed": 3,
+            "total_slots": 24,
+            "requests_per_slot": 4.0,
+            "input_pattern": "sinusoidal",
+            "carbon_request_alignment": "phase-opposition",
+            "carbon_phase_shift_fraction": 0.4,
+            "request_pattern_start": "high",
+        },
+        tmp_path / "wave.json",
+    )
+
+    assert scenario["metadata"]["carbon_request_alignment"] == "phase-opposition"
+    assert scenario["metadata"]["carbon_phase_shift_fraction"] == 0.4
+    assert scenario["metadata"]["request_pattern_start"] == "high"
 
 
 def test_future_assignment_trimming_extends_horizon_without_extra_arrivals(tmp_path):
@@ -311,16 +341,16 @@ def test_rust_invocation_uses_scenario_input_horizon_for_trimming(tmp_path, monk
 
 # ─── _format_run_folder_name ───────────────────────────────────────────────
 
-def test_folder_name_realtime_disabled_uses_zero_token():
+def test_folder_name_realtime_disabled_omits_scale_token():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, False, 0.5, False)
-    assert name == "mybattery_0709_1123_20_0_F"
+    name = rb._format_run_folder_name("mybattery", dt, 20, False, 0.5)
+    assert name == "mybattery_0709_1123_20"
 
 
 def test_folder_name_realtime_enabled_strips_dot_from_scale():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.5, True)
-    assert name == "mybattery_0709_1123_20_05_T"
+    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.5)
+    assert name == "mybattery_0709_1123_20_05"
 
 
 def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
@@ -328,7 +358,7 @@ def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
 ):
     output_root = tmp_path / "results"
     output_root.mkdir()
-    battery_id = "suite_flat_unit_0"
+    battery_id = "suite_FLAT_perrequest_0"
     previous_run = output_root / f"{battery_id}_previous"
     previous_run.mkdir()
     saved_config = {}
@@ -353,16 +383,16 @@ def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
 
     monkeypatch.setattr(mr, "save_config", save_config)
     monkeypatch.setattr(mr, "run_battery", interrupt_run)
-    phase = mr.PhaseGrid("unit", {}, [{}])
 
     with pytest.raises(KeyboardInterrupt):
         mr.run_phase(
             {"output_dir": str(output_root), "scenarios": []},
-            phase,
+            mr.PhaseGrid("per_request", {}, [{}]),
             "suite",
             "flat",
         )
 
+    assert saved_config["battery_id"] == battery_id
     assert previous_run.is_dir()
     assert not (output_root / f"{battery_id}_incomplete").exists()
     assert (output_root / f"{battery_id}_completed").is_dir()
@@ -417,6 +447,7 @@ def test_multiple_runs_default_patterns_is_a_single_pattern_not_characters():
     assert mr.INPUT_PATTERNS == ("sinusoidal",)
     patterned = mr._with_input_pattern({"scenarios": [{"id": "tiny"}]}, mr.INPUT_PATTERNS[0])
     assert patterned["scenarios"][0]["input_pattern"] == "sinusoidal"
+    assert patterned["scenarios"][0]["id"] == "tiny_sine"
 
 
 def test_main_reports_interrupt_without_traceback_and_restores_config(tmp_path, monkeypatch, capsys):
@@ -443,14 +474,8 @@ def test_main_reports_interrupt_without_traceback_and_restores_config(tmp_path, 
 
 def test_folder_name_scale_with_leading_zero():
     dt = datetime(2026, 7, 9, 11, 23)
-    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.05, True)
-    assert name.endswith("_005_T")
-
-
-def test_folder_name_altstrat_false_when_no_strategies():
-    dt = datetime(2026, 1, 1, 0, 0)
-    name = rb._format_run_folder_name("b", dt, 5, False, 0.05, False)
-    assert name == "b_0101_0000_5_0_F"
+    name = rb._format_run_folder_name("mybattery", dt, 20, True, 0.05)
+    assert name.endswith("_005")
 
 
 # ─── _parse_rust_config_defaults ───────────────────────────────────────────

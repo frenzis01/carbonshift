@@ -16,7 +16,22 @@ Set `input_pattern` on a scenario in `battery_config.json` to:
   rebalanced so the rounded total over the horizon is preserved.
 
 Both patterns retain independently seeded random arrival times within each
-slot. Carbon-intensity generation is unchanged by this setting.
+slot.
+
+For `sinusoidal` scenarios, configure:
+
+- `carbon_request_alignment`: `in-phase`, `phase-opposition`, or
+  `phase-shifted` (the standalone scenario-generation default; `multiple_runs.py`
+  uses its `CARBON_REQUEST_ALIGNMENT` constant).
+- `carbon_phase_shift_fraction`: the shifted-wave offset as a fraction of the
+  cycle, from `0.0` to `0.5`; it applies only to `phase-shifted`. The default
+  `0.25` is halfway between aligned and opposed peaks.
+- `request_pattern_start`: `low` (default: night demand low, daytime demand
+  high) or `high` to invert the request wave.
+
+`multiple_runs.py` configures these with the `CARBON_REQUEST_ALIGNMENT`,
+`CARBON_PHASE_SHIFT_FRACTION`, and `REQUEST_PATTERN_START` constants beside
+`INPUT_PATTERNS`.
 
 ## Batch-worker parallelism
 
@@ -59,12 +74,13 @@ other execution-level measurements still describe the full extended run.
 horizon. These values can differ across strategy runs. Leaving
 `trim_future_assignments` absent or `false` preserves the existing behavior.
 
-`multiple_runs.py` runs each requested phase for both `sinusoidal` and `flat`
-by default. Use `--input-pattern flat` or
-`--input-pattern sinusoidal flat` to choose a subset. It adds the pattern to
-scenario and battery IDs so results from different patterns do not overwrite
-one another. For a single battery run, set `input_pattern` per scenario in
-the config; omitting it keeps the `sinusoidal` default.
+`multiple_runs.py` runs the `sinusoidal` input pattern by default. Use
+`--input-pattern flat` or `--input-pattern sinusoidal flat` to choose other
+patterns. It adds the selected pattern and sinusoidal wave settings to scenario
+and battery IDs so results do not overwrite one another. For a single battery
+run, set `input_pattern`, `carbon_request_alignment`, and
+`request_pattern_start` per scenario in the config; omitted values use the
+defaults in `scenario_config.py`.
 
 If you interrupt `multiple_runs.py` with Ctrl+C, it removes the newly created
 folder for the active run if that run is incomplete. Earlier completed runs,
