@@ -475,11 +475,12 @@ fn cheapest_feasible_flavour(
 
 /// Randomized strategy that favours low-carbon, low-capacity-cost slots.
 ///
-/// The flavour distribution still targets the configured expected error,
-/// while slot probabilities are inversely proportional to forecast carbon
-/// intensity multiplied by the capacity tier at that slot's next position.
-/// The algorithm keeps only an atomic stream counter, so concurrent solves
-/// can use reproducible independent random streams without a shared RNG lock.
+/// The flavour distribution targets the configured expected error when it is
+/// attainable, and otherwise the nearest attainable error. Slot probabilities
+/// are inversely proportional to forecast carbon intensity multiplied by the
+/// capacity tier at that slot's next position. The algorithm keeps only an
+/// atomic stream counter, so concurrent solves can use reproducible independent
+/// random streams without a shared RNG lock.
 pub struct HazardAlgorithm {
     seed: u64,
     next_stream: AtomicU64,
@@ -534,25 +535,32 @@ impl SolverAlgorithm for HazardAlgorithm {
         let mut window_count = input.qos.error_window.baseline_err.count;
         let mut window_sum = input.qos.error_window.baseline_err.sum;
 
-        // Preserve the former flavour policy: its expected error equals the
-        // configured threshold, though an individual random run can differ.
+        // Target the configured mean when possible. A restricted flavour set
+        // may not span the threshold; clamp to its nearest endpoint rather
+        // than failing every batch (for example, Accurate-only at a 4% target).
         let flavour_errors: Vec<f64> = input
             .qos
             .flavours
             .iter()
             .map(|flavour| flavour.error)
             .collect();
+        let min_flavour_error = flavour_errors.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_flavour_error = flavour_errors
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let attainable_target_error = input
+            .qos
+            .max_average_error
+            .clamp(min_flavour_error, max_flavour_error);
         let flavour_probabilities = if input
             .requests
             .iter()
             .any(|request| input.current_slot <= request.deadline_slot)
         {
             Some(
-                closest_to_uniform_flavour_probabilities(
-                    &flavour_errors,
-                    input.qos.max_average_error,
-                )
-                .map_err(SolverError::Algorithm)?,
+                closest_to_uniform_flavour_probabilities(&flavour_errors, attainable_target_error)
+                    .map_err(SolverError::Algorithm)?,
             )
         } else {
             None
@@ -1611,12 +1619,33 @@ mod tests {
     }
 
     #[test]
-    fn hazard_returns_flavour_probability_errors_instead_of_panicking() {
+    fn hazard_uses_nearest_attainable_error_when_target_is_outside_flavour_range() {
         let mut solve_input = input();
         solve_input.requests.truncate(1);
         let runtime = runtime_for("hazard");
 
-        assert!(runtime.propose(&solve_input).is_err());
+        let proposal = runtime.propose(&solve_input).unwrap();
+        assert_eq!(proposal.proposal.placements.len(), 1);
+        assert_eq!(
+            proposal.proposal.placements[0].flavour_name, "Default",
+            "the Accurate-only flavour is the nearest attainable target to 4%"
+        );
+    }
+
+    #[test]
+    fn hazard_clamps_below_the_minimum_flavour_error() {
+        let mut solve_input = input();
+        solve_input.requests.truncate(1);
+        solve_input.qos.max_average_error = 0.0;
+        solve_input.qos.flavours = vec![Flavour {
+            name: "Fast".to_owned(),
+            error: 5.0,
+            duration: 1.0,
+        }];
+
+        let proposal = runtime_for("hazard").propose(&solve_input).unwrap();
+        assert_eq!(proposal.proposal.placements.len(), 1);
+        assert_eq!(proposal.proposal.placements[0].flavour_name, "Fast");
     }
 
     #[test]

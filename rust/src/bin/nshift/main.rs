@@ -56,9 +56,9 @@
 //!   `offline_singleton_best` scans feasible slot/flavour pairs and commits the cheapest choice;
 //!   `offline_singleton_best_accurate` uses the same search with only the lowest-error flavour.
 //!   `hazard` samples flavours from the closest-to-uniform distribution whose expected error
-//!   equals the scenario threshold, then samples slots inversely to forecast intensity multiplied
-//!   by the capacity tier at the slot's next occupancy position. It is statistical, not a per-run
-//!   QoS guarantee.
+//!   equals the scenario threshold when attainable, otherwise the nearest attainable error. It
+//!   then samples slots inversely to forecast intensity multiplied by the capacity tier at the
+//!   slot's next occupancy position. It is statistical, not a per-run QoS guarantee.
 //! - `flavours`: overrides `Config::flavours` (the 3 built-in Accurate/Balanced/Fast
 //!   defaults) with `[{"name": "...", "error": <f64>, "duration_sec": <f64>}, ...]`.
 //!   Printed at startup alongside the other config knobs so it's clear which flavours
