@@ -4,9 +4,13 @@
   "_trim_future_assignments_comment": "Optional. When true, requests are still generated only in each scenario's total_slots, but the planning horizon and carbon forecast extend by ERROR_WINDOW_FUTURE slots. Assignments and request-level metrics beyond the configured total_slots are trimmed; reqs_in counts scenario inputs and reqs_out counts retained assignments.",
   "trim_future_assignments": true,
   "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat keeps a nearly constant rate with seeded 5%-of-rate slot-count jitter and the same rounded horizon total. Sinusoidal scenarios may also set carbon_request_alignment (in-phase, phase-opposition, phase-shifted), carbon_phase_shift_fraction (0.0-0.5), and request_pattern_start (low/high). Both retain random sub-slot arrival times. This does not configure client emulation.",
-  "battery_id": "cfg_test4_dp_0",
+  "battery_id": "T01_sine_IP_L_dp_0",
   "batch_sizes": [
-    4
+    1,
+    2,
+    3,
+    4,
+    5
   ],
   "online_strategies": [],
   "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. ant_colony, bandit, hazard, and singleton_best use this sweep.",
@@ -16,8 +20,8 @@
     8
   ],
   "additional_strategies": [],
-  "_flavours_comment": "Optional override of Config::default()'s 3 built-in Accurate/Balanced/Fast flavours, applied to every phase/scenario in this run. Omit (or rename away the __ suffix below) to keep nshift's built-in defaults (see config.rs).",
-  "flavours__": [
+  "_flavours_comment": "Optional flavour override shared by the baseline and every enabled phase/scenario. Edit this list to use any subset (for example, keep only Accurate), or set flavours to null to use nshift's built-in defaults.",
+  "flavours": [
     {
       "name": "Accurate",
       "error": 0.0,
@@ -37,12 +41,15 @@
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
   "_runtime_knobs_comment": "Runtime knobs below mirror the Rust solver configuration; omit them to use the documented defaults.",
-  "max_batch_solver_parallelism": 12,
+  "max_batch_solver_parallelism": 1,
+  "_aco_search_comment": "nshift simulation ACO defaults. Each batch automatically scales down ants and iterations, preserving their ratio, if their product exceeds future-window slots * flavours * batch size. The live service does not use this cap.",
+  "aco_n_ants": 10,
+  "aco_n_iterations": 3,
   "realtime_slots": false,
   "realtime_speed_scale": 1.0,
   "scenarios": [
     {
-      "id": "high_load_1500_92",
+      "id": "scen_1500_92_sine_IP_L",
       "seed": 92,
       "requests_per_slot": 1500.0,
       "total_slots": 72,
@@ -53,7 +60,7 @@
           "multiplier": 1.0
         },
         {
-          "max_requests": 3000,
+          "max_requests": 2625,
           "multiplier": 1.5
         },
         {
@@ -61,10 +68,38 @@
           "multiplier": 5.0
         }
       ],
-      "max_error_threshold": 4.0
+      "max_error_threshold": 4.0,
+      "carbon_request_alignment": "in-phase",
+      "carbon_phase_shift_fraction": 0.25,
+      "request_pattern_start": "low"
     },
     {
-      "id": "xhigh_load_2000_120",
+      "id": "scen_1800_230_sine_IP_L",
+      "seed": 230,
+      "requests_per_slot": 1800.0,
+      "total_slots": 72,
+      "input_pattern": "sinusoidal",
+      "capacity_tiers": [
+        {
+          "max_requests": 1800,
+          "multiplier": 1.0
+        },
+        {
+          "max_requests": 3150,
+          "multiplier": 1.5
+        },
+        {
+          "max_requests": null,
+          "multiplier": 5.0
+        }
+      ],
+      "max_error_threshold": 4.0,
+      "carbon_request_alignment": "in-phase",
+      "carbon_phase_shift_fraction": 0.25,
+      "request_pattern_start": "low"
+    },
+    {
+      "id": "scen_2000_120_sine_IP_L",
       "seed": 120,
       "requests_per_slot": 2000.0,
       "total_slots": 72,
@@ -75,7 +110,7 @@
           "multiplier": 1.0
         },
         {
-          "max_requests": 4000,
+          "max_requests": 3500,
           "multiplier": 1.5
         },
         {
@@ -83,7 +118,10 @@
           "multiplier": 5.0
         }
       ],
-      "max_error_threshold": 4.0
+      "max_error_threshold": 4.0,
+      "carbon_request_alignment": "in-phase",
+      "carbon_phase_shift_fraction": 0.25,
+      "request_pattern_start": "low"
     }
   ]
 }

@@ -53,12 +53,15 @@ additional_strategies: list[str]   – offline strategies to run once per scenar
                                      error and favours slots with lower forecast carbon cost,
                                      including the next capacity-tier multiplier.
 flavours             : list        – optional; overrides Config::default()'s 3 built-in
-                                     Accurate/Balanced/Fast flavours for every phase/scenario
-                                     in this run. Each entry: {"name": str, "error": float
-                                     (%), "duration_sec": float}. Omit to keep nshift's
-                                     built-in defaults (see config.rs). Printed at the start
-                                     of every scenario (Python side) and at every nshift
-                                     invocation (Rust stdout, "Flavours in use: [...]").
+                                     Accurate/Balanced/Fast flavours for the baseline and
+                                     every phase/scenario in this run. Each entry:
+                                     {"name": str, "error": float (%), "duration_sec": float}.
+                                     Omit or set to null to use nshift's built-in defaults
+                                     (see config.rs). Printed at the start of every scenario
+                                     (Python side) and at every nshift invocation (Rust stdout,
+                                     "Flavours in use: [...]").
+aco_n_ants           : int         – optional nshift simulation ACO default; default 40.
+aco_n_iterations     : int         – optional nshift simulation ACO default; default 10.
 rust_binary_path     : str         – path to the nshift binary (relative to repo root)
 output_dir           : str         – where to write run artefacts + battery_results.csv
 scenarios            : list        – each entry has:
@@ -110,6 +113,8 @@ from scenario_io import generate_scenario_data, load_json, save_json  # noqa: E4
 DEFAULT_MAX_BATCH_SOLVER_PARALLELISM = 20
 DEFAULT_REALTIME_SLOTS = False
 DEFAULT_REALTIME_SPEED_SCALE = 0.05
+DEFAULT_ACO_N_ANTS = 40
+DEFAULT_ACO_N_ITERATIONS = 10
 OUTPUT_SCHEMA_VERSION = 2
 
 RESULT_COLUMNS = [
@@ -206,6 +211,8 @@ def _write_rust_config(
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     baseline_total_carbon_cost: Optional[float] = None,
     flavours: Optional[List[Dict[str, Any]]] = None,
+    aco_n_ants: int = DEFAULT_ACO_N_ANTS,
+    aco_n_iterations: int = DEFAULT_ACO_N_ITERATIONS,
 ) -> Path:
     """Write a temporary nshift config.json; caller is responsible for deletion."""
     fd, tmp = tempfile.mkstemp(suffix=".json")
@@ -215,6 +222,8 @@ def _write_rust_config(
         "realtime_slots": realtime_slots,
         "realtime_speed_scale": realtime_speed_scale,
         "max_batch_solver_parallelism": max_batch_solver_parallelism,
+        "aco_n_ants": aco_n_ants,
+        "aco_n_iterations": aco_n_iterations,
     }
     if flavours:
         runner["flavours"] = flavours
@@ -574,6 +583,8 @@ def _run_baseline_only(
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     flavours: Optional[List[Dict[str, Any]]] = None,
+    aco_n_ants: int = DEFAULT_ACO_N_ANTS,
+    aco_n_iterations: int = DEFAULT_ACO_N_ITERATIONS,
 ) -> float:
     """Compute the greedy baseline once via a dedicated, lightweight Rust
     invocation (no DP/online/offline work) so every phase can reuse the same
@@ -586,6 +597,8 @@ def _run_baseline_only(
         realtime_speed_scale=realtime_speed_scale,
         max_batch_solver_parallelism=max_batch_solver_parallelism,
         flavours=flavours,
+        aco_n_ants=aco_n_ants,
+        aco_n_iterations=aco_n_iterations,
     )
     _run_rust_binary(rust_binary, tmp_config)
 
@@ -611,6 +624,8 @@ def _run_dp_phase(
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     flavours: Optional[List[Dict[str, Any]]] = None,
+    aco_n_ants: int = DEFAULT_ACO_N_ANTS,
+    aco_n_iterations: int = DEFAULT_ACO_N_ITERATIONS,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Sweep DP batch sizes. The baseline is precomputed and passed in."""
     all_rows: List[Dict[str, Any]] = []
@@ -628,6 +643,8 @@ def _run_dp_phase(
         max_batch_solver_parallelism=max_batch_solver_parallelism,
         baseline_total_carbon_cost=baseline_cost,
         flavours=flavours,
+        aco_n_ants=aco_n_ants,
+        aco_n_iterations=aco_n_iterations,
     )
     _run_rust_binary(rust_binary, tmp_config)
 
@@ -668,6 +685,8 @@ def _run_online_phase(
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     flavours: Optional[List[Dict[str, Any]]] = None,
+    aco_n_ants: int = DEFAULT_ACO_N_ANTS,
+    aco_n_iterations: int = DEFAULT_ACO_N_ITERATIONS,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run `online_strategies` once, independent of the DP phase (`batch_sizes`
     is always `[]` for this invocation — see `online_batch_sizes` instead).
@@ -686,6 +705,8 @@ def _run_online_phase(
         max_batch_solver_parallelism=max_batch_solver_parallelism,
         baseline_total_carbon_cost=baseline_cost,
         flavours=flavours,
+        aco_n_ants=aco_n_ants,
+        aco_n_iterations=aco_n_iterations,
     )
     _run_rust_binary(rust_binary, tmp_config)
 
@@ -728,6 +749,8 @@ def _run_offline_phase(
     realtime_speed_scale: float = DEFAULT_REALTIME_SPEED_SCALE,
     max_batch_solver_parallelism: int = DEFAULT_MAX_BATCH_SOLVER_PARALLELISM,
     flavours: Optional[List[Dict[str, Any]]] = None,
+    aco_n_ants: int = DEFAULT_ACO_N_ANTS,
+    aco_n_iterations: int = DEFAULT_ACO_N_ITERATIONS,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Run `additional_strategies` once per scenario, independently of DP batches."""
     all_rows: List[Dict[str, Any]] = []
@@ -743,6 +766,8 @@ def _run_offline_phase(
         max_batch_solver_parallelism=max_batch_solver_parallelism,
         baseline_total_carbon_cost=baseline_cost,
         flavours=flavours,
+        aco_n_ants=aco_n_ants,
+        aco_n_iterations=aco_n_iterations,
     )
     _run_rust_binary(rust_binary, tmp_config)
 
@@ -1031,6 +1056,8 @@ def run_battery(config_path: Path) -> None:
     max_batch_solver_parallelism = int(
         cfg.get("max_batch_solver_parallelism", DEFAULT_MAX_BATCH_SOLVER_PARALLELISM)
     )
+    aco_n_ants = int(cfg.get("aco_n_ants", DEFAULT_ACO_N_ANTS))
+    aco_n_iterations = int(cfg.get("aco_n_iterations", DEFAULT_ACO_N_ITERATIONS))
     realtime_slots = bool(cfg.get("realtime_slots", DEFAULT_REALTIME_SLOTS))
     realtime_speed_scale = float(cfg.get("realtime_speed_scale", DEFAULT_REALTIME_SPEED_SCALE))
     trim_future_assignments = bool(cfg.get("trim_future_assignments", False))
@@ -1122,6 +1149,8 @@ def run_battery(config_path: Path) -> None:
             realtime_speed_scale=realtime_speed_scale,
             max_batch_solver_parallelism=max_batch_solver_parallelism,
             flavours=flavours,
+            aco_n_ants=aco_n_ants,
+            aco_n_iterations=aco_n_iterations,
         )
 
         if run_dp:
@@ -1132,6 +1161,8 @@ def run_battery(config_path: Path) -> None:
                 realtime_speed_scale=realtime_speed_scale,
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
                 flavours=flavours,
+                aco_n_ants=aco_n_ants,
+                aco_n_iterations=aco_n_iterations,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)
@@ -1145,6 +1176,8 @@ def run_battery(config_path: Path) -> None:
                 realtime_speed_scale=realtime_speed_scale,
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
                 flavours=flavours,
+                aco_n_ants=aco_n_ants,
+                aco_n_iterations=aco_n_iterations,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)
@@ -1157,6 +1190,8 @@ def run_battery(config_path: Path) -> None:
                 realtime_speed_scale=realtime_speed_scale,
                 max_batch_solver_parallelism=max_batch_solver_parallelism,
                 flavours=flavours,
+                aco_n_ants=aco_n_ants,
+                aco_n_iterations=aco_n_iterations,
             )
             all_rows.extend(rows)
             per_n_timing_rows.extend(n_timings)

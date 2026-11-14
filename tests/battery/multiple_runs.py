@@ -37,6 +37,11 @@ selects the flat pattern instead; the two input patterns can also be requested
 together. Pattern settings are included in scenario and battery names to keep
 their output files separate.
 
+Edit the `FLAVOURS` list beside `INPUT_PATTERNS` to choose the flavour
+definitions shared by the baseline and all enabled phases. Comment out entries
+to test a subset. This list overrides `battery_config.json`'s `flavours` field
+for runs launched by this script.
+
 On Ctrl+C, the newly created folder for the interrupted run is removed unless
 its final result files show that the run completed. Earlier completed folders
 are left untouched.
@@ -91,7 +96,7 @@ DP_CONTENT: Dict[str, Any] = {
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
     # "batch_sizes": [8,10,22],
     # "batch_sizes": [1,4,6,8,22],
-    "batch_sizes": [1,4,6,8,22],
+    "batch_sizes": [1,2,3,4,5],
     "online_strategies": [],
     "additional_strategies": [],
 }
@@ -99,14 +104,14 @@ DP_CONTENT: Dict[str, Any] = {
 SWARM_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "online_strategies": ["ant_colony"],
-    "online_batch_sizes": [8,96,256,1024],
+    "online_batch_sizes": [8],
     "additional_strategies": [],
 }
 
 PER_REQUEST_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "online_strategies": ["bandit", "singleton_best", "hazard"],
-    "online_batch_sizes": [1, 8, 96, 256, 1024],
+    "online_batch_sizes": [8],
     "additional_strategies": [],
 }
 
@@ -131,6 +136,19 @@ OUTPUT_ALIGNMENT_TOKENS = {
 }
 OUTPUT_REQUEST_START_TOKENS = {"low": "L", "high": "H"}
 OUTPUT_PHASE_TOKENS = {"per_request": "perrequest"}
+
+# Shared by the baseline and all phases. Comment out entries to restrict the
+# available solver choices for a test run.
+FLAVOURS: List[Dict[str, Any]] = [
+    {"name": "Accurate", "error": 0.0, "duration_sec": 60.0},
+    {"name": "Balanced", "error": 2.5, "duration_sec": 30.0},
+    {"name": "Fast", "error": 5.0, "duration_sec": 10.0},
+]
+
+APPEND_SUFFIX_TO_SCENARIOS = True
+
+BATTERY_ID_PREFIX = "T01"
+
 # Select which supported scenario pattern(s) the default sweep runs.
 INPUT_PATTERNS = ("sinusoidal",)
 # Sinusoidal-only relationship, shift amount, and request-wave orientation.
@@ -151,7 +169,7 @@ _PARALLELISM_X_THRESHOLD = [
         "max_batch_solver_parallelism": parallelism,
         "max_error_threshold": threshold,
     }
-    for parallelism in (20,)
+    for parallelism in (1,10,20,)
     for threshold in (4.0,)
 ]
 
@@ -194,14 +212,15 @@ def _with_input_pattern(cfg: Dict[str, Any], input_pattern: str) -> Dict[str, An
 
     output_token = OUTPUT_INPUT_PATTERN_TOKENS[input_pattern]
     patterned_cfg = dict(cfg)
-    patterned_cfg["scenarios"] = [
-        {
-            **scenario,
-            "id": f"{scenario['id']}_{output_token}",
-            "input_pattern": input_pattern,
-        }
-        for scenario in cfg.get("scenarios", [])
-    ]
+    if APPEND_SUFFIX_TO_SCENARIOS:
+        patterned_cfg["scenarios"] = [
+            {
+                **scenario,
+                "id": f"{scenario['id']}_{output_token}",
+                "input_pattern": input_pattern,
+            }
+            for scenario in cfg.get("scenarios", [])
+        ]
     return patterned_cfg
 
 
@@ -225,18 +244,19 @@ def _with_sinusoidal_wave_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     wave_suffix = _wave_output_suffix()
     configured = dict(cfg)
-    configured["scenarios"] = [
-        {
-            **scenario,
-            "id": f"{scenario['id']}{wave_suffix}",
-            "carbon_request_alignment": CARBON_REQUEST_ALIGNMENT,
-            "carbon_phase_shift_fraction": CARBON_PHASE_SHIFT_FRACTION,
-            "request_pattern_start": REQUEST_PATTERN_START,
-        }
-        if scenario.get("input_pattern") == "sinusoidal"
-        else scenario
-        for scenario in cfg.get("scenarios", [])
-    ]
+    if APPEND_SUFFIX_TO_SCENARIOS:
+        configured["scenarios"] = [
+            {
+                **scenario,
+                "id": f"{scenario['id']}{wave_suffix}",
+                "carbon_request_alignment": CARBON_REQUEST_ALIGNMENT,
+                "carbon_phase_shift_fraction": CARBON_PHASE_SHIFT_FRACTION,
+                "request_pattern_start": REQUEST_PATTERN_START,
+            }
+            if scenario.get("input_pattern") == "sinusoidal"
+            else scenario
+            for scenario in cfg.get("scenarios", [])
+        ]
     return configured
 
 
@@ -349,6 +369,7 @@ def run_phase(
     for idx, knobs in enumerate(phase.knob_grid, start=1):
         cfg = dict(base_cfg)
         cfg.update(phase.content)
+        cfg["flavours"] = FLAVOURS
         cfg = _with_input_pattern(cfg, input_pattern)
         if input_pattern == "sinusoidal":
             cfg = _with_sinusoidal_wave_settings(cfg)
@@ -422,7 +443,7 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--battery-id-prefix",
-        default="T00",
+        default=BATTERY_ID_PREFIX,
         help="Prefix used to build each run's battery_id "
         "(final id includes input/wave settings, phase, and grid index).",
     )

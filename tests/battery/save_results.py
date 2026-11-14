@@ -78,7 +78,12 @@ def load_run(run_dir: Path) -> pd.DataFrame:
     return df
 
 
-def aggregate_and_save(run_dirs=None, prefix_regex=r"^(cfg)_test(1|2|3|4|5|6|7|8|9|10)_"):
+def aggregate_and_save(
+    run_dirs=None,
+    prefix_regex=r"^(cfg)_test(1|2|3|4|5|6|7|8|9|10)_",
+    sort_by=None,
+):
+    """Aggregate run results, optionally sort rows, and save the full-precision data."""
     if run_dirs is None:
         run_dirs = sorted(
             d for d in RESULTS_DIR.iterdir()
@@ -94,39 +99,75 @@ def aggregate_and_save(run_dirs=None, prefix_regex=r"^(cfg)_test(1|2|3|4|5|6|7|8
     df_all = pd.concat(dfs, ignore_index=True)
 
     print(f"Righe totali: {len(df_all)}")
+
+    # Rename source metrics to the concise names used by the active analysis.
+    column_map = {
+        "batch_size": "batch",
+        "strategy": "policy",
+        "parallelism": "paral",
+        "final_global_error": "error",
+        "elapsed_seconds": "elapsed_s",
+        "carbon_cost": "carb_cost",
+        "baseline_carbon_cost": "baseline_carb_cost",
+        "carbon_saving": "carb_saving",
+        "solver_time_ms_avg": "solver_ms",
+    }
+    collisions = [
+        new_name
+        for old_name, new_name in column_map.items()
+        if old_name in df_all.columns and new_name in df_all.columns
+    ]
+    if collisions:
+        raise ValueError(
+            f"Cannot rename aggregate columns because target names already exist: {collisions}"
+        )
+    df_all = df_all.rename(columns=column_map)
+
+    columns = [
+        "run_id",
+        "scenario_id",
+        "reqs_in",
+        "reqs_out",
+        "batch",
+        "policy",
+        "carb_saving",
+        "elapsed_s",
+        "error",
+        "carb_cost",
+        "reqs_fallback_assigned",
+        "paral",
+        "solver_ms",
+        "peak_concurrent_workers",
+        "avg_concurrent_workers",
+        "baseline_carb_cost",
+        "path",
+    ]
+    missing_columns = [column for column in columns if column not in df_all.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Aggregated run results are missing required columns: {missing_columns}"
+        )
+    ordered_columns = list(columns)
+    ordered_columns.extend(
+        column for column in df_all.columns if column not in ordered_columns
+    )
+    df_all = df_all.loc[:, ordered_columns]
+
     print(f"Colonne: {list(df_all.columns)}")
 
-    # sort columns to match this order
-    cols = [
-        'run_id',
-        'scenario_id',
-        'reqs_in',
-        'reqs_out',
-        'batch_size',
-        'strategy',
-        'parallelism',
-        'solver_time_ms_avg',
-        'elapsed_seconds',
-        'carbon_cost',
-        'carbon_saving',
-        'reqs_fallback_assigned',
-        'peak_concurrent_workers',
-        'avg_concurrent_workers',
-        'baseline_carbon_cost',
-        'final_global_error',
-        'path',
+    if sort_by is not None:
+        sort_columns = [sort_by] if isinstance(sort_by, str) else list(sort_by)
+        missing_columns = [column for column in sort_columns if column not in df_all.columns]
+        if missing_columns:
+            raise ValueError(
+                f"Cannot sort aggregate results by missing columns: {missing_columns}"
+            )
+        df_all = df_all.sort_values(
+            by=sort_columns,
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
 
-    ]
-    df_all = df_all[cols]
-
-
-    # round float columns to 2 decimal places
-    float_cols = df_all.select_dtypes(include=["float64"]).columns
-    df_all[float_cols] = df_all[float_cols].round(2)
-
-    # Preview of the aggregated data
-
-    # Save the aggregated dataframe
     output_csv = RESULTS_DIR / "aggregated_battery_results.csv"
     df_all.to_csv(output_csv, index=False)
     (RESULTS_DIR / "output_schema.json").write_text(
@@ -141,3 +182,4 @@ def aggregate_and_save(run_dirs=None, prefix_regex=r"^(cfg)_test(1|2|3|4|5|6|7|8
         encoding="utf-8",
     )
     print(f"Salvato in: {output_csv}")
+    return df_all

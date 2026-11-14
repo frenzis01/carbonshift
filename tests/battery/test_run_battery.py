@@ -41,7 +41,44 @@ def test_battery_runner_does_not_emit_obsolete_runtime_controls(tmp_path):
         config["runner"]["max_batch_solver_parallelism"]
         == rb.DEFAULT_MAX_BATCH_SOLVER_PARALLELISM
     )
+    assert config["runner"]["aco_n_ants"] == rb.DEFAULT_ACO_N_ANTS
+    assert config["runner"]["aco_n_iterations"] == rb.DEFAULT_ACO_N_ITERATIONS
     assert "infeasibility_recovery_mode" not in config["runner"]
+
+
+def test_battery_runner_forwards_flavour_override_to_nshift(tmp_path):
+    flavours = [{"name": "Accurate", "error": 0.0, "duration_sec": 60.0}]
+    config_path = rb._write_rust_config(
+        tmp_path / "scenario.json",
+        [1],
+        tmp_path / "output",
+        False,
+        flavours=flavours,
+    )
+    try:
+        config = json.loads(config_path.read_text())
+    finally:
+        config_path.unlink(missing_ok=True)
+
+    assert config["runner"]["flavours"] == flavours
+
+
+def test_battery_runner_forwards_aco_defaults_to_nshift(tmp_path):
+    config_path = rb._write_rust_config(
+        tmp_path / "scenario.json",
+        [],
+        tmp_path / "output",
+        False,
+        aco_n_ants=24,
+        aco_n_iterations=6,
+    )
+    try:
+        config = json.loads(config_path.read_text())
+    finally:
+        config_path.unlink(missing_ok=True)
+
+    assert config["runner"]["aco_n_ants"] == 24
+    assert config["runner"]["aco_n_iterations"] == 6
 
 
 def test_carbon_saving_formatter_reports_amount_and_percentage():
@@ -448,6 +485,33 @@ def test_multiple_runs_default_patterns_is_a_single_pattern_not_characters():
     patterned = mr._with_input_pattern({"scenarios": [{"id": "tiny"}]}, mr.INPUT_PATTERNS[0])
     assert patterned["scenarios"][0]["input_pattern"] == "sinusoidal"
     assert patterned["scenarios"][0]["id"] == "tiny_sine"
+
+
+def test_multiple_runs_flavours_override_battery_config_for_each_phase(
+    tmp_path, monkeypatch
+):
+    flavours = [{"name": "Accurate", "error": 0.0, "duration_sec": 60.0}]
+    monkeypatch.setattr(mr, "FLAVOURS", flavours)
+    saved_configs = []
+    monkeypatch.setattr(mr, "save_config", lambda _path, cfg: saved_configs.append(cfg))
+    monkeypatch.setattr(mr, "run_battery", lambda: 0)
+
+    status = mr.run_phase(
+        {
+            "output_dir": str(tmp_path),
+            "scenarios": [],
+            "flavours": [
+                {"name": "Accurate", "error": 0.0, "duration_sec": 60.0},
+                {"name": "Balanced", "error": 2.5, "duration_sec": 30.0},
+            ],
+        },
+        mr.PhaseGrid("dp", {"batch_sizes": [1]}, [{}]),
+        "flavour-test",
+        "flat",
+    )
+
+    assert status == 0
+    assert saved_configs[0]["flavours"] == flavours
 
 
 def test_main_reports_interrupt_without_traceback_and_restores_config(tmp_path, monkeypatch, capsys):

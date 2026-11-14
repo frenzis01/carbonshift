@@ -33,6 +33,27 @@ For `sinusoidal` scenarios, configure:
 `CARBON_PHASE_SHIFT_FRACTION`, and `REQUEST_PATTERN_START` constants beside
 `INPUT_PATTERNS`.
 
+## Flavour selection
+
+For `multiple_runs.py`, edit its `FLAVOURS` list to choose the flavour
+definitions shared by the baseline and every enabled phase. Comment out entries
+to test a subset, such as only Accurate. Each entry uses `name`, `error`
+(percent), and `duration_sec` (seconds). This list overrides the top-level
+`flavours` field in `battery_config.json`. When running `run_battery.py`
+directly, configure that JSON field instead; set it to `null` or remove it to
+use nshift's built-in defaults.
+
+## Ant-colony search size
+
+Set top-level `aco_n_ants` and `aco_n_iterations` in `battery_config.json` to
+choose nshift's default ACO effort (40 ants × 10 iterations by default). For
+each batch, nshift caps that product against
+`error_window_future × flavour_count × batch_size`. When it must scale down, it
+scales both values proportionally and rounds each up. Offline whole-scenario
+ACO runs use the scenario request count as their batch size. This adjustment
+applies only to nshift simulations; the live service keeps its configured ACO
+settings unchanged.
+
 ## Batch-worker parallelism
 
 `max_batch_solver_parallelism` is an upper bound on concurrent online
@@ -100,12 +121,12 @@ once per scenario:
   to forecast carbon intensity multiplied by the capacity-tier multiplier at
   that slot's next occupancy position. It samples flavours from the
   distribution closest to equal probabilities in squared Euclidean distance,
-  subject to expected flavour error equalling the configured threshold. For
+  subject to expected flavour error equalling the configured threshold when
+  attainable; otherwise it targets the nearest available flavour error. For
   errors 0%, 5%, and 10% with a 7.5% threshold, the flavour probabilities are
   1/12, 1/3, and 7/12. This is an expectation over many assignments; it does
   not enforce the threshold on each run or error window. The scenario seed
-  makes the hazard schedule reproducible. A target outside the available
-  flavour-error range cannot be achieved and is reported as an error.
+  makes the hazard schedule reproducible.
 - `bandit` and `ant_colony`: use the common engine kernels, with a fresh
   runtime and learned state for each run. The live scheduler and offline
   runner use the same common engine registry.
