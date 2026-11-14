@@ -63,6 +63,9 @@
 //!   defaults) with `[{"name": "...", "error": <f64>, "duration_sec": <f64>}, ...]`.
 //!   Printed at startup alongside the other config knobs so it's clear which flavours
 //!   a given run actually used.
+//! - `runner.aco_n_ants` / `runner.aco_n_iterations`: simulation-only ACO defaults
+//!   (40 / 10 when omitted). Each run scales them down, keeping their ratio, when
+//!   the batch's estimated assignment space is smaller.
 //!
 //! **Key fields:**
 //! - `batch_sizes`: list of N values to benchmark.
@@ -113,6 +116,9 @@ use reporting::*;
 mod simulation;
 use simulation::*;
 
+const DEFAULT_SIMULATION_ACO_N_ANTS: usize = 40;
+const DEFAULT_SIMULATION_ACO_N_ITERATIONS: usize = 10;
+
 // ─── benchmark config ─────────────────────────────────────────────────────────
 
 struct BenchmarkConfig {
@@ -136,6 +142,9 @@ struct BenchmarkConfig {
     batch_timeout_secs: f64,
     /// Overrides `Config::max_batch_solver_parallelism` when present; `None` keeps the default.
     max_batch_solver_parallelism: Option<usize>,
+    /// Simulation-only ACO search defaults, capped per batch before registry creation.
+    aco_n_ants: usize,
+    aco_n_iterations: usize,
     /// Precomputed baseline carbon cost to reuse when `include_greedy_baseline` is false
     /// (e.g. a second nshift invocation for additional/offline strategies that shouldn't
     /// recompute the greedy baseline already produced by an earlier invocation of the same
@@ -235,6 +244,32 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         .and_then(|x| x.as_u64())
         .map(|x| x as usize);
 
+    let aco_n_ants = runner
+        .get("aco_n_ants")
+        .map(|x| {
+            usize::try_from(
+                x.as_u64()
+                    .expect("runner.aco_n_ants must be a positive integer"),
+            )
+            .expect("runner.aco_n_ants exceeds usize")
+        })
+        .unwrap_or(DEFAULT_SIMULATION_ACO_N_ANTS);
+    let aco_n_iterations = runner
+        .get("aco_n_iterations")
+        .map(|x| {
+            usize::try_from(
+                x.as_u64()
+                    .expect("runner.aco_n_iterations must be a positive integer"),
+            )
+            .expect("runner.aco_n_iterations exceeds usize")
+        })
+        .unwrap_or(DEFAULT_SIMULATION_ACO_N_ITERATIONS);
+    assert!(aco_n_ants > 0, "runner.aco_n_ants must be positive");
+    assert!(
+        aco_n_iterations > 0,
+        "runner.aco_n_iterations must be positive"
+    );
+
     let baseline_total_carbon_cost = runner
         .get("baseline_total_carbon_cost")
         .and_then(|x| x.as_f64());
@@ -256,6 +291,8 @@ fn load_benchmark_config(config_path: &Path) -> BenchmarkConfig {
         online_batch_sizes,
         batch_timeout_secs,
         max_batch_solver_parallelism,
+        aco_n_ants,
+        aco_n_iterations,
         baseline_total_carbon_cost,
         flavours,
     }
@@ -393,14 +430,18 @@ fn main() {
     if let Some(parallelism) = bcfg.max_batch_solver_parallelism {
         base_cfg.solver.max_batch_solver_parallelism = parallelism;
     }
+    base_cfg.swarm.aco_n_ants = bcfg.aco_n_ants;
+    base_cfg.swarm.aco_n_iterations = bcfg.aco_n_iterations;
     if let Some(flavours) = &bcfg.flavours {
         base_cfg.flavours = flavours.clone();
     }
 
     // Build the registry once for this benchmark run. Each configured strategy
     // then gets a fresh scoped runtime from the same factories.
+    let mut offline_cfg = base_cfg.clone();
+    cap_simulation_aco_search(&mut offline_cfg, scenario.requests.len());
     let common_engine_registry =
-        build_solver_registry(&base_cfg, scenario.metadata.seed ^ HAZARD_SEED_SALT)
+        build_solver_registry(&offline_cfg, scenario.metadata.seed ^ HAZARD_SEED_SALT)
             .unwrap_or_else(|error| panic!("Cannot register common solver engines: {error}"));
 
     println!(

@@ -505,6 +505,30 @@ pub(super) fn schedule_late_requests(
     out
 }
 
+/// Scale nshift's ACO search down when a batch's assignment space is smaller
+/// than its configured default effort. The live service intentionally does
+/// not use this heuristic because profile horizons and flavours may vary.
+pub(super) fn cap_simulation_aco_search(config: &mut Config, batch_size: usize) {
+    let ants = config.swarm.aco_n_ants;
+    let iterations = config.swarm.aco_n_iterations;
+    let configured_solutions = ants.saturating_mul(iterations);
+    let future_slots = usize::try_from(config.error_window_future)
+        .unwrap_or_default()
+        .max(1);
+    let assignment_space = future_slots
+        .saturating_mul(config.flavours.len().max(1))
+        .saturating_mul(batch_size.max(1));
+
+    if configured_solutions <= assignment_space || configured_solutions == 0 {
+        return;
+    }
+
+    let scale = (assignment_space as f64 / configured_solutions as f64).sqrt();
+    config.swarm.aco_n_ants = ((ants as f64 * scale).ceil() as usize).clamp(1, ants);
+    config.swarm.aco_n_iterations =
+        ((iterations as f64 * scale).ceil() as usize).clamp(1, iterations);
+}
+
 pub(super) fn run_single_n(
     scenario: &Scenario,
     base_cfg: &Config,
@@ -517,6 +541,7 @@ pub(super) fn run_single_n(
     // Build per-run config.
     let mut cfg = base_cfg.clone();
     cfg.solver.batch_size = batch_size;
+    cap_simulation_aco_search(&mut cfg, batch_size);
     cfg.logging.verbose = verbose;
     // For fast simulation: use skip_empty_slots=true with slot_speed_scale=1.0.
     // The skip mechanism advances the virtual clock when a slot is empty, so the

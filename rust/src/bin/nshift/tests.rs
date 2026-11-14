@@ -204,6 +204,8 @@ fn online_batch_sizes_absent_defaults_to_none() {
     std::fs::remove_file(&path).ok();
     assert_eq!(bcfg.online_batch_sizes, None);
     assert_eq!(bcfg.batch_sizes, vec![1, 4]);
+    assert_eq!(bcfg.aco_n_ants, 40);
+    assert_eq!(bcfg.aco_n_iterations, 10);
 }
 
 #[test]
@@ -211,12 +213,45 @@ fn online_batch_sizes_explicit_value_is_parsed() {
     let path = write_tmp_config(
         "explicit",
         r#"{"batch_sizes": [], "scenario_path": "s.json", "output_dir": "out",
-                "runner": {"online_batch_sizes": [1, 6, 12]}}"#,
+                "runner": {"online_batch_sizes": [1, 6, 12],
+                           "aco_n_ants": 24, "aco_n_iterations": 8}}"#,
     );
     let bcfg = load_benchmark_config(&path);
     std::fs::remove_file(&path).ok();
     assert_eq!(bcfg.online_batch_sizes, Some(vec![1, 6, 12]));
     assert!(bcfg.batch_sizes.is_empty());
+    assert_eq!(bcfg.aco_n_ants, 24);
+    assert_eq!(bcfg.aco_n_iterations, 8);
+}
+
+#[test]
+fn simulation_aco_search_scales_both_dimensions_to_assignment_space() {
+    let mut config = Config::default();
+    config.error_window_future = 14;
+    config.swarm.aco_n_ants = 40;
+    config.swarm.aco_n_iterations = 10;
+
+    cap_simulation_aco_search(&mut config, 1);
+
+    assert_eq!(config.swarm.aco_n_ants, 13);
+    assert_eq!(config.swarm.aco_n_iterations, 4);
+    assert_eq!(
+        config.swarm.aco_n_ants as f64 / config.swarm.aco_n_iterations as f64,
+        3.25
+    );
+}
+
+#[test]
+fn simulation_aco_search_keeps_defaults_when_assignment_space_is_large_enough() {
+    let mut config = Config::default();
+    config.error_window_future = 14;
+    config.swarm.aco_n_ants = 40;
+    config.swarm.aco_n_iterations = 10;
+
+    cap_simulation_aco_search(&mut config, 10);
+
+    assert_eq!(config.swarm.aco_n_ants, 40);
+    assert_eq!(config.swarm.aco_n_iterations, 10);
 }
 
 #[test]
