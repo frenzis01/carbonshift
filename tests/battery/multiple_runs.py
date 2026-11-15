@@ -96,7 +96,7 @@ DP_CONTENT: Dict[str, Any] = {
     # "batch_sizes": [6, 8, 10, 12, 16, 22],
     # "batch_sizes": [8,10,22],
     # "batch_sizes": [1,4,6,8,22],
-    "batch_sizes": [1,2,3,4,5],
+    "batch_sizes": [1,],
     "online_strategies": [],
     "additional_strategies": [],
 }
@@ -147,7 +147,7 @@ FLAVOURS: List[Dict[str, Any]] = [
 
 APPEND_SUFFIX_TO_SCENARIOS = True
 
-BATTERY_ID_PREFIX = "T01"
+BATTERY_ID_PREFIX = "T30"
 
 # Select which supported scenario pattern(s) the default sweep runs.
 INPUT_PATTERNS = ("sinusoidal",)
@@ -169,7 +169,7 @@ _PARALLELISM_X_THRESHOLD = [
         "max_batch_solver_parallelism": parallelism,
         "max_error_threshold": threshold,
     }
-    for parallelism in (1,10,20,)
+    for parallelism in (1,10,20)
     for threshold in (4.0,)
 ]
 

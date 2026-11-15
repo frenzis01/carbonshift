@@ -4,13 +4,9 @@
   "_trim_future_assignments_comment": "Optional. When true, requests are still generated only in each scenario's total_slots, but the planning horizon and carbon forecast extend by ERROR_WINDOW_FUTURE slots. Assignments and request-level metrics beyond the configured total_slots are trimmed; reqs_in counts scenario inputs and reqs_out counts retained assignments.",
   "trim_future_assignments": true,
   "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat keeps a nearly constant rate with seeded 5%-of-rate slot-count jitter and the same rounded horizon total. Sinusoidal scenarios may also set carbon_request_alignment (in-phase, phase-opposition, phase-shifted), carbon_phase_shift_fraction (0.0-0.5), and request_pattern_start (low/high). Both retain random sub-slot arrival times. This does not configure client emulation.",
-  "battery_id": "T01_sine_IP_L_dp_0",
+  "battery_id": "T21_sine_IP_L_dp_0",
   "batch_sizes": [
-    1,
-    2,
-    3,
-    4,
-    5
+    1
   ],
   "online_strategies": [],
   "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. ant_colony, bandit, hazard, and singleton_best use this sweep.",
@@ -26,22 +22,12 @@
       "name": "Accurate",
       "error": 0.0,
       "duration_sec": 60.0
-    },
-    {
-      "name": "Balanced",
-      "error": 2.5,
-      "duration_sec": 30.0
-    },
-    {
-      "name": "Fast",
-      "error": 5.0,
-      "duration_sec": 10.0
     }
   ],
   "rust_binary_path": "rust/target/release/nshift",
   "output_dir": "tests/battery/results",
   "_runtime_knobs_comment": "Runtime knobs below mirror the Rust solver configuration; omit them to use the documented defaults.",
-  "max_batch_solver_parallelism": 1,
+  "max_batch_solver_parallelism": 20,
   "_aco_search_comment": "nshift simulation ACO defaults. Each batch automatically scales down ants and iterations, preserving their ratio, if their product exceeds future-window slots * flavours * batch size. The live service does not use this cap.",
   "aco_n_ants": 10,
   "aco_n_iterations": 3,
@@ -49,7 +35,7 @@
   "realtime_speed_scale": 1.0,
   "scenarios": [
     {
-      "id": "scen_1500_92_sine_IP_L",
+      "id": "scen_1500_92",
       "seed": 92,
       "requests_per_slot": 1500.0,
       "total_slots": 72,
@@ -74,7 +60,7 @@
       "request_pattern_start": "low"
     },
     {
-      "id": "scen_1800_230_sine_IP_L",
+      "id": "scen_1800_230",
       "seed": 230,
       "requests_per_slot": 1800.0,
       "total_slots": 72,
@@ -99,7 +85,7 @@
       "request_pattern_start": "low"
     },
     {
-      "id": "scen_2000_120_sine_IP_L",
+      "id": "scen_2000_120",
       "seed": 120,
       "requests_per_slot": 2000.0,
       "total_slots": 72,
