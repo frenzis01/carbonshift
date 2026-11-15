@@ -295,11 +295,16 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
         // Initialize placements and counts
         let mut placements = Vec::with_capacity(input.requests.len());
         let mut slot_count = input.baseline_slot_counts.clone();
-        let mut solved_errors = Vec::with_capacity(input.requests.len());
+        // let mut solved_errors = Vec::with_capacity(input.requests.len());
+        let mut solved_error_by_slot = vec![(0.0_f64, 0.0_f64); scope.total_slots];
         let mut cumulative_count = input.qos.cumulative_err.count as i64;
         let mut cumulative_sum = input.qos.cumulative_err.sum;
         let mut window_count = input.qos.error_window.baseline_err.count;
         let mut window_sum = input.qos.error_window.baseline_err.sum;
+
+        let mut sorted_flavours: Vec<&Flavour> = flavours.iter().collect();
+        sorted_flavours.sort_by(|left, right| left.duration.total_cmp(&right.duration));
+
 
         for request in &input.requests {
             // If request is late, mark it as such and go on
@@ -314,7 +319,10 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
                     window_sum,
                 )?;
                 *slot_count.entry(input.current_slot).or_insert(0) += 1;
-                solved_errors.push((input.current_slot, flavour.error));
+                // solved_errors.push((input.current_slot, flavour.error));
+                let (slot_sum, slot_count) = &mut solved_error_by_slot[input.current_slot as usize];
+                *slot_sum += flavour.error;
+                *slot_count += 1.0;
                 cumulative_count = cumulative_count.checked_add(1).ok_or_else(|| {
                     SolverError::Algorithm("cumulative error count overflowed i64".to_owned())
                 })?;
@@ -331,11 +339,27 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
 
             // Find best slot and feasible flavour
             let (start_slot, deadline) = request_slot_bounds(input, request, scope)?;
-            let mut sorted_flavours: Vec<&Flavour> = flavours.iter().collect();
-            sorted_flavours.sort_by(|left, right| left.duration.total_cmp(&right.duration));
 
             let mut best: Option<(f64, i32, &Flavour)> = None;
 
+            // Match the existing policy: the local window is anchored
+            // to this request's arrival slot.
+            let win_start =
+                (request.arrival_slot - input.qos.error_window.past_slots).max(0);
+            let win_end = (request.arrival_slot + input.qos.error_window.future_slots)
+                .min(scope.total_slots as i32 - 1);
+            // Compute local window sum and count contribution for assignments made in this solver run
+            let (local_win_sum, local_win_count) = solved_error_by_slot
+                [win_start as usize..=win_end as usize]
+                .iter()
+                .fold((0.0, 0.0), |(sum, count), (slot_sum, slot_count)| {
+                    (sum + slot_sum, count + slot_count)
+                });
+
+            let win_sum_before_candidate = input.qos.error_window.baseline_err.sum + local_win_sum;
+            let win_count_before_candidate = input.qos.error_window.baseline_err.count + local_win_count;
+
+            
             for slot in start_slot..=deadline {
                 // Input validation and deadline capping guarantee this index
                 // is inside the forecast; the current value is the observed CI.
@@ -356,20 +380,12 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
                         continue;
                     }
 
-                    // Match the existing policy: the local window is anchored
-                    // to this request's arrival slot.
-                    let win_start =
-                        (request.arrival_slot - input.qos.error_window.past_slots).max(0);
-                    let win_end = (request.arrival_slot + input.qos.error_window.future_slots)
-                        .min(scope.total_slots as i32 - 1);
-                    let mut win_sum = input.qos.error_window.baseline_err.sum + flav.error;
-                    let mut win_count = input.qos.error_window.baseline_err.count + 1.0;
-                    for &(placed_slot, placed_error) in &solved_errors {
-                        if (win_start..=win_end).contains(&placed_slot) {
-                            win_sum += placed_error;
-                            win_count += 1.0;
-                        }
-                    }
+
+                
+
+                    
+                    let win_sum = win_sum_before_candidate + flav.error;
+                    let win_count = win_count_before_candidate + 1.0;
 
                     // Reject this candidate if it would violate the window
                     // budget; another flavour or slot may still be feasible.
@@ -400,7 +416,10 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
             };
 
             *slot_count.entry(chosen_slot).or_insert(0) += 1;
-            solved_errors.push((chosen_slot, chosen_flavour.error));
+            // solved_errors.push((chosen_slot, chosen_flavour.error));
+            let (slot_sum, slot_count) = &mut solved_error_by_slot[chosen_slot as usize];
+            *slot_sum += chosen_flavour.error;
+            *slot_count += 1.0;
             cumulative_count = cumulative_count.checked_add(1).ok_or_else(|| {
                 SolverError::Algorithm("cumulative error count overflowed i64".to_owned())
             })?;
