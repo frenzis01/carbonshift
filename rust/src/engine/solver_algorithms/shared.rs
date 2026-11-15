@@ -1,10 +1,205 @@
 // Helper functions
 
 use crate::engine::{
-    solver::QoSProfileInput,
+    solver::{
+        QoSProfileInput, SolveInput, SolveRequest, SolverError, SolverScope,
+        cap_assignment_deadline,
+    },
     types::{CapacityTier, Flavour, get_capacity_multiplier},
 };
 use std::collections::HashMap;
+
+/// Price the next request at a slot's current global occupancy position.
+pub(super) fn get_slot_cost(
+    slot: i32,
+    flavour: &Flavour,
+    carbon_forecast: &[f64],
+    tiers: &[CapacityTier],
+    slot_counts: &HashMap<i32, i64>,
+    scale: f64,
+) -> f64 {
+    let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
+    let position = *slot_counts.get(&slot).unwrap_or(&0) + 1;
+    let multiplier = get_capacity_multiplier(tiers, position);
+    ci * multiplier * flavour.duration * scale
+}
+
+/// Return the profile flavour with minimum error for best-effort fallback.
+pub(super) fn get_fallback_flav(flavours: &[Flavour]) -> Result<&Flavour, SolverError> {
+    flavours
+        .iter()
+        .min_by(|left, right| left.error.total_cmp(&right.error))
+        .ok_or_else(|| SolverError::Algorithm("no fallback flavour is available".to_owned()))
+}
+
+/// Choose the cheapest flavour that keeps the supplied cumulative and window
+/// error totals within the profile threshold.
+pub(super) fn cheapest_feasible_flavour(
+    flavours: &[Flavour],
+    threshold: f64,
+    cumulative_constraint_active: bool,
+    cumulative_count: i64,
+    cumulative_sum: f64,
+    window_count: f64,
+    window_sum: f64,
+) -> Result<&Flavour, SolverError> {
+    flavours
+        .iter()
+        .filter(|flavour| {
+            let cumulative_ok = !cumulative_constraint_active
+                || (cumulative_sum + flavour.error) / (cumulative_count as f64 + 1.0) <= threshold;
+            let window_ok = (window_sum + flavour.error) / (window_count + 1.0) <= threshold;
+            cumulative_ok && window_ok
+        })
+        .min_by(|left, right| left.duration.total_cmp(&right.duration))
+        .ok_or_else(|| {
+            SolverError::Algorithm(
+                "no flavour satisfies the cumulative and window error limits for late work"
+                    .to_owned(),
+            )
+        })
+}
+
+/// Validate the solver input shared by the stateless, random, and stateful
+/// strategies before they inspect forecasts, deadlines, or QoS values.
+pub(super) fn validate_solve_input(
+    input: &SolveInput,
+    scope: &SolverScope,
+) -> Result<(), SolverError> {
+    let horizon = usize::try_from(scope.total_slots)
+        .map_err(|_| SolverError::Algorithm("planning horizon must be positive".to_owned()))?;
+    if horizon == 0 {
+        return Err(SolverError::Algorithm(
+            "planning horizon must be positive".to_owned(),
+        ));
+    }
+    if input.carbon_forecast.len() != horizon {
+        return Err(SolverError::Algorithm(format!(
+            "forecast length {} does not match planning horizon {horizon}",
+            input.carbon_forecast.len()
+        )));
+    }
+    if input.current_slot < 0 || input.current_slot >= scope.total_slots as i32 {
+        return Err(SolverError::Algorithm(format!(
+            "current slot {} is outside the planning horizon",
+            input.current_slot
+        )));
+    }
+    if input.qos.error_window.past_slots < 0 || input.qos.error_window.future_slots < 0 {
+        return Err(SolverError::Algorithm(
+            "error-window slot counts cannot be negative".to_owned(),
+        ));
+    }
+    if input
+        .forecast_max_slot
+        .is_some_and(|max_slot| max_slot < input.current_slot)
+    {
+        return Err(SolverError::Algorithm(
+            "forecast coverage ends before the current slot".to_owned(),
+        ));
+    }
+    if !input.carbon_cost_duration_scale.is_finite()
+        || input.carbon_cost_duration_scale < 0.0
+        || input.carbon_forecast.iter().any(|value| !value.is_finite())
+    {
+        return Err(SolverError::Algorithm(
+            "carbon forecast and duration scale must be finite and non-negative".to_owned(),
+        ));
+    }
+    if !input.qos.max_average_error.is_finite() {
+        return Err(SolverError::Algorithm(
+            "sliding-window error threshold must be finite".to_owned(),
+        ));
+    }
+    if !input.qos.cumulative_err.count.is_finite()
+        || input.qos.cumulative_err.count < 0.0
+        || input.qos.cumulative_err.count.fract() != 0.0
+        || input.qos.cumulative_err.count > (i64::MAX as f64)
+        || !input.qos.cumulative_err.sum.is_finite()
+        || !input.qos.error_window.baseline_err.sum.is_finite()
+        || !input.qos.error_window.baseline_err.count.is_finite()
+        || input.qos.error_window.baseline_err.count < 0.0
+    {
+        return Err(SolverError::Algorithm(
+            "QoS error sums must be finite and error counts non-negative".to_owned(),
+        ));
+    }
+    if input.baseline_slot_counts.values().any(|count| *count < 0) {
+        return Err(SolverError::Algorithm(
+            "baseline slot counts cannot be negative".to_owned(),
+        ));
+    }
+    if !input.requests.is_empty() && input.qos.flavours.is_empty() {
+        return Err(SolverError::Algorithm(
+            "the QoS profile has no available flavours".to_owned(),
+        ));
+    }
+    if input.qos.flavours.is_empty() {
+        return Err(SolverError::EmptyFlavours);
+    }
+    if input.qos.flavours.iter().any(|flavour| {
+        !flavour.error.is_finite() || !flavour.duration.is_finite() || flavour.duration < 0.0
+    }) {
+        return Err(SolverError::Algorithm(
+            "QoS profile contains a flavour with invalid error or duration".to_owned(),
+        ));
+    }
+
+    for request in &input.requests {
+        request_slot_bounds(input, request, scope)?;
+    }
+    Ok(())
+}
+
+/// Cap a request's deadline to its arrival-based QoS look-ahead and to slots
+/// for which this solve has forecast data. Expired work remains at the current
+/// slot so algorithms can mark it late and use their explicit late-work policy.
+fn cap_deadline_inside_forecast(
+    input: &SolveInput,
+    request: &SolveRequest,
+    scope: &SolverScope,
+) -> Result<i32, SolverError> {
+    if input.current_slot > request.deadline_slot {
+        return cap_assignment_deadline(
+            request.request_id,
+            request.arrival_slot,
+            request.deadline_slot,
+            input.current_slot,
+            input.qos.error_window.future_slots,
+            latest_forecast_slot(input, scope),
+            scope.total_slots as i32,
+        );
+    }
+
+    let derived_cap = cap_assignment_deadline(
+        request.request_id,
+        request.arrival_slot,
+        request.deadline_slot,
+        input.current_slot,
+        input.qos.error_window.future_slots,
+        latest_forecast_slot(input, scope),
+        scope.total_slots as i32,
+    )?;
+    Ok(derived_cap.min(request.assignment_deadline_slot))
+}
+
+/// Return the request's earliest legal and latest forecast/QoS-capped slots.
+pub(super) fn request_slot_bounds(
+    input: &SolveInput,
+    request: &SolveRequest,
+    scope: &SolverScope,
+) -> Result<(i32, i32), SolverError> {
+    Ok((
+        request.arrival_slot.max(input.current_slot),
+        cap_deadline_inside_forecast(input, request, scope)?,
+    ))
+}
+
+/// Latest slot available in both the planning horizon and this solve's forecast.
+pub(super) fn latest_forecast_slot(input: &SolveInput, scope: &SolverScope) -> i32 {
+    let total_slots = scope.total_slots as i32;
+    (total_slots - 1).min(input.forecast_max_slot.unwrap_or(total_slots - 1))
+}
 
 /// Return the sorted candidate slots after request bounds have already been
 /// capped by the deadline, QoS future window, and forecast availability.

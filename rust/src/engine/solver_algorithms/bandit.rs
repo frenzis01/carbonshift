@@ -1,18 +1,16 @@
-use super::shared::{pick_feasible_flavour, record_local_profile_error, valid_slots};
+use super::shared::{
+    cheapest_feasible_flavour, get_fallback_flav, get_slot_cost, pick_feasible_flavour,
+    record_local_profile_error, request_slot_bounds, valid_slots, validate_solve_input,
+};
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use crate::engine::{
-    solver::{
-        CommitReport, ProposedPlacement, SolveInput, SolverAlgorithm, SolverError, SolverProposal,
-        SolverScope,
-    },
-    solver_algorithms::{
-        cheapest_feasible_flavour, get_fallback_flav, get_slot_cost, validate_solve_input,
-    },
+use crate::engine::solver::{
+    CommitReport, ProposedPlacement, SolveInput, SolverAlgorithm, SolverError, SolverProposal,
+    SolverScope,
 };
 
 #[derive(Debug, Clone)]
@@ -152,7 +150,7 @@ impl SolverAlgorithm for BanditAlgorithm {
                 continue;
             }
 
-            let (earliest_slot, deadline_slot) = super::request_slot_bounds(input, request, scope)?;
+            let (earliest_slot, deadline_slot) = request_slot_bounds(input, request, scope)?;
             let candidates = valid_slots(earliest_slot, deadline_slot, scope.total_slots);
             // Should not happen, unless there has been improper configuration/input
             if candidates.is_empty() {

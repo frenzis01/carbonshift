@@ -18,18 +18,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::{
-    engine::{
-        solver::{
-            CommitReport, ProposedPlacement, SolveInput, SolverAlgorithm, SolverError,
-            SolverProposal, SolverScope,
-        },
-        solver_algorithms::{
-            cheapest_feasible_flavour, get_fallback_flav, get_slot_cost, request_slot_bounds,
-            shared::{pick_feasible_flavour, record_local_profile_error, valid_slots},
-            validate_solve_input,
-        },
+    engine::solver::{
+        CommitReport, ProposedPlacement, SolveInput, SolverAlgorithm, SolverError, SolverProposal,
+        SolverScope,
     },
     types::{Flavour, get_capacity_multiplier},
+};
+
+use super::shared::{
+    cheapest_feasible_flavour, get_fallback_flav, get_slot_cost, pick_feasible_flavour,
+    record_local_profile_error, request_slot_bounds, valid_slots, validate_solve_input,
 };
 
 #[derive(Debug, Clone)]
