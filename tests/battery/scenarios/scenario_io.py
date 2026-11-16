@@ -168,7 +168,8 @@ def generate_carbon_intensity_forecast(
         Lower values -> smoother transitions.
 
     inverted:
-        Reverse the normal day/night carbon wave.
+        Reflect the daylight shape around its midpoint, swapping day/night
+        peaks while preserving the wave's configured range.
 
     phase_shift_fraction:
         Shift the carbon wave forward by this fraction of a cycle, in [0, 1).
@@ -215,10 +216,10 @@ def generate_carbon_intensity_forecast(
 
         daylight_factor = rise - fall
         
-        # in case the user wants to invert the wave 
-        # (e.g. testing purposes or simulating a different region with opposite solar cycle)
+        # Reflect the normalized daylight shape so inversion swaps the same
+        # night/day endpoints instead of changing the wave's amplitude.
         if inverted:
-            daylight_factor = -daylight_factor
+            daylight_factor = 1.0 - daylight_factor
 
         trend = (
             night_max
