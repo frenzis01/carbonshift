@@ -3,11 +3,13 @@ pub mod aco;
 pub mod bandit;
 mod dp;
 mod hazard;
+mod random_assignment;
 mod shared;
 mod singleton_best;
 
 pub use dp::{DpAlgorithm, DpAlgorithmConfig};
 pub use hazard::HazardAlgorithm;
+pub use random_assignment::{RandomAssignmentAlgorithm, RandomAssignmentMode};
 pub use singleton_best::{SingletonBestAlgorithm, SingletonBestFlavourPolicy};
 
 use crate::engine::config::SwarmConfig;
@@ -30,6 +32,18 @@ pub fn register_stateless_solvers(
         SingletonBestAlgorithm::new(SingletonBestFlavourPolicy::MostAccurateOnly)
     })?;
     registry.register("hazard", move || HazardAlgorithm::new(hazard_seed))?;
+    registry.register("random_slot", move || {
+        RandomAssignmentAlgorithm::new(
+            RandomAssignmentMode::RandomSlot,
+            hazard_seed ^ 0xD6E8_FEB8_6659_FD93,
+        )
+    })?;
+    registry.register("arrival_slot", move || {
+        RandomAssignmentAlgorithm::new(
+            RandomAssignmentMode::ArrivalSlot,
+            hazard_seed ^ 0xA5A3_58D1_9E37_79B9,
+        )
+    })?;
 
     Ok(())
 }
@@ -793,6 +807,8 @@ mod tests {
             "singleton_best",
             "singleton_best_accurate",
             "hazard",
+            "random_slot",
+            "arrival_slot",
             "bandit",
             "ant_colony",
         ] {

@@ -257,7 +257,14 @@ fn simulation_aco_search_keeps_defaults_when_assignment_space_is_large_enough() 
 #[test]
 fn online_batch_sizes_sweep_for_all_supported_strategies() {
     let configured = [1, 4, 8];
-    for strategy in ["ant_colony", "bandit", "hazard", "singleton_best"] {
+    for strategy in [
+        "ant_colony",
+        "bandit",
+        "hazard",
+        "singleton_best",
+        "random_slot",
+        "arrival_slot",
+    ] {
         assert_eq!(
             online_batch_sizes_for_strategy(strategy, &configured),
             configured
@@ -330,6 +337,14 @@ fn offline_strategy_names_resolve_to_common_engine_names() {
     assert_eq!(
         canonical_offline_engine_name("offline_singleton_best_accurate").unwrap(),
         ("singleton_best_accurate", "offline_singleton_best_accurate")
+    );
+    assert_eq!(
+        canonical_offline_engine_name("offline_random_slot").unwrap(),
+        ("random_slot", "offline_random_slot")
+    );
+    assert_eq!(
+        canonical_offline_engine_name("offline_arrival_slot").unwrap(),
+        ("arrival_slot", "offline_arrival_slot")
     );
     assert!(canonical_offline_engine_name("random").is_err());
     assert!(canonical_offline_engine_name("not-a-solver").is_err());

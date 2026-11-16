@@ -43,14 +43,16 @@
 //!
 //! **Key runner fields:**
 //! - `online_strategies`: online strategies to run through the scheduler pipeline, e.g.
-//!   `["bandit", "ant_colony", "singleton_best", "hazard"]`. Independent of the DP phase:
+//!   `["bandit", "ant_colony", "singleton_best", "hazard", "random_slot", "arrival_slot"]`.
+//!   Independent of the DP phase:
 //!   set the top-level `batch_sizes` to
 //!   `[]` to skip DP entirely and only run online strategies.
 //! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
 //!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent.
-//!   "ant_colony", "bandit", "hazard", and "singleton_best" use the configured sweep.
+//!   ant_colony, bandit, hazard, singleton_best, random_slot, and arrival_slot use the configured sweep.
 //! - `additional_strategies`: common-engine strategies to run once per scenario (no batching or
-//!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate", "hazard"]`.
+//!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate",
+//!   "offline_random_slot", "offline_arrival_slot", "hazard"]`.
 //!   `hazard` is the canonical stochastic strategy name. These runs are fully independent of `batch_sizes`,
 //!   `max_batch_solver_parallelism`.
 //!   `offline_singleton_best` scans feasible slot/flavour pairs and commits the cheapest choice;
@@ -356,9 +358,16 @@ fn recompute_carbon_costs(
 /// These algorithms choose each request's placement sequentially, but can
 /// amortize scheduler setup by receiving several requests in one solve.
 fn supports_online_batch_size_sweep(strategy: &str) -> bool {
-    ["ant_colony", "bandit", "hazard", "singleton_best"]
-        .iter()
-        .any(|supported| strategy.eq_ignore_ascii_case(supported))
+    [
+        "ant_colony",
+        "bandit",
+        "hazard",
+        "singleton_best",
+        "random_slot",
+        "arrival_slot",
+    ]
+    .iter()
+    .any(|supported| strategy.eq_ignore_ascii_case(supported))
 }
 
 fn online_batch_sizes_for_strategy(strategy: &str, configured: &[usize]) -> Vec<usize> {
