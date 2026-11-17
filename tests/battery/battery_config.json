@@ -4,7 +4,7 @@
   "_trim_future_assignments_comment": "Optional. When true, requests are still generated only in each scenario's total_slots, but the planning horizon and carbon forecast extend by ERROR_WINDOW_FUTURE slots. Assignments and request-level metrics beyond the configured total_slots are trimmed; reqs_in counts scenario inputs and reqs_out counts retained assignments.",
   "trim_future_assignments": true,
   "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat keeps a nearly constant rate with seeded 5%-of-rate slot-count jitter and the same rounded horizon total. Sinusoidal scenarios may also set carbon_request_alignment (in-phase, phase-opposition, phase-shifted), carbon_phase_shift_fraction (0.0-0.5), and request_pattern_start (low/high). Both retain random sub-slot arrival times. This does not configure client emulation.",
-  "battery_id": "T21_sine_IP_L_dp_0",
+  "battery_id": "T32_sine_PS_shift0p25_L_dp_0",
   "batch_sizes": [
     1
   ],
@@ -22,6 +22,16 @@
       "name": "Accurate",
       "error": 0.0,
       "duration_sec": 60.0
+    },
+    {
+      "name": "Balanced",
+      "error": 2.5,
+      "duration_sec": 30.0
+    },
+    {
+      "name": "Fast",
+      "error": 5.0,
+      "duration_sec": 10.0
     }
   ],
   "rust_binary_path": "rust/target/release/nshift",
@@ -35,7 +45,7 @@
   "realtime_speed_scale": 1.0,
   "scenarios": [
     {
-      "id": "scen_1500_92",
+      "id": "scen_1500_92_sine_PS_shift0p25_L",
       "seed": 92,
       "requests_per_slot": 1500.0,
       "total_slots": 72,
@@ -55,12 +65,12 @@
         }
       ],
       "max_error_threshold": 4.0,
-      "carbon_request_alignment": "in-phase",
+      "carbon_request_alignment": "phase-shifted",
       "carbon_phase_shift_fraction": 0.25,
       "request_pattern_start": "low"
     },
     {
-      "id": "scen_1800_230",
+      "id": "scen_1800_230_sine_PS_shift0p25_L",
       "seed": 230,
       "requests_per_slot": 1800.0,
       "total_slots": 72,
@@ -80,12 +90,12 @@
         }
       ],
       "max_error_threshold": 4.0,
-      "carbon_request_alignment": "in-phase",
+      "carbon_request_alignment": "phase-shifted",
       "carbon_phase_shift_fraction": 0.25,
       "request_pattern_start": "low"
     },
     {
-      "id": "scen_2000_120",
+      "id": "scen_2000_120_sine_PS_shift0p25_L",
       "seed": 120,
       "requests_per_slot": 2000.0,
       "total_slots": 72,
@@ -105,7 +115,7 @@
         }
       ],
       "max_error_threshold": 4.0,
-      "carbon_request_alignment": "in-phase",
+      "carbon_request_alignment": "phase-shifted",
       "carbon_phase_shift_fraction": 0.25,
       "request_pattern_start": "low"
     }

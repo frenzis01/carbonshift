@@ -97,9 +97,12 @@ horizon. These values can differ across strategy runs. Leaving
 
 `multiple_runs.py` runs the `sinusoidal` input pattern by default. Use
 `--input-pattern flat` or `--input-pattern sinusoidal flat` to choose other
-patterns. It adds the selected pattern and sinusoidal wave settings to scenario
-and battery IDs so results do not overwrite one another. For a single battery
-run, set `input_pattern`, `carbon_request_alignment`, and
+patterns. It always sets each scenario's input pattern and sinusoidal wave
+settings. `APPEND_SUFFIX_TO_SCENARIOS` controls whether the corresponding tags
+are also added to scenario IDs; previously generated tags are normalized first.
+The battery ID includes the selected pattern and wave settings regardless of
+this option, so sweep outputs remain distinct. For a single battery run, set
+`input_pattern`, `carbon_request_alignment`, and
 `request_pattern_start` per scenario in the config; omitted values use the
 defaults in `scenario_config.py`.
 
@@ -117,6 +120,14 @@ once per scenario:
   is exhaustive over that request's candidates, not over complete schedules.
 - `offline_singleton_best_accurate`: uses the lowest-error flavour only, then scans feasible
   slots for the least-carbon-cost assignment.
+- `offline_random_slot` and `offline_arrival_slot`: reference random assignments.
+  They choose a random flavour while both the cumulative and current-slot-centered
+  window averages are at or below the threshold; once either is above it, they
+  use the minimum-error flavour at the slot selected by that strategy's mode.
+  Randomized assignments may push an average above threshold; later requests
+  in that solve then use the fallback until both averages are back at or below
+  threshold. `offline_random_slot` samples a legal slot, while
+  `offline_arrival_slot` uses the earliest legal slot (normally arrival).
 - `hazard`: samples a feasible slot with probability inversely proportional
   to forecast carbon intensity multiplied by the capacity-tier multiplier at
   that slot's next occupancy position. It samples flavours from the
@@ -133,11 +144,20 @@ once per scenario:
 
 ## Online strategies
 
-Set `hazard`, `bandit`, `ant_colony`, or `singleton_best` in
+Set `hazard`, `bandit`, `ant_colony`, `singleton_best`, `random_slot`, or
+`arrival_slot` in
 `online_strategies` to run it through the streaming scheduler. The same engine
 implementations are available offline through `additional_strategies`.
 
-`ant_colony`, `bandit`, `hazard`, and `singleton_best` use the
+The random-reference modes use the cumulative and current-slot-centered window
+averages as a gate: random flavour selection is allowed at or below threshold,
+and above threshold the minimum-error flavour is used without changing the
+selected slot mode. A random choice may cross the threshold; subsequent
+requests then use the fallback until both averages are back at or below
+threshold.
+
+`ant_colony`, `bandit`, `hazard`, `singleton_best`, `random_slot`, and
+`arrival_slot` use the
 `online_batch_sizes` sweep. Batch size changes when request-level strategies
 observe committed feedback, so compare both runtime and scheduling quality.
 

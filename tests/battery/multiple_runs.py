@@ -7,8 +7,9 @@ is sensitive to a different subset of runtime knobs:
 
   - Every online strategy is sensitive to `max_batch_solver_parallelism`.
   - The `online` phase is the joint-batch ACO sweep.
-  - The `per_request` phase keeps Bandit, singleton-best, and Hazard grouped
-    by their request-level decision policy, while sweeping their batch size.
+  - The `per_request` phase keeps Bandit, singleton-best, Hazard, and the two
+    random-reference policies grouped by their request-level decision policy,
+    while sweeping their batch size.
     A batch still processes requests sequentially where the algorithm does so;
     it changes how often scheduler setup and committed feedback occur.
   - offline strategies (offline_singleton_best, offline_singleton_best_accurate,
@@ -56,6 +57,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -110,7 +112,13 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
 
 PER_REQUEST_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
-    "online_strategies": ["bandit", "singleton_best", "hazard"],
+    "online_strategies": [
+        "bandit",
+        "singleton_best",
+        "hazard",
+        "random_slot",
+        "arrival_slot",
+    ],
     "online_batch_sizes": [8],
     "additional_strategies": [],
 }
@@ -121,6 +129,8 @@ OFFLINE_CONTENT: Dict[str, Any] = {
     "additional_strategies": [
         "offline_singleton_best",
         "offline_singleton_best_accurate",
+        "offline_random_slot",
+        "offline_arrival_slot",
         "hazard",
         "bandit",
         "ant_colony",
@@ -136,6 +146,9 @@ OUTPUT_ALIGNMENT_TOKENS = {
 }
 OUTPUT_REQUEST_START_TOKENS = {"low": "L", "high": "H"}
 OUTPUT_PHASE_TOKENS = {"per_request": "perrequest"}
+_SCENARIO_WAVE_SUFFIX = re.compile(
+    r"_(?:IP|PO)_[LH]$|_PS_shift[+-]?[0-9]+(?:p[0-9]+)?(?:e[+-]?[0-9]+)?_[LH]$"
+)
 
 # Shared by the baseline and all phases. Comment out entries to restrict the
 # available solver choices for a test run.
@@ -145,17 +158,18 @@ FLAVOURS: List[Dict[str, Any]] = [
     {"name": "Fast", "error": 5.0, "duration_sec": 10.0},
 ]
 
+# TODO: better assess
 APPEND_SUFFIX_TO_SCENARIOS = True
 
-BATTERY_ID_PREFIX = "T30"
+BATTERY_ID_PREFIX = "T33"
 
 # Select which supported scenario pattern(s) the default sweep runs.
-INPUT_PATTERNS = ("sinusoidal",)
+INPUT_PATTERNS = ("flat",)
 # Sinusoidal-only relationship, shift amount, and request-wave orientation.
 # "in-phase"
 # "phase_opposition"
 # "phase-shifted"
-CARBON_REQUEST_ALIGNMENT = "in-phase"
+CARBON_REQUEST_ALIGNMENT = "phase-shifted"
 # Used only for phase-shifted; 0.25 is halfway from alignment to opposition.
 CARBON_PHASE_SHIFT_FRACTION = 0.25
 REQUEST_PATTERN_START = "low"
@@ -169,7 +183,7 @@ _PARALLELISM_X_THRESHOLD = [
         "max_batch_solver_parallelism": parallelism,
         "max_error_threshold": threshold,
     }
-    for parallelism in (1,10,20)
+    for parallelism in (20,)
     for threshold in (4.0,)
 ]
 
@@ -205,6 +219,19 @@ def save_config(path: Path, cfg: Dict[str, Any]) -> None:
         fh.write("\n")
 
 
+def _strip_scenario_output_suffixes(scenario_id: str) -> str:
+    """Remove pattern and wave tags previously added by this sweep script."""
+    while True:
+        previous = scenario_id
+        scenario_id = _SCENARIO_WAVE_SUFFIX.sub("", scenario_id)
+        for token in OUTPUT_INPUT_PATTERN_TOKENS.values():
+            suffix = f"_{token}"
+            if scenario_id.endswith(suffix):
+                scenario_id = scenario_id[: -len(suffix)]
+        if scenario_id == previous:
+            return scenario_id
+
+
 def _with_input_pattern(cfg: Dict[str, Any], input_pattern: str) -> Dict[str, Any]:
     """Return a config copy whose scenarios identify one simulation pattern."""
     if input_pattern not in SUPPORTED_INPUT_PATTERNS:
@@ -212,15 +239,14 @@ def _with_input_pattern(cfg: Dict[str, Any], input_pattern: str) -> Dict[str, An
 
     output_token = OUTPUT_INPUT_PATTERN_TOKENS[input_pattern]
     patterned_cfg = dict(cfg)
-    if APPEND_SUFFIX_TO_SCENARIOS:
-        patterned_cfg["scenarios"] = [
-            {
-                **scenario,
-                "id": f"{scenario['id']}_{output_token}",
-                "input_pattern": input_pattern,
-            }
-            for scenario in cfg.get("scenarios", [])
-        ]
+    patterned_cfg["scenarios"] = []
+    for scenario in cfg.get("scenarios", []):
+        scenario_id = _strip_scenario_output_suffixes(scenario["id"])
+        if APPEND_SUFFIX_TO_SCENARIOS:
+            scenario_id = f"{scenario_id}_{output_token}"
+        patterned_cfg["scenarios"].append(
+            {**scenario, "id": scenario_id, "input_pattern": input_pattern}
+        )
     return patterned_cfg
 
 
@@ -244,19 +270,27 @@ def _with_sinusoidal_wave_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     wave_suffix = _wave_output_suffix()
     configured = dict(cfg)
-    if APPEND_SUFFIX_TO_SCENARIOS:
-        configured["scenarios"] = [
+    configured["scenarios"] = []
+    for scenario in cfg.get("scenarios", []):
+        if scenario.get("input_pattern") != "sinusoidal":
+            configured["scenarios"].append(scenario)
+            continue
+
+        scenario_id = _strip_scenario_output_suffixes(scenario["id"])
+        if APPEND_SUFFIX_TO_SCENARIOS:
+            scenario_id = (
+                f"{scenario_id}_"
+                f"{OUTPUT_INPUT_PATTERN_TOKENS['sinusoidal']}{wave_suffix}"
+            )
+        configured["scenarios"].append(
             {
                 **scenario,
-                "id": f"{scenario['id']}{wave_suffix}",
+                "id": scenario_id,
                 "carbon_request_alignment": CARBON_REQUEST_ALIGNMENT,
                 "carbon_phase_shift_fraction": CARBON_PHASE_SHIFT_FRACTION,
                 "request_pattern_start": REQUEST_PATTERN_START,
             }
-            if scenario.get("input_pattern") == "sinusoidal"
-            else scenario
-            for scenario in cfg.get("scenarios", [])
-        ]
+        )
     return configured
 
 

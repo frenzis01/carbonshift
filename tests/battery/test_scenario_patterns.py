@@ -16,6 +16,7 @@ import multiple_runs  # noqa: E402
 from scenario_io import (  # noqa: E402
     _request_rate_per_slot,
     _resolve_carbon_wave_flags,
+    generate_carbon_intensity_forecast,
     generate_scenario_data,
 )
 
@@ -139,6 +140,33 @@ def test_carbon_alignment_accounts_for_reversed_carbon_baseline_direction():
     )
 
 
+def test_inverted_carbon_wave_swaps_endpoints_without_changing_range():
+    common = {
+        "total_slots": 24,
+        "carbon_intensity_cycle_slots": 24,
+        "seed": 1,
+        "night_max": 75.0,
+        "day_min": 170.0,
+        "noise_std": 0.0,
+        "noise_persistence": 0.0,
+    }
+
+    def generate(inverted: bool) -> list[float]:
+        return generate_carbon_intensity_forecast(**common, inverted=inverted)
+
+    in_phase = generate(inverted=False)
+    opposed = generate(inverted=True)
+
+    assert all(
+        opposite == pytest.approx(75.0 + 170.0 - normal)
+        for normal, opposite in zip(in_phase, opposed, strict=True)
+    )
+    assert min(opposed) > 70.0
+    assert max(opposed) < 175.0
+    assert opposed[0] > in_phase[0]
+    assert opposed[12] < in_phase[12]
+
+
 def test_generated_carbon_wave_follows_selected_alignment():
     def forecast(alignment: str, request_start: str) -> list[float]:
         scenario = generate_scenario_data(
@@ -167,6 +195,10 @@ def test_generated_carbon_wave_follows_selected_alignment():
 
     assert in_phase[12] > in_phase[0]
     assert opposed[12] < opposed[0]
+    assert all(
+        opposite == pytest.approx(75.0 + 170.0 - normal)
+        for normal, opposite in zip(in_phase, opposed, strict=True)
+    )
     assert inverted_in_phase[12] < inverted_in_phase[0]
     assert shifted != in_phase
 
@@ -191,20 +223,35 @@ def test_unknown_scenario_pattern_is_rejected():
         )
 
 
-def test_multiple_runs_patterns_get_distinct_scenario_ids():
-    base = {"scenarios": [{"id": "workload", "seed": 9}]}
+@pytest.mark.parametrize(
+    ("append_suffix", "expected_flat_id", "expected_sinusoidal_id"),
+    [
+        (False, "workload", "workload"),
+        (True, "workload_FLAT", "workload_sine_IP_L"),
+    ],
+)
+def test_multiple_runs_patterns_set_metadata_and_normalize_scenario_ids(
+    monkeypatch, append_suffix, expected_flat_id, expected_sinusoidal_id
+):
+    monkeypatch.setattr(multiple_runs, "APPEND_SUFFIX_TO_SCENARIOS", append_suffix)
+    monkeypatch.setattr(multiple_runs, "CARBON_REQUEST_ALIGNMENT", "in-phase")
+    monkeypatch.setattr(multiple_runs, "REQUEST_PATTERN_START", "low")
+    base = {"scenarios": [{"id": "workload_sine_IP_L", "seed": 9}]}
 
     flat = multiple_runs._with_input_pattern(base, "flat")
     sinusoidal = multiple_runs._with_input_pattern(base, "sinusoidal")
+    sinusoidal = multiple_runs._with_sinusoidal_wave_settings(sinusoidal)
 
-    assert flat["scenarios"][0]["id"] == "workload_FLAT"
+    assert flat["scenarios"][0]["id"] == expected_flat_id
     assert flat["scenarios"][0]["input_pattern"] == "flat"
-    assert sinusoidal["scenarios"][0]["id"] == "workload_sine"
+    assert sinusoidal["scenarios"][0]["id"] == expected_sinusoidal_id
     assert sinusoidal["scenarios"][0]["input_pattern"] == "sinusoidal"
-    assert base["scenarios"][0] == {"id": "workload", "seed": 9}
+    assert sinusoidal["scenarios"][0]["carbon_request_alignment"] == "in-phase"
+    assert base["scenarios"][0] == {"id": "workload_sine_IP_L", "seed": 9}
 
 
 def test_multiple_runs_applies_sinusoidal_wave_constants_without_mutating_base(monkeypatch):
+    monkeypatch.setattr(multiple_runs, "APPEND_SUFFIX_TO_SCENARIOS", True)
     monkeypatch.setattr(multiple_runs, "CARBON_REQUEST_ALIGNMENT", "phase-shifted")
     monkeypatch.setattr(multiple_runs, "REQUEST_PATTERN_START", "high")
     monkeypatch.setattr(multiple_runs, "CARBON_PHASE_SHIFT_FRACTION", 0.4)

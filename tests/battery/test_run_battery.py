@@ -113,6 +113,8 @@ def test_multiple_runs_keeps_request_strategies_in_per_request_batch_sweep():
         "bandit",
         "singleton_best",
         "hazard",
+        "random_slot",
+        "arrival_slot",
     ]
     assert mr.PER_REQUEST_ONLINE_CONTENT["online_batch_sizes"] == [
         1,
@@ -122,6 +124,15 @@ def test_multiple_runs_keeps_request_strategies_in_per_request_batch_sweep():
         1024,
     ]
     assert mr.SWARM_ONLINE_CONTENT["online_strategies"] == ["ant_colony"]
+
+
+def test_multiple_runs_includes_random_reference_policies():
+    assert {"random_slot", "arrival_slot"}.issubset(
+        mr.PER_REQUEST_ONLINE_CONTENT["online_strategies"]
+    )
+    assert {"offline_random_slot", "offline_arrival_slot"}.issubset(
+        mr.OFFLINE_CONTENT["additional_strategies"]
+    )
 
 
 def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path):
@@ -484,7 +495,7 @@ def test_multiple_runs_default_patterns_is_a_single_pattern_not_characters():
     assert mr.INPUT_PATTERNS == ("sinusoidal",)
     patterned = mr._with_input_pattern({"scenarios": [{"id": "tiny"}]}, mr.INPUT_PATTERNS[0])
     assert patterned["scenarios"][0]["input_pattern"] == "sinusoidal"
-    assert patterned["scenarios"][0]["id"] == "tiny_sine"
+    assert patterned["scenarios"][0]["id"] == "tiny"
 
 
 def test_multiple_runs_flavours_override_battery_config_for_each_phase(

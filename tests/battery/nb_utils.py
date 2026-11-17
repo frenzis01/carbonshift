@@ -65,31 +65,37 @@ class AssignmentRun:
 def discover_assignment_runs(
     results_root: Path, run_folder_filter: str | None = None
 ) -> list[AssignmentRun]:
-    """Find batch and offline assignment results in the battery output tree.
+    """Find batch, online, and offline assignment results in the battery output tree.
 
-    Batch runs store ``per_request.csv`` under ``rust_<mode>/N<batch_size>``;
-    offline strategies store it under ``rust_offline/strategy_<name>``.
+    Batch runs store ``per_request.csv`` under ``rust_<mode>/N<batch_size>``.
+    Online runs add a solver directory under ``rust_online``; offline strategies
+    store one result directly under ``rust_offline/strategy_<name>``.
     """
     results_root = Path(results_root)
     search_root = results_root / run_folder_filter if run_folder_filter else results_root
     batch_sizes_by_mode: dict[Path, set[int]] = {}
+    batch_sizes_by_online_solver: dict[Path, set[int]] = {}
     offline_dirs: set[Path] = set()
 
     for per_request_path in search_root.rglob("per_request.csv"):
         assignment_dir = per_request_path.parent
-        require_output_schema(assignment_dir, schema_name="carbonshift.nshift")
         parent = assignment_dir.parent
-        if (
-            assignment_dir.name.startswith("N")
-            and assignment_dir.name[1:].isdigit()
-            and parent.name.startswith("rust_")
-            and parent.name != "rust_offline"
-        ):
-            batch_sizes_by_mode.setdefault(parent, set()).add(int(assignment_dir.name[1:]))
+        if assignment_dir.name.startswith("N") and assignment_dir.name[1:].isdigit():
+            batch_size = int(assignment_dir.name[1:])
+            if parent.name.startswith("rust_") and parent.name not in {
+                "rust_baseline",
+                "rust_offline",
+            }:
+                require_output_schema(assignment_dir, schema_name="carbonshift.nshift")
+                batch_sizes_by_mode.setdefault(parent, set()).add(batch_size)
+            elif parent.name.startswith("online_") and parent.parent.name == "rust_online":
+                require_output_schema(assignment_dir, schema_name="carbonshift.nshift")
+                batch_sizes_by_online_solver.setdefault(parent, set()).add(batch_size)
         elif (
             assignment_dir.name.startswith("strategy_")
             and parent.name == "rust_offline"
         ):
+            require_output_schema(assignment_dir, schema_name="carbonshift.nshift")
             offline_dirs.add(assignment_dir)
 
     runs = []
@@ -103,6 +109,20 @@ def discover_assignment_runs(
                 run_folder_id=relative_parts[0] if len(relative_parts) > 1 else None,
                 run_type="batch",
                 mode_label=mode_dir.name.removeprefix("rust_"),
+                batch_sizes=tuple(sorted(batch_sizes)),
+            )
+        )
+
+    for solver_dir, batch_sizes in batch_sizes_by_online_solver.items():
+        scenario_dir = solver_dir.parent.parent
+        relative_parts = scenario_dir.relative_to(results_root).parts
+        runs.append(
+            AssignmentRun(
+                assignment_dir=solver_dir,
+                scenario_dir=scenario_dir,
+                run_folder_id=relative_parts[0] if len(relative_parts) > 1 else None,
+                run_type="online",
+                mode_label=solver_dir.name,
                 batch_sizes=tuple(sorted(batch_sizes)),
             )
         )
