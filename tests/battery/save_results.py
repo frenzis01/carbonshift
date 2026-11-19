@@ -59,6 +59,13 @@ def load_run(run_dir: Path) -> pd.DataFrame:
 
     df = pd.read_csv(csv_path)
     df.insert(0, "run_id", run_id)
+    scenario_thresholds = {
+        scenario["id"]: scenario.get("max_error_threshold")
+        for scenario in cfg.get("scenarios", [])
+    }
+    df["thresh"] = df["scenario_id"].map(scenario_thresholds)
+    # round thresh
+    df["thresh"] = df["thresh"].round(2)
     df["path"] = df.apply(
         lambda r: _resolve_run_path(run_dir, r["scenario_id"], r["strategy"]),
         axis=1,
@@ -133,6 +140,7 @@ def aggregate_and_save(
         "carb_saving",
         "elapsed_s",
         "error",
+        "thresh",
         "carb_cost",
         "reqs_fallback_assigned",
         "paral",

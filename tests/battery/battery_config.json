@@ -4,10 +4,8 @@
   "_trim_future_assignments_comment": "Optional. When true, requests are still generated only in each scenario's total_slots, but the planning horizon and carbon forecast extend by ERROR_WINDOW_FUTURE slots. Assignments and request-level metrics beyond the configured total_slots are trimmed; reqs_in counts scenario inputs and reqs_out counts retained assignments.",
   "trim_future_assignments": true,
   "_input_pattern_comment": "Simulation-only request pattern: sinusoidal follows the daylight load wave; flat keeps a nearly constant rate with seeded 5%-of-rate slot-count jitter and the same rounded horizon total. Sinusoidal scenarios may also set carbon_request_alignment (in-phase, phase-opposition, phase-shifted), carbon_phase_shift_fraction (0.0-0.5), and request_pattern_start (low/high). Both retain random sub-slot arrival times. This does not configure client emulation.",
-  "battery_id": "T32_sine_PS_shift0p25_L_dp_0",
-  "batch_sizes": [
-    1
-  ],
+  "battery_id": "T40_sine_IP_L_offline_0",
+  "batch_sizes": [],
   "online_strategies": [],
   "_online_batch_sizes_comment": "Batch sizes swept ONLY by online_strategies, independent of the DP phase's batch_sizes above. Omit to fall back to batch_sizes. ant_colony, bandit, hazard, and singleton_best use this sweep.",
   "online_batch_sizes__": [
@@ -15,7 +13,15 @@
     4,
     8
   ],
-  "additional_strategies": [],
+  "additional_strategies": [
+    "offline_singleton_best",
+    "offline_singleton_best_accurate",
+    "offline_random_slot",
+    "offline_arrival_slot",
+    "hazard",
+    "bandit",
+    "ant_colony"
+  ],
   "_flavours_comment": "Optional flavour override shared by the baseline and every enabled phase/scenario. Edit this list to use any subset (for example, keep only Accurate), or set flavours to null to use nshift's built-in defaults.",
   "flavours": [
     {
@@ -45,7 +51,7 @@
   "realtime_speed_scale": 1.0,
   "scenarios": [
     {
-      "id": "scen_1500_92_sine_PS_shift0p25_L",
+      "id": "scen_1500_92_sine_IP_L",
       "seed": 92,
       "requests_per_slot": 1500.0,
       "total_slots": 72,
@@ -64,13 +70,13 @@
           "multiplier": 5.0
         }
       ],
-      "max_error_threshold": 4.0,
-      "carbon_request_alignment": "phase-shifted",
+      "max_error_threshold": 0.0,
+      "carbon_request_alignment": "in-phase",
       "carbon_phase_shift_fraction": 0.25,
       "request_pattern_start": "low"
     },
     {
-      "id": "scen_1800_230_sine_PS_shift0p25_L",
+      "id": "scen_1800_230_sine_IP_L",
       "seed": 230,
       "requests_per_slot": 1800.0,
       "total_slots": 72,
@@ -89,13 +95,13 @@
           "multiplier": 5.0
         }
       ],
-      "max_error_threshold": 4.0,
-      "carbon_request_alignment": "phase-shifted",
+      "max_error_threshold": 0.0,
+      "carbon_request_alignment": "in-phase",
       "carbon_phase_shift_fraction": 0.25,
       "request_pattern_start": "low"
     },
     {
-      "id": "scen_2000_120_sine_PS_shift0p25_L",
+      "id": "scen_2000_120_sine_IP_L",
       "seed": 120,
       "requests_per_slot": 2000.0,
       "total_slots": 72,
@@ -114,8 +120,8 @@
           "multiplier": 5.0
         }
       ],
-      "max_error_threshold": 4.0,
-      "carbon_request_alignment": "phase-shifted",
+      "max_error_threshold": 0.0,
+      "carbon_request_alignment": "in-phase",
       "carbon_phase_shift_fraction": 0.25,
       "request_pattern_start": "low"
     }

@@ -161,15 +161,15 @@ FLAVOURS: List[Dict[str, Any]] = [
 # TODO: better assess
 APPEND_SUFFIX_TO_SCENARIOS = True
 
-BATTERY_ID_PREFIX = "T33"
+BATTERY_ID_PREFIX = "T40"
 
 # Select which supported scenario pattern(s) the default sweep runs.
-INPUT_PATTERNS = ("flat",)
+INPUT_PATTERNS = ("sinusoidal",)
 # Sinusoidal-only relationship, shift amount, and request-wave orientation.
 # "in-phase"
 # "phase_opposition"
 # "phase-shifted"
-CARBON_REQUEST_ALIGNMENT = "phase-shifted"
+CARBON_REQUEST_ALIGNMENT = "in-phase"
 # Used only for phase-shifted; 0.25 is halfway from alignment to opposition.
 CARBON_PHASE_SHIFT_FRACTION = 0.25
 REQUEST_PATTERN_START = "low"
@@ -184,7 +184,7 @@ _PARALLELISM_X_THRESHOLD = [
         "max_error_threshold": threshold,
     }
     for parallelism in (20,)
-    for threshold in (4.0,)
+    for threshold in (5.0,)
 ]
 
 PHASES: Dict[str, PhaseGrid] = {
@@ -198,7 +198,7 @@ PHASES: Dict[str, PhaseGrid] = {
     "offline": PhaseGrid(
         "offline",
         OFFLINE_CONTENT,
-        [{"max_error_threshold": threshold} for threshold in (4.0,)],
+        [{"max_error_threshold": threshold} for threshold in (0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.5,5.0)],
     ),
 }
 

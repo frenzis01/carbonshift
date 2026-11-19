@@ -126,9 +126,10 @@ def test_aggregate_sorts_rows_and_preserves_full_precision_metrics(tmp_path, mon
     assert result["carb_saving"].iloc[1] == pytest.approx(50.123456789)
     assert result["solver_ms"].iloc[1] == pytest.approx(0.123456789)
     assert result["error"].iloc[1] == pytest.approx(3.987654321)
+    assert result["Thresh"].isna().all()
     assert result["baseline_carb_cost"].iloc[1] == pytest.approx(200.123456789)
     assert result["custom_metric"].iloc[1] == pytest.approx(9.87654321)
-    assert result.columns[:17].tolist() == [
+    assert result.columns[:18].tolist() == [
         "run_id",
         "scenario_id",
         "reqs_in",
@@ -138,6 +139,7 @@ def test_aggregate_sorts_rows_and_preserves_full_precision_metrics(tmp_path, mon
         "carb_saving",
         "elapsed_s",
         "error",
+        "Thresh",
         "carb_cost",
         "reqs_fallback_assigned",
         "paral",
@@ -163,3 +165,40 @@ def test_aggregate_sorts_rows_and_preserves_full_precision_metrics(tmp_path, mon
     assert saved["solver_ms"].iloc[1] == pytest.approx(0.123456789)
     assert saved["carb_cost"].iloc[1] == pytest.approx(100.123456789)
     assert saved["custom_metric"].iloc[1] == pytest.approx(9.87654321)
+
+
+def test_load_run_adds_per_scenario_error_thresholds(tmp_path):
+    run_dir = tmp_path / "T40_thresholds"
+    run_dir.mkdir()
+    (run_dir / "output_schema.json").write_text(
+        json.dumps(
+            {
+                "schema_version": save_results.OUTPUT_SCHEMA_VERSION,
+                "schema_name": "carbonshift.battery-run",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "battery_config.json").write_text(
+        json.dumps(
+            {
+                "scenarios": [
+                    {"id": "scenario_a", "max_error_threshold": 0.5},
+                    {"id": "scenario_b", "max_error_threshold": 4.0},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_csv(
+        run_dir / "battery_results_T40_thresholds.csv",
+        ["scenario_id", "batch_size", "strategy"],
+        [
+            {"scenario_id": "scenario_a", "batch_size": 1, "strategy": "dp"},
+            {"scenario_id": "scenario_b", "batch_size": 1, "strategy": "dp"},
+        ],
+    )
+
+    result = save_results.load_run(run_dir)
+
+    assert result["Thresh"].tolist() == [0.5, 4.0]
