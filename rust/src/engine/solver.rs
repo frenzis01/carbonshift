@@ -149,6 +149,17 @@ pub enum PlacementOrigin {
     Solver,
     /// The primary DP could not place the request, so the coverage fallback did.
     GreedyFallback,
+    /// No legal slot had a flavour satisfying QoS, so the strategy used its
+    /// documented best-effort placement.
+    InfeasibilityFallback,
+}
+
+impl PlacementOrigin {
+    /// Returns whether this placement came from a recovery path rather than
+    /// the strategy's normal feasible-placement selection.
+    pub const fn is_fallback(self) -> bool {
+        matches!(self, Self::GreedyFallback | Self::InfeasibilityFallback)
+    }
 }
 
 /// A proposed request-to-slot-and-flavour decision; it has no final price yet.
@@ -194,6 +205,17 @@ impl ProposedPlacement {
             flavour_name,
             late: false,
             origin: PlacementOrigin::GreedyFallback,
+        }
+    }
+
+    /// Build a best-effort placement after every legal slot failed its QoS checks.
+    pub fn infeasibility_fallback(req_id: u64, scheduled_slot: i32, flavour_name: String) -> Self {
+        Self {
+            req_id,
+            scheduled_slot,
+            flavour_name,
+            late: false,
+            origin: PlacementOrigin::InfeasibilityFallback,
         }
     }
 }

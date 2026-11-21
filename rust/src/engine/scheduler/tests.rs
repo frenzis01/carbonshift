@@ -552,9 +552,9 @@ fn scoped_snapshot_preserves_solver_inputs_for_its_capacity_and_error_ranges() {
 }
 
 #[test]
-fn common_worker_reports_greedy_fallback_and_selected_flavour() {
+fn common_worker_reports_infeasibility_fallback_and_selected_flavour() {
     let config = make_config(|config| {
-        config.solver.solver_strategy = "dp".to_owned();
+        config.solver.solver_strategy = "singleton_best".to_owned();
         config.flavours = vec![
             Flavour {
                 name: "FastButInaccurate".to_owned(),

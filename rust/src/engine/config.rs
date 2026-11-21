@@ -61,7 +61,9 @@ pub struct SimulationConfig {
 pub struct SwarmConfig {
     /// Exploration probability for the online bandit.
     pub bandit_epsilon: f64,
-    /// Optimistic initial Q-value for the online bandit.
+    /// Initial Q estimate for slots before their first observation. The first
+    /// observation replaces this value; under cost minimization, lower values
+    /// make unvisited slots more attractive.
     pub bandit_initial_q: f64,
     /// RNG seed for the online bandit.
     pub bandit_seed: u64,

@@ -262,8 +262,8 @@ fn online_batch_sizes_sweep_for_all_supported_strategies() {
         "bandit",
         "hazard",
         "singleton_best",
-        "random_slot",
-        "arrival_slot",
+        "random_slotflav",
+        "random_flav",
     ] {
         assert_eq!(
             online_batch_sizes_for_strategy(strategy, &configured),
@@ -274,6 +274,28 @@ fn online_batch_sizes_sweep_for_all_supported_strategies() {
         online_batch_sizes_for_strategy("unknown", &configured),
         vec![1]
     );
+    assert_eq!(
+        online_batch_sizes_for_strategy("random_slot", &configured),
+        vec![1]
+    );
+    assert_eq!(
+        online_batch_sizes_for_strategy("arrival_slot", &configured),
+        vec![1]
+    );
+}
+
+#[test]
+fn renamed_online_random_policies_map_to_their_engine_modes_and_reject_old_names() {
+    assert_eq!(
+        canonical_online_engine_name("random_slotflav").unwrap(),
+        "random_slot"
+    );
+    assert_eq!(
+        canonical_online_engine_name("random_flav").unwrap(),
+        "arrival_slot"
+    );
+    assert!(canonical_online_engine_name("random_slot").is_err());
+    assert!(canonical_online_engine_name("arrival_slot").is_err());
 }
 
 #[test]
@@ -339,13 +361,17 @@ fn offline_strategy_names_resolve_to_common_engine_names() {
         ("singleton_best_accurate", "offline_singleton_best_accurate")
     );
     assert_eq!(
-        canonical_offline_engine_name("offline_random_slot").unwrap(),
-        ("random_slot", "offline_random_slot")
+        canonical_offline_engine_name("offline_random_slotflav").unwrap(),
+        ("random_slot", "offline_random_slotflav")
     );
     assert_eq!(
-        canonical_offline_engine_name("offline_arrival_slot").unwrap(),
-        ("arrival_slot", "offline_arrival_slot")
+        canonical_offline_engine_name("offline_random_flav").unwrap(),
+        ("arrival_slot", "offline_random_flav")
     );
+    assert!(canonical_offline_engine_name("offline_random_slot").is_err());
+    assert!(canonical_offline_engine_name("offline_arrival_slot").is_err());
+    assert!(canonical_offline_engine_name("random_slot").is_err());
+    assert!(canonical_offline_engine_name("arrival_slot").is_err());
     assert!(canonical_offline_engine_name("random").is_err());
     assert!(canonical_offline_engine_name("not-a-solver").is_err());
 
@@ -454,6 +480,39 @@ fn offline_dp_marks_greedy_fallback_and_reports_its_flavour() {
     assert!(per_request[0].fallback_assigned);
     assert_eq!(per_request[0].flavour_name, "LowestError");
     assert_eq!(summary.reqs_fallback_assigned, 1);
+}
+
+#[test]
+fn offline_infeasibility_fallbacks_are_reported() {
+    let scenario = make_scenario(vec![make_request(7, 0, 1)], vec![10.0, 1.0]);
+    let mut config = Config::default();
+    config.total_slots = 2;
+    config.error_window_future = 1;
+    config.max_error_threshold = 0.0;
+    config.global_error_constraint_enabled = false;
+    config.flavours = vec![
+        Flavour {
+            name: "FastButInaccurate".to_owned(),
+            error: 10.0,
+            duration: 1.0,
+        },
+        Flavour {
+            name: "LowestError".to_owned(),
+            error: 1.0,
+            duration: 10.0,
+        },
+    ];
+    let registry = build_solver_registry(&config, 42).unwrap();
+
+    for strategy in ["bandit", "ant_colony", "singleton_best"] {
+        let (per_request, summary) =
+            run_strategy(&registry, strategy, &scenario, &config, 60.0, false, 1.0).unwrap();
+
+        assert_eq!(per_request.len(), 1, "{strategy}");
+        assert!(per_request[0].fallback_assigned, "{strategy}");
+        assert_eq!(per_request[0].flavour_name, "LowestError", "{strategy}");
+        assert_eq!(summary.reqs_fallback_assigned, 1, "{strategy}");
+    }
 }
 
 #[test]

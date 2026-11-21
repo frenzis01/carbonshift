@@ -1,18 +1,20 @@
 /// ACO algorithm wrap up for slot assignment
 ///  
-/// Every ant chooses slots balancing estimated cost and pheromone deposited by previous best solutions.
+/// Every ant chooses QoS-feasible slots using the candidate's estimated carbon
+/// cost and pheromone deposited by previous best solutions.
 ///     - tau represents the pheromone deposit for each slot, and gets updated
 ///         - locally at every iteration
 ///         - globally after commit (n_iterations)
 ///     - eta represents the heuristic desirability of a slot, and is re-computed at each request assignment choice.
 /// Every ant is a solution, i.e. a SolverProposal: Vec<ProposedPlacement>
-/// 1. Each ant builds a candidate solution, choosing among QoS-feasible slots.
+/// 1. Each ant chooses a legal slot using a QoS-feasible flavour, or the
+///    minimum-error flavour when no legal slot can satisfy QoS.
 /// 2. The iteration’s best ant has cost (L).
 /// 3. The working pheromone evaporates: tau[i] *= 1 - rho.
 /// 4. Each placement in that best solution adds a deposit of Q / L to its slot, where Q is q_deposit.
 /// This is repeated each iteration.
 /// Local changes are applied per iteration, not globally. Only the committed best solution globally updates pheromone.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -22,7 +24,7 @@ use crate::{
         CommitReport, ProposedPlacement, SolveInput, SolverAlgorithm, SolverError, SolverProposal,
         SolverScope,
     },
-    types::{Flavour, get_capacity_multiplier},
+    types::Flavour,
 };
 
 use super::shared::{
@@ -221,14 +223,6 @@ impl SolverAlgorithm for AcoAlgorithm {
             ));
         }
 
-        // Find cheapest flavour for reference
-        let cheapest = input
-            .qos
-            .flavours
-            .iter()
-            .min_by(|left, right| left.duration.total_cmp(&right.duration))
-            .ok_or(SolverError::EmptyFlavours)?;
-
         // ACO works on a double loop: iterations and ants
         // Each ant builds a solution for all on-time requests
         // Iterations are loop over ants
@@ -270,6 +264,7 @@ impl SolverAlgorithm for AcoAlgorithm {
                         .filter_map(|&slot| {
                             pick_feasible_flavour(
                                 slot,
+                                request.arrival_slot.max(input.current_slot),
                                 &input.carbon_forecast,
                                 &input.capacity_tiers,
                                 &slot_counts,
@@ -280,52 +275,55 @@ impl SolverAlgorithm for AcoAlgorithm {
                         })
                         .collect();
 
-                    // If no feasible slots, pick fallback flavour at earliest slot
-                    let (chosen_slot, flavour, cost) = if feasible.is_empty() {
-                        // Preserve SingletonBest's best-effort policy: use
-                        // the most-accurate flavour at the earliest slot only
-                        // when no legal placement satisfies the QoS limits.
-                        let chosen_slot = earliest;
+                    let used_infeasibility_fallback = feasible.is_empty();
+                    if used_infeasibility_fallback {
                         let fallback = get_fallback_flav(&qos.flavours)?.clone();
-                        let cost = get_slot_cost(
-                            chosen_slot,
-                            &fallback,
-                            &input.carbon_forecast,
-                            &input.capacity_tiers,
-                            &slot_counts,
-                            input.carbon_cost_duration_scale,
-                        );
-                        (chosen_slot, fallback, cost)
-                    } else {
-                        // Pick slot based on pheromone and counts
-                        let feasible_slots: Vec<_> =
-                            feasible.iter().map(|(slot, _, _)| *slot).collect();
-                        let chosen_slot = choose_slot(
-                            &feasible_slots,
-                            &tau,
-                            &slot_counts,
-                            input,
-                            cheapest,
-                            &mut rng,
-                            self.config.alpha,
-                            self.config.beta,
-                        )?;
-                        // Find the chosen flavour and cost for this slot
-                        let selected_index = feasible
+                        feasible = candidates
                             .iter()
-                            .position(|(slot, _, _)| *slot == chosen_slot)
-                            .expect("ACO selected a slot from its feasible candidates");
-                        let (_, flavour, cost) = feasible.swap_remove(selected_index);
-                        (chosen_slot, flavour, cost)
-                    };
+                            .map(|&slot| {
+                                let cost = get_slot_cost(
+                                    slot,
+                                    &fallback,
+                                    &input.carbon_forecast,
+                                    &input.capacity_tiers,
+                                    &slot_counts,
+                                    input.carbon_cost_duration_scale,
+                                );
+                                (slot, fallback.clone(), cost)
+                            })
+                            .collect();
+                    }
+
+                    // The ant chooses the slot normally, whether the flavour
+                    // came from the feasible set or the min-error fallback.
+                    let chosen_slot = choose_slot(
+                        &feasible,
+                        &tau,
+                        &mut rng,
+                        self.config.alpha,
+                        self.config.beta,
+                    )?;
+                    let selected_index = feasible
+                        .iter()
+                        .position(|(slot, _, _)| *slot == chosen_slot)
+                        .expect("ACO selected a slot from its legal candidates");
+                    let (_, flavour, cost) = feasible.swap_remove(selected_index);
 
                     // Update ant cost and solution
                     ant_cost += cost;
-                    solution.push(ProposedPlacement::new(
-                        request.request_id,
-                        chosen_slot,
-                        flavour.name.clone(),
-                    ));
+                    solution.push(if used_infeasibility_fallback {
+                        ProposedPlacement::infeasibility_fallback(
+                            request.request_id,
+                            chosen_slot,
+                            flavour.name.clone(),
+                        )
+                    } else {
+                        ProposedPlacement::new(
+                            request.request_id,
+                            chosen_slot,
+                            flavour.name.clone(),
+                        )
+                    });
                     *slot_counts.entry(chosen_slot).or_default() += 1;
                     record_local_profile_error(&mut qos, chosen_slot, flavour.error)?;
                 }
@@ -418,14 +416,11 @@ impl SolverAlgorithm for AcoAlgorithm {
     }
 }
 
-/// Chooses a slot based on pheromone and counts
+/// Chooses a slot based on pheromone and candidate-specific feasible costs.
 /// Returns the chosen slot or an error if none are available
 fn choose_slot<R: Rng + ?Sized>(
-    candidates: &[i32],
+    candidates: &[(i32, Flavour, f64)],
     pheromone: &[f64],
-    slot_counts: &HashMap<i32, i64>,
-    input: &SolveInput,
-    cheapest_flavour: &Flavour,
     rng: &mut R,
     alpha: f64,
     beta: f64,
@@ -434,16 +429,8 @@ fn choose_slot<R: Rng + ?Sized>(
     // Keep the log weights aligned with `candidates`; the matching slot is
     // selected after converting them back to ordinary positive weights.
     let mut log_weights = Vec::with_capacity(candidates.len());
-    for &slot in candidates {
-        log_weights.push(slot_log_weight(
-            slot,
-            pheromone,
-            slot_counts,
-            input,
-            cheapest_flavour,
-            alpha,
-            beta,
-        )?);
+    for (slot, _, cost) in candidates {
+        log_weights.push(slot_log_weight(*slot, *cost, pheromone, alpha, beta)?);
     }
 
     // 2. Convert log weights to normal weights safely
@@ -467,50 +454,37 @@ fn choose_slot<R: Rng + ?Sized>(
     let mut draw = rng.r#gen::<f64>() * total_weight;
 
     // Walk through candidates until the draw is below zero
-    for (&slot, weight) in candidates.iter().zip(weights) {
+    for ((slot, _, _), weight) in candidates.iter().zip(weights) {
         draw -= weight;
         if draw < 0.0 {
-            return Ok(slot);
+            return Ok(*slot);
         }
     }
     // A rounding remainder may be left after subtracting all normalized weights.
     candidates
         .last()
-        .copied()
+        .map(|(slot, _, _)| *slot)
         .ok_or_else(|| SolverError::Algorithm("ACO has no candidate slots".to_owned()))
 }
 
 fn slot_log_weight(
     slot: i32,
+    candidate_cost: f64,
     pheromone: &[f64],
-    slot_counts: &HashMap<i32, i64>,
-    input: &SolveInput,
-    cheapest_flavour: &Flavour,
     alpha: f64,
     beta: f64,
 ) -> Result<f64, SolverError> {
-    // Slots are absolute indexes in both the forecast and pheromone vectors.
+    // Slots are absolute indexes in the pheromone vector.
     let index = usize::try_from(slot)
         .map_err(|_| SolverError::Algorithm(format!("negative ACO slot {slot}")))?;
-    let intensity = *input.carbon_forecast.get(index).ok_or_else(|| {
-        SolverError::Algorithm(format!("ACO slot {slot} is outside the forecast"))
-    })?;
-    // 1. Compute estimated cost for this cadidate slot
-    // Estimate the cost of the next request at this slot, including its
-    // global capacity-tier position and the fastest profile flavour.
-    let position = slot_counts.get(&slot).copied().unwrap_or(0) + 1;
-    let multiplier = get_capacity_multiplier(&input.capacity_tiers, position);
-    let estimated_cost =
-        intensity * multiplier * cheapest_flavour.duration * input.carbon_cost_duration_scale;
-    if !estimated_cost.is_finite() || estimated_cost < 0.0 {
+    if !candidate_cost.is_finite() || candidate_cost < 0.0 {
         return Err(SolverError::Algorithm(format!(
-            "ACO estimated cost for slot {slot} must be finite and non-negative"
+            "ACO feasible candidate cost for slot {slot} must be finite and non-negative"
         )));
     }
-    // 2. Compute heuristic desirability (ETA) for this slot
-    // ETA is the heuristic desirability of a slot: cheaper estimated slots
-    // have a larger value. The floor prevents division by zero.
-    let eta = 1.0 / estimated_cost.max(1e-12);
+    // ETA uses the actual cheapest QoS-feasible flavour for this candidate,
+    // including its forecast intensity and current capacity-tier position.
+    let eta = 1.0 / candidate_cost.max(1e-12);
 
     // 3. Combine pheromone tau and heuristic eta
     // Floors keep both logarithms defined; the log form represents
@@ -535,16 +509,16 @@ fn slot_log_weight(
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use rand::{RngCore, SeedableRng, rngs::SmallRng};
+    use rand::RngCore;
 
     use crate::engine::qos::QosProfileId;
     use crate::engine::solver::{
-        CommitReport, ErrorTotals, QoSProfileInput, SolveInput, SolveRequest, SolverAlgorithm,
-        SolverScope,
+        CommitReport, ErrorTotals, PlacementOrigin, QoSProfileInput, SolveInput, SolveRequest,
+        SolverAlgorithm, SolverScope,
     };
     use crate::types::{Assignment, CapacityTier, Flavour};
 
-    use super::{AcoAlgorithm, AcoConfig, AcoDelta, choose_slot, slot_log_weight};
+    use super::{AcoAlgorithm, AcoConfig, AcoDelta};
 
     fn config() -> AcoConfig {
         AcoConfig {
@@ -640,65 +614,13 @@ mod tests {
     }
 
     #[test]
-    fn eta_is_calculated_for_absolute_slots_from_the_current_forecast() {
-        let algorithm = AcoAlgorithm::new(config());
-        let solve_input = input();
-        let cheapest = &solve_input.qos.flavours[1];
-        let counts = HashMap::new();
+    fn heuristic_uses_candidate_specific_cost() {
         let pheromone = vec![1.0; 4];
-        let mut rng = SmallRng::seed_from_u64(1);
 
-        let chosen = choose_slot(
-            &[2],
-            &pheromone,
-            &counts,
-            &solve_input,
-            cheapest,
-            &mut rng,
-            algorithm.config.alpha,
-            algorithm.config.beta,
-        )
-        .unwrap();
-        assert_eq!(chosen, 2);
+        let lower_cost_weight = super::slot_log_weight(2, 8.0, &pheromone, 0.0, 1.0).unwrap();
+        let higher_cost_weight = super::slot_log_weight(2, 10.0, &pheromone, 0.0, 1.0).unwrap();
 
-        let mut changed_forecast = solve_input.clone();
-        changed_forecast.carbon_forecast[2] = 100.0;
-        let mut rng = SmallRng::seed_from_u64(1);
-        let original_log_weight = slot_log_weight(
-            2,
-            &pheromone,
-            &counts,
-            &solve_input,
-            cheapest,
-            algorithm.config.alpha,
-            algorithm.config.beta,
-        )
-        .unwrap();
-        let changed_log_weight = slot_log_weight(
-            2,
-            &pheromone,
-            &counts,
-            &changed_forecast,
-            cheapest,
-            algorithm.config.alpha,
-            algorithm.config.beta,
-        )
-        .unwrap();
-        assert!(changed_log_weight < original_log_weight);
-        assert_eq!(
-            choose_slot(
-                &[2],
-                &pheromone,
-                &counts,
-                &changed_forecast,
-                cheapest,
-                &mut rng,
-                algorithm.config.alpha,
-                algorithm.config.beta,
-            )
-            .unwrap(),
-            2
-        );
+        assert!(lower_cost_weight > higher_cost_weight);
     }
 
     #[test]
@@ -722,10 +644,15 @@ mod tests {
     }
 
     #[test]
-    fn no_qos_feasible_slot_uses_the_earliest_accurate_fallback() {
-        let algorithm = AcoAlgorithm::new(config());
+    fn no_qos_feasible_flavour_still_uses_aco_slot_selection() {
+        let mut algorithm_config = config();
+        algorithm_config.n_ants = 1;
+        algorithm_config.n_iterations = 1;
+        algorithm_config.alpha = 0.0;
+        algorithm_config.beta = 100.0;
+        let algorithm = AcoAlgorithm::new(algorithm_config);
         let scope = scope();
-        let state = algorithm.initial_state(&scope);
+        let mut state = algorithm.initial_state(&scope);
         let mut solve_input = input();
         solve_input.current_slot = 1;
         solve_input.requests[0].arrival_slot = 1;
@@ -737,11 +664,52 @@ mod tests {
         };
         solve_input.qos.max_average_error = 1.0;
 
-        let (proposal, _) = algorithm.solve(&state, &scope, &solve_input).unwrap();
+        let (proposal, delta) = algorithm.solve(&state, &scope, &solve_input).unwrap();
 
-        assert_eq!(proposal.placements[0].scheduled_slot, 1);
+        assert_eq!(proposal.placements[0].scheduled_slot, 2);
         assert_eq!(proposal.placements[0].flavour_name, "Accurate");
         assert!(!proposal.placements[0].late);
+        assert_eq!(
+            proposal.placements[0].origin,
+            PlacementOrigin::InfeasibilityFallback
+        );
+
+        algorithm.merge(
+            &mut state,
+            delta,
+            &CommitReport {
+                assignments: vec![committed_assignment(1, 2, 8.0)],
+            },
+        );
+        assert!(state.tau[2] > 1.6);
+    }
+
+    #[test]
+    fn online_window_center_is_current_slot_when_arrival_is_older() {
+        let algorithm = AcoAlgorithm::new(config());
+        let scope = scope();
+        let state = algorithm.initial_state(&scope);
+        let mut solve_input = input();
+        solve_input.current_slot = 1;
+        solve_input.requests[0].arrival_slot = 0;
+        solve_input.requests[0].deadline_slot = 2;
+        solve_input.requests[0].assignment_deadline_slot = 2;
+        solve_input.qos.error_window.future_slots = 1;
+        solve_input.qos.max_average_error = 0.0;
+        solve_input.qos.err_by_slot.insert(
+            2,
+            ErrorTotals {
+                sum: 1.0,
+                count: 1.0,
+            },
+        );
+
+        let (proposal, _) = algorithm.solve(&state, &scope, &solve_input).unwrap();
+
+        assert_eq!(
+            proposal.placements[0].origin,
+            PlacementOrigin::InfeasibilityFallback
+        );
     }
 
     #[test]

@@ -579,6 +579,10 @@ mod tests {
 
         assert_eq!(placements[0].flavour_name, "Accurate");
         assert_eq!(placements[0].scheduled_slot, 0);
+        assert_eq!(
+            placements[0].origin,
+            crate::engine::solver::PlacementOrigin::InfeasibilityFallback
+        );
     }
 
     #[test]

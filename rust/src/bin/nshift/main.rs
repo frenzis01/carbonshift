@@ -43,16 +43,16 @@
 //!
 //! **Key runner fields:**
 //! - `online_strategies`: online strategies to run through the scheduler pipeline, e.g.
-//!   `["bandit", "ant_colony", "singleton_best", "hazard", "random_slot", "arrival_slot"]`.
+//!   `["bandit", "ant_colony", "singleton_best", "hazard", "random_slotflav", "random_flav"]`.
 //!   Independent of the DP phase:
 //!   set the top-level `batch_sizes` to
 //!   `[]` to skip DP entirely and only run online strategies.
 //! - `online_batch_sizes`: batch sizes to sweep for `online_strategies`, independent of the
 //!   top-level `batch_sizes` (DP's sweep). Falls back to `batch_sizes` when absent.
-//!   ant_colony, bandit, hazard, singleton_best, random_slot, and arrival_slot use the configured sweep.
+//!   ant_colony, bandit, hazard, singleton_best, random_slotflav, and random_flav use the configured sweep.
 //! - `additional_strategies`: common-engine strategies to run once per scenario (no batching or
 //!   concurrency), e.g. `["offline_singleton_best", "offline_singleton_best_accurate",
-//!   "offline_random_slot", "offline_arrival_slot", "hazard"]`.
+//!   "offline_random_slotflav", "offline_random_flav", "hazard"]`.
 //!   `hazard` is the canonical stochastic strategy name. These runs are fully independent of `batch_sizes`,
 //!   `max_batch_solver_parallelism`.
 //!   `offline_singleton_best` scans feasible slot/flavour pairs and commits the cheapest choice;
@@ -363,11 +363,22 @@ fn supports_online_batch_size_sweep(strategy: &str) -> bool {
         "bandit",
         "hazard",
         "singleton_best",
-        "random_slot",
-        "arrival_slot",
+        "random_slotflav",
+        "random_flav",
     ]
     .iter()
     .any(|supported| strategy.eq_ignore_ascii_case(supported))
+}
+
+fn canonical_online_engine_name(strategy: &str) -> Result<String, SolverError> {
+    match strategy.trim().to_ascii_lowercase().as_str() {
+        "random_slotflav" => Ok("random_slot".to_owned()),
+        "random_flav" => Ok("arrival_slot".to_owned()),
+        "random_slot" | "arrival_slot" => Err(SolverError::Algorithm(format!(
+            "online strategy '{strategy}' was renamed; use 'random_slotflav' or 'random_flav'"
+        ))),
+        _ => Ok(strategy.to_owned()),
+    }
 }
 
 fn online_batch_sizes_for_strategy(strategy: &str, configured: &[usize]) -> Vec<usize> {
@@ -578,6 +589,8 @@ fn main() {
         .clone()
         .unwrap_or_else(|| bcfg.batch_sizes.clone());
     for strategy in &bcfg.online_strategies {
+        let engine_name = canonical_online_engine_name(strategy)
+            .unwrap_or_else(|error| panic!("Invalid online strategy '{strategy}': {error}"));
         // Request-level solvers retain their sequential decision policies,
         // while allowing the scheduler to amortize per-batch setup.
         let batch_sizes_for_strategy =
@@ -598,7 +611,7 @@ fn main() {
             let n_t0 = std::time::Instant::now();
 
             let mut online_base_cfg = base_cfg.clone();
-            online_base_cfg.solver.solver_strategy = strategy.clone();
+            online_base_cfg.solver.solver_strategy = engine_name.clone();
 
             let (mut summary, per_ts) = run_single_n(
                 &scenario,
@@ -609,6 +622,7 @@ fn main() {
                 &run_dir,
                 verbose,
             );
+            summary.execution_mode = format!("nshift_{strategy}");
             summary.run_elapsed_seconds = n_t0.elapsed().as_secs_f64();
 
             if let Some(bc) = baseline_cost {

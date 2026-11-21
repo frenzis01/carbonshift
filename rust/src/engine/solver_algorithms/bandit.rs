@@ -13,6 +13,10 @@ use crate::engine::solver::{
     SolverScope,
 };
 
+/// Keep most of the learned value while letting a tier or forecast change
+/// affect the next assignment immediately.
+const CURRENT_COST_WEIGHT: f64 = 0.25;
+
 #[derive(Debug, Clone)]
 pub struct BanditConfig {
     pub epsilon: f64,
@@ -167,6 +171,7 @@ impl SolverAlgorithm for BanditAlgorithm {
                 .filter_map(|&slot| {
                     pick_feasible_flavour(
                         slot,
+                        request.arrival_slot.max(input.current_slot),
                         &input.carbon_forecast,
                         &input.capacity_tiers,
                         &slot_counts,
@@ -176,52 +181,61 @@ impl SolverAlgorithm for BanditAlgorithm {
                     .map(|(flavour, cost)| (slot, flavour.clone(), cost))
                 })
                 .collect();
-            let (chosen_slot, chosen_flav, cost) = if feasible.is_empty() {
-                // Fall back after every legal slot has failed the QoS checks (hence no feasible tuple)
-                // and use the earliest legal slot.
-                let chosen_slot = earliest_slot;
+            let used_infeasibility_fallback = feasible.is_empty();
+            if used_infeasibility_fallback {
                 let fallback_flav = get_fallback_flav(&qos.flavours)?.clone();
-                let cost = get_slot_cost(
-                    chosen_slot,
-                    &fallback_flav,
-                    &input.carbon_forecast,
-                    &input.capacity_tiers,
-                    &slot_counts,
-                    input.carbon_cost_duration_scale,
-                );
-                (chosen_slot, fallback_flav, cost)
+                feasible = candidates
+                    .iter()
+                    .map(|&slot| {
+                        let cost = get_slot_cost(
+                            slot,
+                            &fallback_flav,
+                            &input.carbon_forecast,
+                            &input.capacity_tiers,
+                            &slot_counts,
+                            input.carbon_cost_duration_scale,
+                        );
+                        (slot, fallback_flav.clone(), cost)
+                    })
+                    .collect();
+            }
+
+            // Even when QoS forces the minimum-error flavour, the Bandit still
+            // selects a slot through its normal exploration/exploitation policy.
+            let selected_index = if rng.r#gen::<f64>() < self.config.epsilon {
+                rng.gen_range(0..feasible.len())
             } else {
-                // Explore among feasible placements; otherwise prefer the
-                // feasible slot with the smallest learned average cost.
-                let selected_index = if rng.r#gen::<f64>() < self.config.epsilon {
-                    // EXPLORATION branch
-                    // Explore randomly with probability epsilon
-                    rng.gen_range(0..feasible.len())
-                } else {
-                    // EXPLOITATION branch
-                    // Otherwise pick the best known feasible slot
-                    feasible
-                        .iter()
-                        .enumerate()
-                        .min_by(|(_, (left_slot, _, _)), (_, (right_slot, _, _))| {
+                feasible
+                    .iter()
+                    .enumerate()
+                    .min_by(
+                        |(_, (left_slot, _, left_cost)), (_, (right_slot, _, right_cost))| {
                             let left_q = wq.get(*left_slot as usize).copied().unwrap_or(f64::MAX);
                             let right_q = wq.get(*right_slot as usize).copied().unwrap_or(f64::MAX);
-                            left_q.total_cmp(&right_q)
-                        })
-                        .map(|(index, _)| index)
-                        .expect("feasible placement list is non-empty")
-                };
-                feasible.swap_remove(selected_index)
+                            let left_score = (1.0 - CURRENT_COST_WEIGHT) * left_q
+                                + CURRENT_COST_WEIGHT * left_cost;
+                            let right_score = (1.0 - CURRENT_COST_WEIGHT) * right_q
+                                + CURRENT_COST_WEIGHT * right_cost;
+                            left_score.total_cmp(&right_score)
+                        },
+                    )
+                    .map(|(index, _)| index)
+                    .expect("legal candidate list is non-empty")
             };
+            let (chosen_slot, chosen_flav, cost) = feasible.swap_remove(selected_index);
 
             update_working_mean(&mut wq, &mut wn, chosen_slot, cost)?;
             *slot_counts.entry(chosen_slot).or_default() += 1;
             record_local_profile_error(&mut qos, chosen_slot, chosen_flav.error)?;
-            placements.push(ProposedPlacement::new(
-                request.request_id,
-                chosen_slot,
-                chosen_flav.name.clone(),
-            ));
+            placements.push(if used_infeasibility_fallback {
+                ProposedPlacement::infeasibility_fallback(
+                    request.request_id,
+                    chosen_slot,
+                    chosen_flav.name.clone(),
+                )
+            } else {
+                ProposedPlacement::new(request.request_id, chosen_slot, chosen_flav.name.clone())
+            });
             proposed_request_ids.insert(request.request_id);
         }
 
@@ -355,6 +369,31 @@ mod tests {
     }
 
     #[test]
+    fn exploitation_blends_learned_q_with_current_candidate_cost() {
+        let algorithm = BanditAlgorithm::new(BanditConfig {
+            epsilon: 0.0,
+            initial_q: 1.0,
+            seed: 42,
+        });
+        let scope = scope();
+        let mut state = algorithm.initial_state(&scope);
+        state.q[0] = 10.0;
+        state.q[1] = 9.5;
+        let solve_input = input(vec![SolveRequest {
+            request_id: 1,
+            arrival_slot: 0,
+            deadline_slot: 1,
+            assignment_deadline_slot: 1,
+        }]);
+
+        let (proposal, _) = algorithm.solve(&state, &scope, &solve_input).unwrap();
+
+        // Historical Q alone prefers slot 1; its higher current forecast cost
+        // makes slot 0 the lower blended-cost candidate.
+        assert_eq!(proposal.placements[0].scheduled_slot, 0);
+    }
+
+    #[test]
     fn merge_learns_final_commit_price_and_ignores_unproposed_assignments() {
         let algorithm = BanditAlgorithm::new(BanditConfig {
             epsilon: 0.0,
@@ -392,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn no_qos_feasible_slot_uses_the_earliest_accurate_fallback() {
+    fn no_qos_feasible_flavour_still_uses_bandit_slot_selection() {
         let algorithm = BanditAlgorithm::new(BanditConfig {
             epsilon: 0.0,
             initial_q: 1.0,
@@ -417,9 +456,48 @@ mod tests {
 
         let (proposal, _) = algorithm.solve(&state, &scope, &solve_input).unwrap();
 
-        assert_eq!(proposal.placements[0].scheduled_slot, 1);
+        assert_eq!(proposal.placements[0].scheduled_slot, 2);
         assert_eq!(proposal.placements[0].flavour_name, "Balanced");
         assert!(!proposal.placements[0].late);
+        assert_eq!(
+            proposal.placements[0].origin,
+            crate::engine::solver::PlacementOrigin::InfeasibilityFallback
+        );
+    }
+
+    #[test]
+    fn online_window_center_is_current_slot_when_arrival_is_older() {
+        let algorithm = BanditAlgorithm::new(BanditConfig {
+            epsilon: 0.0,
+            initial_q: 1.0,
+            seed: 42,
+        });
+        let scope = scope();
+        let mut solve_input = input(vec![SolveRequest {
+            request_id: 1,
+            arrival_slot: 0,
+            deadline_slot: 2,
+            assignment_deadline_slot: 2,
+        }]);
+        solve_input.current_slot = 1;
+        solve_input.qos.error_window.future_slots = 1;
+        solve_input.qos.max_average_error = 0.0;
+        solve_input.qos.err_by_slot.insert(
+            2,
+            ErrorTotals {
+                sum: 1.0,
+                count: 1.0,
+            },
+        );
+
+        let (proposal, _) = algorithm
+            .solve(&algorithm.initial_state(&scope), &scope, &solve_input)
+            .unwrap();
+
+        assert_eq!(
+            proposal.placements[0].origin,
+            crate::engine::solver::PlacementOrigin::InfeasibilityFallback
+        );
     }
 
     #[test]

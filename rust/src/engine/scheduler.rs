@@ -22,7 +22,7 @@ use std::sync::RwLock;
 use crate::config::Config;
 use crate::engine::qos::{ErrorWindowPolicy, QosProfileId};
 use crate::engine::solver::{
-    CommitReport, PlacementOrigin, SolverError, SolverRegistry, SolverRuntime, SolverScope,
+    CommitReport, SolverError, SolverRegistry, SolverRuntime, SolverScope,
 };
 use crate::engine::solver_algorithms::{DpAlgorithmConfig, register_all_solvers};
 use crate::metrics_logger::MetricsLogger;
@@ -1225,7 +1225,7 @@ fn batch_worker_entry(
         .proposal
         .placements
         .iter()
-        .filter(|placement| placement.origin == PlacementOrigin::GreedyFallback)
+        .filter(|placement| placement.origin.is_fallback())
         .map(|placement| placement.req_id)
         .collect();
     let late_request_ids: HashSet<u64> = pending_proposal

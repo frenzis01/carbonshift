@@ -96,8 +96,9 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
             }
 
             let (start_slot, deadline) = request_slot_bounds(input, request, scope)?;
-            let win_start = (request.arrival_slot - input.qos.error_window.past_slots).max(0);
-            let win_end = (request.arrival_slot + input.qos.error_window.future_slots)
+            let window_center_slot = request.arrival_slot.max(input.current_slot);
+            let win_start = (window_center_slot - input.qos.error_window.past_slots).max(0);
+            let win_end = (window_center_slot + input.qos.error_window.future_slots)
                 .min(scope.total_slots as i32 - 1);
             let (local_win_sum, local_win_count) = solved_error_by_slot
                 [win_start as usize..=win_end as usize]
@@ -149,11 +150,12 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
                 }
             }
 
-            let (chosen_slot, chosen_flavour) = if let Some((_, slot, flavour)) = best {
-                (slot, flavour)
-            } else {
-                (start_slot, get_fallback_flav(&flavours)?)
-            };
+            let (chosen_slot, chosen_flavour, used_infeasibility_fallback) =
+                if let Some((_, slot, flavour)) = best {
+                    (slot, flavour, false)
+                } else {
+                    (start_slot, get_fallback_flav(&flavours)?, true)
+                };
 
             *slot_count.entry(chosen_slot).or_insert(0) += 1;
             let (slot_sum, slot_count) = &mut solved_error_by_slot[chosen_slot as usize];
@@ -165,11 +167,15 @@ impl SolverAlgorithm for SingletonBestAlgorithm {
             cumulative_sum += chosen_flavour.error;
             window_count += 1.0;
             window_sum += chosen_flavour.error;
-            placements.push(ProposedPlacement::new(
-                request.request_id,
-                chosen_slot,
-                chosen_flavour.name.clone(),
-            ));
+            placements.push(if used_infeasibility_fallback {
+                ProposedPlacement::infeasibility_fallback(
+                    request.request_id,
+                    chosen_slot,
+                    chosen_flavour.name.clone(),
+                )
+            } else {
+                ProposedPlacement::new(request.request_id, chosen_slot, chosen_flavour.name.clone())
+            });
         }
         Ok((SolverProposal { placements }, ()))
     }

@@ -209,10 +209,11 @@ pub(super) fn valid_slots(earliest_slot: i32, deadline_slot: i32, total_slots: u
     (from..=to).collect()
 }
 
-/// Try each flavour (sorted cheapest-first) for `slot`, returning the first
-/// one that satisfies the global and window error constraints, or `None`.
+/// Try each flavour (sorted cheapest-first) for a candidate slot, returning
+/// the first one that satisfies the global and request-centered window limits.
 pub(super) fn pick_feasible_flavour<'a>(
-    slot: i32,
+    candidate_slot: i32,
+    window_center_slot: i32,
     carbon_forecast: &[f64],
     tiers: &[CapacityTier],
     slot_counts: &HashMap<i32, i64>,
@@ -221,10 +222,13 @@ pub(super) fn pick_feasible_flavour<'a>(
 ) -> Option<(&'a Flavour, f64)> {
     // `'a` links the returned flavour reference to `qos`: the caller must keep
     // the profile borrowed for as long as it uses the selected flavour.
-    let ci = carbon_forecast.get(slot as usize).copied().unwrap_or(1.0);
+    let ci = carbon_forecast
+        .get(candidate_slot as usize)
+        .copied()
+        .unwrap_or(1.0);
     // Capacity is global across profiles; profile error counts must not be
     // used to calculate the request's capacity-tier position.
-    let position = slot_counts.get(&slot).copied().unwrap_or(0) + 1;
+    let position = slot_counts.get(&candidate_slot).copied().unwrap_or(0) + 1;
     let mult = get_capacity_multiplier(tiers, position);
     // This local vector owns references into `qos.flavours`, not the flavours;
     // sorting it changes their order without moving the profile's values.
@@ -242,7 +246,11 @@ pub(super) fn pick_feasible_flavour<'a>(
         }
         let mut win_sum = flav.error;
         let mut win_cnt = 1.0f64;
-        for ws in (slot - qos.error_window.past_slots)..=(slot + qos.error_window.future_slots) {
+        let window_start = window_center_slot
+            .saturating_sub(qos.error_window.past_slots)
+            .max(0);
+        let window_end = window_center_slot.saturating_add(qos.error_window.future_slots);
+        for ws in window_start..=window_end {
             if let Some(errs) = qos.err_by_slot.get(&ws) {
                 win_sum += errs.sum;
                 win_cnt += errs.count;
@@ -327,9 +335,50 @@ mod tests {
             },
         ];
 
-        let choice = pick_feasible_flavour(0, &[1.0], &tiers, &HashMap::new(), 1.0, &qos).unwrap();
+        let choice =
+            pick_feasible_flavour(0, 0, &[1.0], &tiers, &HashMap::new(), 1.0, &qos).unwrap();
 
         assert_eq!(choice.1, 1.0);
+    }
+
+    #[test]
+    fn feasible_flavour_window_uses_the_request_reference_slot() {
+        let mut err_by_slot = HashMap::new();
+        err_by_slot.insert(
+            0,
+            ErrorTotals {
+                sum: 2.0,
+                count: 1.0,
+            },
+        );
+        let qos = QoSProfileInput {
+            profile_id: QosProfileId::default_profile(),
+            flavours: vec![Flavour {
+                name: "Accurate".into(),
+                error: 0.0,
+                duration: 1.0,
+            }],
+            cumulative_error_constraint_active: false,
+            cumulative_err: ErrorTotals::default(),
+            err_by_slot,
+            max_average_error: 0.5,
+            error_window: ErrorWindowInput {
+                baseline_err: ErrorTotals::default(),
+                past_slots: 0,
+                future_slots: 0,
+            },
+        };
+        let tiers = vec![CapacityTier {
+            max_requests: None,
+            multiplier: 1.0,
+        }];
+
+        assert!(
+            pick_feasible_flavour(1, 0, &[1.0, 1.0], &tiers, &HashMap::new(), 1.0, &qos).is_none()
+        );
+        assert!(
+            pick_feasible_flavour(1, 1, &[1.0, 1.0], &tiers, &HashMap::new(), 1.0, &qos).is_some()
+        );
     }
 
     #[test]

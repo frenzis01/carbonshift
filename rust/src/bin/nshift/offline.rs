@@ -421,7 +421,7 @@ pub(super) fn convert_engine_results_to_outputs(
             error: assignment_result.error,
             carbon_cost: assignment_result.carbon_cost,
             assignment_solver_status: "ok".to_owned(),
-            fallback_assigned: placement.origin == PlacementOrigin::GreedyFallback,
+            fallback_assigned: placement.origin.is_fallback(),
             late_assigned: placement.late,
             lateness_slots,
         });
@@ -458,10 +458,8 @@ pub(super) fn canonical_offline_engine_name(
             Ok(("singleton_best_accurate", "offline_singleton_best_accurate"))
         }
         "singleton_best_accurate" => Ok(("singleton_best_accurate", "singleton_best_accurate")),
-        "offline_random_slot" => Ok(("random_slot", "offline_random_slot")),
-        "random_slot" => Ok(("random_slot", "random_slot")),
-        "offline_arrival_slot" => Ok(("arrival_slot", "offline_arrival_slot")),
-        "arrival_slot" => Ok(("arrival_slot", "arrival_slot")),
+        "offline_random_slotflav" => Ok(("random_slot", "offline_random_slotflav")),
+        "offline_random_flav" => Ok(("arrival_slot", "offline_random_flav")),
         "hazard" => Ok(("hazard", "hazard")),
         "dp" => Ok(("dp", "dp")),
         "bandit" => Ok(("bandit", "bandit")),
