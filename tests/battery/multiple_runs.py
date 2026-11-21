@@ -116,8 +116,8 @@ PER_REQUEST_ONLINE_CONTENT: Dict[str, Any] = {
         "bandit",
         "singleton_best",
         "hazard",
-        "random_slot",
-        "arrival_slot",
+        "random_slotflav",
+        "random_flav",
     ],
     "online_batch_sizes": [8],
     "additional_strategies": [],
@@ -129,8 +129,8 @@ OFFLINE_CONTENT: Dict[str, Any] = {
     "additional_strategies": [
         "offline_singleton_best",
         "offline_singleton_best_accurate",
-        "offline_random_slot",
-        "offline_arrival_slot",
+        "offline_random_slotflav",
+        "offline_random_flav",
         "hazard",
         "bandit",
         "ant_colony",
@@ -183,8 +183,8 @@ _PARALLELISM_X_THRESHOLD = [
         "max_batch_solver_parallelism": parallelism,
         "max_error_threshold": threshold,
     }
-    for parallelism in (20,)
-    for threshold in (5.0,)
+    for parallelism in (1,)
+    for threshold in (0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0)
 ]
 
 PHASES: Dict[str, PhaseGrid] = {
@@ -198,7 +198,7 @@ PHASES: Dict[str, PhaseGrid] = {
     "offline": PhaseGrid(
         "offline",
         OFFLINE_CONTENT,
-        [{"max_error_threshold": threshold} for threshold in (0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.5,5.0)],
+        [{"max_error_threshold": threshold} for threshold in (4.0,)],
     ),
 }
 

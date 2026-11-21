@@ -16,8 +16,8 @@
   "additional_strategies": [
     "offline_singleton_best",
     "offline_singleton_best_accurate",
-    "offline_random_slot",
-    "offline_arrival_slot",
+    "offline_random_slotflav",
+    "offline_random_flav",
     "hazard",
     "bandit",
     "ant_colony"

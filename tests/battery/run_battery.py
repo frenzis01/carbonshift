@@ -14,8 +14,8 @@ runs the Rust solver across three independent, individually-toggleable phases:
 
   1. DP        – sweeps `batch_sizes`. Skipped entirely if the list is empty.
   2. Online    – runs `online_strategies` (e.g. "bandit", "ant_colony",
-                 "singleton_best", "hazard", "random_slot", "arrival_slot").
-                 ant_colony, bandit, hazard, singleton_best, random_slot, and arrival_slot sweep
+                 "singleton_best", "hazard", "random_slotflav", "random_flav").
+                 ant_colony, bandit, hazard, singleton_best, random_slotflav, and random_flav sweep
                  `online_batch_sizes` (falls back to `batch_sizes` if absent).
                  Skipped if `online_strategies` is empty.
                  Independent of the DP phase/`batch_sizes` — e.g. set
@@ -41,15 +41,15 @@ trim_future_assignments: bool – optional; when true, extends each scenario's
                                      outcomes back to that original horizon.
 batch_sizes          : list[int]   – DP phase N values to benchmark; [] skips DP.
 online_strategies    : list[str]   – online strategies to run (e.g. "bandit", "ant_colony",
-                                     "singleton_best", "hazard", "random_slot", "arrival_slot");
+                                     "singleton_best", "hazard", "random_slotflav", "random_flav");
                                      [] skips the online phase.
 online_batch_sizes   : list[int]   – N sweep for online_strategies; falls back to
                                      `batch_sizes` when omitted. ant_colony, bandit,
-                                     hazard, singleton_best, random_slot, and arrival_slot use
+                                     hazard, singleton_best, random_slotflav, and random_flav use
                                      this sweep.
 additional_strategies: list[str]   – offline strategies to run once per scenario
                                      (e.g. "offline_singleton_best", "offline_singleton_best_accurate",
-                                     "offline_random_slot", "offline_arrival_slot", "hazard",
+                                     "offline_random_slotflav", "offline_random_flav", "hazard",
                                      "ant_colony", "bandit"); [] skips the
                                    offline phase.
                                      "hazard" samples flavours toward the configured mean

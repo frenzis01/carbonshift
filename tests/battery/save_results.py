@@ -1,4 +1,5 @@
 
+import logging
 from pathlib import Path
 import json
 import pandas as pd
@@ -102,7 +103,14 @@ def aggregate_and_save(
     if not run_dirs:
         raise ValueError("No battery run directories match the requested selection")
     
-    dfs = [load_run(d) for d in run_dirs]
+    # dfs = [load_run(d) for d in run_dirs]
+    dfs = []
+    for d in run_dirs:
+        try:
+            dfs.append(load_run(d))
+        except FileNotFoundError:
+            logging.warning(f"No results for {d}")
+    
     df_all = pd.concat(dfs, ignore_index=True)
 
     print(f"Righe totali: {len(df_all)}")

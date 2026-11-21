@@ -120,14 +120,14 @@ once per scenario:
   is exhaustive over that request's candidates, not over complete schedules.
 - `offline_singleton_best_accurate`: uses the lowest-error flavour only, then scans feasible
   slots for the least-carbon-cost assignment.
-- `offline_random_slot` and `offline_arrival_slot`: reference random assignments.
+- `offline_random_slotflav` and `offline_random_flav`: reference random assignments.
   They choose a random flavour while both the cumulative and current-slot-centered
   window averages are at or below the threshold; once either is above it, they
   use the minimum-error flavour at the slot selected by that strategy's mode.
   Randomized assignments may push an average above threshold; later requests
   in that solve then use the fallback until both averages are back at or below
-  threshold. `offline_random_slot` samples a legal slot, while
-  `offline_arrival_slot` uses the earliest legal slot (normally arrival).
+  threshold. `offline_random_slotflav` samples a legal slot, while
+  `offline_random_flav` uses the earliest legal slot (normally arrival).
 - `hazard`: samples a feasible slot with probability inversely proportional
   to forecast carbon intensity multiplied by the capacity-tier multiplier at
   that slot's next occupancy position. It samples flavours from the
@@ -144,8 +144,8 @@ once per scenario:
 
 ## Online strategies
 
-Set `hazard`, `bandit`, `ant_colony`, `singleton_best`, `random_slot`, or
-`arrival_slot` in
+Set `hazard`, `bandit`, `ant_colony`, `singleton_best`, `random_slotflav`, or
+`random_flav` in
 `online_strategies` to run it through the streaming scheduler. The same engine
 implementations are available offline through `additional_strategies`.
 
@@ -156,10 +156,32 @@ selected slot mode. A random choice may cross the threshold; subsequent
 requests then use the fallback until both averages are back at or below
 threshold.
 
-`ant_colony`, `bandit`, `hazard`, `singleton_best`, `random_slot`, and
-`arrival_slot` use the
+The random policy names are intentionally explicit: `random_slotflav` chooses
+a random slot and flavour, while `random_flav` keeps the earliest legal slot
+and chooses a random flavour. Offline configuration uses the corresponding
+`offline_random_slotflav` and `offline_random_flav` names. The previous
+`random_slot` / `arrival_slot` and `offline_random_slot` /
+`offline_arrival_slot` policy names are rejected by nshift.
+
+`ant_colony`, `bandit`, `hazard`, `singleton_best`, `random_slotflav`, and
+`random_flav` use the
 `online_batch_sizes` sweep. Batch size changes when request-level strategies
 observe committed feedback, so compare both runtime and scheduling quality.
+
+Bandit exploitation blends its learned per-slot average with 25% of the
+candidate's current estimated cost. That candidate cost includes its
+QoS-feasible flavour, forecast intensity, and current capacity-tier position.
+ACO's cost heuristic uses the same candidate-specific feasible-flavour cost
+rather than assuming the globally shortest-duration flavour is feasible.
+For these stateful strategies, the sliding error window is centered on
+`max(arrival_slot, current_slot)`, independently of the candidate's scheduled
+slot.
+
+`fallback_assigned` and `reqs_fallback_assigned` include both coverage/greedy
+fallbacks and best-effort placements made when no legal slot has a
+QoS-feasible flavour. Bandit and ACO force the minimum-error flavour but still
+choose its slot using their normal selection policies. It is explicitly
+reported because this best-effort choice may still exceed a QoS limit.
 
 Example:
 

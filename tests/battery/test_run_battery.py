@@ -113,8 +113,8 @@ def test_multiple_runs_keeps_request_strategies_in_per_request_batch_sweep():
         "bandit",
         "singleton_best",
         "hazard",
-        "random_slot",
-        "arrival_slot",
+        "random_slotflav",
+        "random_flav",
     ]
     assert mr.PER_REQUEST_ONLINE_CONTENT["online_batch_sizes"] == [
         1,
@@ -127,10 +127,10 @@ def test_multiple_runs_keeps_request_strategies_in_per_request_batch_sweep():
 
 
 def test_multiple_runs_includes_random_reference_policies():
-    assert {"random_slot", "arrival_slot"}.issubset(
+    assert {"random_slotflav", "random_flav"}.issubset(
         mr.PER_REQUEST_ONLINE_CONTENT["online_strategies"]
     )
-    assert {"offline_random_slot", "offline_arrival_slot"}.issubset(
+    assert {"offline_random_slotflav", "offline_random_flav"}.issubset(
         mr.OFFLINE_CONTENT["additional_strategies"]
     )
 

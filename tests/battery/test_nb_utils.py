@@ -27,7 +27,7 @@ def test_discover_assignment_runs_includes_online_per_request_results(tmp_path: 
     _write_assignment(scenario_dir / "rust_dp" / "N1")
     _write_assignment(scenario_dir / "rust_online" / "online_bandit" / "N1")
     _write_assignment(scenario_dir / "rust_online" / "online_bandit" / "N8")
-    _write_assignment(scenario_dir / "rust_offline" / "strategy_arrival_slot")
+    _write_assignment(scenario_dir / "rust_offline" / "strategy_random_flav")
     _write_assignment(
         scenario_dir / "rust_baseline" / "baseline_greedy",
         schema_name="carbonshift.baseline",
@@ -48,5 +48,5 @@ def test_discover_assignment_runs_includes_online_per_request_results(tmp_path: 
     assert by_type["online"].scenario_dir == scenario_dir
     assert by_type["online"].run_folder_id == "T30_perrequest"
     assert by_type["offline"].assignment_dir == (
-        scenario_dir / "rust_offline" / "strategy_arrival_slot"
+        scenario_dir / "rust_offline" / "strategy_random_flav"
     )
