@@ -22,6 +22,27 @@ def test_default_targets_pair_ner_and_qa_with_two_clients():
     assert [target.qos_profile_id for target in targets] == [None, None]
 
 
+def test_provider_advance_error_includes_json_detail():
+    class Response:
+        status_code = 503
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "detail": {
+                    "slot_close_failed": True,
+                    "deliveries": [{"peer": "carbonshift-close-slot", "status_code": 503}],
+                }
+            }
+
+    message = run_emulation_multi._provider_advance_error(Response(), "1/11")
+
+    assert "step 1/11" in message
+    assert "slot_close_failed" in message
+    assert "carbonshift-close-slot" in message
+
+
 def test_additional_clients_are_configuration_not_new_runner_branches():
     targets = _resolve_targets(
         ["http://client-a:8100", "http://client-b:8100", "http://client-c:8100"],

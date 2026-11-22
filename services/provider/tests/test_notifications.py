@@ -167,7 +167,9 @@ def test_retries_until_success():
 
 def test_gives_up_after_max_attempts_and_reports_why():
     def post(url, json=None, timeout=None):
-        return _Resp(500)
+        response = _Resp(500)
+        response.text = '{"detail":"callbacks_pending=4"}'
+        return response
 
     results = notify_peers(
         [PEERS[0]], {"x": 1},
@@ -177,6 +179,7 @@ def test_gives_up_after_max_attempts_and_reports_why():
     assert results[0].ok is False
     assert results[0].attempts == 2
     assert "500" in (results[0].error or "")
+    assert "callbacks_pending=4" in (results[0].error or "")
 
 
 def test_missing_manual_clock_is_reported_without_pointless_retries():

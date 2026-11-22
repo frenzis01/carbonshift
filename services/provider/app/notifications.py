@@ -257,7 +257,11 @@ def _deliver(
                         peer=peer.name, url=peer.url, ok=True, attempts=attempt, status_code=status
                     )
             if status is None or not 200 <= status < 300:
-                last_error = f"unexpected status {status}"
+                response_text = getattr(resp, "text", "").strip()
+                if response_text:
+                    last_error = f"unexpected status {status}: {response_text[:2000]}"
+                else:
+                    last_error = f"unexpected status {status}"
         except requests.RequestException as exc:
             last_error = str(exc)
 

@@ -131,6 +131,21 @@ def build_capacity_tiers(requests_per_slot: int) -> list[dict[str, int | float |
     ]
 
 
+def _provider_advance_error(response: requests.Response, step: int | str) -> str:
+    """Include the provider's structured failure detail in CLI output."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = response.text.strip()
+    detail = body.get("detail", body) if isinstance(body, dict) else body
+    if isinstance(detail, (dict, list)):
+        detail = json.dumps(detail, sort_keys=True)
+    return (
+        f"provider advance-slot failed at step {step}: "
+        f"HTTP {response.status_code}: {detail}"
+    )
+
+
 DEFAULT_CLIENT_URLS = ("http://localhost:8100", "http://localhost:8101")
 DEFAULT_TASKS = ("ner", "question_answering")
 
@@ -357,7 +372,10 @@ def main() -> None:
     advance_timeout = max(args.timeout, 180.0)
     for step in range(advances_for_plan):
         adv_resp = requests.post(f"{args.provider_url}/v1/advance-slot", json={}, timeout=advance_timeout)
-        adv_resp.raise_for_status()
+        if adv_resp.status_code >= 400:
+            raise SystemExit(
+                _provider_advance_error(adv_resp, f"{step + 1}/{advances_for_plan}")
+            )
         adv_data = adv_resp.json()
         print(f"  [Step {step + 1}/{advances_for_plan}] Advanced provider to slot {adv_data.get('current_slot')}")
         time.sleep(0.1)
@@ -416,9 +434,15 @@ def main() -> None:
             for _, progress in progress_by_client
         ):
             try:
-                requests.post(f"{args.provider_url}/v1/advance-slot", json={}, timeout=advance_timeout)
+                adv_resp = requests.post(
+                    f"{args.provider_url}/v1/advance-slot",
+                    json={},
+                    timeout=advance_timeout,
+                )
+                if adv_resp.status_code >= 400:
+                    logger.error("%s", _provider_advance_error(adv_resp, "extra tick"))
             except Exception as adv_err:
-                logger.debug("extra advance tick error: %s", adv_err)
+                logger.warning("extra advance tick request failed: %s", adv_err)
 
         time.sleep(args.poll_interval)
     else:
