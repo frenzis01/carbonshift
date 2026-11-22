@@ -75,6 +75,9 @@ scenarios            : list        – each entry has:
     input_pattern        : str     – "sinusoidal" (default) or "flat"; flat distributes
                                      requests nearly evenly with low count jitter, preserves
                                      the rounded total, and keeps sub-slot jitter
+    carbon_pattern      : str     – "sinusoidal" (default) or "flat", independent of
+                                     input_pattern. Flat uses a constant midpoint CI baseline
+                                     with deterministic bounded ±10% jitter.
     carbon_request_alignment: str  – sinusoidal-only relationship to the carbon wave:
                                      "in-phase", "phase-opposition", "phase-shifted"
     carbon_phase_shift_fraction: float – shifted-wave offset in [0.0, 0.5]
@@ -194,6 +197,7 @@ def _generate_scenario(
             )
         ),
         input_pattern=str(scenario_def.get("input_pattern", scenario_config.INPUT_PATTERN)),
+        carbon_pattern=str(scenario_def.get("carbon_pattern", scenario_config.CARBON_PATTERN)),
     )
     save_json(output_path, data)
     return data
@@ -960,6 +964,7 @@ def _write_run_readme(
     online_strategies: List[str],
     online_batch_sizes: Optional[List[int]],
     input_patterns: List[str],
+    carbon_patterns: List[str],
     all_rows: List[Dict[str, Any]],
     per_n_timing_rows: List[Dict[str, Any]],
     battery_elapsed: float,
@@ -976,6 +981,7 @@ def _write_run_readme(
         f"- Total elapsed: {battery_elapsed:.1f}s",
         "- Solver: Rust (nshift)",
         f"- Simulation input pattern(s): {', '.join(input_patterns)}",
+        f"- Carbon-intensity pattern(s): {', '.join(carbon_patterns)}",
         "",
         "## Run-identifying parameters (also encoded in the folder name)",
         "",
@@ -1104,6 +1110,9 @@ def run_battery(config_path: Path) -> None:
         total_slots: int = int(scenario_def.get("total_slots", 24))
         req_per_slot: float = float(scenario_def.get("requests_per_slot", scenario_config.PREDICTED_REQUESTS_PER_SLOT))
         input_pattern = str(scenario_def.get("input_pattern", scenario_config.INPUT_PATTERN))
+        carbon_pattern = str(
+            scenario_def.get("carbon_pattern", scenario_config.CARBON_PATTERN)
+        )
         planning_slots = total_slots + (
             int(scenario_config.ERROR_WINDOW_FUTURE) if trim_future_assignments else 0
         )
@@ -1111,7 +1120,8 @@ def run_battery(config_path: Path) -> None:
         print(f"\n{'='*60}")
         print(
             f"Scenario: {sid}  (seed={seed}, slots={total_slots}, planning_slots={planning_slots}, "
-            f"req/slot={req_per_slot}, pattern={input_pattern})"
+            f"req/slot={req_per_slot}, input_pattern={input_pattern}, "
+            f"carbon_pattern={carbon_pattern})"
         )
         print("=" * 60)
         if flavours:
@@ -1228,6 +1238,10 @@ def run_battery(config_path: Path) -> None:
         str(scenario.get("input_pattern", scenario_config.INPUT_PATTERN))
         for scenario in cfg.get("scenarios", [])
     })
+    carbon_patterns = sorted({
+        str(scenario.get("carbon_pattern", scenario_config.CARBON_PATTERN))
+        for scenario in cfg.get("scenarios", [])
+    })
     _write_run_readme(
         output_dir,
         battery_id,
@@ -1241,6 +1255,7 @@ def run_battery(config_path: Path) -> None:
         online_strategies,
         online_batch_sizes,
         input_patterns,
+        carbon_patterns,
         all_rows,
         per_n_timing_rows,
         battery_elapsed,

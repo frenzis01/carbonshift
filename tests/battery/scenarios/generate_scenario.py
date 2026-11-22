@@ -19,7 +19,7 @@ if str(SCENARIOS_DIR) not in sys.path:
     sys.path.insert(0, str(SCENARIOS_DIR))
 
 import scenario_config as cfg
-from scenario_io import generate_scenario_data, save_json
+from scenario_io import CARBON_INTENSITY_PATTERNS, generate_scenario_data, save_json
 
 
 def generate_and_save_scenario(
@@ -40,6 +40,7 @@ def generate_and_save_scenario(
     carbon_intensity_cycle_slots: Optional[int] = None,
     capacity_tiers: Optional[list] = None,
     input_pattern: str = cfg.INPUT_PATTERN,
+    carbon_pattern: str = cfg.CARBON_PATTERN,
     carbon_request_alignment: str = cfg.CARBON_REQUEST_ALIGNMENT,
     carbon_phase_shift_fraction: float = cfg.CARBON_PHASE_SHIFT_FRACTION,
     request_pattern_start: str = cfg.REQUEST_PATTERN_START,
@@ -77,6 +78,7 @@ def generate_and_save_scenario(
         request_pattern_start=request_pattern_start,
         request_night_floor_ratio=float(cfg.REQUEST_NIGHT_FLOOR_RATIO),
         input_pattern=input_pattern,
+        carbon_pattern=carbon_pattern,
     )
     save_json(output_path, scenario)
     return scenario
@@ -101,6 +103,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["flat", "sinusoidal"],
         default=cfg.INPUT_PATTERN,
         help="Request-count pattern for this simulation scenario; flat retains sub-slot arrival jitter.",
+    )
+    parser.add_argument(
+        "--carbon-pattern",
+        choices=CARBON_INTENSITY_PATTERNS,
+        default=cfg.CARBON_PATTERN,
+        help="Carbon forecast pattern, independent of the request-count pattern.",
     )
     parser.add_argument("--deadline-min-slack", type=int, default=int(cfg.DEADLINE_MIN_SLACK))
     parser.add_argument("--deadline-max-slack", type=int, default=int(cfg.DEADLINE_MAX_SLACK))
@@ -144,6 +152,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"  Slot Duration (seconds):           {args.slot_duration_seconds}")
     print(f"  Requests per Slot:                 {args.requests_per_slot}")
     print(f"  Input Pattern:                     {args.input_pattern}")
+    print(f"  Carbon Pattern:                    {args.carbon_pattern}")
     print(f"  Request Rate Std Factor:           {args.request_rate_std_factor}")
     print(f"  Deadline Min Slack (slots):        {args.deadline_min_slack}")
     print(f"  Deadline Max Slack (slots):        {args.deadline_max_slack}")
@@ -163,6 +172,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         slot_duration_seconds=args.slot_duration_seconds,
         requests_per_slot=args.requests_per_slot,
         input_pattern=args.input_pattern,
+        carbon_pattern=args.carbon_pattern,
         request_rate_std_factor=args.request_rate_std_factor,
         deadline_min_slack=args.deadline_min_slack,
         deadline_max_slack=args.deadline_max_slack,

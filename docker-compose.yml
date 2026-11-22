@@ -7,7 +7,7 @@ services:
       TZ: "${TZ:-UTC}"
       LISTEN_ADDR: 0.0.0.0:8080
       SELF_BASE_URL: http://carbonshift:8080
-      EXECUTOR_URL: http://executor:9000/dispatch
+      EXECUTOR_URL: http://executor:9020/dispatch
       CARBONSHIFT_ALLOW_PRIVATE_CALLBACKS: "1"
       CARBONSHIFT_API_KEY: "${CARBONSHIFT_API_KEY:-}"
       CARBONSHIFT_ARCHIVE_DIR: "${CARBONSHIFT_ARCHIVE_DIR:-/tmp/carbonshift-archive}"
@@ -31,7 +31,7 @@ services:
   executor:
     build: ./services/executor
     ports:
-      - "9000:9000"
+      - "9020:9000"
     environment:
       TZ: "${TZ:-UTC}"
       EXECUTOR_MANUAL_CLOCK: "${MANUAL_CLOCK:-1}"
@@ -112,7 +112,7 @@ services:
       CARBONSHIFT_URL: http://carbonshift:8080
       CLIENT_URL: http://client:8100
       PROVIDER_CLIENT_URLS: "${PROVIDER_CLIENT_URLS:-}"
-      EXECUTOR_URL: http://executor:9000
+      EXECUTOR_URL: http://executor:9020
       PROVIDER_SELF_BASE_URL: http://provider:9100
     # depends_on: 
       # - carbonshift
@@ -175,7 +175,7 @@ services:
       - --client-url
       - http://client:8100
       - --executor-url
-      - http://executor:9000
+      - http://executor:9020
       - --provider-url
       - http://provider:9100
 
@@ -216,7 +216,7 @@ services:
       - --task
       - question_answering
       - --executor-url
-      - http://executor:9000
+      - http://executor:9020
       - --provider-url
       - http://provider:9100
     volumes:

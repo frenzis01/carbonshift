@@ -24,6 +24,9 @@ SLOT_DURATION_SECONDS: float = 10.0
 # Supported simulation-only request arrival pattern. The battery runner can
 # override this per scenario; emulation plans are configured independently.
 INPUT_PATTERN: str = "sinusoidal"
+# Carbon intensity is independent of request arrivals: flat request scenarios
+# retain the ordinary sinusoidal forecast unless this is explicitly changed.
+CARBON_PATTERN: str = "sinusoidal"
 # Target average requests per slot. Sinusoidal scenarios distribute this
 # average across the day/night cycle; flat scenarios keep it nearly constant.
 PREDICTED_REQUESTS_PER_SLOT: float = 60.0
@@ -42,15 +45,18 @@ ERROR_WINDOW_FUTURE: int = 14
 ERROR_WINDOW_PAST_DECAY_SLOTS: int = 0
 
 # ── request/carbon sinusoidal relationship ────────────────────────────────────
-# Carbon alignment relative to the request wave: "in-phase", "phase-opposition",
-# or "phase-shifted" (a quarter-cycle shift between the first two).
+# Used only when CARBON_PATTERN is sinusoidal. Carbon alignment relative to the
+# request wave: "in-phase", "phase-opposition", or "phase-shifted".
 CARBON_REQUEST_ALIGNMENT: str = "phase-shifted"
 # Fraction of one cycle, from in-phase (0.0) toward phase opposition (0.5).
 CARBON_PHASE_SHIFT_FRACTION: float = 0.25
 # "low" means low requests at night and high requests by day; "high" inverts it.
 REQUEST_PATTERN_START: str = "low"
 
-# ── carbon intensity daylight wave ───────────────────────────────────────────
+# ── carbon intensity pattern and daylight wave ────────────────────────────────
+# Independent of INPUT_PATTERN. "flat" uses the midpoint of the configured
+# carbon levels with seeded per-slot uniform jitter bounded to ±10%.
+CARBON_PATTERN: str = "sinusoidal"
 # Period (slots) of the sinusoidal carbon-intensity wave. 24 == one daily cycle
 # when each slot represents one hour.
 CARBON_INTENSITY_CYCLE_SLOTS: int = 24

@@ -29,14 +29,14 @@ For every grid point the script:
   3. saves it back to `battery_config.json`
   4. invokes `python tests/battery/run_battery.py`
 
-By default, every selected phase is run once with the `sinusoidal` input
-pattern, the configured carbon relation, and the configured request-wave
-orientation. Edit `CARBON_REQUEST_ALIGNMENT`, `CARBON_PHASE_SHIFT_FRACTION`,
-and `REQUEST_PATTERN_START` beside `INPUT_PATTERNS` to change those settings.
-`--input-pattern flat`
-selects the flat pattern instead; the two input patterns can also be requested
-together. Pattern settings are included in scenario and battery names to keep
-their output files separate.
+Request and carbon patterns are independent. Edit `INPUT_PATTERNS` to select
+request-count patterns and `CARBON_PATTERNS` to select CI patterns. The default
+CI pattern is sinusoidal with its configured noise; flat CI uses a constant
+midpoint baseline with deterministic uniform ±10% jitter. Edit
+`CARBON_REQUEST_ALIGNMENT`, `CARBON_PHASE_SHIFT_FRACTION`, and
+`REQUEST_PATTERN_START` to configure the sinusoidal carbon wave. Pattern
+settings are included in scenario and battery names to keep their output files
+separate.
 
 Edit the `FLAVOURS` list beside `INPUT_PATTERNS` to choose the flavour
 definitions shared by the baseline and all enabled phases. Comment out entries
@@ -50,7 +50,6 @@ are left untouched.
 Usage (from the repository root):
     python tests/battery/multiple_runs.py
     python tests/battery/multiple_runs.py --phase dp online offline   # subset
-    python tests/battery/multiple_runs.py --input-pattern flat
 """
 from __future__ import annotations
 
@@ -73,7 +72,11 @@ CONFIG_PATH = BATTERY_DIR / "battery_config.json"
 RUN_BATTERY_SCRIPT = BATTERY_DIR / "run_battery.py"
 
 sys.path.insert(0, str(BATTERY_DIR / "scenarios"))
-from scenario_io import CARBON_REQUEST_ALIGNMENTS, REQUEST_PATTERN_STARTS  # noqa: E402
+from scenario_io import (  # noqa: E402
+    CARBON_INTENSITY_PATTERNS,
+    CARBON_REQUEST_ALIGNMENTS,
+    REQUEST_PATTERN_STARTS,
+)
 
 
 @dataclass
@@ -113,11 +116,11 @@ SWARM_ONLINE_CONTENT: Dict[str, Any] = {
 PER_REQUEST_ONLINE_CONTENT: Dict[str, Any] = {
     "batch_sizes": [],
     "online_strategies": [
-        "bandit",
+        # "bandit",
         "singleton_best",
-        "hazard",
-        "random_slotflav",
-        "random_flav",
+        # "hazard",
+        # "random_slotflav",
+        # "random_flav",
     ],
     "online_batch_sizes": [8],
     "additional_strategies": [],
@@ -128,12 +131,12 @@ OFFLINE_CONTENT: Dict[str, Any] = {
     "online_strategies": [],
     "additional_strategies": [
         "offline_singleton_best",
-        "offline_singleton_best_accurate",
-        "offline_random_slotflav",
-        "offline_random_flav",
-        "hazard",
-        "bandit",
-        "ant_colony",
+        # "offline_singleton_best_accurate",
+        # "offline_random_slotflav",
+        # "offline_random_flav",
+        # "hazard",
+        # "bandit",
+        # "ant_colony",
     ],
 }
 
@@ -145,6 +148,7 @@ OUTPUT_ALIGNMENT_TOKENS = {
     "phase-shifted": "PS",
 }
 OUTPUT_REQUEST_START_TOKENS = {"low": "L", "high": "H"}
+OUTPUT_CARBON_PATTERN_TOKENS = {"sinusoidal": "", "flat": "_CI_FLAT"}
 OUTPUT_PHASE_TOKENS = {"per_request": "perrequest"}
 _SCENARIO_WAVE_SUFFIX = re.compile(
     r"_(?:IP|PO)_[LH]$|_PS_shift[+-]?[0-9]+(?:p[0-9]+)?(?:e[+-]?[0-9]+)?_[LH]$"
@@ -154,17 +158,19 @@ _SCENARIO_WAVE_SUFFIX = re.compile(
 # available solver choices for a test run.
 FLAVOURS: List[Dict[str, Any]] = [
     {"name": "Accurate", "error": 0.0, "duration_sec": 60.0},
-    {"name": "Balanced", "error": 2.5, "duration_sec": 30.0},
-    {"name": "Fast", "error": 5.0, "duration_sec": 10.0},
+    # {"name": "Balanced", "error": 2.5, "duration_sec": 30.0},
+    # {"name": "Fast", "error": 5.0, "duration_sec": 10.0},
 ]
 
 # TODO: better assess
 APPEND_SUFFIX_TO_SCENARIOS = True
 
-BATTERY_ID_PREFIX = "T40"
+BATTERY_ID_PREFIX = "T54"
 
 # Select which supported scenario pattern(s) the default sweep runs.
-INPUT_PATTERNS = ("sinusoidal",)
+INPUT_PATTERNS = ("flat",)
+# Independent CI pattern(s); use ("flat",) for a flat baseline with ±10% jitter.
+CARBON_PATTERNS = ("flat",)
 # Sinusoidal-only relationship, shift amount, and request-wave orientation.
 # "in-phase"
 # "phase_opposition"
@@ -184,7 +190,7 @@ _PARALLELISM_X_THRESHOLD = [
         "max_error_threshold": threshold,
     }
     for parallelism in (1,)
-    for threshold in (0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0)
+    for threshold in (4.0,)
 ]
 
 PHASES: Dict[str, PhaseGrid] = {
@@ -224,6 +230,8 @@ def _strip_scenario_output_suffixes(scenario_id: str) -> str:
     while True:
         previous = scenario_id
         scenario_id = _SCENARIO_WAVE_SUFFIX.sub("", scenario_id)
+        if scenario_id.endswith(OUTPUT_CARBON_PATTERN_TOKENS["flat"]):
+            scenario_id = scenario_id[: -len(OUTPUT_CARBON_PATTERN_TOKENS["flat"])]
         for token in OUTPUT_INPUT_PATTERN_TOKENS.values():
             suffix = f"_{token}"
             if scenario_id.endswith(suffix):
@@ -260,38 +268,47 @@ def _wave_output_suffix() -> str:
     return f"_{alignment}_{request_start}"
 
 
-def _with_sinusoidal_wave_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    if CARBON_REQUEST_ALIGNMENT not in CARBON_REQUEST_ALIGNMENTS:
-        raise ValueError(f"Unknown carbon request alignment: {CARBON_REQUEST_ALIGNMENT!r}")
-    if REQUEST_PATTERN_START not in REQUEST_PATTERN_STARTS:
-        raise ValueError(f"Unknown request pattern start: {REQUEST_PATTERN_START!r}")
-    if not 0.0 <= CARBON_PHASE_SHIFT_FRACTION <= 0.5:
-        raise ValueError("CARBON_PHASE_SHIFT_FRACTION must be between 0 and 0.5")
+def _with_carbon_pattern(
+    cfg: Dict[str, Any], carbon_pattern: str
+) -> Dict[str, Any]:
+    """Set the independent CI pattern and normalize its identifying scenario tags."""
+    if carbon_pattern not in CARBON_INTENSITY_PATTERNS:
+        raise ValueError(f"Unknown carbon pattern: {carbon_pattern!r}")
+    if carbon_pattern == "sinusoidal":
+        if CARBON_REQUEST_ALIGNMENT not in CARBON_REQUEST_ALIGNMENTS:
+            raise ValueError(
+                f"Unknown carbon request alignment: {CARBON_REQUEST_ALIGNMENT!r}"
+            )
+        if REQUEST_PATTERN_START not in REQUEST_PATTERN_STARTS:
+            raise ValueError(f"Unknown request pattern start: {REQUEST_PATTERN_START!r}")
+        if not 0.0 <= CARBON_PHASE_SHIFT_FRACTION <= 0.5:
+            raise ValueError("CARBON_PHASE_SHIFT_FRACTION must be between 0 and 0.5")
 
-    wave_suffix = _wave_output_suffix()
+    wave_suffix = _wave_output_suffix() if carbon_pattern == "sinusoidal" else ""
     configured = dict(cfg)
     configured["scenarios"] = []
     for scenario in cfg.get("scenarios", []):
-        if scenario.get("input_pattern") != "sinusoidal":
-            configured["scenarios"].append(scenario)
-            continue
-
+        input_pattern = scenario.get("input_pattern", "sinusoidal")
         scenario_id = _strip_scenario_output_suffixes(scenario["id"])
         if APPEND_SUFFIX_TO_SCENARIOS:
-            scenario_id = (
-                f"{scenario_id}_"
-                f"{OUTPUT_INPUT_PATTERN_TOKENS['sinusoidal']}{wave_suffix}"
+            input_token = OUTPUT_INPUT_PATTERN_TOKENS[input_pattern]
+            scenario_id = f"{scenario_id}_{input_token}{wave_suffix}"
+            if carbon_pattern == "flat":
+                scenario_id += OUTPUT_CARBON_PATTERN_TOKENS["flat"]
+        updated = {**scenario, "id": scenario_id, "carbon_pattern": carbon_pattern}
+        if carbon_pattern == "sinusoidal":
+            updated.update(
+                carbon_request_alignment=CARBON_REQUEST_ALIGNMENT,
+                carbon_phase_shift_fraction=CARBON_PHASE_SHIFT_FRACTION,
+                request_pattern_start=REQUEST_PATTERN_START,
             )
-        configured["scenarios"].append(
-            {
-                **scenario,
-                "id": scenario_id,
-                "carbon_request_alignment": CARBON_REQUEST_ALIGNMENT,
-                "carbon_phase_shift_fraction": CARBON_PHASE_SHIFT_FRACTION,
-                "request_pattern_start": REQUEST_PATTERN_START,
-            }
-        )
+        configured["scenarios"].append(updated)
     return configured
+
+
+def _with_sinusoidal_wave_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Compatibility helper for applying the selected sinusoidal CI settings."""
+    return _with_carbon_pattern(cfg, "sinusoidal")
 
 
 def run_battery() -> int:
@@ -394,6 +411,7 @@ def run_phase(
     phase: PhaseGrid,
     battery_id_prefix: str,
     input_pattern: str,
+    carbon_pattern: str,
 ) -> int:
     """Run every grid point of one phase, returning the last non-zero exit
     status seen (0 if all grid points succeeded)."""
@@ -405,8 +423,7 @@ def run_phase(
         cfg.update(phase.content)
         cfg["flavours"] = FLAVOURS
         cfg = _with_input_pattern(cfg, input_pattern)
-        if input_pattern == "sinusoidal":
-            cfg = _with_sinusoidal_wave_settings(cfg)
+        cfg = _with_carbon_pattern(cfg, carbon_pattern)
 
         # `max_error_threshold` is a per-scenario override in battery_config.json
         # (nested under "scenarios"[i]), not a top-level runtime knob — apply it
@@ -421,27 +438,27 @@ def run_phase(
             ]
 
         input_pattern_token = OUTPUT_INPUT_PATTERN_TOKENS[input_pattern]
-        wave_suffix = (
+        carbon_suffix = (
             _wave_output_suffix()
-            if input_pattern == "sinusoidal"
-            else ""
+            if carbon_pattern == "sinusoidal"
+            else OUTPUT_CARBON_PATTERN_TOKENS["flat"]
         )
         phase_token = OUTPUT_PHASE_TOKENS.get(phase.name, phase.name)
         cfg["battery_id"] = (
-            f"{battery_id_prefix}_{input_pattern_token}{wave_suffix}_{phase_token}_{idx - 1}"
+            f"{battery_id_prefix}_{input_pattern_token}{carbon_suffix}_{phase_token}_{idx - 1}"
         )
 
         print("\n" + "=" * 70)
-        wave_settings = (
+        carbon_settings = (
             f"carbon_alignment={CARBON_REQUEST_ALIGNMENT}, "
             f"phase_shift={CARBON_PHASE_SHIFT_FRACTION:g}, "
             f"request_start={REQUEST_PATTERN_START}"
-            if input_pattern == "sinusoidal"
-            else "wave settings=n/a"
+            if carbon_pattern == "sinusoidal"
+            else "flat carbon baseline with ±10% jitter"
         )
         print(
-            f"Pattern '{input_pattern}', phase '{phase.name}' — "
-            f"{wave_settings}, "
+            f"Input pattern '{input_pattern}', carbon pattern '{carbon_pattern}', "
+            f"phase '{phase.name}' — {carbon_settings}, "
             f"run {idx}/{total}: knobs={knobs}"
         )
         print("=" * 70)
@@ -479,14 +496,7 @@ def main(argv: List[str] | None = None) -> int:
         "--battery-id-prefix",
         default=BATTERY_ID_PREFIX,
         help="Prefix used to build each run's battery_id "
-        "(final id includes input/wave settings, phase, and grid index).",
-    )
-    parser.add_argument(
-        "--input-pattern",
-        nargs="+",
-        choices=SUPPORTED_INPUT_PATTERNS,
-        default=list(INPUT_PATTERNS),
-        help="Simulation request pattern(s) to sweep (default: sinusoidal).",
+        "(final id includes input/carbon wave settings, phase, and grid index).",
     )
     args = parser.parse_args(argv)
 
@@ -497,16 +507,18 @@ def main(argv: List[str] | None = None) -> int:
     base_cfg = load_config(CONFIG_PATH)
     overall_status = 0
     try:
-        for input_pattern in args.input_pattern:
-            for phase_name in args.phase:
-                status = run_phase(
-                    base_cfg,
-                    PHASES[phase_name],
-                    args.battery_id_prefix,
-                    input_pattern,
-                )
-                if status != 0:
-                    overall_status = status
+        for input_pattern in INPUT_PATTERNS:
+            for carbon_pattern in CARBON_PATTERNS:
+                for phase_name in args.phase:
+                    status = run_phase(
+                        base_cfg,
+                        PHASES[phase_name],
+                        args.battery_id_prefix,
+                        input_pattern,
+                        carbon_pattern,
+                    )
+                    if status != 0:
+                        overall_status = status
     except KeyboardInterrupt:
         print(
             "\nInterrupted by user. The active child process was stopped, "
@@ -523,11 +535,9 @@ def main(argv: List[str] | None = None) -> int:
 
     print("\n" + "=" * 70)
     print(
-        f"All requested patterns ({', '.join(args.input_pattern)}) and "
-        f"phases ({', '.join(args.phase)}) completed with sinusoidal alignment "
-        f"{CARBON_REQUEST_ALIGNMENT} "
-        f"{f'(shift={CARBON_PHASE_SHIFT_FRACTION:g}) ' if CARBON_REQUEST_ALIGNMENT == 'phase-shift' else ''}"
-        f"and request start {REQUEST_PATTERN_START}."
+        f"All requested input patterns ({', '.join(INPUT_PATTERNS)}), carbon "
+        f"patterns ({', '.join(CARBON_PATTERNS)}), and phases "
+        f"({', '.join(args.phase)}) completed."
     )
     print("=" * 70)
     return overall_status

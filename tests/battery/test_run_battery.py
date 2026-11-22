@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "scenarios"))
 
 import multiple_runs as mr  # noqa: E402
 import run_battery as rb  # noqa: E402
+import scenario_config  # noqa: E402
 from nb_utils import require_output_schema  # noqa: E402
 
 
@@ -146,6 +147,27 @@ def test_generated_scenario_uses_configured_deadline_and_future_window(tmp_path)
     assert scenario["metadata"]["error_window_future"] == 14
     assert "input_total_slots" not in scenario["metadata"]
     assert len(scenario["carbon_forecast"]) == 2
+
+
+def test_generated_scenario_uses_flat_carbon_pattern_override(tmp_path):
+    scenario = rb._generate_scenario(
+        {
+            "id": "flat-ci",
+            "seed": 1,
+            "total_slots": 32,
+            "requests_per_slot": 1.0,
+            "input_pattern": "flat",
+            "carbon_pattern": "flat",
+        },
+        tmp_path / "flat-ci.json",
+    )
+
+    center = (
+        scenario_config.CARBON_NIGHT_MAX + scenario_config.CARBON_DAY_MIN
+    ) / 2.0
+    assert scenario["metadata"]["input_pattern"] == "flat"
+    assert scenario["metadata"]["carbon_pattern"] == "flat"
+    assert all(0.9 * center <= value <= 1.1 * center for value in scenario["carbon_forecast"])
 
 
 def test_generated_scenario_uses_sinusoidal_wave_overrides(tmp_path):
@@ -438,6 +460,7 @@ def test_run_phase_removes_only_new_incomplete_folder_after_interrupt(
             mr.PhaseGrid("per_request", {}, [{}]),
             "suite",
             "flat",
+            "sinusoidal",
         )
 
     assert saved_config["battery_id"] == battery_id
@@ -492,10 +515,49 @@ def test_run_battery_forwards_interrupt_and_waits_for_child(monkeypatch):
 
 
 def test_multiple_runs_default_patterns_is_a_single_pattern_not_characters():
-    assert mr.INPUT_PATTERNS == ("sinusoidal",)
+    assert len(mr.INPUT_PATTERNS) == 1
+    assert mr.INPUT_PATTERNS[0] in mr.SUPPORTED_INPUT_PATTERNS
+    assert len(mr.CARBON_PATTERNS) == 1
+    assert mr.CARBON_PATTERNS[0] in mr.CARBON_INTENSITY_PATTERNS
     patterned = mr._with_input_pattern({"scenarios": [{"id": "tiny"}]}, mr.INPUT_PATTERNS[0])
-    assert patterned["scenarios"][0]["input_pattern"] == "sinusoidal"
-    assert patterned["scenarios"][0]["id"] == "tiny"
+    assert patterned["scenarios"][0]["input_pattern"] == mr.INPUT_PATTERNS[0]
+
+
+def test_multiple_runs_uses_pattern_constants_as_a_cartesian_sweep(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "battery_config.json"
+    config_path.write_text("{}")
+    base_config = {"scenarios": []}
+    calls = []
+
+    monkeypatch.setattr(mr, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(mr, "load_config", lambda _path: base_config)
+    monkeypatch.setattr(mr, "save_config", lambda *_args: None)
+    monkeypatch.setattr(mr, "INPUT_PATTERNS", ("flat", "sinusoidal"))
+    monkeypatch.setattr(mr, "CARBON_PATTERNS", ("flat", "sinusoidal"))
+    monkeypatch.setattr(mr, "run_phase", lambda _cfg, _phase, _prefix, input_pattern, carbon_pattern: (
+        calls.append((input_pattern, carbon_pattern)) or 0
+    ))
+
+    assert mr.main(["--phase", "dp"]) == 0
+    assert calls == [
+        ("flat", "flat"),
+        ("flat", "sinusoidal"),
+        ("sinusoidal", "flat"),
+        ("sinusoidal", "sinusoidal"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--input-pattern", "--carbon-pattern"],
+)
+def test_multiple_runs_rejects_pattern_cli_overrides(option):
+    with pytest.raises(SystemExit) as error:
+        mr.main([option, "flat"])
+
+    assert error.value.code == 2
 
 
 def test_multiple_runs_flavours_override_battery_config_for_each_phase(
@@ -519,6 +581,7 @@ def test_multiple_runs_flavours_override_battery_config_for_each_phase(
         mr.PhaseGrid("dp", {"batch_sizes": [1]}, [{}]),
         "flavour-test",
         "flat",
+        "sinusoidal",
     )
 
     assert status == 0
@@ -540,7 +603,7 @@ def test_main_reports_interrupt_without_traceback_and_restores_config(tmp_path, 
 
     monkeypatch.setattr(mr, "run_phase", interrupt)
 
-    assert mr.main(["--phase", "dp", "--input-pattern", "sinusoidal"]) == 130
+    assert mr.main(["--phase", "dp"]) == 130
     assert saved == [base_config]
     captured = capsys.readouterr()
     assert "Interrupted by user" in captured.err

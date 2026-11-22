@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 FLAT_REQUEST_JITTER_STD_FACTOR = 0.05
+FLAT_CARBON_JITTER_FRACTION = 0.10
+CARBON_INTENSITY_PATTERNS = ("sinusoidal", "flat")
 CARBON_REQUEST_ALIGNMENTS = ("in-phase", "phase-opposition", "phase-shifted")
 REQUEST_PATTERN_STARTS = ("low", "high")
 
@@ -240,6 +242,34 @@ def generate_carbon_intensity_forecast(
     return forecast
 
 
+def _generate_flat_carbon_forecast(
+    total_slots: int,
+    seed: int,
+    baseline_min: float,
+    baseline_max: float,
+) -> List[float]:
+    """Generate a seeded flat baseline with independent bounded ±10% jitter."""
+    rng = random.Random(seed ^ 0xC1F1_771E)
+    center = (baseline_min + baseline_max) / 2.0
+    return [
+        round(
+            max(
+                1.0,
+                center
+                * (
+                    1.0
+                    + rng.uniform(
+                        -FLAT_CARBON_JITTER_FRACTION,
+                        FLAT_CARBON_JITTER_FRACTION,
+                    )
+                ),
+            ),
+            6,
+        )
+        for slot in range(total_slots)
+    ]
+
+
 def generate_scenario_data(
     *,
     seed: int,
@@ -269,6 +299,7 @@ def generate_scenario_data(
     carbon_phase_shift_fraction: float = 0.25,
     request_night_floor_ratio: float = 0.40,
     input_pattern: str = "sinusoidal",
+    carbon_pattern: str = "sinusoidal",
 ) -> Dict[str, Any]:
     """
     Build a deterministic scenario payload.
@@ -283,16 +314,21 @@ def generate_scenario_data(
 
     ``input_pattern`` controls request arrivals: ``sinusoidal`` follows the
     daylight shape and ``flat`` adds small, deterministic Gaussian slot-count
-    jitter (5% of the target rate), preserving the rounded total. Both retain
+    jitter (5% of the target rate), preserving the rounded total.
+    Independently, ``carbon_pattern`` selects the sinusoidal forecast with
+    autocorrelated noise or a flat midpoint baseline with deterministic
+    per-slot uniform jitter bounded to ±10%. Both request patterns retain
     random sub-slot arrival jitter.
 
     For sinusoidal inputs, ``request_pattern_start`` selects low demand at
-    night/high by day or its inverse. ``carbon_request_alignment`` sets carbon
-    intensity in phase, opposed, or shifted by a quarter cycle relative to
-    that request wave.
+    night/high by day or its inverse. When ``carbon_pattern`` is sinusoidal,
+    ``carbon_request_alignment`` sets carbon intensity in phase, opposed, or
+    shifted relative to that request wave.
     """
     if input_pattern not in {"flat", "sinusoidal"}:
         raise ValueError(f"Unknown input pattern: {input_pattern!r}")
+    if carbon_pattern not in CARBON_INTENSITY_PATTERNS:
+        raise ValueError(f"Unknown carbon pattern: {carbon_pattern!r}")
     carbon_inverted, phase_shift_fraction = _resolve_carbon_wave_flags(
         carbon_request_alignment,
         request_pattern_start,
@@ -309,20 +345,28 @@ def generate_scenario_data(
 
     rng = random.Random(seed)
 
-    forecast = generate_carbon_intensity_forecast(
-        total_slots=total_slots,
-        carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
-        seed=seed,
-        night_max=carbon_night_max,
-        day_min=carbon_day_min,
-        sunrise_fraction=carbon_sunrise_fraction,
-        sunset_fraction=carbon_sunset_fraction,
-        transition_slope=carbon_transition_slope,
-        noise_std=carbon_noise_std,
-        noise_persistence=carbon_noise_persistence,
-        inverted=carbon_inverted,
-        phase_shift_fraction=phase_shift_fraction,
-    )
+    if carbon_pattern == "flat":
+        forecast = _generate_flat_carbon_forecast(
+            total_slots,
+            seed,
+            carbon_night_max,
+            carbon_day_min,
+        )
+    else:
+        forecast = generate_carbon_intensity_forecast(
+            total_slots=total_slots,
+            carbon_intensity_cycle_slots=carbon_intensity_cycle_slots,
+            seed=seed,
+            night_max=carbon_night_max,
+            day_min=carbon_day_min,
+            sunrise_fraction=carbon_sunrise_fraction,
+            sunset_fraction=carbon_sunset_fraction,
+            transition_slope=carbon_transition_slope,
+            noise_std=carbon_noise_std,
+            noise_persistence=carbon_noise_persistence,
+            inverted=carbon_inverted,
+            phase_shift_fraction=phase_shift_fraction,
+        )
 
     requests: List[Dict[str, Any]] = []
     request_id = 0
@@ -403,6 +447,7 @@ def generate_scenario_data(
         "metadata": {
             "seed": int(seed),
             "input_pattern": input_pattern,
+            "carbon_pattern": carbon_pattern,
             "carbon_request_alignment": carbon_request_alignment,
             "request_pattern_start": request_pattern_start,
             "carbon_phase_shift_fraction": float(carbon_phase_shift_fraction),

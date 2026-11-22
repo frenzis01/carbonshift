@@ -18,7 +18,21 @@ Set `input_pattern` on a scenario in `battery_config.json` to:
 Both patterns retain independently seeded random arrival times within each
 slot.
 
-For `sinusoidal` scenarios, configure:
+## Carbon-intensity patterns
+
+`carbon_pattern` is independent of `input_pattern`:
+
+- `sinusoidal` (default): uses the configured daylight-shaped CI forecast and
+  its existing autocorrelated noise. This remains the default with flat request
+  counts.
+- `flat`: uses the midpoint of the configured carbon levels as a constant
+  baseline, with deterministic per-slot uniform jitter bounded to ±10%.
+
+Emulation's synthetic measured reading remains the forecast multiplied by
+relative Gaussian jitter with 5% standard deviation. This measurement jitter
+is separate from the scenario's baseline CI pattern.
+
+For sinusoidal carbon forecasts, configure:
 
 - `carbon_request_alignment`: `in-phase`, `phase-opposition`, or
   `phase-shifted` (the standalone scenario-generation default; `multiple_runs.py`
@@ -31,7 +45,8 @@ For `sinusoidal` scenarios, configure:
 
 `multiple_runs.py` configures these with the `CARBON_REQUEST_ALIGNMENT`,
 `CARBON_PHASE_SHIFT_FRACTION`, and `REQUEST_PATTERN_START` constants beside
-`INPUT_PATTERNS`.
+`INPUT_PATTERNS`. Set `CARBON_PATTERNS` to `("flat",)` to switch the CI
+baseline while keeping the request pattern unchanged.
 
 ## Flavour selection
 
@@ -95,16 +110,16 @@ other execution-level measurements still describe the full extended run.
 horizon. These values can differ across strategy runs. Leaving
 `trim_future_assignments` absent or `false` preserves the existing behavior.
 
-`multiple_runs.py` runs the `sinusoidal` input pattern by default. Use
-`--input-pattern flat` or `--input-pattern sinusoidal flat` to choose other
-patterns. It always sets each scenario's input pattern and sinusoidal wave
-settings. `APPEND_SUFFIX_TO_SCENARIOS` controls whether the corresponding tags
-are also added to scenario IDs; previously generated tags are normalized first.
-The battery ID includes the selected pattern and wave settings regardless of
-this option, so sweep outputs remain distinct. For a single battery run, set
-`input_pattern`, `carbon_request_alignment`, and
-`request_pattern_start` per scenario in the config; omitted values use the
-defaults in `scenario_config.py`.
+`multiple_runs.py` sweeps the input and carbon patterns in its `INPUT_PATTERNS`
+and `CARBON_PATTERNS` settings (currently flat requests and sinusoidal CI).
+Edit either constant to select a different pattern; the two settings are
+independent. `APPEND_SUFFIX_TO_SCENARIOS`
+controls whether the selected input, carbon, and wave tags are also added to
+scenario IDs; previously generated tags are normalized first. The battery ID
+includes the selected patterns regardless of this option, so sweep outputs
+remain distinct. For a single battery run, set `input_pattern`,
+`carbon_pattern`, `carbon_request_alignment`, and `request_pattern_start` per
+scenario; omitted values use the defaults in `scenario_config.py`.
 
 If you interrupt `multiple_runs.py` with Ctrl+C, it removes the newly created
 folder for the active run if that run is incomplete. Earlier completed runs,

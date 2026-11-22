@@ -28,6 +28,7 @@ def _generate(
     slots: int = 24,
     carbon_request_alignment: str = "phase-shifted",
     request_pattern_start: str = "low",
+    carbon_pattern: str = "sinusoidal",
 ):
     return generate_scenario_data(
         seed=173,
@@ -41,6 +42,7 @@ def _generate(
         error_window_future=2,
         max_error_threshold=4.0,
         input_pattern=pattern,
+        carbon_pattern=carbon_pattern,
         carbon_request_alignment=carbon_request_alignment,
         request_pattern_start=request_pattern_start,
     )
@@ -85,6 +87,19 @@ def test_sinusoidal_pattern_varies_counts_and_preserves_arrival_jitter():
     assert scenario["metadata"]["carbon_request_alignment"] == "phase-shifted"
     assert scenario["metadata"]["request_pattern_start"] == "low"
     assert scenario["carbon_forecast"] == flat_scenario["carbon_forecast"]
+
+
+def test_flat_carbon_pattern_has_seeded_bounded_ten_percent_jitter():
+    scenario = _generate("flat", slots=128, carbon_pattern="flat")
+    repeated = _generate("flat", slots=128, carbon_pattern="flat")
+    forecast = scenario["carbon_forecast"]
+    center = (75.0 + 170.0) / 2.0
+
+    assert scenario == repeated
+    assert scenario["metadata"]["carbon_pattern"] == "flat"
+    assert all(center * 0.9 <= value <= center * 1.1 for value in forecast)
+    assert max(forecast) - min(forecast) > center * 0.15
+    assert sum(forecast) / len(forecast) == pytest.approx(center, abs=center * 0.02)
 
 
 def test_sinusoidal_request_wave_can_start_low_or_high_without_changing_mean():
@@ -241,12 +256,23 @@ def test_multiple_runs_patterns_set_metadata_and_normalize_scenario_ids(
     flat = multiple_runs._with_input_pattern(base, "flat")
     sinusoidal = multiple_runs._with_input_pattern(base, "sinusoidal")
     sinusoidal = multiple_runs._with_sinusoidal_wave_settings(sinusoidal)
+    flat_sine_ci = multiple_runs._with_carbon_pattern(flat, "sinusoidal")
+    flat_flat_ci = multiple_runs._with_carbon_pattern(flat, "flat")
 
     assert flat["scenarios"][0]["id"] == expected_flat_id
     assert flat["scenarios"][0]["input_pattern"] == "flat"
     assert sinusoidal["scenarios"][0]["id"] == expected_sinusoidal_id
     assert sinusoidal["scenarios"][0]["input_pattern"] == "sinusoidal"
     assert sinusoidal["scenarios"][0]["carbon_request_alignment"] == "in-phase"
+    assert flat_sine_ci["scenarios"][0]["id"] == (
+        "workload_FLAT_IP_L" if append_suffix else "workload"
+    )
+    assert flat_sine_ci["scenarios"][0]["carbon_pattern"] == "sinusoidal"
+    assert flat_sine_ci["scenarios"][0]["carbon_request_alignment"] == "in-phase"
+    assert flat_flat_ci["scenarios"][0]["id"] == (
+        "workload_FLAT_CI_FLAT" if append_suffix else "workload"
+    )
+    assert flat_flat_ci["scenarios"][0]["carbon_pattern"] == "flat"
     assert base["scenarios"][0] == {"id": "workload_sine_IP_L", "seed": 9}
 
 
@@ -269,7 +295,11 @@ def test_multiple_runs_applies_sinusoidal_wave_constants_without_mutating_base(m
     assert sinusoidal["carbon_phase_shift_fraction"] == 0.4
     assert sinusoidal["request_pattern_start"] == "high"
     assert sinusoidal["id"] == "workload_sine_PS_shift0p4_H"
-    assert flat == base["scenarios"][1]
+    assert flat["carbon_request_alignment"] == "phase-shifted"
+    assert flat["carbon_phase_shift_fraction"] == 0.4
+    assert flat["request_pattern_start"] == "high"
+    assert flat["carbon_pattern"] == "sinusoidal"
+    assert flat["id"] == "workload_FLAT_PS_shift0p4_H"
     assert base["scenarios"][0] == {
         "id": "workload_sine",
         "input_pattern": "sinusoidal",

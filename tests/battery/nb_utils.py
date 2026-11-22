@@ -10,9 +10,9 @@ import pandas as pd
 
 
 FLAVOUR_COLORS: Dict[str, str] = {
-    "Fast": "#1f77b4",
-    "Balanced": "#2ca02c",
-    "Accurate": "#ff7f0e",
+    "Fast": "#2E7D32",
+    "Balanced": "#C0A924",
+    "Accurate": "#8D4516",
 }
 
 OUTPUT_SCHEMA_VERSION = 2
