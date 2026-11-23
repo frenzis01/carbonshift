@@ -136,6 +136,7 @@ class ErrorMetricsTests(unittest.TestCase):
             self.assertEqual(dashboard["indicators"]["global_error_avg"], 12.5)
             self.assertEqual(dashboard["error_plot"]["global_error_avg"], 12.5)
             self.assertEqual(dashboard["error_plot"]["window_error_avg"], 8.5)
+            self.assertEqual(dashboard["assignment_plot"]["current_slot"], 2)
             self.assertEqual(
                 dashboard["assignment_plot"]["slot_zero_start_utc"],
                 "2026-10-14T00:00:00+00:00",

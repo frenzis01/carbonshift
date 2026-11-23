@@ -132,7 +132,8 @@ def build_rollover_payload(
     * `forecast` — the *whole* window, because it is a prediction and spans
       many slots. Sending the whole window (not just the current value) means
       a peer that missed a notification can recover from the next one without
-      a separate pull protocol.
+      a separate pull protocol. The configured horizon counts future slots, so
+      this includes the current slot plus `horizon_slots` future slots.
     * `observed` — the single reading taken for the slot being entered, or
       `null`. A measurement concerns exactly one slot and only exists once
       that slot has been reached, so it is never a list and never covers the
@@ -146,7 +147,7 @@ def build_rollover_payload(
     rather than substituting the forecast for a measurement.
     """
     current = clock.current_slot()
-    points = source.forecast(current, horizon_slots)
+    points = source.forecast(current, horizon_slots + 1)
 
     return {
         "source": source.name,

@@ -45,7 +45,7 @@ curl -X POST localhost:9100/v1/advance-slot -H 'Content-Type: application/json' 
 | `PROVIDER_PORT` | `9100` | HTTP port |
 | `PROVIDER_SLOT_MINUTES` | `60` | Slot length; **must match** carbonshift's `SLOT_DURATION_SECONDS` |
 | `PROVIDER_EPOCH` | `2020-01-01T00:00:00+00:00` | Origin of global slot 0 |
-| `PROVIDER_FORECAST_HORIZON_SLOTS` | `24` | Window length served and pushed in manual mode |
+| `PROVIDER_FORECAST_HORIZON_SLOTS` | `24` | Future-slot lookahead; includes the current slot too, so 24 produces 25 forecast points |
 | `PROVIDER_GENERATOR_CYCLE_SLOTS` | `1440 / PROVIDER_SLOT_MINUTES` | Synthetic forecast cycle; defaults to one local day |
 | `PROVIDER_MANUAL_CLOCK` | `0` | Freeze time for provider-driven emulation; never in production |
 | `TZ` | `UTC` in Compose | Local timezone used to choose emulation midnight; keep identical across services |

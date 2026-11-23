@@ -394,6 +394,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       min-height: var(--plot-height);
       overflow-x: auto;
     }
+    .ci-strip-caption {
+      margin: 0 100px 4px 50px;
+      color: var(--text-muted);
+      font-size: 0.72rem;
+    }
 
     /* Tables & Breakdown Grid */
     .breakdown-grid {
@@ -510,6 +515,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="chart-desc">Selected-profile assignments, with capacity tiers and carbon intensity shown separately.</div>
       </div>
     </div>
+    <div class="ci-strip-caption">Carbon intensity by slot · g (future slots use forecast)</div>
     <div id="assignment-plot" class="plot-wrapper"></div>
   </section>
 
@@ -590,6 +596,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     let resampleBin = 1;
     let autoRefresh = true;
     let refreshTimer = null;
+    let resizeRenderTimer = null;
+    let assignmentPlotRelayoutHandler = null;
     let selectedTheme = 'dark';
 
     const FLAVOUR_COLORS = {
@@ -598,6 +606,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       'Accurate': '#8D4516'
     };
     const CARBON_INTENSITY_COLOR = '#1f77b4';
+    const CARBON_INTENSITY_COLORSCALE = [
+      [0, '#14532d'],
+      [0.125, '#15803d'],
+      [0.25, '#4d7c0f'],
+      [0.375, '#854d0e'],
+      [0.5, '#9a3412'],
+      [0.75, '#7f1d1d'],
+      [1, '#2b110c'],
+    ];
     const ERROR_COLOR = '#d81b60';
     const WINDOW_ERROR_COLOR = '#f97316';
 
@@ -1006,6 +1023,66 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       };
     }
 
+    function carbonIntensityStripData(plot) {
+      let startIndex = 0;
+      if (selectedRange !== 'all') {
+        startIndex = Math.max(0, plot.slots.length - parseInt(selectedRange));
+      }
+
+      const slots = plot.slots.slice(startIndex);
+      const values = [];
+      const tooltips = [];
+      for (let offset = 0; offset < slots.length; offset += 1) {
+        const index = startIndex + offset;
+        const slot = slots[offset];
+        const observed = plot.carbon_intensity_actual[index];
+        const forecast = plot.carbon_intensity_forecast[index];
+        const observedValue = observed !== null && observed !== undefined &&
+          Number.isFinite(Number(observed)) ? Number(observed) : null;
+        const forecastValue = forecast !== null && forecast !== undefined &&
+          Number.isFinite(Number(forecast)) ? Number(forecast) : null;
+        const isFuture = Number(slot) > Number(plot.current_slot);
+        const source = isFuture && forecastValue !== null
+          ? 'Forecast'
+          : observedValue !== null
+            ? 'Observed'
+            : forecastValue !== null
+              ? 'Forecast'
+              : null;
+        const value = source === 'Observed' ? observedValue
+          : source === 'Forecast' ? forecastValue
+            : null;
+        values.push(value);
+        tooltips.push(value === null
+          ? `Slot ${displaySlotValue(slot)} · no carbon-intensity value available`
+          : `Slot ${displaySlotValue(slot)} · ${source}: ${value.toFixed(2)} gCO₂/kWh`);
+      }
+
+      return {
+        slots: displaySlotAxis(slots),
+        values,
+        tooltips,
+      };
+    }
+
+    function updateCarbonIntensityStripLabels() {
+      const graph = document.getElementById('assignment-plot');
+      if (!Array.isArray(graph.data)) return;
+
+      const traceIndex = graph.data.findIndex(trace => trace.name === 'Carbon Intensity by Slot');
+      const range = graph._fullLayout?.xaxis?.range;
+      const plotWidth = graph._fullLayout?._size?.w;
+      if (traceIndex < 0 || !Array.isArray(range) || !Number.isFinite(plotWidth)) return;
+
+      const rangeWidth = Math.abs(Number(range[1]) - Number(range[0]));
+      if (!Number.isFinite(rangeWidth) || rangeWidth <= 0) return;
+
+      const texttemplate = plotWidth / rangeWidth >= 28 ? '%{text}' : '';
+      if (graph.data[traceIndex].texttemplate !== texttemplate) {
+        Plotly.restyle(graph, { texttemplate }, [traceIndex]);
+      }
+    }
+
     function renderAssignmentPlot(plot, errorPlot) {
       const flavourCount = plot.flavours.length;
       const theme = chartTheme();
@@ -1032,6 +1109,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const slots = filtered.slots;
       const flavourSeries = filtered.arrays.slice(0, flavourCount);
       const [globalOccupancy, ciForecast, ciActual] = filtered.arrays.slice(flavourCount);
+      const ciStrip = carbonIntensityStripData(plot);
+      const assignmentPlot = document.getElementById('assignment-plot');
+      const plotWidth = assignmentPlot._fullLayout?._size?.w ??
+        Math.max(0, assignmentPlot.clientWidth - 150);
+      const range = assignmentPlot._fullLayout?.xaxis?.range;
+      const rangeWidth = Array.isArray(range)
+        ? Math.abs(Number(range[1]) - Number(range[0]))
+        : ciStrip.slots.length;
+      const showCIValues = ciStrip.slots.length > 0 &&
+        Number.isFinite(rangeWidth) && rangeWidth > 0 &&
+        plotWidth / rangeWidth >= 28;
       const traces = plot.flavours.map((name, index) => ({
         x: slots,
         y: flavourSeries[index],
@@ -1078,6 +1166,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           hovertemplate: 'Slot %{x}<br>%{y:.2f} gCO₂/kWh<extra></extra>',
         }
       );
+      if (ciStrip.slots.length > 0) {
+        traces.push({
+          x: ciStrip.slots,
+          y: ['CI'],
+          z: [ciStrip.values],
+          customdata: [ciStrip.tooltips],
+          text: [ciStrip.values.map(value => value === null ? '' : `${Math.round(value)} g`)],
+          texttemplate: showCIValues ? '%{text}' : '',
+          textfont: { size: 10, color: '#f8fafc' },
+          type: 'heatmap',
+          colorscale: CARBON_INTENSITY_COLORSCALE,
+          zmin: 0,
+          zmax: 400,
+          xgap: 2,
+          ygap: 2,
+          showscale: false,
+          hoverongaps: true,
+          hovertemplate: '%{customdata}<extra></extra>',
+          name: 'Carbon Intensity by Slot',
+          showlegend: false,
+          xaxis: 'x2',
+          yaxis: 'y4',
+        });
+      }
       if (showProfileError && errorHistory.slots.length > 0) {
         traces.push({
           x: errorHistory.slots,
@@ -1185,7 +1297,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             bordercolor: theme.sliderBorder,
           }
         },
+        xaxis2: {
+          overlaying: 'x',
+          matches: 'x',
+          anchor: 'y4',
+          side: 'top',
+          showticklabels: false,
+          ticks: '',
+          showgrid: false,
+          zeroline: false,
+          showline: false
+        },
         yaxis: {
+          domain: [0, 0.86],
           title: 'Requests Scheduled',
           gridcolor: theme.grid,
           zerolinecolor: theme.zeroLine
@@ -1210,12 +1334,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: ERROR_COLOR
           }
         } : {}),
+        yaxis4: {
+          domain: [0.9, 1],
+          anchor: 'x2',
+          type: 'category',
+          categoryorder: 'array',
+          categoryarray: ['CI'],
+          showticklabels: false,
+          ticks: '',
+          showgrid: false,
+          zeroline: false,
+          fixedrange: true
+        },
         shapes: shapes,
         annotations: annotations
       };
 
       const config = { responsive: true, displayModeBar: true, scrollZoom: true };
-      Plotly.react('assignment-plot', traces, layout, config);
+      Plotly.react(assignmentPlot, traces, layout, config).then(() => {
+        if (assignmentPlotRelayoutHandler === null) {
+          assignmentPlotRelayoutHandler = updateCarbonIntensityStripLabels;
+          assignmentPlot.on('plotly_relayout', assignmentPlotRelayoutHandler);
+        }
+        updateCarbonIntensityStripLabels();
+      });
     }
 
     function renderErrorPlot(plot) {
@@ -1434,6 +1576,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     });
     fetchData();
     syncRefreshTimer();
+    window.addEventListener('resize', () => {
+      if (resizeRenderTimer !== null) clearTimeout(resizeRenderTimer);
+      resizeRenderTimer = setTimeout(() => {
+        resizeRenderTimer = null;
+        if (rawData) renderAll();
+      }, 150);
+    });
   </script>
 </body>
 </html>

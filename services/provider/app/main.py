@@ -283,10 +283,15 @@ async def current_slot() -> CurrentSlotResponse:
 @app.get("/v1/forecast")
 async def forecast(
     from_slot: int | None = Query(default=None, description="Start slot; defaults to the current one."),
-    count: int | None = Query(default=None, ge=1, le=288, description="How many slots; defaults to the configured horizon."),
+    count: int | None = Query(
+        default=None,
+        ge=1,
+        le=288,
+        description="How many points; defaults to the current slot plus the configured future lookahead.",
+    ),
 ) -> ForecastResponse:
     start = clock.current_slot() if from_slot is None else from_slot
-    n = settings.forecast_horizon_slots if count is None else count
+    n = settings.forecast_horizon_slots + 1 if count is None else count
     points = source.forecast(start, n)
     return ForecastResponse(
         source=source.name,

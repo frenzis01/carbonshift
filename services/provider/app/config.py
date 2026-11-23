@@ -53,8 +53,8 @@ class Settings:
     slot_minutes: float = float(os.environ.get("PROVIDER_SLOT_MINUTES", "60"))
 
     # ── horizon ───────────────────────────────────────────────────────────
-    # How many slots ahead of "now" a forecast covers. The user's stated
-    # requirement is ~24 slots; at 30 min/slot that is 12h of lookahead.
+    # Number of future slots covered beyond the current slot. The forecast
+    # includes the current slot as well, so 24 means 25 points in total.
     forecast_horizon_slots: int = int(os.environ.get("PROVIDER_FORECAST_HORIZON_SLOTS", "24"))
 
     # ── manual clock / emulation ──────────────────────────────────────────

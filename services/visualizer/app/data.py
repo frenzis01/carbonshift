@@ -509,6 +509,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
         },
         "assignment_plot": {
             "slots": slot_axis,
+            "current_slot": current_slot,
             **slot_clock,
             "flavours": flavours,
             "flavour_counts": [flavour_counts[flavour] for flavour in flavours],

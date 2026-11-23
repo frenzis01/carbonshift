@@ -84,9 +84,12 @@ def test_slot_endpoint_returns_a_consistent_view(client):
     assert body["local_step"] == 0
 
 
-def test_forecast_defaults_to_the_configured_horizon(client):
+def test_forecast_defaults_to_current_slot_plus_configured_lookahead(client):
+    current = client.get("/v1/slot").json()["current_slot"]
     body = client.get("/v1/forecast").json()
-    assert len(body["points"]) == 24
+    assert [point["slot"] for point in body["points"]] == list(
+        range(current, current + main.settings.forecast_horizon_slots + 1)
+    )
 
 
 def test_forecast_starts_at_the_current_slot_by_default(client):
@@ -306,8 +309,14 @@ def test_advance_slot_pushes_the_forecast_window_to_peers(client, monkeypatch):
     monkeypatch.setattr(main.notifications.requests, "post", fake_post)
     client.post("/v1/advance-slot", json={})
 
-    assert len(captured["forecast"]) == 24
+    assert len(captured["forecast"]) == main.settings.forecast_horizon_slots + 1
     assert captured["current_slot"] is not None
+    assert [point["slot"] for point in captured["forecast"]] == list(
+        range(
+            captured["current_slot"],
+            captured["current_slot"] + main.settings.forecast_horizon_slots + 1,
+        )
+    )
     assert "observed" in captured
     # The reading belongs to the slot the peers have just entered.
     assert captured["observed"]["slot"] == captured["current_slot"]
