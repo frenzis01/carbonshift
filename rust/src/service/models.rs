@@ -306,6 +306,7 @@ pub struct SlotErrorItem {
     pub slot: i32,
     pub request_count: usize,
     pub average_error: f64,
+    /// Window average including linearly decayed observations before its past edge.
     #[serde(default)]
     pub window_error: Option<f64>,
     #[serde(default)]
@@ -333,5 +334,8 @@ pub struct ErrorHistoryResponse {
     pub window_past: i32,
     #[serde(default)]
     pub window_future: i32,
+    /// Additional preceding slots included with linear decay in `window_error`.
+    #[serde(default)]
+    pub window_past_decay_slots: i32,
     pub slots: Vec<SlotErrorItem>,
 }

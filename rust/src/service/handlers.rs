@@ -1525,6 +1525,10 @@ pub async fn get_error_history(
         .as_ref()
         .map(|profile| profile.error_window.future_slots)
         .unwrap_or(_state.scheduler.error_window_future);
+    let window_past_decay_slots = selected_profile
+        .as_ref()
+        .map(|profile| profile.error_window.past_decay_slots)
+        .unwrap_or(_state.scheduler.error_window_past_decay_slots);
 
     let mut slots = Vec::with_capacity((to - from + 1) as usize);
     let mut running_error_sum = 0.0;
@@ -1565,29 +1569,25 @@ pub async fn get_error_history(
             None
         };
 
-        // This is an observational endpoint, so unlike an in-progress solve
-        // it excludes no movable assignments from the current window.
-        let empty_exclusion = std::collections::HashSet::new();
-        let win_stats = if let Some(profile_id) = selected_profile_id {
-            _state.shared_state.get_profile_window_error_stats(
-                profile_id,
+        // Match the solver's policy by including linearly decayed observations
+        // immediately before the active past window.
+        let window_error = if let Some(profile_id) = selected_profile_id {
+            _state
+                .shared_state
+                .get_profile_window_error_average_with_decay(
+                    profile_id,
+                    slot,
+                    window_past,
+                    window_future,
+                    window_past_decay_slots,
+                )
+        } else {
+            _state.shared_state.get_window_error_average_with_decay(
                 slot,
                 window_past,
                 window_future,
-                &empty_exclusion,
+                window_past_decay_slots,
             )
-        } else {
-            _state.shared_state.get_window_error_stats(
-                slot,
-                window_past,
-                window_future,
-                &empty_exclusion,
-            )
-        };
-        let window_error = if win_stats.count > 0 {
-            Some(win_stats.average)
-        } else {
-            None
         };
 
         slots.push(SlotErrorItem {
@@ -1609,6 +1609,7 @@ pub async fn get_error_history(
         task_thresholds,
         window_past,
         window_future,
+        window_past_decay_slots,
         slots,
     }))
 }

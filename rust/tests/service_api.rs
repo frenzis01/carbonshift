@@ -1162,6 +1162,39 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
             carbonshift_rs::engine::qos::QosProfileId::parse("qa-standard-v1").unwrap(),
         ),
         carbonshift_rs::engine::types::Assignment::new_for_profile(
+            42,
+            7,
+            "Balanced".to_string(),
+            1.0,
+            60.0,
+            10.0,
+            Some(7),
+            Some(8),
+            carbonshift_rs::engine::qos::QosProfileId::parse("qa-standard-v1").unwrap(),
+        ),
+        carbonshift_rs::engine::types::Assignment::new_for_profile(
+            43,
+            8,
+            "Balanced".to_string(),
+            1.0,
+            30.0,
+            10.0,
+            Some(8),
+            Some(9),
+            carbonshift_rs::engine::qos::QosProfileId::parse("qa-standard-v1").unwrap(),
+        ),
+        carbonshift_rs::engine::types::Assignment::new_for_profile(
+            44,
+            9,
+            "Fast".to_string(),
+            1.0,
+            0.0,
+            10.0,
+            Some(9),
+            Some(10),
+            carbonshift_rs::engine::qos::QosProfileId::parse("qa-standard-v1").unwrap(),
+        ),
+        carbonshift_rs::engine::types::Assignment::new_for_profile(
             41,
             0,
             "NerFast".to_string(),
@@ -1173,7 +1206,11 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
             carbonshift_rs::engine::qos::QosProfileId::parse("ner-standard-v1").unwrap(),
         ),
     ]);
-    let cfg = Arc::new(test_engine_config());
+    let mut engine_config = test_engine_config();
+    engine_config.error_window_past = 1;
+    engine_config.error_window_future = 1;
+    engine_config.error_window_past_decay_slots = 2;
+    let cfg = Arc::new(engine_config);
     let state = AppState::new(
         shared_state,
         cfg.clone(),
@@ -1199,7 +1236,7 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
             "error_window": {
                 "past_slots": 1,
                 "future_slots": 1,
-                "past_decay_slots": 0
+                "past_decay_slots": 2
             },
             "cumulative_error": {"enabled": true, "hard": true}
         })
@@ -1224,10 +1261,11 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
         .unwrap();
     assert_eq!(assignments.status(), StatusCode::OK);
     let assignments = json_body(assignments).await;
-    assert_eq!(assignments.as_array().unwrap().len(), 1);
+    assert_eq!(assignments.as_array().unwrap().len(), 4);
     assert_eq!(assignments[0]["qos_profile_id"], "qa-standard-v1");
 
     let history = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(
@@ -1243,11 +1281,32 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
     assert_eq!(history["qos_profile_id"], "qa-standard-v1");
     assert_eq!(history["error_semantics"], "word-overlap-f1-v1");
     assert_eq!(history["max_error_threshold"], 17.5);
-    assert_eq!(history["profile_error_avg"], 10.0);
-    assert_eq!(history["global_error_avg"], 50.0);
+    assert_eq!(history["profile_error_avg"], 25.0);
+    assert_eq!(history["global_error_avg"], 38.0);
+    assert_eq!(history["window_past_decay_slots"], 2);
     assert_eq!(history["slots"][0]["request_count"], 1);
     assert_eq!(history["slots"][0]["average_error"], 10.0);
     assert_eq!(history["slots"][0]["window_error"], 10.0);
+
+    for (profile_query, expected_window_error) in
+        [("qos_profile_id=qa-standard-v1&", 20.0), ("", 20.0)]
+    {
+        let history = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/metrics/error-history?{profile_query}from_slot=10&to_slot=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let history = json_body(history).await;
+        assert_eq!(history["slots"][0]["window_error"], expected_window_error);
+    }
 }
 
 #[tokio::test]
@@ -1825,11 +1884,11 @@ async fn scheduler_dispatches_profile_homogeneous_batches_for_distinct_qos_polic
     scheduler.stop();
 }
 
-/// An `actual_error_pct` reported via the executor callback must correct the
-/// scheduler's global error average (predicted → actual), per-assignment,
-/// without changing how many assignments are counted.
+/// An `actual_error_pct` reported via the executor callback must correct
+/// global and profile window-error history (predicted → actual), without
+/// changing how many assignments are counted.
 #[tokio::test]
-async fn executor_callback_with_actual_error_pct_corrects_global_error() {
+async fn executor_callback_with_actual_error_pct_corrects_global_and_window_error() {
     let mut cfg = test_engine_config();
     cfg.solver.batch_size = 1;
     let cfg = Arc::new(cfg);
@@ -1870,8 +1929,34 @@ async fn executor_callback_with_actual_error_pct_corrects_global_error() {
         "expected a nonzero predicted error from the chosen flavour"
     );
 
+    let assignments = shared_state.get_current_assignments();
+    let assignment = assignments.get(&request_id).unwrap();
+    let predicted_error = assignment.error;
+    let history_uri = format!(
+        "/v1/metrics/error-history?qos_profile_id={}&from_slot={}&to_slot={}",
+        assignment.qos_profile_id, assignment.scheduled_slot, assignment.scheduled_slot
+    );
+    let history_before = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&history_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_before.status(), StatusCode::OK);
+    let history_before = json_body(history_before).await;
+    let window_before = history_before["slots"][0]["window_error"].as_f64().unwrap();
+    assert!(
+        (window_before - predicted_error).abs() < 1e-9,
+        "expected the profile window to include the predicted error {predicted_error}, got {window_before}"
+    );
+
     let callback_body = r#"{"success": true, "result": {"actual_error_pct": 0.0}}"#;
     let resp = app
+        .clone()
         .oneshot(json_request(
             "POST",
             &format!("/v1/callback/{request_id}"),
@@ -1890,6 +1975,23 @@ async fn executor_callback_with_actual_error_pct_corrects_global_error() {
         stats_after.error_sum.abs() < 1e-9,
         "actual_error_pct=0.0 => error_sum should become ~0, got {}",
         stats_after.error_sum
+    );
+
+    let history_after = app
+        .oneshot(
+            Request::builder()
+                .uri(&history_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_after.status(), StatusCode::OK);
+    let history_after = json_body(history_after).await;
+    let window_after = history_after["slots"][0]["window_error"].as_f64().unwrap();
+    assert!(
+        window_after.abs() < 1e-9,
+        "actual_error_pct=0.0 => profile window_error should become ~0, got {window_after}"
     );
 
     scheduler.stop();

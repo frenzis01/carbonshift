@@ -2,6 +2,7 @@
 
 use crate::config::AssignmentPolicy;
 use crate::engine::qos::QosProfileId;
+use crate::engine::shared_state::linear_past_decay_weight;
 use crate::shared_state::SolverSnapshot;
 
 /// Weighted error history accumulated before the current batch is considered.
@@ -37,7 +38,6 @@ pub(super) fn augment_with_decayed_past(
 
     let mut weighted_count = 0.0;
     let mut weighted_error_sum = 0.0;
-    let denominator = (decay_slots + 1) as f64;
 
     for idx in 1..=decay_slots {
         let slot = current_slot - assignment.error_window_past - idx as i32;
@@ -47,7 +47,7 @@ pub(super) fn augment_with_decayed_past(
         }
 
         let count = stats.count as f64;
-        let weight = (decay_slots - idx + 1) as f64 / denominator;
+        let weight = linear_past_decay_weight(assignment.error_window_past_decay_slots, idx as i32);
         weighted_count += count * weight;
         weighted_error_sum += stats.error_sum * weight;
     }

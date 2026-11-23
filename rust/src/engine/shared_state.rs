@@ -235,6 +235,43 @@ fn sum_slot_error_totals(
         })
 }
 
+/// Weight for a slot at `distance` before the active past window.
+pub(crate) fn linear_past_decay_weight(past_decay_slots: i32, distance: i32) -> f64 {
+    if past_decay_slots <= 0 || distance <= 0 || distance > past_decay_slots {
+        return 0.0;
+    }
+    (f64::from(past_decay_slots) - f64::from(distance) + 1.0) / (f64::from(past_decay_slots) + 1.0)
+}
+
+fn window_error_average_with_decayed_past(
+    slots: &BTreeMap<i32, SlotErrorTotals>,
+    center_slot: i32,
+    window_past: i32,
+    window_future: i32,
+    past_decay_slots: i32,
+) -> Option<f64> {
+    let active_start = center_slot.saturating_sub(window_past.max(0));
+    let active_end = center_slot.saturating_add(window_future.max(0));
+    let (mut weighted_error_sum, count) = sum_slot_error_totals(slots, active_start, active_end);
+    let mut weighted_count = count as f64;
+    let past_decay_slots = past_decay_slots.max(0);
+
+    if past_decay_slots > 0 {
+        let decay_start = active_start.saturating_sub(past_decay_slots);
+        let decay_end = active_start.saturating_sub(1);
+        if decay_start <= decay_end {
+            for (slot, totals) in slots.range(decay_start..=decay_end) {
+                let distance = active_start.saturating_sub(*slot);
+                let weight = linear_past_decay_weight(past_decay_slots, distance);
+                weighted_error_sum += totals.error_sum * weight;
+                weighted_count += totals.count as f64 * weight;
+            }
+        }
+    }
+
+    (weighted_count > 0.0).then_some(weighted_error_sum / weighted_count)
+}
+
 /// Requests claimed by a worker together with their atomic shared-state snapshot.
 pub struct ClaimedRequestBatch {
     pub requests: Vec<Request>,
@@ -1179,6 +1216,45 @@ impl SharedState {
         }
     }
 
+    /// Window error average including linearly decayed observations before the
+    /// configured past window, matching the scheduler's QoS baseline policy.
+    pub fn get_window_error_average_with_decay(
+        &self,
+        center_slot: i32,
+        window_past: i32,
+        window_future: i32,
+        past_decay_slots: i32,
+    ) -> Option<f64> {
+        let g = self.inner.lock().unwrap();
+        window_error_average_with_decayed_past(
+            &g.global_slot_errors,
+            center_slot,
+            window_past,
+            window_future,
+            past_decay_slots,
+        )
+    }
+
+    /// Profile-scoped window average including the policy's decayed past.
+    pub fn get_profile_window_error_average_with_decay(
+        &self,
+        profile_id: &QosProfileId,
+        center_slot: i32,
+        window_past: i32,
+        window_future: i32,
+        past_decay_slots: i32,
+    ) -> Option<f64> {
+        let g = self.inner.lock().unwrap();
+        let slots = g.profile_slot_errors.get(profile_id)?;
+        window_error_average_with_decayed_past(
+            slots,
+            center_slot,
+            window_past,
+            window_future,
+            past_decay_slots,
+        )
+    }
+
     /// Assignment error stats for one slot and QoS profile.
     pub fn get_profile_slot_error_stats(
         &self,
@@ -1233,9 +1309,8 @@ impl SharedState {
     /// this is only ever called from the executor-callback handler).
     ///
     /// Updates both bookkeeping mechanisms consistently:
-    /// - the window-error average, computed live from `Assignment::error`
-    ///   at query time, sees the correction automatically once `a.error` is
-    ///   overwritten here;
+    /// - the per-slot error totals used by window-history queries are adjusted
+    ///   by the same delta;
     /// - the global running sum (`global_error_sum`), which is *not*
     ///   recomputed live, is adjusted by the delta (subtract the old
     ///   predicted contribution, add the new actual one).
