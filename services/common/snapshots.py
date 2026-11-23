@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 SNAPSHOT_FORMAT_VERSION = 1
 _SNAPSHOT_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+_SNAPSHOT_TIMEZONE = ZoneInfo("Europe/Rome")
 
 
 class SnapshotError(Exception):
@@ -39,12 +41,17 @@ def collect_dashboard_views(
     if not isinstance(all_profiles_view, dict):
         raise SnapshotError("the dashboard all-profile response must be a JSON object")
 
-    active_profiles = all_profiles_view.get("active_profiles", [])
-    if not isinstance(active_profiles, list):
-        raise SnapshotError("the dashboard active_profiles field must be a list")
+    profile_catalog = all_profiles_view.get(
+        "profile_catalog",
+        all_profiles_view.get("active_profiles", []),
+    )
+    if not profile_catalog:
+        profile_catalog = all_profiles_view.get("active_profiles", [])
+    if not isinstance(profile_catalog, list):
+        raise SnapshotError("the dashboard profile_catalog field must be a list")
 
     profile_views: dict[str, dict[str, Any]] = {}
-    for profile in active_profiles:
+    for profile in profile_catalog:
         if not isinstance(profile, dict):
             raise SnapshotError("each active QoS profile must be a JSON object")
         profile_id = profile.get("profile_id")
@@ -112,7 +119,7 @@ def write_snapshot(
     source: str = "visualizer",
     source_snapshot_id: str | None = None,
 ) -> dict[str, str]:
-    """Atomically publish a snapshot/summary pair; the snapshot file is the commit marker."""
+    """Atomically publish a pair with Rome-local paths and UTC capture metadata."""
     _validate_views(views)
     if not isinstance(clients, list) or any(not isinstance(client, dict) for client in clients):
         raise SnapshotError("snapshot client summaries must be a list of JSON objects")
@@ -121,10 +128,11 @@ def write_snapshot(
 
     captured_at = datetime.now(timezone.utc)
     captured_at_text = captured_at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    local_captured_at = captured_at.astimezone(_SNAPSHOT_TIMEZONE)
     snapshot_id = uuid.uuid4().hex
-    date_directory = snapshots_dir / captured_at.strftime("%Y%m%d")
+    date_directory = snapshots_dir / local_captured_at.strftime("%Y%m%d")
     safe_label = _filename_label(label)
-    stem = f"{captured_at.strftime('%H%M_%S')}_{safe_label}_{snapshot_id}"
+    stem = f"{local_captured_at.strftime('%H%M_%S')}_{safe_label}_{snapshot_id}"
     snapshot_path = date_directory / f"{stem}_snapshot.json"
     summary_path = date_directory / f"{stem}_summary.json"
 

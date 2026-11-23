@@ -8,11 +8,16 @@ from common.snapshots import load_snapshot, write_snapshot
 
 
 def _views():
+    profile_catalog = [
+        {"profile_id": "profile-a", "task_kind": "ner"},
+        {"profile_id": "profile-b", "task_kind": "question_answering"},
+    ]
     all_view = {
         "active_profiles": [
-            {"profile_id": "profile-a", "task_kind": "ner"},
-            {"profile_id": "profile-b", "task_kind": "question_answering"},
+            profile_catalog[0],
+            profile_catalog[1],
         ],
+        "profile_catalog": profile_catalog,
         "indicators": {"qos_profile_id": None},
     }
     return {
@@ -22,7 +27,7 @@ def _views():
                 "active_profiles": all_view["active_profiles"],
                 "indicators": {"qos_profile_id": profile["profile_id"]},
             }
-            for profile in all_view["active_profiles"]
+            for profile in all_view["profile_catalog"]
         },
     }
 
@@ -52,6 +57,53 @@ def test_snapshot_api_preserves_profile_selection_and_summary_download(monkeypat
     assert summary.json()["clients"][0]["label"] == "_1"
 
 
+def test_snapshot_api_recovers_profile_selector_from_saved_profile_views(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(main_module.settings, "snapshots_dir", tmp_path)
+    profile_view = {
+        "active_profiles": [],
+        "indicators": {
+            "qos_profile_id": "profile-a",
+            "selected_profile": {
+                "profile_id": "profile-a",
+                "task_kind": "ner",
+            },
+        },
+    }
+    record = write_snapshot(
+        snapshots_dir=tmp_path,
+        views={
+            "all": {
+                "active_profiles": [],
+                "indicators": {"qos_profile_id": None},
+            },
+            "by_profile": {"profile-a": profile_view},
+        },
+        clients=[],
+    )
+
+    with TestClient(main_module.app) as client:
+        all_profiles = client.get(
+            "/api/data",
+            params={"snapshot_id": record["snapshot_id"]},
+        )
+        selected_profile = client.get(
+            "/api/data",
+            params={
+                "snapshot_id": record["snapshot_id"],
+                "qos_profile_id": "profile-a",
+            },
+        )
+
+    expected_profiles = [{"profile_id": "profile-a", "task_kind": "ner"}]
+    assert all_profiles.status_code == 200
+    assert all_profiles.json()["profile_catalog"] == expected_profiles
+    assert selected_profile.status_code == 200
+    assert selected_profile.json()["profile_catalog"] == expected_profiles
+
+
 def test_visualizer_export_uses_shared_store_and_can_copy_a_saved_snapshot(
     monkeypatch,
     tmp_path,
@@ -77,8 +129,52 @@ def test_visualizer_export_uses_shared_store_and_can_copy_a_saved_snapshot(
     copied, summary = load_snapshot(tmp_path, source_id)
     assert copied["label"] == "renamed checkpoint"
     assert copied["source_snapshot_id"] == first_id
+    assert copied["views"]["all"]["active_profiles"] == _views()["all"]["active_profiles"]
+    assert copied["views"]["all"]["profile_catalog"] == _views()["all"]["profile_catalog"]
     assert copied["views"]["by_profile"]["profile-b"]["indicators"]["qos_profile_id"] == "profile-b"
     assert summary["clients"] == []
+
+
+def test_snapshot_api_hides_profiles_with_zero_requests(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_module.settings, "snapshots_dir", tmp_path)
+    profile_catalog = [
+        {"profile_id": "used-profile", "task_kind": "ner"},
+        {"profile_id": "unused-profile", "task_kind": "question_answering"},
+    ]
+    record = write_snapshot(
+        snapshots_dir=tmp_path,
+        views={
+            "all": {
+                "active_profiles": [],
+                "profile_catalog": profile_catalog,
+                "indicators": {"qos_profile_id": None},
+            },
+            "by_profile": {
+                "used-profile": {
+                    "indicators": {
+                        "qos_profile_id": "used-profile",
+                        "total_requests": 1,
+                    },
+                },
+                "unused-profile": {
+                    "indicators": {
+                        "qos_profile_id": "unused-profile",
+                        "total_requests": 0,
+                    },
+                },
+            },
+        },
+        clients=[],
+    )
+
+    with TestClient(main_module.app) as client:
+        response = client.get(
+            "/api/data",
+            params={"snapshot_id": record["snapshot_id"]},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["profile_catalog"] == [profile_catalog[0]]
 
 
 def test_visualizer_remains_available_without_carbonshift(monkeypatch, tmp_path):
@@ -119,6 +215,11 @@ def test_snapshot_export_status_is_a_separate_header_row_and_clears_on_source_sw
 
     header = page.split("<header>", 1)[1].split("</header>", 1)[0]
     assert header.index('<span id="snapshot-status"') > header.index('<div class="controls">')
-    assert "flex-basis: 100%;" in page
+    assert "flex-direction: column;" in page
+    assert (
+        "document.getElementById('snapshot-status').textContent = '';\n"
+        "        selectedProfileId = '';"
+    ) in page
+    assert "if (snapshotId !== selectedSnapshotId) selectedProfileId = '';" in page
     assert "dataSourceGeneration += 1;" in page
     assert "document.getElementById('snapshot-status').textContent = '';" in page

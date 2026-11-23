@@ -44,7 +44,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     scheduler_requests: List[Dict[str, Any]] = _cache["scheduler_requests"]
 
     raw_profiles: Optional[List[Dict[str, Any]]] = fetch_json(
-        f"{settings.carbonshift_url}/v1/profiles"
+        f"{settings.carbonshift_url}/v1/profiles?include_inactive=true"
     )
     if raw_profiles is not None:
         _cache["active_profiles"] = raw_profiles
@@ -54,20 +54,19 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
             "could not load active QoS profiles; check Carbonshift connectivity and CARBONSHIFT_API_KEY"
         )
         _cache["profiles_unavailable_logged"] = True
-    # The API already defaults to active-only results. Filter once more here
-    # so a mixed-version service or test fixture cannot expose inactive
-    # policies in the dashboard selector.
-    active_profiles: List[Dict[str, Any]] = [
-        profile
-        for profile in _cache["active_profiles"]
-        if profile.get("active") is True
-    ]
+    # Keep registered policies selectable even after their assignments settle
+    # and are evicted from live scheduler state.
+    registered_profiles: List[Dict[str, Any]] = list(_cache["active_profiles"])
     selected_profile = next(
-        (profile for profile in active_profiles if profile.get("profile_id") == qos_profile_id),
+        (
+            profile
+            for profile in registered_profiles
+            if profile.get("profile_id") == qos_profile_id
+        ),
         None,
     )
     if qos_profile_id is not None and selected_profile is None:
-        logger.warning("requested QoS profile %s is not active; showing all profiles", qos_profile_id)
+        logger.warning("requested QoS profile %s is not registered; showing all profiles", qos_profile_id)
     selected_profile_id = selected_profile.get("profile_id") if selected_profile else None
     profile_query = (
         f"?qos_profile_id={quote(selected_profile_id, safe='')}"
@@ -127,6 +126,24 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
     global_assignments: Optional[List[Dict[str, Any]]] = fetch_json(
         f"{settings.carbonshift_url}/v1/assignments"
     )
+    profiles_with_requests = {
+        profile_id
+        for request in scheduler_requests
+        if isinstance((profile_id := request.get("qos_profile_id")), str) and profile_id
+    }
+    profiles_with_requests.update(
+        profile_id
+        for assignment in (global_assignments or [])
+        if isinstance((profile_id := assignment.get("qos_profile_id")), str) and profile_id
+    )
+    profile_catalog = [
+        profile
+        for profile in registered_profiles
+        if profile.get("profile_id") in profiles_with_requests
+    ]
+    active_profiles = [
+        profile for profile in profile_catalog if profile.get("active") is True
+    ]
     if selected_profile_id is None:
         engine_assignments = global_assignments
     else:
@@ -464,6 +481,7 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
 
     return {
         "active_profiles": active_profiles,
+        "profile_catalog": profile_catalog,
         "indicators": {
             "total_requests": total_req_count,
             "completed_requests": completed_req_count,
@@ -507,9 +525,9 @@ def get_dashboard_data(qos_profile_id: str | None = None) -> Dict[str, Any]:
             "qos_profile_id": selected_profile_id,
             "capacity_tiers": capacity_tiers,
             "flavour_colors": {
-                "Fast": "#1f77b4",
-                "Balanced": "#2ca02c",
-                "Accurate": "#ff7f0e",
+                "Fast": "#2E7D32",
+                "Balanced": "#C0A924",
+                "Accurate": "#8D4516",
             },
         },
         "error_plot": {

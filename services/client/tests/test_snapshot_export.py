@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import stat
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -12,6 +14,12 @@ from common.snapshots import (
     load_snapshot,
     write_snapshot,
 )
+
+
+def _snapshot_date_directory(tmp_path, record):
+    captured_at = datetime.fromisoformat(record["captured_at_utc"].replace("Z", "+00:00"))
+    local_captured_at = captured_at.astimezone(ZoneInfo("Europe/Rome"))
+    return tmp_path / local_captured_at.strftime("%Y%m%d")
 
 
 def test_shared_exporter_writes_matching_profile_views_and_client_summaries(
@@ -28,12 +36,18 @@ def test_shared_exporter_writes_matching_profile_views_and_client_summaries(
         def json(self):
             return self.payload
 
+    profile_catalog = [
+        {"profile_id": "profile-a", "task_kind": "ner", "active": True},
+        {"profile_id": "profile-b", "task_kind": "question_answering", "active": False},
+    ]
+
     def fake_get(url, params=None, timeout=None):
         profile_id = (params or {}).get("qos_profile_id")
         if profile_id:
             return Response(
                 {
                     "active_profiles": [{"profile_id": "profile-a"}],
+                    "profile_catalog": profile_catalog,
                     "indicators": {"qos_profile_id": profile_id},
                 }
             )
@@ -41,8 +55,8 @@ def test_shared_exporter_writes_matching_profile_views_and_client_summaries(
             {
                 "active_profiles": [
                     {"profile_id": "profile-a"},
-                    {"profile_id": "profile-b"},
                 ],
+                "profile_catalog": profile_catalog,
                 "indicators": {"qos_profile_id": None},
             }
         )
@@ -64,19 +78,23 @@ def test_shared_exporter_writes_matching_profile_views_and_client_summaries(
     assert snapshots[0]["label"] == "../../evening run"
     assert ".." not in record["snapshot_filename"]
     assert record["summary_filename"].endswith("_summary.json")
+    captured_at = datetime.fromisoformat(record["captured_at_utc"].replace("Z", "+00:00"))
+    local_captured_at = captured_at.astimezone(ZoneInfo("Europe/Rome"))
+    assert record["snapshot_filename"].startswith(local_captured_at.strftime("%H%M_%S"))
 
     snapshot, summary = load_snapshot(tmp_path, record["snapshot_id"])
     assert set(snapshot["views"]["by_profile"]) == {"profile-a", "profile-b"}
+    assert snapshot["views"]["all"]["profile_catalog"] == profile_catalog
     assert snapshot["views"]["by_profile"]["profile-a"]["indicators"]["qos_profile_id"] == "profile-a"
     assert [client["label"] for client in summary["clients"]] == ["_1", "_2"]
     assert summary["snapshot_id"] == snapshot["snapshot_id"]
     assert summary["captured_at_utc"] == snapshot["captured_at_utc"]
     assert summary["source"] == snapshot["source"] == "emulation"
-    date_directory = tmp_path / record["captured_at_utc"][:10].replace("-", "")
+    date_directory = _snapshot_date_directory(tmp_path, record)
     assert stat.S_IMODE((date_directory / record["snapshot_filename"]).stat().st_mode) == 0o666
     assert stat.S_IMODE((date_directory / record["summary_filename"]).stat().st_mode) == 0o666
     assert json.loads(
-        (tmp_path / record["captured_at_utc"][:10].replace("-", "") / record["snapshot_filename"])
+        (date_directory / record["snapshot_filename"])
         .read_text(encoding="utf-8")
     )["label"] == "../../evening run"
 
@@ -89,8 +107,7 @@ def test_incomplete_snapshot_pair_is_not_listed_or_loadable(tmp_path):
         label="incomplete",
     )
     summary_path = (
-        tmp_path
-        / record["captured_at_utc"][:10].replace("-", "")
+        _snapshot_date_directory(tmp_path, record)
         / record["summary_filename"]
     )
     summary_path.unlink()

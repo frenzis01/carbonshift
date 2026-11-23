@@ -50,6 +50,26 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertIn("hoverlabel: { bgcolor: theme.hoverBackground", response.text)
         self.assertIn("bgcolor: theme.sliderBackground", response.text)
         self.assertIn("bordercolor: theme.sliderBorder", response.text)
+        self.assertIn("'Fast': '#2E7D32'", response.text)
+        self.assertIn("'Balanced': '#C0A924'", response.text)
+        self.assertIn("'Accurate': '#8D4516'", response.text)
+        self.assertIn("const CARBON_INTENSITY_COLOR = '#1f77b4';", response.text)
+        self.assertIn("const ERROR_COLOR = '#d81b60';", response.text)
+        self.assertIn("const WINDOW_ERROR_COLOR = '#f97316';", response.text)
+        self.assertIn("const showProfileError = Boolean(selectedProfileId);", response.text)
+        self.assertIn("rawData.profile_catalog && rawData.profile_catalog.length", response.text)
+        self.assertIn("const errorHistory = showProfileError ? filteredErrorHistory(errorPlot) : null;", response.text)
+        self.assertIn("y: errorHistory.cumulative", response.text)
+        self.assertIn("name: `${errorPlot.error_avg_label} (last per slot)`", response.text)
+        self.assertIn("yaxis: 'y3'", response.text)
+        self.assertIn("marker: { color: '#9ca3af', opacity: 0.75 }", response.text)
+        self.assertIn("text: `Thresh: ${threshold.toFixed(4)}`", response.text)
+        self.assertIn("x: 0.01", response.text)
+        self.assertIn("opacity: 0.35", response.text)
+        self.assertIn("Carbon saving percentage compared to baseline", response.text)
+        self.assertIn('id="info-actual-carbon-cost"', response.text)
+        self.assertIn('id="info-baseline-carbon-cost"', response.text)
+        self.assertIn("--plot-height: 420px;", response.text)
         self.assertIn(
             "selectedProfileId && plot.global_slot_occupancy_visible_by_default",
             response.text,
@@ -279,7 +299,7 @@ class ErrorMetricsTests(unittest.TestCase):
         ]
         responses = {
             "http://carbonshift:8080/v1/requests": requests + second_client_requests,
-            "http://carbonshift:8080/v1/profiles": profiles,
+            "http://carbonshift:8080/v1/profiles?include_inactive=true": profiles,
             "http://carbonshift:8080/v1/horizon": {"current_slot": 2, "total_slots": 100},
             "http://carbonshift:8080/v1/stats": {},
             "http://provider:9100/v1/slot": {"current_slot": 2},
@@ -356,6 +376,18 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(qa["indicators"]["qos_profile_id"], "qa-calibrated-v1")
         self.assertEqual(qa["indicators"]["error_semantics"], "word-overlap-f1-v1")
         self.assertEqual(qa["indicators"]["max_error_threshold"], 20.0)
+        self.assertEqual(
+            [profile["profile_id"] for profile in qa["active_profiles"]],
+            ["qa-calibrated-v1", "ner-calibrated-v1"],
+        )
+        self.assertEqual(
+            [profile["profile_id"] for profile in qa["profile_catalog"]],
+            ["qa-calibrated-v1", "ner-calibrated-v1"],
+        )
+        self.assertNotIn(
+            "default-text-generation",
+            [profile["profile_id"] for profile in qa["profile_catalog"]],
+        )
         self.assertEqual(qa["error_plot"]["displayed_error_avg"], 14.0)
         self.assertEqual(qa["error_plot"]["error_avg_label"], "Profile cumulative error")
         self.assertEqual(qa["error_plot"]["error_history_slots"], [0, 1, 2])
@@ -366,6 +398,14 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertEqual(qa["assignment_plot"]["global_slot_occupancy"][2], 3)
         self.assertTrue(qa["assignment_plot"]["global_slot_occupancy_visible_by_default"])
         self.assertEqual(qa["assignment_plot"]["capacity_tiers"], capacity_tiers)
+        self.assertEqual(
+            qa["assignment_plot"]["flavour_colors"],
+            {
+                "Fast": "#2E7D32",
+                "Balanced": "#C0A924",
+                "Accurate": "#8D4516",
+            },
+        )
         self.assertEqual(
             qa["error_plot"]["profile_thresholds"],
             [
@@ -406,11 +446,72 @@ class ErrorMetricsTests(unittest.TestCase):
             qa["error_plot"]["profile_thresholds"],
         )
 
-        responses["http://carbonshift:8080/v1/profiles"] = [profiles[0]]
+        responses["http://carbonshift:8080/v1/profiles?include_inactive=true"] = [profiles[0]]
         one_profile = data.get_dashboard_data()
         self.assertFalse(
             one_profile["assignment_plot"]["global_slot_occupancy_visible_by_default"]
         )
+
+    def test_profile_catalog_omits_registered_profiles_without_requests(self):
+        used_profile = {
+            "profile_id": "used-profile",
+            "task_kind": "ner",
+            "active": False,
+        }
+        unused_profile = {
+            "profile_id": "unused-profile",
+            "task_kind": "question_answering",
+            "active": False,
+        }
+        responses = {
+            "http://carbonshift:8080/v1/requests": [
+                {
+                    "request_id": 1,
+                    "qos_profile_id": "used-profile",
+                    "arrival_slot": 0,
+                    "scheduled_slot": None,
+                    "status": "pending",
+                }
+            ],
+            "http://carbonshift:8080/v1/profiles?include_inactive=true": [
+                used_profile,
+                unused_profile,
+            ],
+            "http://carbonshift:8080/v1/horizon": {"current_slot": 0, "total_slots": 10},
+            "http://carbonshift:8080/v1/stats": {},
+            "http://provider:9100/v1/slot": {"current_slot": 0},
+            "http://carbonshift:8080/v1/metrics/costs": {},
+            "http://carbonshift:8080/v1/metrics/error-history": {
+                "current_slot": 0,
+                "slots": [],
+            },
+            "http://carbonshift:8080/v1/assignments": [],
+        }
+        cache = {
+            "scheduler_requests": [],
+            "capacity_tiers": [],
+            "active_profiles": [],
+            "profiles_unavailable_logged": False,
+            "carbon_ci_list": [],
+            "error_metrics_by_profile": {},
+        }
+
+        def fetch_json(url: str, timeout: float = 3.0):
+            if url.startswith("http://carbonshift:8080/v1/carbon_intensity?"):
+                return []
+            return responses.get(url)
+
+        with (
+            patch.object(data, "_cache", cache),
+            patch.object(data, "fetch_json", side_effect=fetch_json),
+        ):
+            dashboard = data.get_dashboard_data()
+
+        self.assertEqual(
+            [profile["profile_id"] for profile in dashboard["profile_catalog"]],
+            ["used-profile"],
+        )
+        self.assertEqual(dashboard["active_profiles"], [])
 
 
 if __name__ == "__main__":
