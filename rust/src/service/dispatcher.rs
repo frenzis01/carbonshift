@@ -172,7 +172,11 @@ fn record_failure(state: &AppState, request_id: u64, error: String) {
     let Some(t) = guard.get_mut(&request_id) else {
         return;
     };
-    if t.executor_callback_received {
+    // A concurrent/late dispatch response must not undo an accepted dispatch
+    // or a terminal lifecycle transition.
+    if t.executor_callback_received
+        || !matches!(t.status, RequestStatus::Pending | RequestStatus::Scheduled)
+    {
         return;
     }
     t.dispatch_attempts += 1;
@@ -278,6 +282,21 @@ mod tests {
         let request = tracked.get(&1).unwrap();
         assert_eq!(request.payload, serde_json::Value::Null);
         assert_eq!(request.task.as_deref(), Some("text_generation"));
+    }
+
+    #[test]
+    fn late_dispatch_failure_does_not_replace_an_accepted_dispatch() {
+        let state = test_state(1);
+        state.tracked.lock().unwrap().insert(1, tracked_request());
+        set_status(&state, 1, RequestStatus::Dispatched, None);
+
+        record_failure(&state, 1, "duplicate dispatch was rejected".to_owned());
+
+        let tracked = state.tracked.lock().unwrap();
+        let request = tracked.get(&1).unwrap();
+        assert_eq!(request.status, RequestStatus::Dispatched);
+        assert!(request.error.is_none());
+        assert_eq!(request.dispatch_attempts, 0);
     }
 
     #[test]

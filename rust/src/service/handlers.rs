@@ -91,6 +91,16 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> ApiError {
     (status, Json(serde_json::json!({ "error": msg.into() })))
 }
 
+/// Mark request as scheduled if pending
+/// ensures monotonic status progression
+fn mark_request_scheduled_if_pending(request: &mut TrackedRequest) {
+    // The dispatcher may advance this request while the submit handler is
+    // polling for its assignment; never regress a later lifecycle state.
+    if request.status == RequestStatus::Pending {
+        request.status = RequestStatus::Scheduled;
+    }
+}
+
 /// Rejects obviously unsafe callback URLs (SSRF guard).
 ///
 /// This is a best-effort check, not a full SSRF defence: it rejects non-
@@ -168,6 +178,10 @@ pub async fn register_qos_profile(
     // retry is idempotent, while a caller must choose a new ID to change policy.
     match state.qos_profiles.register(profile.clone()) {
         Ok(ProfileRegistration::Created) => {
+            state.shared_state.register_profile_error_window(
+                profile.profile_id.clone(),
+                profile.error_window.clone(),
+            );
             if let Some(logger) = &state.profile_metrics_logger {
                 logger.log_qos_profile(&profile);
             }
@@ -1531,24 +1545,6 @@ pub async fn get_error_history(
         .unwrap_or(_state.scheduler.error_window_past_decay_slots);
 
     let mut slots = Vec::with_capacity((to - from + 1) as usize);
-    let mut running_error_sum = 0.0;
-    let mut running_count = 0u64;
-
-    // Seed cumulative error with all history before `from`; the returned
-    // series then shows the cumulative average as it evolves through the
-    // selected interval, rather than restarting at its first displayed slot.
-    for s in 0..from {
-        let stats = if let Some(profile_id) = selected_profile_id {
-            _state
-                .shared_state
-                .get_profile_slot_error_stats(profile_id, s)
-        } else {
-            _state.shared_state.get_slot_error_stats(s)
-        };
-        running_error_sum += stats.error_sum;
-        running_count += stats.count;
-    }
-
     for slot in from..=to {
         let stats = if let Some(profile_id) = selected_profile_id {
             _state
@@ -1557,45 +1553,19 @@ pub async fn get_error_history(
         } else {
             _state.shared_state.get_slot_error_stats(slot)
         };
-        // Per-slot aggregates survive assignment eviction, so error history
-        // does not need to rescan request archive rows. Use the stored sum
-        // directly rather than reconstructing it from a rounded average.
-        running_error_sum += stats.error_sum;
-        running_count += stats.count;
-
-        let cumulative_error = if running_count > 0 {
-            Some(running_error_sum / running_count as f64)
-        } else {
-            None
-        };
-
-        // Match the solver's policy by including linearly decayed observations
-        // immediately before the active past window.
-        let window_error = if let Some(profile_id) = selected_profile_id {
-            _state
-                .shared_state
-                .get_profile_window_error_average_with_decay(
-                    profile_id,
-                    slot,
-                    window_past,
-                    window_future,
-                    window_past_decay_slots,
-                )
-        } else {
-            _state.shared_state.get_window_error_average_with_decay(
-                slot,
-                window_past,
-                window_future,
-                window_past_decay_slots,
-            )
-        };
+        // The backend stores these together at the last assignment/execution
+        // update in each slot. Recomputing a historical center from today's
+        // assignments would make old window points drift as later work arrives.
+        let history_point = _state
+            .shared_state
+            .get_error_history_point(slot, selected_profile_id);
 
         slots.push(SlotErrorItem {
             slot,
             average_error: stats.average,
             request_count: stats.count as usize,
-            window_error,
-            cumulative_error,
+            window_error: history_point.and_then(|point| point.window_error),
+            cumulative_error: history_point.and_then(|point| point.cumulative_error),
         });
     }
 
@@ -1707,9 +1677,7 @@ pub async fn submit_request(
                 as f64
                 * eff_slot_dur;
             if let Some(t) = state.tracked.lock().unwrap().get_mut(&request_id) {
-                if !t.executor_callback_received {
-                    t.status = RequestStatus::Scheduled;
-                }
+                mark_request_scheduled_if_pending(t);
             }
             // TODO: remove this debug print
             println!(
@@ -2193,6 +2161,30 @@ pub async fn executor_callback(
 mod tests {
     use super::*;
     use std::sync::RwLock;
+
+    #[test]
+    fn scheduled_response_does_not_downgrade_dispatch_lifecycle() {
+        let mut request = TrackedRequest::new(
+            None,
+            serde_json::json!({"task": "ner"}),
+            1.0,
+            1.0,
+            0,
+            QosProfileId::default_profile(),
+        );
+
+        mark_request_scheduled_if_pending(&mut request);
+        assert_eq!(request.status, RequestStatus::Scheduled);
+
+        request.status = RequestStatus::Dispatched;
+        mark_request_scheduled_if_pending(&mut request);
+        assert_eq!(request.status, RequestStatus::Dispatched);
+
+        request.status = RequestStatus::Completed;
+        request.executor_callback_received = true;
+        mark_request_scheduled_if_pending(&mut request);
+        assert_eq!(request.status, RequestStatus::Completed);
+    }
 
     #[test]
     fn relative_deadline_uses_future_arrival_slot_as_its_base() {
