@@ -1212,7 +1212,7 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
     engine_config.error_window_past_decay_slots = 2;
     let cfg = Arc::new(engine_config);
     let state = AppState::new(
-        shared_state,
+        shared_state.clone(),
         cfg.clone(),
         test_service_cfg(),
         test_forecast(cfg.total_slots),
@@ -1288,6 +1288,7 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
     assert_eq!(history["slots"][0]["average_error"], 10.0);
     assert_eq!(history["slots"][0]["window_error"], 10.0);
 
+    shared_state.set_current_slot(10);
     for (profile_query, expected_window_error) in
         [("qos_profile_id=qa-standard-v1&", 20.0), ("", 20.0)]
     {
@@ -1307,6 +1308,98 @@ async fn assignment_and_error_history_queries_filter_by_qos_profile() {
         let history = json_body(history).await;
         assert_eq!(history["slots"][0]["window_error"], expected_window_error);
     }
+}
+
+#[tokio::test]
+async fn error_history_keeps_event_time_points_and_applies_past_decay() {
+    let mut engine_config = test_engine_config();
+    engine_config.total_slots = 32;
+    engine_config.error_window_past = 12;
+    engine_config.error_window_future = 14;
+    engine_config.error_window_past_decay_slots = 12;
+    let cfg = Arc::new(engine_config);
+    let shared_state = SharedState::new();
+    let state = AppState::new(
+        shared_state.clone(),
+        cfg.clone(),
+        test_service_cfg(),
+        test_forecast(cfg.total_slots),
+    );
+    let app = build_router(state);
+    let profile_id = carbonshift_rs::engine::qos::QosProfileId::parse("default-ner").unwrap();
+    let assignment = |request_id, slot, error| {
+        carbonshift_rs::engine::types::Assignment::new_for_profile(
+            request_id,
+            slot,
+            "Fast".to_string(),
+            1.0,
+            error,
+            60.0,
+            Some(slot),
+            Some(slot + 1),
+            profile_id.clone(),
+        )
+    };
+
+    shared_state.add_assignments(vec![assignment(1, 0, 10.0)]);
+    shared_state.set_current_slot(1);
+    shared_state.add_assignments(vec![assignment(2, 1, 30.0)]);
+    for slot in 2..=5 {
+        shared_state.set_current_slot(slot);
+    }
+    shared_state.add_assignments(vec![assignment(3, 5, 50.0)]);
+    shared_state.set_current_slot(6);
+    shared_state.add_assignments(vec![assignment(4, 6, 80.0)]);
+    shared_state.correct_assignment_error(1, 90.0);
+    for slot in 7..=12 {
+        shared_state.set_current_slot(slot);
+    }
+
+    let history = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics/error-history?qos_profile_id=default-ner&to_slot=12")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.status(), StatusCode::OK);
+    let history = json_body(history).await;
+    for slot in 0..=12 {
+        let point = &history["slots"][slot];
+        let cumulative = point["cumulative_error"].as_f64().unwrap();
+        let window = point["window_error"].as_f64().unwrap();
+        assert!(
+            (cumulative - window).abs() < 1e-9,
+            "slot {slot}: event-time cumulative {cumulative} should equal its full-window average {window}"
+        );
+    }
+    assert_eq!(history["slots"][0]["cumulative_error"], 10.0);
+    assert_eq!(history["slots"][1]["cumulative_error"], 20.0);
+    assert_eq!(history["slots"][5]["cumulative_error"], 30.0);
+    assert_eq!(history["slots"][6]["cumulative_error"], 62.5);
+    assert_eq!(history["slots"][12]["cumulative_error"], 62.5);
+
+    shared_state.set_current_slot(13);
+    let history = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics/error-history?qos_profile_id=default-ner&from_slot=13&to_slot=13")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.status(), StatusCode::OK);
+    let history = json_body(history).await;
+    let point = &history["slots"][0];
+    assert_eq!(point["cumulative_error"], 62.5);
+    assert!(
+        (point["window_error"].as_f64().unwrap() - 3160.0 / 51.0).abs() < 1e-9,
+        "slot 0 should receive the configured 12/13 past-decay weight"
+    );
 }
 
 #[tokio::test]
@@ -1932,9 +2025,10 @@ async fn executor_callback_with_actual_error_pct_corrects_global_and_window_erro
     let assignments = shared_state.get_current_assignments();
     let assignment = assignments.get(&request_id).unwrap();
     let predicted_error = assignment.error;
+    let event_slot = shared_state.get_current_slot();
     let history_uri = format!(
         "/v1/metrics/error-history?qos_profile_id={}&from_slot={}&to_slot={}",
-        assignment.qos_profile_id, assignment.scheduled_slot, assignment.scheduled_slot
+        assignment.qos_profile_id, event_slot, event_slot
     );
     let history_before = app
         .clone()

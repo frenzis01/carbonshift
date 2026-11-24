@@ -523,8 +523,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <section class="chart-container">
     <div class="chart-header">
       <div>
-        <div class="chart-title">Error Tracking by Scheduled Slot</div>
-        <div class="chart-desc">Selected-profile error contributions; the all-profile average is descriptive only and has no QoS threshold.</div>
+        <div class="chart-title">Error Tracking by Slot</div>
+        <div class="chart-desc">Bars show scheduled-slot contributions. Error lines snapshot the latest state in each slot; later assignments and execution results do not rewrite earlier points. The window line applies the configured future, past, and decayed-past ranges.</div>
       </div>
       <div class="chart-current-metrics">
         <span id="plot-error-avg-label">Current all-profile cumulative error: <strong id="plot-global-error-avg">-</strong></span>

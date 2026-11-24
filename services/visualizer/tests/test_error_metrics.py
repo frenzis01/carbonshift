@@ -29,6 +29,10 @@ class ErrorMetricsTests(unittest.TestCase):
         self.assertIn("function plotUiRevision(chartName", response.text)
         self.assertIn("function slotAxisClockTicks(slots, plot)", response.text)
         self.assertIn("const maxLabels = 12;", response.text)
+        self.assertIn(
+            "later assignments and execution results do not rewrite earlier points",
+            response.text,
+        )
         self.assertIn("getUTCHours()", response.text)
         self.assertNotIn("${pad2(utc.getUTCMonth() + 1)} UTC", response.text)
         self.assertNotIn("fleet", response.text.lower())

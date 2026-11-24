@@ -27,6 +27,12 @@ struct SlotErrorTotals {
     count: u64,
 }
 
+#[derive(Clone, Default)]
+struct ErrorHistorySnapshot {
+    global: ErrorHistoryPoint,
+    profiles: HashMap<QosProfileId, ErrorHistoryPoint>,
+}
+
 // ─── solver snapshot ─────────────────────────────────────────────────────────
 
 /// Immutable projection of shared-state data needed by one solver batch.
@@ -305,6 +311,12 @@ struct Inner {
     profile_error_stats: HashMap<QosProfileId, GlobalErrorStats>,
     profile_slot_errors: HashMap<QosProfileId, BTreeMap<i32, SlotErrorTotals>>,
     global_slot_errors: BTreeMap<i32, SlotErrorTotals>,
+    /// Window policies used to capture event-time error history.
+    global_error_window: Option<ErrorWindowPolicy>,
+    profile_error_windows: HashMap<QosProfileId, ErrorWindowPolicy>,
+    /// Latest error snapshot for each scheduler slot, captured when entering
+    /// the slot and refreshed after assignment/error updates in that slot.
+    error_history_snapshots: BTreeMap<i32, ErrorHistorySnapshot>,
 }
 
 impl Inner {
@@ -354,6 +366,95 @@ impl Inner {
         self.add_slot_error_totals(&assignment);
         self.index_assignment(&assignment);
         self.assignments.insert(assignment.request_id, assignment);
+        // Commits and replans change the live population, so replace this
+        // slot's point with the state visible after the latest assignment.
+        self.refresh_error_history_snapshot_for_profile(&profile_id);
+    }
+
+    fn global_error_history_point(&self) -> ErrorHistoryPoint {
+        // Keep the global running average and centered window on one state
+        // snapshot; the history endpoint returns these as a comparable pair.
+        ErrorHistoryPoint {
+            cumulative_error: (self.global_assignment_count > 0)
+                .then(|| self.global_error_sum / self.global_assignment_count as f64),
+            window_error: self.global_error_window.as_ref().and_then(|policy| {
+                window_error_average_with_decayed_past(
+                    &self.global_slot_errors,
+                    self.current_slot,
+                    policy.past_slots,
+                    policy.future_slots,
+                    policy.past_decay_slots,
+                )
+            }),
+        }
+    }
+
+    fn profile_error_history_point(&self, profile_id: &QosProfileId) -> ErrorHistoryPoint {
+        // Use this profile's own totals and window policy so other profiles
+        // cannot change the QoS history shown for this budget.
+        let cumulative_error = self
+            .profile_error_stats
+            .get(profile_id)
+            .filter(|stats| stats.count > 0)
+            .map(|stats| stats.avg);
+        let window_error = self
+            .profile_error_windows
+            .get(profile_id)
+            .and_then(|policy| {
+                self.profile_slot_errors.get(profile_id).and_then(|slots| {
+                    window_error_average_with_decayed_past(
+                        slots,
+                        self.current_slot,
+                        policy.past_slots,
+                        policy.future_slots,
+                        policy.past_decay_slots,
+                    )
+                })
+            });
+        ErrorHistoryPoint {
+            cumulative_error,
+            window_error,
+        }
+    }
+
+    fn refresh_error_history_snapshot_for_profile(&mut self, profile_id: &QosProfileId) {
+        let current_slot = self.current_slot;
+        if !self.error_history_snapshots.contains_key(&current_slot) {
+            // The first update in a slot needs a baseline for every profile;
+            // later updates can refresh only the changed profile and fleet.
+            self.refresh_error_history_snapshot();
+            return;
+        }
+
+        let global = self.global_error_history_point();
+        let profile = self.profile_error_history_point(profile_id);
+        let snapshot = self
+            .error_history_snapshots
+            .get_mut(&current_slot)
+            .expect("history snapshot was checked above");
+        // A profile event also changes the fleet aggregate, but leaves every
+        // other profile's point in this slot unchanged.
+        snapshot.global = global;
+        snapshot.profiles.insert(profile_id.clone(), profile);
+    }
+
+    fn refresh_error_history_snapshot(&mut self) {
+        let current_slot = self.current_slot;
+        // Slot entry changes the window center even when no assignments
+        // changed, so capture all scopes at the new point in virtual time.
+        let global = self.global_error_history_point();
+        let mut profile_ids: HashSet<_> = self.profile_error_windows.keys().cloned().collect();
+        profile_ids.extend(self.profile_error_stats.keys().cloned());
+        profile_ids.extend(self.profile_slot_errors.keys().cloned());
+        let profiles = profile_ids
+            .into_iter()
+            .map(|profile_id| {
+                let point = self.profile_error_history_point(&profile_id);
+                (profile_id, point)
+            })
+            .collect();
+        self.error_history_snapshots
+            .insert(current_slot, ErrorHistorySnapshot { global, profiles });
     }
 
     fn add_slot_error_totals(&mut self, assignment: &Assignment) {
@@ -503,6 +604,9 @@ impl Inner {
             profile_error_stats: HashMap::new(),
             profile_slot_errors: HashMap::new(),
             global_slot_errors: BTreeMap::new(),
+            global_error_window: None,
+            profile_error_windows: HashMap::new(),
+            error_history_snapshots: BTreeMap::new(),
         }
     }
 }
@@ -565,6 +669,33 @@ impl SharedState {
         if current.is_none() {
             *current = Some(tiers);
         }
+    }
+
+    /// Configure the immutable policies used to record point-in-time error
+    /// history for the service's global and profile-scoped views.
+    pub fn initialize_error_history_windows(
+        &self,
+        global_policy: ErrorWindowPolicy,
+        profile_policies: HashMap<QosProfileId, ErrorWindowPolicy>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.global_error_window = Some(global_policy);
+        inner.profile_error_windows = profile_policies;
+        inner.refresh_error_history_snapshot();
+    }
+
+    /// Add the window policy for a newly registered profile and refresh the
+    /// current-slot point with the profile's existing aggregate, if any.
+    pub fn register_profile_error_window(
+        &self,
+        profile_id: QosProfileId,
+        policy: ErrorWindowPolicy,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .profile_error_windows
+            .insert(profile_id.clone(), policy);
+        inner.refresh_error_history_snapshot_for_profile(&profile_id);
     }
 
     /// Replace the global ladder for future baselines and scheduling work.
@@ -1302,6 +1433,23 @@ impl SharedState {
             })
     }
 
+    /// Return the event-time error values captured for one slot and scope.
+    ///
+    /// These values are not recomputed from later assignments or callbacks;
+    /// the current slot's point is refreshed as events occur in that slot.
+    pub fn get_error_history_point(
+        &self,
+        slot: i32,
+        profile_id: Option<&QosProfileId>,
+    ) -> Option<ErrorHistoryPoint> {
+        let inner = self.inner.lock().unwrap();
+        let snapshot = inner.error_history_snapshots.get(&slot)?;
+        match profile_id {
+            Some(profile_id) => snapshot.profiles.get(profile_id).copied(),
+            None => Some(snapshot.global),
+        }
+    }
+
     /// Replaces a committed assignment's *predicted* error with the
     /// *actual* error measured once the request was really executed (e.g.
     /// derived from the executor's `quality_score` in an emulation/real
@@ -1342,6 +1490,9 @@ impl SharedState {
                 0.0
             };
         }
+        // Executor feedback is observed now, not at the assignment's
+        // scheduled slot; refresh the current event-time point only.
+        g.refresh_error_history_snapshot_for_profile(&profile_id);
     }
 
     /// Returns the predicted error for a given assignment
@@ -1381,7 +1532,14 @@ impl SharedState {
     // ── slot management ───────────────────────────────────────────────────
 
     pub fn set_current_slot(&self, slot: i32) {
-        self.inner.lock().unwrap().current_slot = slot;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.current_slot == slot {
+            return;
+        }
+        inner.current_slot = slot;
+        // Start a point for the new window center without recalculating the
+        // already-recorded points for earlier slots.
+        inner.refresh_error_history_snapshot();
     }
 
     pub fn get_current_slot(&self) -> i32 {
@@ -1631,6 +1789,13 @@ pub struct GlobalErrorStats {
     pub error_sum: f64,
     pub count: u64,
     pub avg: f64,
+}
+
+/// Cumulative and window values captured together for one scheduler-slot event.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ErrorHistoryPoint {
+    pub cumulative_error: Option<f64>,
+    pub window_error: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

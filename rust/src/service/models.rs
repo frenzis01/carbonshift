@@ -304,11 +304,14 @@ pub struct CostMetricsResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SlotErrorItem {
     pub slot: i32,
+    /// Assignment count and average grouped by scheduled slot.
     pub request_count: usize,
     pub average_error: f64,
-    /// Window average including linearly decayed observations before its past edge.
+    /// Window average captured at the last state update in this scheduler slot.
+    /// It uses the configured future/past range and linearly decayed past.
     #[serde(default)]
     pub window_error: Option<f64>,
+    /// Global/profile cumulative average captured at the same event-time point.
     #[serde(default)]
     pub cumulative_error: Option<f64>,
 }

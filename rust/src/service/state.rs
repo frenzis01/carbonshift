@@ -461,6 +461,19 @@ impl AppState {
         // service binary the scheduler constructor has already done so.
         shared_state.initialize_capacity_tiers(cfg.capacity_tiers.clone());
         let qos_profiles = QosProfileRegistry::from_config(&cfg);
+        let profile_error_windows = qos_profiles
+            .list()
+            .into_iter()
+            .map(|profile| (profile.profile_id, profile.error_window))
+            .collect();
+        shared_state.initialize_error_history_windows(
+            ErrorWindowPolicy {
+                past_slots: cfg.error_window_past,
+                future_slots: cfg.error_window_future,
+                past_decay_slots: cfg.error_window_past_decay_slots,
+            },
+            profile_error_windows,
+        );
         if let Some(logger) = &profile_metrics_logger {
             for profile in qos_profiles.list() {
                 logger.log_qos_profile(&profile);
